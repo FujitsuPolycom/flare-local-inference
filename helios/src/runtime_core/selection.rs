@@ -11,7 +11,7 @@ use std::collections::{BTreeSet, HashSet};
 use serde_json::Value;
 
 use super::format::{Core, invalid};
-use crate::{Result, execution::BATCH_CAPACITIES};
+use crate::{Result, execution::BATCH_CAPACITIES, execution::roce_fabric::Shape};
 
 #[derive(Clone, Debug, Default)]
 pub struct LoadOptions {
@@ -39,6 +39,11 @@ pub struct LoadOptions {
     pub prefix_cache: crate::offload::PrefixCacheOffload,
     /// For a core whose ranks run on separate hosts: the one rank this host loads.
     pub cluster_rank: Option<usize>,
+    /// The shape this rank's transport will build, when it relays around a ring or chain: that
+    /// allocates and registers the proxy's mailbox area (`execution::roce::ring_bytes`) at startup.
+    /// Cache sizing reserves it before the transport exists, and the shape decides its geometry,
+    /// because only an open line broadcasts and only a line allocates the larger area.
+    pub relay_shape: Option<Shape>,
 }
 
 impl LoadOptions {

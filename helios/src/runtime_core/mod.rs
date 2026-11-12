@@ -28,6 +28,7 @@ pub use metadata::{unverified_metadata, unverified_metadata_selected};
 mod memory;
 mod model;
 mod payload;
+pub(crate) mod roce_layout;
 mod protection;
 mod protobuf;
 pub use protobuf::wire;
@@ -70,6 +71,21 @@ use driver::{
     MemsetParams, TensorMap,
 };
 use format::{Blob, Memory, Node, Core, Reference, Relocation, RelocationKind, invalid};
+
+// Test instrumentation: every attempt to open a CUDA device passes here, so loader tests can
+// prove that a metadata refusal happened before the first device did.
+#[cfg(test)]
+static DEVICE_OPENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn device_open() {
+    DEVICE_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn device_opens() -> u64 {
+    DEVICE_OPENS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 struct Storage {
     base: u64,
@@ -312,6 +328,8 @@ impl NativeResources {
     }
 
     unsafe fn initialize(core: &Core, ordinal: i32) -> Result<Self> {
+        #[cfg(test)]
+        device_open();
         let driver = Arc::new(Driver::load()?);
         // SAFETY: Driver signatures are checked against cuda.h; output storage is
         // valid, and CUDA initialization precedes all context/resource operations.

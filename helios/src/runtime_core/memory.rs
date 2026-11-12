@@ -13,6 +13,7 @@ use super::{
 };
 use crate::{
     Result,
+    execution::roce_fabric::Shape,
     startup::StartupProgress,
 };
 
@@ -188,6 +189,32 @@ fn budget(free: u64, total: u64, headroom: u64, integrated: bool) -> u64 {
     free.saturating_sub(headroom.saturating_add(host))
 }
 
+/// Host memory the native relay proxy allocates and registers when this rank relays.
+///
+/// `roce_enable_ring` owns this area: it is allocated once per rank and then registered with every
+/// configured HCA at startup, it is not part of `roce_layout`'s captured region, and a planner that
+/// budgets only that region would miss it. The shape decides the geometry: a closed ring allocates
+/// 4.02 MiB per rank at four ranks and 16.06 MiB at sixteen, while a line of four or more ranks
+/// broadcasts and allocates 192.19 MiB at four ranks, 896.90 MiB at eight and 3.75 GiB at sixteen.
+/// On a GB10 it competes with the unified-memory workload, and on any host it is memory the rank
+/// cannot hand to the cache.
+fn ring_reservation(shape: Option<Shape>, world: Option<usize>) -> u64 {
+    let Some(shape) = shape else {
+        return 0;
+    };
+    #[cfg(feature = "roce")]
+    {
+        world.map_or(0, |world| {
+            crate::execution::roce::ring_bytes(world, shape == Shape::Chain)
+        })
+    }
+    #[cfg(not(feature = "roce"))]
+    {
+        let _ = (shape, world);
+        0
+    }
+}
+
 /// Account for loaded storage and observed module/graph growth. The device observation is
 /// taken before loading model resources; on integrated GPUs it includes host allocations too.
 #[derive(Clone, Copy, Debug)]
@@ -268,6 +295,28 @@ fn limited_budget(
         "memory limit is {cap} bytes, but loaded model resources and runtime headroom require {required} bytes"
     )))?;
     Ok(available.min(remaining))
+}
+
+/// One rank's share of the cache budget after its own relay mailbox area.
+///
+/// The ring is charged exactly once, after the shared pool is divided: every relaying rank
+/// allocates and registers its own area, so a four-rank pool loses four rings in total, not one.
+/// Subtracting it after `limited_budget` also covers the reserve mode, whose budget does not
+/// shrink when the ring is added to the loaded footprint.
+fn rank_budget(
+    memory: MemorySnapshot,
+    loaded: u64,
+    limit: Option<MemoryLimit>,
+    default_headroom: u64,
+    integrated: bool,
+    future: u64,
+    share: u64,
+    ring: u64,
+) -> Result<u64> {
+    Ok(
+        (limited_budget(memory, loaded, limit, default_headroom, integrated, future)? / share)
+            .saturating_sub(ring),
+    )
 }
 
 /// Token limits describe useful history. Draft-page offsets are storage required in addition
@@ -506,6 +555,10 @@ impl NativeModel {
         ) {
             return Ok(());
         }
+        let ring = ring_reservation(
+            options.relay_shape,
+            self.cluster().map(|cluster| cluster.world),
+        );
         for ((rank, core), &memory) in self.ranks.iter().zip(cores).zip(initial) {
             let fixed = if rank.integrated {
                 cores
@@ -530,6 +583,9 @@ impl NativeModel {
                     0
                 })
                 .and_then(|fixed| fixed.checked_add(memory.free.saturating_sub(current.free)))
+                // The relay's mailbox area is budgeted here, before the transport exists; a
+                // limit that ignores it would be breached as soon as the group connects.
+                .and_then(|loaded| loaded.checked_add(ring))
                 .ok_or_else(|| invalid("fixed memory and context footprint overflow"))?;
             limited_budget(
                 current,
@@ -650,6 +706,12 @@ impl NativeModel {
             .ok_or_else(|| invalid("CPU image input windows overflow host memory"))?;
         let mut available = Vec::new();
         let mut loaded_bytes = Vec::new();
+        // Reserved before the transport is constructed and charged to every rank that relays,
+        // because every rank allocates its own area.
+        let ring = ring_reservation(
+            options.relay_shape,
+            self.cluster().map(|cluster| cluster.world),
+        );
         for (index, (rank, core)) in self.ranks.iter().zip(cores.iter()).enumerate() {
             let (memory, loaded, future, share) = if rank.integrated {
                 let memory = MemorySnapshot {
@@ -692,16 +754,17 @@ impl NativeModel {
                     1,
                 )
             };
-            available.push(
-                limited_budget(
-                    memory,
-                    loaded,
-                    options.memory_limit,
-                    reserve,
-                    rank.integrated,
-                    future,
-                )? / share,
-            );
+            // Each rank takes its own mailbox area out of its share of a shared pool.
+            available.push(rank_budget(
+                memory,
+                loaded,
+                options.memory_limit,
+                reserve,
+                rank.integrated,
+                future,
+                share,
+                ring,
+            )?);
             loaded_bytes.push(loaded / share);
         }
         let context = self.server_config["max_sequence_tokens"]
@@ -845,6 +908,12 @@ impl NativeModel {
             gib(&loaded_bytes),
             gib(&available),
         );
+        if ring != 0 {
+            summary.push_str(&format!(
+                " · RoCE ring {:.2} GiB reserved",
+                ring as f64 / (1u64 << 30) as f64
+            ));
+        }
         match options
             .memory_limit
             .unwrap_or(MemoryLimit::Reserve(reserve - HEADROOM_BYTES))
@@ -1063,6 +1132,95 @@ mod tests {
         protobuf::wire::Sizing,
     };
     use super::*;
+
+    #[test]
+    fn relay_mailboxes_leave_the_cache_budget_before_the_transport_exists() {
+        // A mesh rank relays nothing, and a rank whose world is unknown cannot size the area.
+        assert_eq!(ring_reservation(None, Some(4)), 0);
+        assert_eq!(ring_reservation(Some(Shape::Ring), None), 0);
+        // A world the proxy does not support reserves nothing, and the transport refuses to open.
+        assert_eq!(ring_reservation(Some(Shape::Ring), Some(1)), 0);
+        assert_eq!(ring_reservation(Some(Shape::Chain), Some(17)), 0);
+        #[cfg(feature = "roce")]
+        {
+            // The exact allocation the proxy makes, from `roce_enable_ring`: a closed ring keeps
+            // 64 KiB packets behind a shared eight-slot window.
+            assert_eq!(ring_reservation(Some(Shape::Ring), Some(2)), 2_105_600);
+            assert_eq!(ring_reservation(Some(Shape::Ring), Some(4)), 4_211_200);
+            assert_eq!(ring_reservation(Some(Shape::Ring), Some(8)), 8_422_400);
+            assert_eq!(ring_reservation(Some(Shape::Ring), Some(16)), 16_844_800);
+            // From `roce_enable_ring_open`: a line of four or more ranks broadcasts, so it needs
+            // 256 KiB packets behind a window per destination. Two or three ranks allocate the
+            // closed geometry.
+            assert_eq!(ring_reservation(Some(Shape::Chain), Some(2)), 2_105_600);
+            assert_eq!(ring_reservation(Some(Shape::Chain), Some(4)), 201_529_344);
+            assert_eq!(ring_reservation(Some(Shape::Chain), Some(8)), 940_470_272);
+            assert_eq!(ring_reservation(Some(Shape::Chain), Some(16)), 4_030_586_880);
+        }
+    }
+
+    #[test]
+    fn the_cache_planner_charges_each_rank_its_own_relay_ring_once() {
+        let gib = 1u64 << 30;
+        // The area a four-rank line allocates and registers per rank.
+        let ring = 201_529_344u64;
+        #[cfg(feature = "roce")]
+        assert_eq!(ring, ring_reservation(Some(Shape::Chain), Some(4)));
+        let memory = MemorySnapshot {
+            free: 100 * gib,
+            total: 100 * gib,
+        };
+        let loaded = 20 * gib;
+        // The same snapshot under every limit mode, before the ring is charged.
+        let cases = [
+            (None, 100 * gib - HEADROOM_BYTES),
+            (Some(MemoryLimit::Bytes(50 * gib)), 30 * gib - HEADROOM_BYTES),
+            (
+                Some(MemoryLimit::Fraction(0.5)),
+                30 * gib - HEADROOM_BYTES,
+            ),
+            (
+                Some(MemoryLimit::Reserve(50 * gib)),
+                50 * gib - HEADROOM_BYTES,
+            ),
+        ];
+        for (limit, budget) in cases {
+            assert_eq!(
+                limited_budget(memory, loaded, limit, HEADROOM_BYTES, false, 0).unwrap(),
+                budget
+            );
+            // One rank alone loses exactly the area it will allocate.
+            let alone =
+                rank_budget(memory, loaded, limit, HEADROOM_BYTES, false, 0, 1, ring).unwrap();
+            assert_eq!(alone, budget - ring);
+            // Four ranks sharing a pool each lose their own area, and nothing else.
+            let shared =
+                rank_budget(memory, loaded, limit, HEADROOM_BYTES, false, 0, 4, ring).unwrap();
+            assert_eq!(shared, budget / 4 - ring);
+            assert_eq!(4 * (shared + ring), 4 * (budget / 4));
+        }
+        // The reserve mode is why the ring is subtracted after the budget, not from the
+        // loaded footprint: a reserve does not shrink when more memory is occupied.
+        assert_eq!(
+            rank_budget(
+                memory,
+                loaded + ring,
+                Some(MemoryLimit::Reserve(50 * gib)),
+                HEADROOM_BYTES,
+                false,
+                0,
+                1,
+                0
+            )
+            .unwrap(),
+            50 * gib - HEADROOM_BYTES
+        );
+        // A ring larger than the whole budget floors the cache at zero instead of wrapping.
+        assert_eq!(
+            rank_budget(memory, loaded, None, HEADROOM_BYTES, false, 0, 1, 200 * gib).unwrap(),
+            0
+        );
+    }
 
     #[test]
     fn integrated_memory_includes_reclaimable_ram_but_not_swap() {

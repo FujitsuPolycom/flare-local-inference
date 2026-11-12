@@ -80,6 +80,10 @@ unsafe fn discrete_free(pci: &[c_char]) -> Result<u64> {
 
 impl NativeResources {
     pub(super) unsafe fn memory_before_context(ordinal: i32) -> Result<MemorySnapshot> {
+        // The other device-entry path: the package loader reaches CUDA through memory sizing before
+        // it builds a context, so the instrumentation must count here too.
+        #[cfg(test)]
+        super::device_open();
         let driver = Driver::load()?;
         unsafe {
             driver.check("cuInit", (driver.init)(0))?;

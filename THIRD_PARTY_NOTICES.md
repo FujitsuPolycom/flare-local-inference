@@ -46,9 +46,10 @@ full license and copyrights are included in `licenses/PyTorch.txt` in binary
 archives and in `helios/licenses/PyTorch.txt` in the source tree.
 
 The Linux aarch64 runtime also compiles the RoCE proxy in
-`helios/native/roce_proxy.c`, contributed by its original author from the pinned
-FlashInfer/b12x source. Its upstream Apache-2.0 license
-is retained in `helios/licenses/FlashInfer.txt` and included in binary archives.
+`helios/native/roce_proxy.c`, contributed by its original author from FlashInfer's
+`flashinfer/experimental/b12x/comm/roce/_roce_proxy.c` at proxy ABI 15. Its upstream
+Apache-2.0 license is retained in `helios/licenses/FlashInfer.txt` and included in
+binary archives.
 This native C source is distinct from the separately installed Python package.
 
 The vLLM-derived sampler and DeepSeek recipe assets belong to the source and

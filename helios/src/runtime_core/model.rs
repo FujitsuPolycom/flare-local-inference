@@ -74,8 +74,14 @@ fn roce_spec(
         varlen_bytes: wire.varlen_bytes,
         ctrl_offset: wire.ctrl_offset,
     };
-    let within = |address: u64, nbytes: u64, memory: super::format::Memory| {
-        core.allocations.iter().any(|a| {
+    // Layout and ABI compatibility is arithmetic over the recorded geometry, so it is checked
+    // here, while the core metadata is read: an ABI 12 core with two pipelined rows per peer and
+    // chunk, a region that is not this geometry's layout, or a foreign proxy ABI is refused
+    // before any CUDA context, allocation, resource or cache exists. `RoceTransport::open`
+    // repeats it as a defensive check.
+    super::roce_layout::check_core_layout(&spec)?;
+    let allocation = |address: u64, nbytes: u64, memory: super::format::Memory| {
+        core.allocations.iter().find(|a| {
             std::mem::discriminant(&a.memory) == std::mem::discriminant(&memory)
                 && a.address.is_some_and(|base| {
                     base <= address
@@ -88,27 +94,73 @@ fn roce_spec(
     if !(2..=16).contains(&spec.world) || spec.rank >= spec.world {
         return Err(invalid("RoCE transport geometry is inconsistent"));
     }
+    let missing = || {
+        invalid("RoCE transport memory must lie in the rank's mapped host and device allocations")
+    };
     if spec.region_bytes == 0
         || spec
             .ctrl_offset
             .checked_add(4096)
             .is_none_or(|end| end > spec.region_bytes)
-        || !within(
+        || allocation(
             spec.region_address,
             spec.region_bytes,
             super::format::Memory::MappedHost,
         )
-        || !within(
-            spec.counters_address,
-            spec.counters_bytes,
-            super::format::Memory::Device,
-        )
+        .is_none()
+    {
+        return Err(missing());
+    }
+    let counters = allocation(
+        spec.counters_address,
+        spec.counters_bytes,
+        super::format::Memory::Device,
+    )
+    .ok_or_else(missing)?;
+    // FlashInfer's restore contract: the region and the device counters are restored at their
+    // recorded addresses and zeroed, so a fresh group starts again at sequence 1 with an empty
+    // epoch and no poison. The new proxy starts at sequence 0, so a retained epoch would make its
+    // first doorbells look like a gap and be skipped rather than served. A counters block that a
+    // stored span would overwrite could restore exactly that, so refuse it while no device exists.
+    let offset = spec.counters_address - counters.address.unwrap_or_default();
+    let end = offset.saturating_add(spec.counters_bytes);
+    if spec.counters_bytes == 0
+        || counters
+            .spans()
+            .any(|[start, nbytes]| (start as u64) < end && offset < (start + nbytes) as u64)
     {
         return Err(invalid(
-            "RoCE transport memory must lie in the rank's mapped host and device allocations",
+            "RoCE device counters must be restored zeroed, but a stored span covers the epoch and poison words",
         ));
     }
     Ok(spec)
+}
+
+/// Validate every rank's recorded RoCE metadata, before any device is opened.
+///
+/// This is the loader's whole transport-metadata phase: it reads each rank's recorded transport,
+/// validates its geometry and ABI, and requires its rank's cluster identity. It touches no device
+/// and no allocation, so a refusal here costs nothing that a later load would have to release.
+fn transport_specs(
+    cluster: Option<&ClusterRank>,
+    transports: Vec<Option<protobuf::wire::RoceTransport>>,
+    cores: &[super::format::Core],
+) -> Result<Vec<Option<RoceSpec>>> {
+    let roce = transports
+        .into_iter()
+        .zip(cores)
+        .map(|(wire, core)| wire.map(|w| roce_spec(w, core)).transpose())
+        .collect::<Result<Vec<_>>>()?;
+    if roce.iter().flatten().any(|spec| {
+        cluster
+            .as_ref()
+            .is_none_or(|c| (c.world, c.rank) != (spec.world, spec.rank))
+    }) {
+        return Err(invalid(
+            "a RoCE transport requires its rank's cluster identity",
+        ));
+    }
+    Ok(roce)
 }
 
 /// The cluster an authorized core's ranks form: (world, export id), or None
@@ -351,20 +403,7 @@ impl NativeModel {
             core.validate()?;
             Files::validate(&files, core)?;
         }
-        let roce = transports
-            .into_iter()
-            .zip(&cores)
-            .map(|(wire, core)| wire.map(|w| roce_spec(w, core)).transpose())
-            .collect::<Result<Vec<_>>>()?;
-        if roce.iter().flatten().any(|spec| {
-            cluster
-                .as_ref()
-                .is_none_or(|c| (c.world, c.rank) != (spec.world, spec.rank))
-        }) {
-            return Err(invalid(
-                "a RoCE transport requires its rank's cluster identity",
-            ));
-        }
+        let roce = transport_specs(cluster.as_ref(), transports, &cores)?;
         let mut server_config = protobuf::serving_contract(
             descriptor
                 .contract
@@ -1110,6 +1149,185 @@ mod tests {
             unsafe { model.prepare_offload(Path::new("unopened-core"), &options, &progress, 1) }
                 .unwrap_err();
         assert!(error.to_string().contains("lacks an identity"));
+    }
+
+    /// One rank's core metadata: the transport's mapped host region and its device counters,
+    /// with no payload, module or graph, because the transport gate is checked before any of them
+    /// matter.
+    fn transport_core(
+        region_address: u64,
+        region_bytes: u64,
+        counters_address: u64,
+        counters_bytes: u64,
+    ) -> super::super::format::Core {
+        protobuf::decode(protobuf::wire::BundleIndex {
+            architecture: vec![12, 0],
+            context: Some(Default::default()),
+            reservations: vec![
+                protobuf::wire::Reservation {
+                    address: counters_address,
+                    nbytes: counters_bytes,
+                },
+                protobuf::wire::Reservation {
+                    address: region_address,
+                    nbytes: region_bytes,
+                },
+            ],
+            allocations: vec![
+                protobuf::wire::Allocation {
+                    name: "region".into(),
+                    nbytes: region_bytes,
+                    alignment: 4096,
+                    address: Some(region_address),
+                    memory: protobuf::wire::Memory::MappedHost as i32,
+                    ..Default::default()
+                },
+                protobuf::wire::Allocation {
+                    name: "counters".into(),
+                    nbytes: counters_bytes,
+                    alignment: 4096,
+                    address: Some(counters_address),
+                    memory: protobuf::wire::Memory::Device as i32,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn doubled_row_abi12_transport_is_refused_by_core_metadata_before_any_device_opens() {
+        use super::super::roce_layout::{PROXY_ABI, layout, parity_pipe_excess};
+
+        let (world, slot_bytes, pipe_bytes, varlen_bytes) = (4usize, 4096, 4096, 4096);
+        let layout = layout(world, slot_bytes, pipe_bytes, varlen_bytes).unwrap();
+        let region = 0x7f00_0000_0000u64;
+        let counters = 0x7f00_1000_0000u64;
+        let page = |bytes: u64| bytes.div_ceil(4096) * 4096;
+        let core = transport_core(region, page(layout[4]), counters, 64);
+        let cluster = ClusterRank {
+            world,
+            rank: 0,
+            export_id: "review".into(),
+        };
+        let transport = |proxy_abi: u32, region_bytes: u64| protobuf::wire::RoceTransport {
+            proxy_abi,
+            world: world as u32,
+            rank: 0,
+            region_address: region,
+            region_bytes,
+            counters_address: counters,
+            counters_bytes: 64,
+            slot_bytes,
+            pipe_bytes,
+            ctrl_offset: layout[3],
+            varlen_bytes,
+        };
+        // A sequence-parity core: proxy ABI 12 with two pipelined rows per peer and chunk.
+        let parity = transport(12, layout[4] + parity_pipe_excess(world as u64, &layout));
+        let opens = super::super::device_opens();
+        let error = transport_specs(
+            Some(&cluster),
+            vec![Some(parity)],
+            std::slice::from_ref(&core),
+        )
+        .expect_err("the doubled-row ABI 12 layout must be refused")
+        .to_string();
+        assert!(error.contains("sequence-parity"), "{error}");
+        assert!(
+            error.contains("re-export from a proxy ABI 15"),
+            "the refusal names its fix: {error}"
+        );
+        assert_eq!(
+            super::super::device_opens(),
+            opens,
+            "the doubled-row ABI 12 refusal must happen before any device opens"
+        );
+        // Any other region that is not this geometry's layout is refused at the same point.
+        let shifted = transport(PROXY_ABI, layout[4] + 4096);
+        let error = transport_specs(
+            Some(&cluster),
+            vec![Some(shifted)],
+            std::slice::from_ref(&core),
+        )
+        .expect_err("a mismatched region must be refused")
+        .to_string();
+        assert!(error.contains("region differs"), "{error}");
+        assert_eq!(super::super::device_opens(), opens);
+        // The same rank with its own geometry's region passes the gate, so the refusal was the
+        // layout and not the fixture.
+        let spec = transport_specs(
+            Some(&cluster),
+            vec![Some(transport(PROXY_ABI, layout[4]))],
+            std::slice::from_ref(&core),
+        )
+        .expect("a matching layout is accepted")[0]
+            .clone()
+            .unwrap();
+        assert_eq!(spec.region_bytes, layout[4]);
+        assert_eq!(
+            super::super::device_opens(),
+            opens,
+            "transport metadata validation never opens a device"
+        );
+        // The hooks are live: both device-entry paths count, whatever the driver then reports,
+        // so the ordering above cannot pass by instrumenting only one of them.
+        unsafe { super::super::NativeResources::initialize(&core, 0) }.ok();
+        assert_eq!(super::super::device_opens(), opens + 1);
+        unsafe { super::super::NativeResources::memory_before_context(0) }.ok();
+        assert_eq!(super::super::device_opens(), opens + 2);
+    }
+
+    #[test]
+    fn transport_counters_must_be_restored_zeroed() {
+        use super::super::roce_layout::{PROXY_ABI, layout};
+
+        let (world, slot_bytes, pipe_bytes, varlen_bytes) = (4usize, 4096, 4096, 4096);
+        let layout = layout(world, slot_bytes, pipe_bytes, varlen_bytes).unwrap();
+        let region = 0x7f00_0000_0000u64;
+        let counters = 0x7f00_1000_0000u64;
+        let page = |bytes: u64| bytes.div_ceil(4096) * 4096;
+        let mut core = transport_core(region, page(layout[4]), counters, 64);
+        let cluster = ClusterRank {
+            world,
+            rank: 0,
+            export_id: "review".into(),
+        };
+        let transport = || protobuf::wire::RoceTransport {
+            proxy_abi: PROXY_ABI,
+            world: world as u32,
+            rank: 0,
+            region_address: region,
+            region_bytes: layout[4],
+            counters_address: counters,
+            counters_bytes: 64,
+            slot_bytes,
+            pipe_bytes,
+            ctrl_offset: layout[3],
+            varlen_bytes,
+        };
+        assert!(
+            transport_specs(
+                Some(&cluster),
+                vec![Some(transport())],
+                std::slice::from_ref(&core)
+            )
+            .is_ok(),
+            "counters outside every stored span are restored zeroed"
+        );
+        // A stored span over the counters would restore a retained epoch or poison instead of the
+        // zero the new proxy needs before its first sequence.
+        core.allocations[1].data_spans = vec![[0, 64]];
+        core.allocations[1].file = Some("counters.bin".into());
+        let error = transport_specs(
+            Some(&cluster),
+            vec![Some(transport())],
+            std::slice::from_ref(&core),
+        )
+        .expect_err("stored counters must be refused")
+        .to_string();
+        assert!(error.contains("restored zeroed"), "{error}");
     }
 
     #[test]

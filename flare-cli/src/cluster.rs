@@ -46,6 +46,15 @@ pub struct Joined<S> {
 }
 
 /// The check every completed frame passes: a failed transport poisons the rank.
+///
+/// A failure here is terminal, not recoverable in place. The proxy refuses `roce_start` on a
+/// context that failed or was stopped inside an operation, and in-process quiesce/reset/rejoin is
+/// not implemented: a replacement would have to exchange records with peers that already hold the
+/// failed one. A rank that reports this error must stop admitting replays, keep its package and
+/// CUDA owners live until the proxy has destroyed every queue pair, and leave the process. The
+/// group recovers by restarting every rank, which reloads the package — restoring the pinned region
+/// and the device counters zeroed — and starts a fresh transport that publishes and exchanges its
+/// own records. Serving never calls `start` on the same context again.
 pub fn health(transport: &Arc<RoceTransport>) -> CollectiveHealth {
     #[cfg(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce")))]
     {
