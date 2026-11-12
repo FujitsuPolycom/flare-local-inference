@@ -19,8 +19,21 @@ use super::roce_fabric::Shape;
 use crate::runtime_core::RoceSpec;
 use crate::{ExecutionError, Failure, Result};
 
-/// The proxy ABI compiled into this runtime; cores record the one their kernels use.
-pub const PROXY_ABI: u32 = 11;
+/// The proxy ABI of the vendored `native/roce_proxy.c`, which every rank tags its queue-pair
+/// record with and which a linked library must report for this runtime to use it.
+///
+/// The record carries one queue-pair number per lane and the lane count, and the control page
+/// holds start-of-op credits past the words the kernels post. The seventeen-word region layout
+/// and the kernel-posted flags are the same for ABI 9, 10, 11 and 14, so cores recording any of
+/// them load.
+pub const PROXY_ABI: u32 = 14;
+/// Queue pairs this rank opens per rail and peer, and the value every rank passes to
+/// `roce_create`: ABI 14 refuses a group whose peers report a different count at connect.
+///
+/// One keeps ABI 11's queue-pair topology. The record carries the count, so a group mixing
+/// builds that choose differently is refused before any queue pair is connected; cores do not
+/// record it.
+const LANES: c_int = 1;
 /// Control word 7 after a variable-length all-gather met a byte count it cannot send.
 const INVALID_VARLEN_COUNT: u32 = 1;
 
@@ -46,6 +59,7 @@ unsafe extern "C" {
         n_hca: c_int,
         gid_index: c_int,
         traffic_class: c_int,
+        n_lane: c_int,
         region: *mut c_void,
         region_bytes: u64,
         slot_bytes: u64,
@@ -75,18 +89,38 @@ fn failure(message: impl Into<String>) -> crate::Error {
 }
 
 fn peer_blobs(records: &[Vec<u8>], world: usize) -> Result<Vec<u8>> {
-    // ABI 10 changes startup-owned ring mailboxes and ABI 11 adds op kinds, not the captured
-    // kernel region.
-    // Older cores can use the new proxy, but all live peers must use its wire layout.
+    // The record carries the proxy ABI and the C blob's bytes, which changed with ABI 12's
+    // queue-pair lanes. Every live peer must run this proxy: a record from another build is
+    // refused here, by rank, before any queue pair is connected.
     let size = unsafe { roce_blob_bytes() } as usize;
-    if records.len() != world
-        || records
-            .iter()
-            .any(|record| record.len() != size + 4 || record[..4] != PROXY_ABI.to_le_bytes())
-    {
-        return Err(failure(
-            "RoCE queue-pair records must cover every rank with the same native proxy ABI",
-        ));
+    if records.len() != world {
+        return Err(failure(format!(
+            "RoCE queue-pair records cover {} ranks, not {world}",
+            records.len()
+        )));
+    }
+    for (rank, record) in records.iter().enumerate() {
+        if record.len() < 4 {
+            return Err(failure(format!(
+                "rank {rank} sent a {}-byte RoCE queue-pair record, which carries no ABI",
+                record.len()
+            )));
+        }
+        let abi = u32::from_le_bytes([record[0], record[1], record[2], record[3]]);
+        if abi != PROXY_ABI {
+            return Err(failure(format!(
+                "rank {rank} sent RoCE proxy ABI {abi} in its queue-pair record; this group \
+                 needs {PROXY_ABI}"
+            )));
+        }
+        if record.len() != size + 4 {
+            return Err(failure(format!(
+                "rank {rank} sent a {}-byte RoCE queue-pair record for ABI {abi}; this \
+                 runtime's is {}",
+                record.len(),
+                size + 4
+            )));
+        }
     }
     Ok(records
         .iter()
@@ -119,13 +153,22 @@ impl RoceTransport {
     /// before `connect` returns.
     pub unsafe fn open(spec: &RoceSpec, topology: &Topology) -> Result<Self> {
         let abi = unsafe { roce_abi_version() } as u32;
-        // ABI 9, 10 and 11 have identical kernel-visible layouts. ABI 10's wider CPU ring
-        // window is allocated by this runtime at startup. ABI 11 adds the reduce-scatter and
-        // shard-gather op kinds, which cores recording ABI 9 or 10 never post.
-        if !matches!(spec.proxy_abi, 9 | 10 | 11) || abi != PROXY_ABI {
+        // Cores recording ABI 9, 10, 11 or 14 lay out the same seventeen-word region, so this
+        // runtime loads all of them: ABI 14's start-of-op credits are proxy-side waits that ABI 9
+        // through 11 kernels never trigger. Flare has exported no core at ABI 12 or 13, so those
+        // and any other value are refused before a device opens.
+        if !matches!(spec.proxy_abi, 9 | 10 | 11 | PROXY_ABI) {
             return Err(failure(format!(
-                "core RoCE kernels use proxy ABI {}, this runtime provides {abi}",
+                "core records RoCE proxy ABI {}; this runtime loads 9, 10, 11 or 14, so re-export \
+                 the core with the pinned FlashInfer",
                 spec.proxy_abi
+            )));
+        }
+        // Credits cross ranks, so the linked library must be the proxy this runtime was built
+        // against even when the core's ABI is one this runtime loads.
+        if abi != PROXY_ABI {
+            return Err(failure(format!(
+                "linked RoCE proxy reports ABI {abi}, this runtime is built for {PROXY_ABI}"
             )));
         }
         let mut layout = [0u64; 17];
@@ -191,6 +234,7 @@ impl RoceTransport {
                 pointers.len() as c_int,
                 topology.gid_index as c_int,
                 topology.traffic_class as c_int,
+                LANES,
                 region,
                 spec.region_bytes,
                 spec.slot_bytes,
@@ -390,9 +434,9 @@ mod tests {
     }
 
     #[test]
-    fn compatible_core_abis_still_validate_the_captured_region() {
+    fn only_loadable_core_abis_reach_the_captured_region() {
         let (region, spec, topology) = specification();
-        for abi in [8, 9, 10, 11, 12] {
+        for abi in [8, 9, 10, 11, 12, 13, 14, 15, 16] {
             let mut spec = spec.clone();
             spec.proxy_abi = abi;
             spec.ctrl_offset += 128;
@@ -402,7 +446,7 @@ mod tests {
                 .expect("invalid layout must fail")
                 .to_string();
             assert!(
-                error.contains(if matches!(abi, 9 | 10 | 11) {
+                error.contains(if matches!(abi, 9 | 10 | 11 | 14) {
                     "region differs"
                 } else {
                     "proxy ABI"
@@ -427,8 +471,15 @@ mod tests {
         assert_eq!(peer_blobs(&records, 2).unwrap(), expected);
         assert!(peer_blobs(&records, 3).is_err());
         let mut foreign = records.clone();
-        foreign[1] = record(9, 0x34);
+        foreign[1] = record(11, 0x34);
         assert!(peer_blobs(&foreign, 2).is_err());
+        // ABI 14's record carries one queue-pair number per lane and the count, so a record
+        // from an older proxy is refused by length even when it claims this ABI.
+        let mut short = records.clone();
+        short[1] = record(PROXY_ABI, 0x34);
+        let short_len = short[1].len();
+        short[1].truncate(short_len - 4);
+        assert!(peer_blobs(&short, 2).is_err());
         let mut unversioned = records.clone();
         unversioned[1] = vec![0; size];
         assert!(peer_blobs(&unversioned, 2).is_err());

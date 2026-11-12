@@ -157,11 +157,16 @@ uv sync --locked --extra prepare --extra test
 cargo build --release --manifest-path flare-cli/Cargo.toml
 ```
 
-Preparation and serving use proxy ABI 11. Its proxy holds eight packets in flight per sender and
-rail in ring mailboxes that the runtime allocates at startup, and it serves the pipelined
-reduce-scatter and shard-gather operations. Cores recording proxy ABI 9 or 10 have the same
-captured region layout, so the runtime loads cores that record ABI 9, 10 or 11. The chain topology
-is a mode of this layout, and startup rejects any other proxy ABI before replay.
+Preparation and serving use proxy ABI 14, the ABI of the FlashInfer revision `pyproject.toml`
+pins. Its proxy holds eight packets in flight per sender and rail in ring mailboxes that the
+runtime allocates at startup, serves the pipelined reduce-scatter and shard-gather operations,
+and adds start-of-op credits to the control page: a rank writes its operation's sequence number
+to every peer before a phase that could overrun that peer's previous operation. Every rank of a
+group posts and waits for those credits, so all of them must run this proxy. The runtime loads
+cores that record ABI 9, 10, 11 or 14: all four lay out the same seventeen-word region with the
+same kernel-posted flags, and credits are proxy-side waits that ABI 9 through 11 kernels never
+trigger. A core recording ABI 12 or 13, or any other value, is refused before a device opens.
+The chain topology is a mode of this layout.
 
 ### Prepare across four hosts
 
@@ -246,10 +251,10 @@ Ranks that disagree about ring mode fail during transport record exchange.
 
 Select ring mode explicitly during serving, including for a core prepared
 with the option. The serving flag chooses routing independently of the
-core's graph catalog. A core recording proxy ABI 9, 10 or 11 can use either transport
-without changing its captured addresses or collective algorithms. Preparation
-on a physical ring also needs `--roce-ring`, because non-neighbor direct routes
-are unavailable during warmup and capture. A chain (`--roce-chain`) uses the
+core's graph catalog. A core recording proxy ABI 9, 10, 11 or 14 can use either
+transport without changing its captured addresses or collective algorithms.
+Preparation on a physical ring also needs `--roce-ring`, because non-neighbor
+direct routes are unavailable during warmup and capture. A chain (`--roce-chain`) uses the
 neighbor transport for collectives, and its checkpoint loading and preparation
 export follow the chain routes through the rank-owned helpers, as
 [chains](#chains) describes.
@@ -378,9 +383,12 @@ control-error interpretation without opening an RDMA device or CUDA context:
 ```sh
 cargo test --manifest-path helios/Cargo.toml --features roce \
   --lib execution::roce::tests
+python3 -m pytest tests/transport -q
 ```
 
-This command requires a C compiler and libibverbs development files. Formal
+These commands require a C compiler and libibverbs development files. The
+pytest driver builds the same proxy against a fake verbs provider, so it needs
+no device, and it skips on a host without those headers. Formal
 checks use finite configurations and explicit progress assumptions described
 with each model. They do not establish CPU/GPU/NIC cache coherence, unbounded
 sequence-number behavior, fault recovery, or full-model serving correctness.
@@ -399,7 +407,8 @@ is unsupported; restarting the proxy thread alone does not reset the runtime.
 | Symptom | Check |
 | --- | --- |
 | `--roce-ring and --roce-chain require a multi-host core with 2..16 ranks` (Orbit) or `experimental RoCE ring requires 2..16 ranks` (serving rank) | Use a multi-host core with a supported rank count. The flag does not add model sharding geometries. |
-| `core RoCE kernels use proxy ABI ...` | Align the preparation dependency and native executable; re-export cores recording a proxy ABI other than 9 or 10. |
+| `core records RoCE proxy ABI ...` | Align the preparation dependency and native executable. Cores load at ABI 9, 10, 11 and 14; re-export a core recording 12, 13 or another value with the pinned FlashInfer. |
+| `linked RoCE proxy reports ABI ...` | Rebuild the native library from the vendored proxy; a library built for another ABI cannot join the group. |
 | `RoCE rails have a link to rank ...` | Verify rank order, active ports, GIDs, and the IPv4 subnet shared by each neighbor pair. |
 | `rank R selected RoCE transport shape ... where this rank selected ...`, or `rank zero did not select --roce-ring` | Select `--roce-ring` on rank zero and use matching binaries; serving bootstrap passes its routing mode to peers. |
 | Proxy error or collective timeout | Stop the ranks together and inspect the originating rank's error. There is no automatic rerouting around a failed neighbor. |
