@@ -174,8 +174,14 @@ request subsets.
 Each prefill capacity competes using the actual tokens it can consume. Atomic
 image spans, system boundaries, and prompt length restrict logical work. A
 4096-token graph processing a 64-token tail earns 64 prompt units and at most one
-output token. There is no smallest-fitting-shape filter, duration ceiling,
-forced oldest-request filter, or per-chunk prefill lateness cost.
+output token. When one catalog capacity reaches the end of that stretch, a
+smaller capacity that leaves a remainder is withheld if the covering graph's
+measured duration is no more than this graph's duration plus the cheapest graph
+that would finish the remainder. This compares measured total durations; it does
+not assume a fixed launch cost or a linear padding cost. A stretch longer than
+every catalog capacity keeps every capacity, because no single graph covers it.
+Selection has no smallest-fitting-shape preference, duration ceiling, forced
+oldest-request filter, or per-chunk prefill lateness cost.
 
 With no active decoder, the age term vanishes. Fully occupied large prefill
 graphs win when their useful value rate is highest. With decoding streams, a
