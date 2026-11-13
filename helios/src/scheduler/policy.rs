@@ -831,6 +831,48 @@ impl RequestScheduler {
         }
     }
 
+    /// True when a measured graph covering the entire stretch costs no more than this launch
+    /// plus the cheapest measured graph that can finish its remainder.
+    ///
+    /// `prefill_work` ends a launch at the next checkpoint cut, prefill limit or chunk size.
+    /// A smaller graph can leave work for another launch. Withhold it only when the catalog
+    /// contains measured covering and remainder graphs and their total-duration comparison
+    /// favors one covering launch or a tie. A stretch no catalog graph covers keeps all offers.
+    fn split_costs_more(
+        &self,
+        request: &LiveRequest,
+        kind: GraphKind,
+        batch: usize,
+        work: usize,
+        duration_ns: u64,
+    ) -> bool {
+        if duration_ns == 0 {
+            return false;
+        }
+        // The whole stretch to the next stop: the graph that covers it whole must exist, or
+        // the launch after this one is needed whatever this one lands on.
+        let stretch = self.prefill_work(request, usize::MAX);
+        if stretch <= work {
+            return false;
+        }
+        let catalog = self.prefill_catalog(kind);
+        let cheapest = |at_least: usize| {
+            catalog
+                .iter()
+                .filter(|&&other| self.prefill_work(request, other) >= at_least)
+                .filter_map(|&other| self.costs.duration(kind, batch, other))
+                .filter(|&nanos| nanos != 0)
+                .min()
+        };
+        let Some(whole) = cheapest(stretch) else {
+            return false;
+        };
+        let Some(remainder) = cheapest(stretch - work) else {
+            return false;
+        };
+        whole <= duration_ns.saturating_add(remainder)
+    }
+
     fn add_candidate(
         &self,
         output: &mut Vec<Candidate>,
@@ -857,6 +899,9 @@ impl RequestScheduler {
                         .take_while(|&&smaller| smaller < capacity)
                         .any(|&smaller| self.prefill_work(r, smaller) == work))
                 {
+                    continue;
+                }
+                if self.split_costs_more(r, kind, batch, work, duration_ns) {
                     continue;
                 }
             }

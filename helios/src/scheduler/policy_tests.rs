@@ -1457,6 +1457,84 @@ fn decode_waiting_selects_a_smaller_prefill_at_the_efficiency_knee() {
     );
 }
 
+/// A scheduler fixture with a 4,096-token prefill chunk and synthetic graph durations:
+/// 90 ms plus 0.17 ms per capacity token. Production scheduling uses measured durations.
+fn prefill_cover_engine() -> RequestScheduler {
+    let mut s = interactive_engine(1, false);
+    s.policy.checkpoint_extra_work_fraction = 0.0;
+    let catalog = prefill_capacities(s.limits.prefill_chunk_size).collect::<Vec<_>>();
+    s.prefill_graphs(&catalog).unwrap();
+    for &capacity in &catalog {
+        set_cost(
+            &mut s,
+            GraphKind::Prefill,
+            1,
+            capacity,
+            90 * MS + capacity as u64 * 170_000,
+        );
+    }
+    set_cost(&mut s, GraphKind::Snapshot, 1, 1, 90 * MS);
+    s
+}
+
+fn prefill_launches(s: &mut RequestScheduler, handle: RequestHandle) -> Vec<(usize, usize)> {
+    let prompt = s.request(handle).unwrap().prompt_tokens as u64;
+    let mut launches = Vec::new();
+    for _ in 0..16 {
+        let plan = step(s, 0);
+        if plan.kind.is_prefill() {
+            let lane = plan.lanes.iter().find(|lane| lane.request == handle).unwrap();
+            launches.push((plan.token_capacity, lane.tokens));
+        }
+        if s.request(handle).unwrap().consumed_tokens >= prompt {
+            return launches;
+        }
+    }
+    panic!("prefill did not finish");
+}
+
+fn conversation_request(tokens: usize, boundaries: Vec<usize>) -> RequestSpec {
+    RequestSpec {
+        prompt: vec![1; tokens],
+        message_boundaries: boundaries,
+        conditioning: vec![],
+        max_new_tokens: 2,
+        grammar_constrained: false,
+        host_stops: false,
+        prompt_logprobs: false,
+        growable_output: false,
+    }
+}
+
+/// The last message boundary at 4,000 leaves a 4,000-token stretch from the start. The 4,096
+/// graph covers it with 96 tokens of padding, and splitting it into 3,584 + 416 saves that
+/// padding at the cost of a second launch. The covering graph must be the offer that wins, so
+/// the stretch takes one launch instead of two.
+#[test]
+fn a_stretch_the_catalog_almost_covers_is_one_launch() {
+    let mut s = prefill_cover_engine();
+    let handle = s.admit(conversation_request(4_100, vec![4_000])).unwrap();
+    assert_eq!(
+        prefill_launches(&mut s, handle),
+        [(4096, 4_000), (128, 100)]
+    );
+}
+
+/// The rule is a cost comparison: when the graphs that cover a 3,584-token stretch whole each
+/// cost 2 s, the 3,072 + 512 split stays available and is chosen.
+#[test]
+fn a_split_stays_available_when_the_covering_graph_costs_more() {
+    let mut s = prefill_cover_engine();
+    for capacity in [3_584, 4_096] {
+        set_cost(&mut s, GraphKind::Prefill, 1, capacity, 2_000 * MS);
+    }
+    let handle = s.admit(conversation_request(3_584, vec![])).unwrap();
+    assert_eq!(
+        prefill_launches(&mut s, handle),
+        [(3_072, 3_072), (512, 512)]
+    );
+}
+
 #[test]
 fn terminal_snapshot_completes_while_another_long_prompt_is_still_prefilling() {
     let mut s = interactive_engine(2, false);
