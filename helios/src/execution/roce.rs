@@ -84,6 +84,7 @@ unsafe extern "C" {
         routes: *const i32,
         n_rail: c_int,
     ) -> c_int;
+    fn roce_set_relay(c: *mut Context, plan: *const i32, n: c_int) -> c_int;
     fn roce_start(c: *mut Context) -> c_int;
     fn roce_failed(c: *mut Context) -> c_int;
     fn roce_error(c: *mut Context) -> *const c_char;
@@ -218,6 +219,8 @@ trait Proxy {
         routes: &[i32],
         rails: usize,
     ) -> std::result::Result<(), String>;
+    /// Install the all-gather relay plan on a connected context that has not started.
+    fn set_relay(&self, plan: &[i32]) -> std::result::Result<(), String>;
     /// Start the posting thread on a connected context.
     fn start(&self) -> std::result::Result<(), String>;
     fn failed(&self) -> bool;
@@ -292,6 +295,14 @@ impl Proxy for Native {
         if status != 0 { Err(self.message()) } else { Ok(()) }
     }
 
+    fn set_relay(&self, plan: &[i32]) -> std::result::Result<(), String> {
+        if unsafe { roce_set_relay(self.context, plan.as_ptr(), plan.len() as c_int) } != 0 {
+            Err(self.message())
+        } else {
+            Ok(())
+        }
+    }
+
     fn start(&self) -> std::result::Result<(), String> {
         if unsafe { roce_start(self.context) } != 0 {
             Err(self.message())
@@ -337,6 +348,8 @@ struct Session<P: Proxy> {
     rank: usize,
     rails: usize,
     routes: Vec<i32>,
+    /// The all-gather relay plan installed between connect and start, if this transport relays.
+    relay: Option<Vec<i32>>,
     link: LinkState,
 }
 
@@ -384,6 +397,13 @@ impl<P: Proxy> Session<P> {
         self.proxy
             .connect(&joined, &self.routes, self.rails)
             .map_err(|message| failure(format!("RoCE queue-pair connect failed: {message}")))?;
+        // The proxy accepts a relay plan only on a connected context that has not begun posting,
+        // so the plan goes in here, between connect and start.
+        if let Some(plan) = self.relay.as_deref() {
+            self.proxy.set_relay(plan).map_err(|message| {
+                failure(format!("RoCE all-gather relay plan was refused: {message}"))
+            })?;
+        }
         self.proxy
             .start()
             .map_err(|message| failure(format!("RoCE proxy thread failed to start: {message}")))?;
@@ -450,11 +470,89 @@ fn routes(spec: &RoceSpec, topology: &Topology) -> Vec<i32> {
     routes
 }
 
+/// How an all-gather chunk reaches a peer this rank holds no cable to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayMode {
+    /// Every peer has a cable to this rank, so the proxy writes each chunk straight to it.
+    Direct,
+    /// The chunk travels hop by hop through the ring mailboxes, one packet and one CPU forward per
+    /// hop.
+    Mailbox,
+    /// A closed four-rank ring forwards even and odd far-shard chunks through opposite
+    /// neighbors. Each chunk has one carrier and does not use a mailbox payload.
+    Partner,
+}
+
+impl RelayMode {
+    /// The word a rank publishes so its peers can refuse a disagreement before any route is used.
+    pub fn name(self) -> &'static str {
+        match self {
+            RelayMode::Direct => "direct",
+            RelayMode::Mailbox => "mailbox",
+            RelayMode::Partner => "partner",
+        }
+    }
+
+    /// This rank's all-gather relay plan, as the proxy's `roce_set_relay` takes it, or `None` when
+    /// the transport installs no plan. A partner relay needs a closed four-rank ring: only there
+    /// is the rank two hops away adjacent to both of this rank's neighbors, so every forward is a
+    /// direct write. Anywhere else a forward would leave by mailbox, and the proxy refuses it.
+    fn plan(self, shape: Shape, world: usize, rank: usize) -> Result<Option<Vec<i32>>> {
+        match self {
+            RelayMode::Direct | RelayMode::Mailbox => Ok(None),
+            RelayMode::Partner => ring_relay_plan(world, rank)
+                .filter(|_| shape == Shape::Ring)
+                .map(Some)
+                .ok_or_else(|| {
+                    failure(format!(
+                        "the all-gather partner relay needs a closed ring of four ranks, this \
+                         transport is {} with {world} ranks",
+                        shape.name()
+                    ))
+                }),
+        }
+    }
+}
+
+/// The all-gather relay a topology runs: a mesh writes every peer directly, a closed four-rank
+/// ring forwards through a neighbor, and every other ring or chain keeps the ring mailboxes. The
+/// topology alone decides it, so every rank of a group derives the same mode from the shape it was
+/// started with and the group it joined.
+pub fn relay_mode(shape: Shape, world: usize) -> RelayMode {
+    match shape {
+        Shape::Mesh => RelayMode::Direct,
+        Shape::Ring if world == 4 => RelayMode::Partner,
+        Shape::Ring | Shape::Chain => RelayMode::Mailbox,
+    }
+}
+
+/// The all-gather relay plan of `rank` on a closed four-rank ring, as the proxy's `roce_set_relay`
+/// takes it: entry `p` names the neighbor that carries this rank's chunks to rank `p` (-1: sent
+/// directly) and entry `world + s` the neighbor that this rank forwards rank `s`'s chunks to
+/// (-1: none). Every rank writes its shard to both neighbors, which need it anyway, and each
+/// neighbor forwards its assigned chunks: rank `r` forwards the even chunks of rank `r - 1`'s
+/// shard and the odd chunks of rank `r + 1`'s shard, so the far target receives one copy of each
+/// chunk. `None` for every world size other than four; those transports do not install a partner
+/// plan.
+fn ring_relay_plan(world: usize, rank: usize) -> Option<Vec<i32>> {
+    if world != 4 {
+        return None;
+    }
+    let clockwise = (rank + 1) % world;
+    let counter = (rank + world - 1) % world;
+    let mut plan = vec![-1i32; 2 * world];
+    plan[(rank + 2) % world] = clockwise as i32;
+    plan[world + counter] = clockwise as i32;
+    plan[world + clockwise] = counter as i32;
+    Some(plan)
+}
+
 /// One rank's connected transport. Dropping it stops the proxy and releases the HCAs; the region
 /// itself belongs to the core.
 pub struct RoceTransport {
     spec: RoceSpec,
     topology: Topology,
+    relay: RelayMode,
     session: Session<Native>,
 }
 
@@ -468,11 +566,14 @@ impl RoceTransport {
     /// pinned region and the device counters (epoch and poison) at their recorded addresses and
     /// zeroed, so every rank begins again at sequence 1.
     ///
+    /// `relay` is the mode every rank agreed on before the rendezvous, from [`relay_mode`]; it
+    /// decides whether a plan is installed between `connect` and start.
+    ///
     /// # Safety
     /// `spec.region_address` must name `spec.region_bytes` of mapped, locked host memory that the
     /// core restored for this rank and that outlives the transport; no graph may run on it
     /// before `connect` returns.
-    pub unsafe fn open(spec: &RoceSpec, topology: &Topology) -> Result<Self> {
+    pub unsafe fn open(spec: &RoceSpec, topology: &Topology, relay: RelayMode) -> Result<Self> {
         let abi = unsafe { roce_abi_version() } as u32;
         if abi != PROXY_ABI {
             return Err(failure(format!(
@@ -522,10 +623,14 @@ impl RoceTransport {
             }
         }
         let routes = routes(spec, topology);
+        // The ranks agreed on this mode before they opened devices, so the plan it names is the
+        // one every peer expects; a mode the topology cannot carry is refused here.
+        let plan = relay.plan(topology.shape, spec.world, spec.rank)?;
         let context = unsafe { Self::create(spec, topology)? };
         Ok(Self {
             spec: spec.clone(),
             topology: topology.clone(),
+            relay,
             session: Session {
                 proxy: Native {
                     context,
@@ -535,6 +640,7 @@ impl RoceTransport {
                 rank: spec.rank,
                 rails: topology.rails,
                 routes,
+                relay: plan,
                 link: LinkState::default(),
             },
         })
@@ -599,6 +705,17 @@ impl RoceTransport {
 
     pub fn topology(&self) -> &Topology {
         &self.topology
+    }
+
+    /// The all-gather relay this transport runs, as the ranks agreed it before opening devices.
+    pub fn relay_mode(&self) -> RelayMode {
+        self.relay
+    }
+
+    /// The all-gather relay plan the proxy was given, or `None` when this transport relays through
+    /// the ring mailboxes instead.
+    pub fn relay_plan(&self) -> Option<&[i32]> {
+        self.session.relay.as_deref()
     }
 
     /// This rank's queue-pair record, sent to every peer before [`RoceTransport::connect`].
@@ -810,7 +927,9 @@ mod tests {
                 spec.pipe_bytes = pipe_bytes;
                 spec.ctrl_offset += 128;
                 // SAFETY: ABI or layout validation rejects before touching the live region.
-                let Err(error) = (unsafe { RoceTransport::open(&spec, &topology) }) else {
+                let Err(error) =
+                    (unsafe { RoceTransport::open(&spec, &topology, RelayMode::Mailbox) })
+                else {
                     panic!("invalid layout must fail");
                 };
                 let error = error.to_string();
@@ -875,7 +994,8 @@ mod tests {
         assert!(error.contains("re-export from a proxy ABI 15"), "{error}");
         // The refusal happens in preflight, before the region is zeroed or a device opened.
         // SAFETY: The parity geometry fails validation before touching the live allocation.
-        let Err(error) = (unsafe { RoceTransport::open(&parity, &topology) }) else {
+        let Err(error) = (unsafe { RoceTransport::open(&parity, &topology, RelayMode::Mailbox) })
+        else {
             panic!("parity region must fail preflight");
         };
         let error = error.to_string();
@@ -888,7 +1008,8 @@ mod tests {
         other.region_bytes += 4096;
         assert!(check_core_abi(PARITY_PACKAGE_ABI, 15, &other, &layout).is_ok());
         // SAFETY: A region that does not match the layout is rejected before device access.
-        let Err(error) = (unsafe { RoceTransport::open(&other, &topology) }) else {
+        let Err(error) = (unsafe { RoceTransport::open(&other, &topology, RelayMode::Mailbox) })
+        else {
             panic!("a mismatched region must fail");
         };
         let error = error.to_string();
@@ -906,6 +1027,9 @@ mod tests {
         connects: usize,
         starts: usize,
         destroys: usize,
+        relays: usize,
+        relay_plan: Option<Vec<i32>>,
+        events: Vec<&'static str>,
         failed: bool,
         error: String,
         connect_error: Option<String>,
@@ -933,15 +1057,25 @@ mod tests {
         ) -> std::result::Result<(), String> {
             let mut state = self.state.lock().unwrap();
             state.connects += 1;
+            state.events.push("connect");
             match &state.connect_error {
                 Some(error) => Err(error.clone()),
                 None => Ok(()),
             }
         }
 
+        fn set_relay(&self, plan: &[i32]) -> std::result::Result<(), String> {
+            let mut state = self.state.lock().unwrap();
+            state.relays += 1;
+            state.relay_plan = Some(plan.to_vec());
+            state.events.push("set_relay");
+            Ok(())
+        }
+
         fn start(&self) -> std::result::Result<(), String> {
             let mut state = self.state.lock().unwrap();
             state.starts += 1;
+            state.events.push("start");
             match &state.start_error {
                 Some(error) => Err(error.clone()),
                 None => Ok(()),
@@ -984,6 +1118,7 @@ mod tests {
             rank: 0,
             rails: 1,
             routes: vec![0, 0, 0, 0],
+            relay: None,
             link: LinkState::default(),
         };
         (state, control, session)
@@ -1018,6 +1153,115 @@ mod tests {
         let state = state.lock().unwrap();
         assert_eq!(state.connects, 1, "the proxy saw one connect");
         assert_eq!(state.starts, 1, "the proxy saw one start");
+    }
+
+    #[test]
+    fn the_ring_relay_plan_matches_the_reference_for_four_ranks() {
+        // FlashInfer's `_routes.ring_relay_plan(4, rank)`: the first four entries name the neighbor
+        // that carries our chunks to each peer, the last four the neighbor we forward each rank's
+        // chunks to. Both are -1 where we write or forward nothing.
+        let expected: [[i32; 8]; 4] = [
+            [-1, -1, 1, -1, -1, 3, -1, 1],
+            [-1, -1, -1, 2, 2, -1, 0, -1],
+            [3, -1, -1, -1, -1, 3, -1, 1],
+            [-1, 0, -1, -1, 2, -1, 0, -1],
+        ];
+        for (rank, plan) in expected.iter().enumerate() {
+            assert_eq!(
+                ring_relay_plan(4, rank).as_deref(),
+                Some(&plan[..]),
+                "rank {rank}"
+            );
+        }
+        for world in [1, 2, 3, 5, 8, 16] {
+            assert_eq!(ring_relay_plan(world, 0), None, "world {world}");
+        }
+    }
+
+    #[test]
+    fn the_partner_relay_engages_on_a_closed_four_rank_ring_only() {
+        // Every shape and world a transport can run. The topology alone decides the relay: a mesh
+        // writes every peer directly, a closed ring of four ranks forwards a far chunk through a
+        // neighbor, and every other ring or chain keeps the ring mailboxes. Nothing else varies,
+        // so every rank of a group derives the same mode from the group it joined.
+        for (shape, world, mode) in [
+            (Shape::Mesh, 2, RelayMode::Direct),
+            (Shape::Mesh, 4, RelayMode::Direct),
+            (Shape::Mesh, 16, RelayMode::Direct),
+            (Shape::Ring, 2, RelayMode::Mailbox),
+            (Shape::Ring, 3, RelayMode::Mailbox),
+            (Shape::Ring, 4, RelayMode::Partner),
+            (Shape::Ring, 5, RelayMode::Mailbox),
+            (Shape::Ring, 8, RelayMode::Mailbox),
+            (Shape::Ring, 16, RelayMode::Mailbox),
+            (Shape::Chain, 2, RelayMode::Mailbox),
+            (Shape::Chain, 4, RelayMode::Mailbox),
+            (Shape::Chain, 16, RelayMode::Mailbox),
+        ] {
+            assert_eq!(relay_mode(shape, world), mode, "{shape:?} {world}");
+            // The plan the mode installs: one per rank for the partner relay, none otherwise.
+            let plan = mode.plan(shape, world, 0).unwrap();
+            if mode == RelayMode::Partner {
+                let plan = plan.expect("the partner relay plans a route");
+                assert_eq!(
+                    plan,
+                    ring_relay_plan(world, 0).unwrap(),
+                    "{shape:?} {world}"
+                );
+            } else {
+                assert_eq!(plan, None, "{shape:?} {world}");
+            }
+        }
+        // A partner relay names a transport that carries direct writes between the two neighbors
+        // of the far peer, so only a closed ring of four ranks accepts it. The proxy refuses the
+        // plan on anything else, and the transport refuses the mode before it opens a device.
+        for (shape, world) in [
+            (Shape::Mesh, 4),
+            (Shape::Ring, 3),
+            (Shape::Ring, 5),
+            (Shape::Ring, 8),
+            (Shape::Chain, 4),
+        ] {
+            let error = RelayMode::Partner
+                .plan(shape, world, 0)
+                .expect_err("a partner relay on another transport must be refused")
+                .to_string();
+            assert!(error.contains("closed ring of four ranks"), "{error}");
+            assert!(error.contains(&format!("with {world} ranks")), "{error}");
+        }
+        let (_region, spec, topology) = specification();
+        let mut chain = topology.clone();
+        chain.shape = Shape::Chain;
+        chain.routes[3].clear();
+        // SAFETY: The mode is refused before any device opens or the region is modified.
+        let Err(error) = (unsafe { RoceTransport::open(&spec, &chain, RelayMode::Partner) }) else {
+            panic!("a chain must refuse the partner relay");
+        };
+        let error = error.to_string();
+        assert!(error.contains("closed ring of four ranks"), "{error}");
+        assert!(error.contains("chain with 4 ranks"), "{error}");
+    }
+
+    #[test]
+    fn a_relay_plan_is_installed_between_connect_and_start() {
+        let plan = vec![-1, 0, 0, -1];
+        let (state, _control, mut session) = shim();
+        session.relay = Some(plan.clone());
+        session.connect(&shim_records()).unwrap();
+        let state = state.lock().unwrap();
+        // The proxy accepts a plan only on a connected context that has not begun posting.
+        assert_eq!(state.events, ["connect", "set_relay", "start"]);
+        assert_eq!(state.relays, 1);
+        assert_eq!(state.relay_plan.as_deref(), Some(&plan[..]));
+    }
+
+    #[test]
+    fn a_transport_without_a_plan_never_sets_one() {
+        let (state, _control, mut session) = shim();
+        session.connect(&shim_records()).unwrap();
+        let state = state.lock().unwrap();
+        assert_eq!(state.events, ["connect", "start"]);
+        assert_eq!(state.relays, 0);
     }
 
     #[test]
@@ -1152,7 +1396,8 @@ mod tests {
         // Mislabeling a core as ABI 15 must not bypass size validation.
         spec.region_bytes -= 4 * 2 * layout[10] + 2 * 4 * 64 * 2 * 128;
         // SAFETY: The malformed region is rejected before modifying it or opening devices.
-        let Err(error) = (unsafe { RoceTransport::open(&spec, &topology) }) else {
+        let Err(error) = (unsafe { RoceTransport::open(&spec, &topology, RelayMode::Mailbox) })
+        else {
             panic!("a short region must fail");
         };
         let error = error.to_string();
@@ -1216,7 +1461,7 @@ mod tests {
             }
             // SAFETY: Every case fails preflight before accessing or registering the region.
             // The backing allocation nevertheless remains live throughout the call.
-            let result = unsafe { RoceTransport::open(&spec, &topology) };
+            let result = unsafe { RoceTransport::open(&spec, &topology, RelayMode::Mailbox) };
             assert!(
                 result.is_err(),
                 "invalid transport case {case} passed preflight"
