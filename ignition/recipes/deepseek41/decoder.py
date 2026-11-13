@@ -31,6 +31,16 @@ from .engram import EngramScratch, PreparedEngram, PreparedTableRequests
 # callers select bounded calls only by passing max_rows_per_call to PreparedMHC.
 MHC_CALL_ROWS = 512
 
+# These per-rank row counts enable sharding for the 3,072-, 5,120- and 7,168-row TP4 graphs.
+# With an explicit 512-row call bound, each decomposes into whole calls plus 256 rows.
+# The DeepSeek V4.1 decoder leaves that bound unset and uses one call per block.
+MHC_TAIL_BUCKETS = (768, 1280, 1792)
+
+
+def shard_rows_ready(rows):
+    """Accept whole 512-row blocks and the three explicitly enabled remainder blocks."""
+    return rows % MHC_CALL_ROWS == 0 or rows in MHC_TAIL_BUCKETS
+
 
 @dataclass(frozen=True)
 class RowShard:
@@ -55,24 +65,32 @@ class RowShard:
     attention_hc: MHCScratch
     ffn_hc: MHCScratch
     # Row-sharded attention: the shard's own attention scratch, the full-row KV latent the window
-    # writer stores, the shard's router logits before its own top-k runs, and the route records
-    # that top-k writes and one gather spreads over every row.
+    # writer stores, the shard's router logits before its own top-k runs, the route records that
+    # top-k writes and one gather spreads over every row, and the live tokens inside the block,
+    # past which the block's router routes no expert work.
     attention: AttentionScratch | None = None
     window_values: torch.Tensor | None = None
     router_logits: torch.Tensor | None = None
     routes: RouteRecord | None = None
     gathered_routes: RouteRecord | None = None
-    # Every graph's `rows_index` is a view of this table, one segment per shard row count (see
-    # `_row_table_layout`). One compiled forward binds every rank, and binding compares storage
-    # offsets, so a segment sits at the same offset on every rank and only its contents, this rank's
-    # row numbers, differ.
+    live_tokens: torch.Tensor | None = None
+    # The chunk row this rank's block begins at. `start` holds the same number for preparation, but
+    # one TP forward compiles once per shape and every rank binds that artifact, so a forward that
+    # read an integer attribute would specialize the artifact on the compiling rank and every other
+    # rank would be rejected with a binding mismatch. The forward reads this tensor instead.
+    live_offset: torch.Tensor | None = None
+    # Every graph's `rows_index` and `live_offset` are views of these tables, one segment per shard
+    # row count (see `_row_table_layout`). One compiled forward binds every rank, and binding
+    # compares storage offsets, so a segment sits at the same offset on every rank and only its
+    # contents, this rank's row numbers and block offset, differ.
     rows_table: torch.Tensor | None = None
+    offset_table: torch.Tensor | None = None
 
     @classmethod
     def allocate(cls, tokens, world, rank, device, *, candidate_tokens=None, attention=False,
                  experts=384, top_k=6):
-        """This rank's shard declarations for a decoder of `tokens` rows, or None when rows do not divide."""
-        if world < 2 or tokens % world or tokens // world % MHC_CALL_ROWS:
+        """This rank's shard declarations for a decoder of `tokens` rows, or None when no block divides."""
+        if world < 2 or tokens % world or not shard_rows_ready(tokens // world):
             return None
         rows, start = tokens // world, rank * (tokens // world)
         def zeros(*shape, dtype=torch.bfloat16):
@@ -82,11 +100,17 @@ class RowShard:
         layout = _row_table_layout(rows)
         rows_values = torch.cat([torch.arange(rank * count, (rank + 1) * count, dtype=torch.int64)
                                  for count, _ in layout])
-        # The table is snapshot storage: prefill scratch is exported as zeros, and a captured graph
-        # reads these row numbers as data. `persistent_zeros` routes to the core-owned arena while a
+        offset_values = torch.zeros(_OFFSET_STRIDE * len(layout), dtype=torch.int32)
+        for index, (count, _) in enumerate(layout):
+            offset_values[_OFFSET_STRIDE * index] = rank * count
+        # The tables are snapshot storage: prefill scratch is exported as zeros, and a captured graph
+        # reads these integers as data. `persistent_zeros` routes to the core-owned arena while a
         # preparation exports, and to ordinary storage on a CPU test.
-        rows_table = persistent_zeros(rows_values.shape, rows_values.dtype, device).copy_(rows_values)
-        first = layout[-1][1]
+        def table(values):
+            return persistent_zeros(values.shape, values.dtype, device).copy_(values)
+        rows_table = table(rows_values)
+        offset_table = table(offset_values) if attention else None
+        index, (_, first) = len(layout) - 1, layout[-1]
         return cls(world, rank, rows, start, rows_table[first:first + rows], zeros(rows, 5120),
                    zeros(rows, 5120), zeros(rows, 4, 5120), zeros(rows, 4, dtype=torch.float32),
                    zeros(rows, 4, dtype=torch.float32), scratch(), scratch(),
@@ -96,12 +120,15 @@ class RowShard:
                    zeros(rows, experts, dtype=torch.float32) if attention else None,
                    RouteRecord.allocate(rows, top_k, device) if attention else None,
                    RouteRecord.allocate(tokens, top_k, device) if attention else None,
-                   rows_table)
+                   zeros(1, dtype=torch.int32) if attention else None,
+                   None if offset_table is None
+                   else offset_table[_OFFSET_STRIDE * index:_OFFSET_STRIDE * index + 1],
+                   rows_table, offset_table)
 
     def graph(self, tokens):
-        """The shard a decoder of `tokens` rows uses, or None when its rows do not divide."""
+        """The shard a decoder of `tokens` rows uses, or None when no block divides."""
         rows = tokens // self.world
-        if tokens % self.world or rows % MHC_CALL_ROWS or rows > self.rows:
+        if tokens % self.world or not shard_rows_ready(rows) or rows > self.rows:
             return None
         # A narrower graph holds fewer rows per rank, so this rank's block begins earlier than it
         # does in the captured layout: the graph reads its row count's segment of the table.
@@ -119,7 +146,13 @@ class RowShard:
                        router_logits=None if self.router_logits is None else self.router_logits[:rows],
                        routes=None if self.routes is None else self.routes.rows(rows),
                        gathered_routes=None if self.gathered_routes is None
-                       else self.gathered_routes.rows(tokens))
+                       else self.gathered_routes.rows(tokens),
+                       live_offset=None if self.live_offset is None
+                       else self.offset_table[_OFFSET_STRIDE * index:_OFFSET_STRIDE * index + 1])
+
+
+# One int32 block offset per 16 bytes, so every `live_offset` view keeps the alignment of the first.
+_OFFSET_STRIDE = 4
 
 
 def _row_table_layout(rows):
@@ -130,7 +163,7 @@ def _row_table_layout(rows):
     """
     layout, first = [], 0
     for count in range(1, rows + 1):
-        if count % MHC_CALL_ROWS == 0:
+        if shard_rows_ready(count):
             layout.append((count, first))
             first += count
     return layout
@@ -162,6 +195,28 @@ def attention_shard_ready(scratch, shard, runtime):
             and PreparedGatherShards.fits(runtime, shard.routes.packed, shard.gathered_routes.packed)
             and PreparedGatherShards.fits(runtime, shard.attention.selected.view(torch.bfloat16),
                                           scratch.attention.selected.view(torch.bfloat16)))
+
+
+def router_valid_tokens(mode, shard=None):
+    """The live-token count a sharded router masks, or None when the layer routes every row it reads.
+
+    A prefill chunk pads to a fixed row count. An attention-sharded prefill router reads the
+    live count inside its contiguous block and excludes the block's padded suffix. The caller
+    supplies no shard for a full-row router. Decode, verification and draft also pass no count,
+    preserving the route-plan interface and routing behavior declared for those graphs.
+    """
+    return shard.live_tokens if mode == "prefill" and shard is not None else None
+
+
+def shard_live_rows(metadata, shard):
+    """Write the live tokens inside `shard`'s block into the count its router reads.
+
+    The batch's live tokens are the first `metadata.live_counts[0]` rows of the chunk and a rank
+    owns a contiguous block of the chunk, so the rows it routes are that count inside the block.
+    The offset is the prepared `live_offset` tensor, not the `start` integer: this runs inside the
+    compiled forward, which every rank binds.
+    """
+    shard.live_tokens.copy_(torch.clamp(metadata.live_counts[0:1] - shard.live_offset, 0, shard.rows))
 
 
 def shard_schedule(config, stop, sharded, aux_layers=()):
@@ -470,11 +525,16 @@ class PreparedLayer:
         # prepared call reads once the route records replace the gathered logits.
         route_scratch = (s.router if not attention_shard
                          else row_shard.routes.router_scratch(s.router.selected_logits[:row_shard.rows]))
+        # A sharded router routes the live tokens inside this rank's block, and the padding inside
+        # the block routes no expert work: the router writes ID -1 and zero weight there, which the
+        # b12x route pack skips. SM103's expert kernels are unchecked at a negative ID, and a
+        # full-row router masks nothing.
+        self.valid_tokens = router_valid_tokens(mode, row_shard if attention_shard else None)
         self.router = PreparedRouter(router_logits, route_scratch, session=session, name=name + ".topk",
             score_func=text["scoring_func"], renormalize=text["norm_topk_prob"],
             routed_scaling_factor=text["routed_scaling_factor"], correction_bias=weights.experts.correction,
             image_correction_bias=weights.experts.vision_correction if self.image_mask is not None else None,
-            image_mask=self.image_mask)
+            image_mask=self.image_mask, num_valid_tokens=self.valid_tokens)
         self.experts = PreparedRoutedExperts(s.ffn_hc.normalized, weights.experts.experts, s.router.ids,
             s.router.weights, s.routed, session=session, name=name + ".experts", workspace=workspace,
             router_plan=self.router.plan)
@@ -587,7 +647,8 @@ class PreparedLayer:
             image_mask = (metadata.token_ids if not self.attention_shard
                           else metadata.token_ids.index_select(0, shard.rows_index)) >= 129280
         router_logits = self.router_projection(router_source if self.attention_shard else normalized)
-        route = self.router(router_logits, image_mask=image_mask)
+        route = self.router(router_logits, image_mask=image_mask,
+                            num_valid_tokens=self.valid_tokens)
         route_ids, route_weights = route.ids, route.weights
         if self.route_gather is not None:
             # Pack live route outputs and unpack gathered words into forward-local storage.
@@ -763,6 +824,9 @@ class PreparedDecoder:
             # The first layer keeps this rank's rows, so enter with them.
             incoming = (residual.index_select(0, self.row_shard.rows_index),)
             pre_mix = pre_mix.index_select(0, self.row_shard.rows_index)
+            if self.attention_shard:
+                # Every sharded layer routes the live tokens that fall inside this rank's block.
+                shard_live_rows(metadata, self.row_shard)
         indices = self.window_metadata(metadata)
         # The carried selection holds this rank's rows from the first layer on; every later change
         # of row representation moves it in the layer that crosses over.

@@ -69,6 +69,7 @@ def test_layer_consumes_standalone_router_results_with_runtime_image_mask():
     layer.residual_gather = layer.mix_gather = None
     layer.selection_move = layer.router_gather = None
     layer.route_gather = None
+    layer.valid_tokens = None
     residual = torch.arange(12, dtype=torch.float32).reshape(3, 4)
     metadata = SimpleNamespace(token_ids=torch.tensor([7, 129280, 9]))
     selection = (torch.zeros(3, 1, dtype=torch.int32), None, None)
@@ -79,7 +80,7 @@ def test_layer_consumes_standalone_router_results_with_runtime_image_mask():
     layer.ffn_hc = lambda source, *args, **kwargs: (source, source, source, source)
     layer.router_projection = lambda source: source + 1
     observed = []
-    def route(logits, *, image_mask):
+    def route(logits, *, image_mask, num_valid_tokens=None):
         observed.append((logits.clone(), image_mask.clone()))
         return SimpleNamespace(ids=torch.tensor([[0], [1], [0]]), weights=logits[:, :1],
                                selected_logits=logits[:, :1])

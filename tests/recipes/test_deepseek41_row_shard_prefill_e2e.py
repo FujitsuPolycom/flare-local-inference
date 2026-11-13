@@ -295,21 +295,27 @@ class ReferenceRouter:
     expert, which the test uses to separate a route that changed from one that sat in a near tie.
     """
 
-    def __init__(self, logits, scratch, *, name=None, score_func=None,
+    def __init__(self, logits, scratch, *, name=None, num_valid_tokens=None, score_func=None,
                  renormalize=True, routed_scaling_factor=1.0, correction_bias=None,
                  image_correction_bias=None, image_mask=None, session=None, **options):
-        self.top_k, self.plan = scratch.ids.shape[1], object()
+        self.top_k, self.valid, self.plan = scratch.ids.shape[1], num_valid_tokens, object()
         self.name = name
 
     def functional(self, *, session=None):
         return self
 
-    def __call__(self, logits, *, image_mask=None):
-        probs = logits.float().softmax(-1)
+    def __call__(self, logits, *, image_mask=None, num_valid_tokens=None):
+        valid = self.valid if num_valid_tokens is None else num_valid_tokens
+        if valid is not None:
+            live = torch.arange(logits.shape[0]) < valid.view(-1)[0]
+        else:
+            live = torch.ones(logits.shape[0], dtype=torch.bool)
+        probs = torch.where(live[:, None], logits.float(), torch.finfo(torch.float32).min).softmax(-1)
         order = torch.argsort(-probs, dim=-1, stable=True)[:, :self.top_k]
         values = probs.gather(1, order)
         weights = values / values.sum(-1, keepdim=True)
-        ids = order
+        ids = torch.where(live[:, None], order, torch.full_like(order, -1))
+        weights = torch.where(live[:, None], weights, torch.zeros_like(weights))
         context = _run()
         sorted_probs = probs.sort(-1, descending=True).values
         if self.top_k < sorted_probs.shape[-1]:

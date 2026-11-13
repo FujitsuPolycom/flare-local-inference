@@ -31,8 +31,43 @@ def test_row_shard_takes_contiguous_rank_rows_and_gates_on_world_and_call_rows()
     assert shard.attention_hc.normalized.shape == (512, 5120)
     assert RowShard.allocate(1024, 1, 0, "cpu") is None
     assert RowShard.allocate(1025, 2, 0, "cpu") is None
-    # One rank's rows must hold whole mHC calls so its call shape matches the full-row pin.
+    # Shard eligibility accepts whole multiples of 512 rows and the listed remainder blocks.
     assert RowShard.allocate(1024, 4, 0, "cpu") is None
+
+
+@pytest.mark.parametrize("tokens,rows", [(3072, 768), (5120, 1280), (7168, 1792)])
+def test_tail_buckets_accept_the_declared_per_rank_row_counts(tokens, rows):
+    """The three TP4 capacities produce the declared local rows and prepared tensor shapes."""
+    from ignition.components.mhc import row_call_bounds
+    from ignition.recipes.deepseek41.decoder import RowShard
+
+    shard = RowShard.allocate(tokens, 4, 2, "cpu", attention=True, candidate_tokens=16)
+    assert (shard.world, shard.rank, shard.rows, shard.start) == (4, 2, rows, 2 * rows)
+    assert shard.rows_index.tolist() == list(range(2 * rows, 3 * rows))
+    assert shard.residual.shape == (rows, 4, 5120)
+    assert shard.attention_hc.normalized.shape == shard.ffn_hc.normalized.shape == (rows, 5120)
+    # With an explicit 512-row bound, these counts decompose into whole calls plus 256 rows.
+    assert [end - start for start, end in row_call_bounds(rows, 512)] == [512] * (rows // 512) + [256]
+    assert shard.attention.query.shape == (rows, 64, 512)
+    assert shard.router_logits.shape == (rows, 384)
+    # Eligibility accepts these explicit remainder counts; neighbouring capacities keep full rows.
+    for other in (tokens - 512, tokens + 512):
+        assert RowShard.allocate(other, 4, 0, "cpu") is None
+
+
+def test_a_whole_call_graph_reaches_every_tail_bucket():
+    from ignition.recipes.deepseek41.decoder import RowShard
+
+    captured = RowShard.allocate(8192, 4, 1, "cpu", attention=True, candidate_tokens=16)
+    for tokens, rows in ((7168, 1792), (5120, 1280), (3072, 768)):
+        shard = captured.graph(tokens)
+        assert (shard.rows, shard.start) == (rows, rows)
+        assert shard.rows_index.tolist() == list(range(rows, 2 * rows))
+        assert shard.attention.query.shape == (rows, 64, 512)
+        assert shard.window_values.shape == (tokens, 512)
+        assert shard.router_logits.shape == (rows, 384)
+    # 2,560 and 3,584 rows do not hold whole calls plus a 256-row tail.
+    assert captured.graph(2560) is None and captured.graph(3584) is None
 
 
 def test_row_shard_graph_shrinks_capacity_and_rejects_rows_that_do_not_divide():
@@ -53,8 +88,12 @@ def test_row_shard_graph_shrinks_capacity_and_rejects_rows_that_do_not_divide():
             assert narrow.rows_index.tolist() == list(range(rank * rows, (rank + 1) * rows))
         assert wide.rows_index.tolist() == list(range(rank * 2048, (rank + 1) * 2048))
     assert shard.graph(1023) is None
-    assert shard.graph(1536) is None
+    # 640 rows per rank holds no whole call and no 256-row tail, so it keeps full rows.
+    assert shard.graph(1280) is None
     assert shard.graph(1024 + 2) is None
+    # A 1,536-row graph over two ranks uses the accepted 768-row block on each rank.
+    tail = shard.graph(1536)
+    assert (tail.rows, tail.start) == (768, 0)
 
 
 def test_decoder_scratch_carries_a_row_shard_only_when_the_bootstrap_asks():
@@ -66,7 +105,7 @@ def test_decoder_scratch_carries_a_row_shard_only_when_the_bootstrap_asks():
                              row_shard=SimpleNamespace(rank=1))
     assert asked.row_shard.rows == 512 and asked.row_shard.rows_index[0].item() == 512
     assert asked.rows(1024, 1).row_shard.rows == 512
-    # A shard keeps whole 512-row mHC calls, so a narrower graph has no shard.
+    # A 256-row shard is outside the accepted counts, so this narrower graph keeps full rows.
     assert asked.rows(512, 1).row_shard is None
 
 
@@ -115,7 +154,7 @@ def _recording_layer(scratch, *, reseed=False):
     layer.mlp_reduce = _Recorder()
     layer.router_projection = _Recorder(scratch.router_logits)
     layer.router_source = (scratch.ffn_hc.normalized if shard is None else shard.ffn_hc.normalized)
-    layer.route_gather = None
+    layer.route_gather, layer.valid_tokens = None, None
     layer.router = _Recorder(SimpleNamespace(ids=torch.zeros(1, dtype=torch.int32), weights=torch.zeros(1),
                                              selected_logits=None))
     layer.experts = _Recorder(scratch.routed)
@@ -171,21 +210,24 @@ def test_a_sharded_forward_gathers_the_lagged_mix_through_its_bf16_view():
     assert residual.data_ptr() == shard.residual.data_ptr()
 
 
-def test_a_resuming_shard_refills_from_the_rows_its_rank_owns():
+@pytest.mark.parametrize("tokens,world,rank", [
+    (1024, 2, 1), (3072, 4, 3), (5120, 4, 3), (7168, 4, 3)])
+def test_a_resuming_shard_refills_from_the_rows_its_rank_owns(tokens, world, rank):
     """The full-row layers own the rows in between, so a resuming shard takes its own rows out.
 
-    Taking rows from zero instead would hand rank one another rank's state. Each 128-row block
-    of the full residual and lagged mix carries its own value, so the two differ.
+    Taking rows from zero instead would hand a rank another rank's state. Each 128-row block of
+    the full residual and lagged mix carries its own value, so the two differ. The 768-, 1,280-
+    and 1,792-row blocks hold a 256-row tail, which the refill copies with the rest.
     """
     from ignition.recipes.deepseek41 import decoder
 
-    scratch = decoder.Scratch.allocate(1024, 8, 2, "cpu", row_shard=SimpleNamespace(rank=1))
+    scratch = decoder.Scratch.allocate(tokens, 8, world, "cpu", row_shard=SimpleNamespace(rank=rank))
     shard = scratch.row_shard
-    blocks = (torch.arange(1024) // 128).to(torch.float32)
-    scratch.residual.copy_(blocks[:, None, None].expand(1024, 4, 5120))
-    scratch.pre_mix.copy_(blocks[:, None].expand(1024, 4))
+    blocks = (torch.arange(tokens) // 128).to(torch.float32)
+    scratch.residual.copy_(blocks[:, None, None].expand(tokens, 4, 5120))
+    scratch.pre_mix.copy_(blocks[:, None].expand(tokens, 4))
     layer = _recording_layer(scratch, reseed=True)
-    layer._run((scratch.residual,), scratch.pre_mix, _metadata(), None, None)
+    layer._run((scratch.residual,), scratch.pre_mix, _metadata(tokens), None, None)
     (refilled,) = layer.attention_hc.calls[0]
     assert torch.equal(refilled, scratch.residual.index_select(0, shard.rows_index))
     assert torch.equal(layer.attention_hc.kwargs["pre_mix"],
@@ -222,15 +264,16 @@ def test_every_row_count_a_graph_can_use_is_one_segment_of_the_table():
     """One allocation holds every segment, so no narrower graph needs storage of its own.
 
     The table is int64, and each graph's row numbers are a view at that row count's segment
-    offset: 512 rows at 0, then 1,024 at 512, 1,536 at 1,536 and 2,048 at 3,072.
+    offset: 512 rows at 0, then 768 at 512, 1,024 at 1,280, 1,280 at 2,304, 1,536 at 3,584,
+    1,792 at 5,120 and 2,048 at 6,912.
     """
     from ignition.recipes.deepseek41.decoder import RowShard
 
     captured = RowShard.allocate(8192, 4, 1, "cpu")
     assert captured.rows_table.dtype is torch.int64
-    assert captured.rows_index.data_ptr() == captured.rows_table.data_ptr() + 3072 * 8
+    assert captured.rows_index.data_ptr() == captured.rows_table.data_ptr() + 6912 * 8
     assert captured.rows_index.tolist() == list(range(2048, 4096))
-    offsets = {8192: 3072, 6144: 1536, 4096: 512, 2048: 0}
+    offsets = {8192: 6912, 7168: 5120, 6144: 3584, 5120: 2304, 4096: 1280, 3072: 512, 2048: 0}
     for tokens, first in offsets.items():
         graph = captured.graph(tokens)
         assert graph.rows_table is captured.rows_table
@@ -252,23 +295,60 @@ def test_the_row_table_is_written_once_into_persistent_storage(monkeypatch):
 
     monkeypatch.setattr(decoder, "persistent_zeros", persistent)
     shard = decoder.RowShard.allocate(4096, 4, 1, "cpu")
-    assert calls == [((1536,), torch.int64, "cpu", {})]
-    assert shard.rows_table.tolist() == [*range(512, 1024), *range(1024, 2048)]
+    assert calls == [((2304,), torch.int64, "cpu", {})]
+    assert shard.rows_table.tolist() == [*range(512, 1024), *range(768, 1536), *range(1024, 2048)]
     assert shard.residual.dtype is torch.bfloat16
+
+
+def test_the_block_offset_is_snapshot_storage_beside_the_row_numbers(monkeypatch):
+    """A captured node reads this rank's block offset, so it needs the row numbers' storage.
+
+    The offset table holds one int32 per 16 bytes, so every graph's single-element view keeps the
+    alignment of the first. Prefill scratch loads as zeros; a block offset stored there would be
+    zero on every rank.
+    """
+    from ignition.recipes.deepseek41 import decoder
+
+    calls = []
+
+    def persistent(shape, dtype, device, **kwargs):
+        calls.append((tuple(shape), dtype, device, kwargs))
+        return torch.zeros(shape, dtype=dtype)
+
+    monkeypatch.setattr(decoder, "persistent_zeros", persistent)
+    shards = [decoder.RowShard.allocate(8192, 4, rank, "cpu", candidate_tokens=16, attention=True)
+              for rank in range(4)]
+    # Attention shards allocate both tables; prefill without attention sharding omits the offset table.
+    assert calls == [((8960,), torch.int64, "cpu", {}), ((28,), torch.int32, "cpu", {})] * 4
+    assert decoder.RowShard.allocate(8192, 4, 0, "cpu", candidate_tokens=16).live_offset is None
+    for rank, shard in enumerate(shards):
+        assert shard.live_offset.tolist() == [rank * 2048]
+        assert shard.live_offset.stride() == (1,) and shard.live_offset.dtype is torch.int32
+        # Every segment starts 16 bytes after the previous one, so one offset per row count.
+        assert shard.offset_table.numel() == 28 and shard.offset_table.is_contiguous()
+        tokens = (8192, 7168, 6144, 5120, 4096, 3072, 2048)
+        offsets = [shard.graph(tokens).live_offset for tokens in tokens]
+        assert [offset.storage_offset() for offset in offsets] == [24, 20, 16, 12, 8, 4, 0]
+        assert offsets[-1].storage_offset() == 0
+        assert [offset.tolist() for offset in reversed(offsets)] == [
+            [rank * count] for count in (512, 768, 1024, 1280, 1536, 1792, 2048)]
 
 
 def test_every_rank_binds_row_shard_tables_at_one_storage_offset():
     """One compiled forward binds every rank, and binding compares storage offsets.
 
-    Each graph's row numbers therefore sit at the same offset on every rank; only their contents
-    differ.
+    Each graph's row numbers and block offset therefore sit at the same offset on every rank; only
+    their contents differ.
     """
     from ignition.recipes.deepseek41.decoder import RowShard
 
-    shards = [RowShard.allocate(8192, 4, rank, "cpu") for rank in range(4)]
-    for tokens in (8192, 6144, 4096, 2048):
+    shards = [RowShard.allocate(8192, 4, rank, "cpu", candidate_tokens=16, attention=True)
+              for rank in range(4)]
+    for tokens in (8192, 7168, 6144, 5120, 4096, 3072, 2048):
         graphs = [shard.graph(tokens) for shard in shards]
         rows = tokens // 4
         assert len({graph.rows_index.storage_offset() for graph in graphs}) == 1
+        assert len({graph.live_offset.storage_offset() for graph in graphs}) == 1
         for rank, graph in enumerate(graphs):
             assert graph.rows_index.tolist() == list(range(rank * rows, (rank + 1) * rows))
+            assert graph.live_offset.tolist() == [rank * rows]

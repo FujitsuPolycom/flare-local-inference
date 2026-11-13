@@ -245,7 +245,7 @@ def test_row_shard_allocates_attention_and_full_row_gather_targets_only_when_ask
     plain = RowShard.allocate(2048, 2, 1, "cpu", candidate_tokens=16)
     assert (plain.rows, plain.start) == (1024, 1024) and plain.attention is None
     assert plain.window_values is None and plain.router_logits is None
-    assert plain.routes is None and plain.gathered_routes is None
+    assert plain.routes is None and plain.gathered_routes is None and plain.live_tokens is None
 
     asked = RowShard.allocate(2048, 2, 1, "cpu", candidate_tokens=16, attention=True)
     assert (asked.rows, asked.start, asked.rows_index[0].item()) == (1024, 1024, 1024)
@@ -258,6 +258,8 @@ def test_row_shard_allocates_attention_and_full_row_gather_targets_only_when_ask
     assert asked.routes.words.shape == (1024, 12) and asked.routes.words.dtype is torch.int32
     assert asked.routes.packed.shape == (1024, 24) and asked.routes.packed.dtype is torch.bfloat16
     assert asked.gathered_routes.words.shape == (2048, 12)
+    # The live count is a device-side scalar the forward rewrites, so every graph reads this one.
+    assert asked.live_tokens.shape == (1,) and asked.live_tokens.dtype is torch.int32
 
     narrowed = asked.graph(1024)
     # A narrower graph gives every rank a shorter block, so rank 1 starts at 512, not at 1024.
@@ -552,6 +554,7 @@ def _attention_layer(scratch):
     layer.ffn_gather = _Recorder(scratch.ffn_hc.normalized)
     layer.router_projection = _Recorder(shard.router_logits)
     layer.route_gather = _RouteRecords(shard)
+    layer.valid_tokens = shard.live_tokens
     layer.router = _Recorder(shard.routes.router_scratch(torch.zeros(shard.rows, 6)))
     layer.experts = _Recorder(scratch.routed)
     layer.shared = _Recorder(scratch.shared.output)
@@ -725,7 +728,8 @@ def test_compiled_row_shard_forwards_read_no_rank_offset_as_a_python_integer():
 
     from ignition.recipes.deepseek41 import attention, decoder
 
-    for forward in (attention.PreparedAttention._run, decoder.PreparedLayer._run):
+    for forward in (attention.PreparedAttention._run, decoder.PreparedLayer._run,
+                    decoder.shard_live_rows, decoder.router_valid_tokens):
         source = inspect.getsource(forward)
         assert re.search(r"\b(?:self|row_shard|shard)\.start\b", source) is None
     prepared = inspect.getsource(attention.PreparedAttention._run)

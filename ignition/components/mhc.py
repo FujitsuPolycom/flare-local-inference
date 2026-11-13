@@ -18,6 +18,16 @@ from ignition.preparation.tuning import declare
 from ignition.preparation.fixtures.resources import candidate_inputs
 
 
+def row_call_bounds(tokens, max_rows_per_call):
+    """The `(start, end)` row span of each sequential mHC call over `tokens` rows.
+
+    Every call but the last holds a whole `max_rows_per_call` rows; the last holds the rows that
+    remain, so a row block that is not a whole number of calls still runs in full.
+    """
+    return tuple((start, min(start + max_rows_per_call, tokens))
+                 for start in range(0, tokens, max_rows_per_call))
+
+
 @dataclass(frozen=True)
 class MHCWeights:
     fn: torch.Tensor
@@ -128,8 +138,7 @@ class PreparedMHC:
             return
         if max_rows_per_call is not None and tokens > max_rows_per_call:
             self.row_calls = []
-            for start in range(0, tokens, max_rows_per_call):
-                end = min(start + max_rows_per_call, tokens)
+            for start, end in row_call_bounds(tokens, max_rows_per_call):
                 call = PreparedMHC(tuple(value[start:end] for value in inputs), weights,
                     scratch.rows(end - start, start=start), session=session,
                     name=f"{name}.rows{start}_{end}", workspace=workspace,
