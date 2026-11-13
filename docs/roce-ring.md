@@ -49,14 +49,16 @@ flowchart LR
 
 Only neighboring queue pairs connect. A transfer to a neighbor uses a direct
 RDMA write. A transfer to another rank follows the shorter direction around the
-cycle; equal-length paths follow increasing rank numbers, wrapping at N.
+cycle. Equal-length paths leave an even rank clockwise and an odd rank
+counter-clockwise, so at four ranks the two far shards travel in opposite
+directions.
 
 | Transfer | Path | Forwarding |
 | --- | --- | --- |
 | Rank 0 to rank 1 | `0 → 1` | Direct |
 | Rank 0 to rank 3 | `0 → 3` | Direct |
 | Rank 0 to rank 2 | `0 → 1 → 2` | Rank 1 relays the transfer |
-| Rank 1 to rank 3 | `1 → 2 → 3` | Rank 2 relays the transfer |
+| Rank 1 to rank 3 | `1 → 0 → 3` | Rank 0 relays the transfer |
 
 Two ranks have one distinct neighbor each; three or more have two. A switch
 does not add direct connections between non-neighbors in ring mode.
@@ -72,6 +74,29 @@ links for the selected rail count.
 Flare does not configure interfaces, addresses, cables, switch forwarding, or
 firewall rules. A physical ring needs both neighbor links and suitable RoCEv2
 addressing already configured.
+
+### All-gather partner relay
+
+An all-gather sends every rank's shard to every rank. On a closed ring of four
+ranks the shard for the rank two hops away is the only one without a direct
+cable, and it reaches its target through a relay mailbox. The runtime instead
+installs a relay plan there. Every rank writes its shard straight to both
+neighbors, which need it anyway, and each neighbor forwards its assigned chunks
+across the ring for the far target: rank `r` forwards the even chunks of rank
+`r - 1`'s shard and the odd chunks of rank `r + 1`'s shard. Each chunk of a far
+shard then has one carrier, chunk parity distributes the forwarding across the
+two cables, and no far chunk enters a mailbox. A chunk is a direct write on its
+way and a direct write when forwarded, so ordering is unchanged.
+
+The runtime installs this plan only on a closed four-rank ring. Other rings and
+all chains retain mailbox mode. Two- and three-rank closed rings have no far
+destination requiring this plan; larger rings do not give every far destination
+a direct link from both neighbors. The topology decides the relay: a closed ring
+of four ranks installs the plan, a ring of another size or a chain keeps the
+mailbox relay, and a mesh writes every peer directly. No setting selects it. The
+mode is part of the transport record the ranks exchange before planning routes,
+so a rank that joined a ring of another size is refused at the rendezvous
+rather than leaving a collective to wait for a shard nobody forwards.
 
 ## Chains
 
@@ -160,8 +185,10 @@ uv sync --locked --extra prepare --extra test
 cargo build --release --manifest-path flare-cli/Cargo.toml
 ```
 
-Serving uses proxy ABI 15. Preparation requires the FlashInfer dependency
-containing #106 and #107 and the same proxy source used by this runtime.
+Serving uses proxy ABI 15 with the four-rank ring partner relay. Preparation
+uses the FlashInfer dependency containing #106 and #107 without that relay.
+The captured region layout is compatible, but the two proxy sources differ
+in ring routing, relay-plan handling and ring protocol.
 The runtime allocates and registers its mailbox area at startup: eight slots
 per origin and rail on a closed ring or a line of two or three ranks, and
 32 slots per destination on a line of four or more ranks. Only the latter
@@ -357,9 +384,11 @@ message sizes, buffer ownership, and proxy failures during replay. Recovery
 from a failed ring neighbor is unsupported; stop and restart all ranks together.
 
 Ring transport is experimental. CPU tests cover recorded-layout validation,
-mailbox sizing and connection refusal for geometry disagreements. This proxy
-implementation has no hardware preparation, export or native-serving
-qualification. Hardware validation requirements are listed in docs/TODO.txt.
+mailbox sizing, connection refusal, relay-plan admission, installation order
+and rendezvous mode agreement. They do not establish live data forwarding.
+This proxy implementation has no hardware preparation, export or
+native-serving qualification. Hardware validation requirements are listed
+in docs/TODO.txt.
 
 ## Protocol model and runtime checks
 
@@ -368,8 +397,8 @@ cover GPU staging, proxy posting, NIC payload reads, completion observation,
 and relay acknowledgments as separate transitions. FlashInfer owns these models
 because its GPU kernels and C proxy define the protocol. Flare vendors the
 serving proxy in `helios/native/roce_proxy.c`; preparation uses the pinned
-FlashInfer dependency. When changing the protocol, keep the vendored source
-identical to the dependency after its provenance header and verify their ABI
+FlashInfer dependency. When changing the protocol, compare the vendored source
+with the dependency after its provenance header and verify their ABI
 and collective-region layouts together.
 
 Flare enforces three boundaries around the protocol:
@@ -413,7 +442,7 @@ is unsupported; restarting the proxy thread alone does not reset the runtime.
 | `--roce-ring and --roce-chain require a multi-host core with 2..16 ranks` (Orbit) or `experimental RoCE ring requires 2..16 ranks` (serving rank) | Use a multi-host core with a supported rank count. The flag does not add model sharding geometries. |
 | `core RoCE kernels use proxy ABI ...` | Align the preparation dependency and native executable; re-export cores recording a proxy ABI other than 9 through 15, or an ABI 12 core with two pipelined receive rows per peer and chunk. |
 | `RoCE rails have a link to rank ...` | Verify rank order, active ports, GIDs, and the IPv4 subnet shared by each neighbor pair. |
-| `rank R selected RoCE transport shape ... where this rank selected ...`, or `rank zero did not select --roce-ring` | Select `--roce-ring` on rank zero and use matching binaries; serving bootstrap passes its routing mode to peers. |
+| `rank R selected RoCE transport ring-mailbox where this rank selected ring-partner`, or `rank zero did not select --roce-ring` | Select `--roce-ring` on rank zero, start every rank in the same group, and use matching binaries; serving bootstrap passes its routing mode to peers. |
 | Proxy error or collective timeout | Stop the ranks together and inspect the originating rank's error. There is no automatic rerouting around a failed neighbor. |
 
 The transport reports failed waits and RDMA errors through Helios's shared

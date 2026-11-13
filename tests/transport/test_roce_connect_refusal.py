@@ -1,7 +1,9 @@
-"""A relay group that disagrees on its wire geometry is refused before it connects.
+"""Transport setups the proxy must refuse before it can post a byte.
 The driver compiles the production proxy against a fake verbs provider, so it needs
-no RDMA hardware and no GPU. It covers ring presence, `ring_protocol`, the ABI 12
-geometry, the lane count and the two-SGE device; `roce.rs` refuses a mixed ABI first.
+no RDMA hardware and no GPU. It covers the four disagreements a relay group can
+carry at connect and the two-SGE device requirement, then admits an all-gather relay
+plan only where forwards are direct: a mesh and a closed four-rank ring accept one, a
+line and rings of three and five refuse it. `roce.rs` refuses a mixed ABI first.
 """
 
 import shutil
@@ -26,7 +28,9 @@ def refusal_driver(tmp_path_factory):
     return driver
 
 
-def test_a_disagreeing_group_never_connects(refusal_driver):
-    result = subprocess.run([str(refusal_driver)], capture_output=True, text=True, timeout=60)
+@pytest.mark.parametrize("mode, expected",
+                         [([], "roce connect refusal: ok"), (["relay"], "roce relay admission: ok")])
+def test_the_proxy_refuses_what_it_cannot_carry(refusal_driver, mode, expected):
+    result = subprocess.run([str(refusal_driver), *mode], capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.strip() == "roce connect refusal: ok"
+    assert result.stdout.strip() == expected

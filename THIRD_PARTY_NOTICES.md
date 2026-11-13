@@ -47,7 +47,8 @@ archives and in `helios/licenses/PyTorch.txt` in the source tree.
 
 The Linux aarch64 runtime also compiles the RoCE proxy in
 `helios/native/roce_proxy.c`, contributed by its original author from FlashInfer's
-`flashinfer/experimental/b12x/comm/roce/_roce_proxy.c` at proxy ABI 15. Its upstream
+`flashinfer/experimental/b12x/comm/roce/_roce_proxy.c` at proxy ABI 15, with
+four-rank ring partner-relay modifications. Its upstream
 Apache-2.0 license is retained in `helios/licenses/FlashInfer.txt` and included in
 binary archives.
 This native C source is distinct from the separately installed Python package.

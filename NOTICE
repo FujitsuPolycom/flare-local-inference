@@ -15,8 +15,9 @@ FlashInfer/b12x RoCE proxy
 -------------------------
 helios/native/roce_proxy.c was contributed by its original author from FlashInfer's
 https://github.com/local-inference-lab/flashinfer/blob/main/flashinfer/experimental/b12x/comm/roce/_roce_proxy.c
-The proxy is compiled into Linux aarch64 builds. Its implementation matches that
-file at proxy ABI 15; Flare adds a license and provenance preamble.
+The proxy is compiled into Linux aarch64 builds. It uses the proxy ABI 15 source
+with a four-rank ring partner relay, parity-based ring routing and ring protocol
+EPO7. Flare adds a license and source-attribution preamble.
 The upstream Apache-2.0 license is reproduced in helios/licenses/FlashInfer.txt
 in the source tree and licenses/FlashInfer.txt in binary distributions.
 

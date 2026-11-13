@@ -32,6 +32,8 @@ pub fn require_transport() -> Result<(), Failure> {
 }
 
 #[cfg(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce")))]
+use flare_helios::execution::roce::RelayMode;
+#[cfg(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce")))]
 pub use flare_helios::execution::roce::RoceTransport;
 
 #[cfg(not(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce"))))]
@@ -76,6 +78,7 @@ fn open(
     fabric: &flare_helios::execution::roce_fabric::Fabric,
     endpoints: &[Vec<u8>],
     shape: Shape,
+    relay: RelayMode,
 ) -> Result<RoceTransport, Failure> {
     use flare_helios::execution::roce_fabric;
 
@@ -89,13 +92,20 @@ fn open(
     let topology = fabric.topology(&endpoints, spec.rank, shape)?;
     // SAFETY: The core restored the region at its recorded address; owner outlives the
     // transport, and no graph runs before every rank connected.
-    Ok(unsafe { RoceTransport::open(spec, &topology)? })
+    Ok(unsafe { RoceTransport::open(spec, &topology, relay)? })
 }
 
 #[cfg(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce")))]
 fn connected(transport: &RoceTransport) -> String {
+    // A mesh writes every peer directly, so its line keeps its text; a ring or chain names how
+    // another rank's all-gather chunk reaches this one.
+    let relay = match transport.relay_mode() {
+        RelayMode::Direct => "",
+        RelayMode::Mailbox => ", all-gather chunks relay through the ring mailbox",
+        RelayMode::Partner => ", all-gather chunks relay through both neighbors",
+    };
     format!(
-        "{} rails per {} over {}",
+        "{} rails per {} over {}{relay}",
         transport.topology().rails,
         match transport.topology().shape {
             Shape::Mesh => "peer",
@@ -106,22 +116,26 @@ fn connected(transport: &RoceTransport) -> String {
     )
 }
 
-/// The transport shape a rank was started with, as the ranks exchange it before planning routes.
+/// The transport shape and relay mode a rank was started with, as the ranks exchange it before
+/// planning routes.
 #[cfg(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce")))]
-fn shape_record(shape: Shape) -> Vec<u8> {
-    shape.name().as_bytes().to_vec()
+fn shape_record(shape: Shape, relay: RelayMode) -> Vec<u8> {
+    // One word per rank, so a disagreement is named by the record instead of surfacing as a
+    // collective that hangs: "ring-mailbox" against "ring-partner" is a rank that joined a ring of
+    // another size, where the topology gives it another relay.
+    format!("{}-{}", shape.name(), relay.name()).into_bytes()
 }
 
-/// Every rank must select the same shape: a chain rank plans no route to the far end that a ring
-/// rank would wait for.
+/// Every rank must select the same shape and relay mode: a chain rank plans no route to the far end
+/// that a ring rank would wait for, and a rank that forwards all-gather chunks expects its peers to
+/// wait for a forwarded chunk.
 #[cfg(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce")))]
-fn agree_shape(records: &[Vec<u8>], shape: Shape) -> Result<(), Failure> {
-    let local = shape_record(shape);
-    if let Some(rank) = records.iter().position(|record| *record != local) {
+fn agree_shape(records: &[Vec<u8>], local: &[u8]) -> Result<(), Failure> {
+    if let Some(rank) = records.iter().position(|record| record != local) {
         return Err(format!(
-            "rank {rank} selected RoCE transport shape {} where this rank selected {}",
+            "rank {rank} selected RoCE transport {} where this rank selected {}",
             String::from_utf8_lossy(&records[rank]),
-            String::from_utf8_lossy(&local)
+            String::from_utf8_lossy(local)
         )
         .into());
     }
@@ -178,17 +192,21 @@ pub fn rank_zero(
 ) -> Result<Joined<Vec<RankStream>>, Failure> {
     #[cfg(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce")))]
     {
-        use flare_helios::execution::{rendezvous, roce_fabric};
+        use flare_helios::execution::{rendezvous, roce, roce_fabric};
         let mut streams = streams;
 
         let phase = progress.phase("Connect RoCE transport", None);
         // Every rank learns every rank's devices and the shape, then plans the same routes from them.
         let fabric = roce_fabric::discover()?;
-        let shapes = rendezvous::share_records(&mut streams, shape_record(shape))?;
-        agree_shape(&shapes, shape)?;
+        // The relay mode is part of what the ranks agree on: a rank that forwards another rank's
+        // all-gather chunk expects the same plan on every peer.
+        let relay = roce::relay_mode(shape, streams.len() + 1);
+        let local = shape_record(shape, relay);
+        let shapes = rendezvous::share_records(&mut streams, local.clone())?;
+        agree_shape(&shapes, &local)?;
         let endpoints =
             rendezvous::share_records(&mut streams, roce_fabric::encode(&fabric.endpoints))?;
-        let mut transport = open(owner, &fabric, &endpoints, shape)?;
+        let mut transport = open(owner, &fabric, &endpoints, shape, relay)?;
         let records = rendezvous::share_records(&mut streams, transport.local_record()?)?;
         transport.connect(&records)?;
         rendezvous::await_connected(&mut streams)?;
@@ -221,19 +239,21 @@ pub fn peer(
 ) -> Result<Joined<RankStream>, Failure> {
     #[cfg(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce")))]
     {
-        use flare_helios::execution::{rendezvous, roce_fabric};
+        use flare_helios::execution::{rendezvous, roce, roce_fabric};
         let mut stream = stream;
 
         let phase = progress.phase("Connect RoCE transport", None);
         let fabric = roce_fabric::discover()?;
-        let shapes = rendezvous::exchange_record(&mut stream, &shape_record(shape), cluster.world)?;
-        agree_shape(&shapes, shape)?;
+        let relay = roce::relay_mode(shape, cluster.world);
+        let local = shape_record(shape, relay);
+        let shapes = rendezvous::exchange_record(&mut stream, &local, cluster.world)?;
+        agree_shape(&shapes, &local)?;
         let endpoints = rendezvous::exchange_record(
             &mut stream,
             &roce_fabric::encode(&fabric.endpoints),
             cluster.world,
         )?;
-        let mut transport = open(owner, &fabric, &endpoints, shape)?;
+        let mut transport = open(owner, &fabric, &endpoints, shape, relay)?;
         let records =
             rendezvous::exchange_record(&mut stream, &transport.local_record()?, cluster.world)?;
         transport.connect(&records)?;
@@ -295,6 +315,39 @@ mod pool_tests {
             assert_eq!(started.recv().unwrap(), peer_approved);
             assert_eq!(zero.join().unwrap(), peer_approved);
         }
+    }
+}
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(target_arch = "aarch64", feature = "roce")
+))]
+mod shape_tests {
+    use super::*;
+
+    #[test]
+    fn the_shape_record_names_the_shape_and_its_relay_and_a_mismatch_is_refused() {
+        // One record per rank, so a peer's transport is named rather than inferred.
+        let record = |shape, relay| String::from_utf8(shape_record(shape, relay)).unwrap();
+        assert_eq!(record(Shape::Mesh, RelayMode::Direct), "mesh-direct");
+        assert_eq!(record(Shape::Ring, RelayMode::Mailbox), "ring-mailbox");
+        assert_eq!(record(Shape::Ring, RelayMode::Partner), "ring-partner");
+        assert_eq!(record(Shape::Chain, RelayMode::Mailbox), "chain-mailbox");
+        // Ranks that agree connect; a rank whose shape or group size gives it another relay is
+        // refused at the rendezvous instead of leaving a collective to wait for a chunk nobody
+        // forwards.
+        let partner = shape_record(Shape::Ring, RelayMode::Partner);
+        let agreed = [partner.clone(), partner.clone()];
+        agree_shape(&agreed, &partner).unwrap();
+        let error = agree_shape(&[partner.clone(), b"ring-mailbox".to_vec()], &partner)
+            .expect_err("a relay disagreement must be refused")
+            .to_string();
+        assert!(
+            error.contains("rank 1 selected RoCE transport ring-mailbox"),
+            "{error}"
+        );
+        assert!(error.contains("this rank selected ring-partner"), "{error}");
     }
 }
 
