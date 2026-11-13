@@ -4,8 +4,9 @@
  */
 
 // Vendored from FlashInfer (flashinfer/experimental/b12x/comm/roce/_roce_proxy.c,
-// proxy ABI 15) from local-inference-lab/flashinfer #106 and #107. Keep the source
-// below identical so preparation and serving share the transport ABI.
+// proxy ABI 15) from local-inference-lab/flashinfer #106 and #107, with the
+// four-rank ring partner relay. The protocol tag, parity-based routing and
+// relay-plan handling differ from FlashInfer's source.
 
 // RDMA proxy for the b12x RoCE one-shot all-reduce.
 //
@@ -91,7 +92,12 @@
 // reads the row between the chunk's arrival and its own pipe_done, which counts the forwarded
 // writes, so the row's reuse rules are those of its kernel's reads.  The bytes are copied, not
 // combined, so results are unchanged bit for bit.  With two pairs, each rank's two-shot traffic is
-// half cable and half switch instead of one third cable.
+// half cable and half switch instead of one third cable.  A four-rank closed ring uses the same
+// mechanism: rank r reaches rank r + 2 through r + 1 and forwards rank r - 1's chunks to r + 1, so
+// its shard leaves as two direct writes and one forward instead of two direct writes, one mailbox
+// packet and one CPU forward.  Both of its neighbors forward for it, the clockwise one the even
+// chunks and the counter-clockwise one the odd chunks, because a forwarded chunk is a direct write
+// whose lane has no per-chunk order.
 //
 // A variable-length all-gather (ctrl kind[slot] = 2) streams each rank's contribution, whose size
 // the kernel reads from device memory, through
@@ -252,7 +258,7 @@ _Static_assert(CTRL_CREDIT >= CTRL_READY_VL + ROCE_VARLEN_MAX_CHUNKS &&
 #define RING_OPEN_CHUNK_BYTES 262144
 #define RING_OPEN_WINDOW 32
 #define RING_MAX_SLOTS (RING_OPEN_WINDOW * (ROCE_MAX_PEERS - 1))
-#define RING_PROTOCOL 0x45504f35u  // EPO5: dense destination lanes with fanout broadcast
+#define RING_PROTOCOL 0x45504f37u  // EPO7: parity routing, fanout and four-rank partner relay
 #define RING_ACK_READY 3
 #define RING_COMPLETION (UINT64_C(1) << 63)
 typedef struct {
@@ -431,12 +437,16 @@ static ring_descriptor_t* ring_outgoing(const roce_ctx_t* c, int origin, int rai
   return (ring_descriptor_t*)(c->ring + ring_outgoing_offset(c, ring_slot(c, origin, rail, slot)));
 }
 // Next hop from `rank` toward target: on a line always toward it; on a cycle the
-// shorter way, clockwise on a tie.
+// shorter way, and on a tie the way its rank parity names, so an even rank sends
+// a two-hop peer clockwise and an odd rank counter-clockwise. A tie only exists
+// where the two arcs are equal, so no rank has two first hops toward one target
+// and every (origin, target) lane keeps one fixed route.
 static int ring_next_at(const roce_ctx_t* c, int rank, int target) {
   if (c->ring_open) return target > rank ? rank + 1 : rank - 1;
   int clockwise = (target - rank + c->world) % c->world;
   int counter = (rank - target + c->world) % c->world;
-  return clockwise <= counter ? (rank + 1) % c->world : (rank + c->world - 1) % c->world;
+  int clockwise_first = clockwise < counter || (clockwise == counter && rank % 2 == 0);
+  return clockwise_first ? (rank + 1) % c->world : (rank + c->world - 1) % c->world;
 }
 static int ring_next(const roce_ctx_t* c, int target) { return ring_next_at(c, c->rank, target); }
 // Relay mailboxes are never addressed at a path endpoint or at the final target.
@@ -939,12 +949,43 @@ int roce_connect(roce_ctx_t* c, const void* blobs, uint64_t blobs_len, const int
 // (-1: we send them ourselves) and plan[world + s] the rank we forward rank s's chunks to (-1:
 // none).  Call after roce_connect and before roce_start.  Every rank must pass the plan derived
 // from the same topology: a chunk nobody forwards stops its receiver's kernel at its wait timeout.
+// A closed ring accepts the plan too, and both neighbors carry parts of the far chunk: rank r
+// reaches rank r + 2 through r + 1 and forwards rank r - 1's chunks to r + 1, while rank r + 2
+// forwards the remaining chunks on the other side (see relay_forwards_chunk).
 int roce_set_relay(roce_ctx_t* c, const int32_t* plan, int n) {
-  if (c->started || c->n_rail == 0 || c->ring != NULL || n != 2 * c->world) {
+  // A four-rank ring forwards every chunk from one neighbor to the other, so both entries must be
+  // present: one of them alone would leave far chunks unforwarded.
+  const int ring = c->ring != NULL && !c->ring_open && c->world == 4;
+  int clockwise = ring ? (c->rank + 1) % c->world : -1;
+  int counter = ring ? (c->rank + c->world - 1) % c->world : -1;
+  // Every forward is a direct write to a cable neighbor: between cable partners on the mesh, and
+  // between the two neighbors of a r + 2 peer on a four-rank ring. Any other ring shape reaches
+  // those peers through the ring mailbox, so a plan built for direct writes does not describe it.
+  // A line is the sharpest case: the plan is accepted, ring_fanout stays off, and every chunk the
+  // plan forwards would leave by mailbox instead.
+  if (c->ring != NULL && !ring) {
     snprintf(c->err, sizeof(c->err),
-             "all-gather relay needs a connected mesh transport that has not started and a plan "
+             "an all-gather relay needs the mesh transport or a closed ring of four ranks, this "
+             "is %s with %d ranks",
+             c->ring_open ? "an open line" : "a closed ring", c->world);
+    return -1;
+  }
+  if (c->started || c->n_rail == 0 || n != 2 * c->world) {
+    snprintf(c->err, sizeof(c->err),
+             "all-gather relay needs a connected transport that has not started and a plan "
              "of %d entries, got %d",
              2 * c->world, n);
+    return -1;
+  }
+  // On a four-rank ring the far peer is two hops away, so it must be forwarded, and each of our
+  // neighbors forwards the other one's chunks to the rank across the ring.
+  if (ring &&
+      (plan[(c->rank + 2) % c->world] < 0 || plan[c->world + clockwise] != counter ||
+       plan[c->world + counter] != clockwise || plan[c->world + (c->rank + 2) % c->world] != -1)) {
+    snprintf(
+        c->err, sizeof(c->err),
+        "a four-rank ring needs via[%d] >= 0 for rank %d, forward[%d] = %d and forward[%d] = %d",
+        (c->rank + 2) % c->world, c->rank, clockwise, counter, counter, clockwise);
     return -1;
   }
   for (int p = 0; p < c->world; p++) {
@@ -1753,6 +1794,15 @@ static int forward_pipe_chunk(roce_ctx_t* c, uint32_t seq, int s, uint32_t chunk
   return 0;
 }
 
+// On a four-rank ring the clockwise neighbor forwards even-numbered far-shard chunks and the
+// counter-clockwise neighbor forwards odd-numbered chunks. Each chunk has exactly one carrier;
+// odd chunk counts and partial tails need not split bytes equally. A forwarded chunk's lane has no
+// per-chunk order, so splitting by chunk costs nothing.
+static int relay_forwards_chunk(const roce_ctx_t* c, int s, uint32_t chunk) {
+  if (c->ring == NULL || c->ring_open || c->world != 4) return 1;
+  return (chunk & 1u) == ((c->rank + c->world - s) % c->world == 1 ? 0u : 1u);
+}
+
 // The phases of an op of `kind` following an op of `prev` that must wait for peers' credits (see
 // the header): phase 0 after a reduce-scatter, phase 1 of a shard gather after an op that gathers.
 static uint32_t credit_phases(uint32_t prev, uint32_t kind) {
@@ -1867,6 +1917,14 @@ static int run_pipe_op(roce_ctx_t* c, uint32_t seq, uint32_t nbytes, uint32_t ch
       posted = 1;
     }
     for (int s = 0; forwarding > 0 && !(credit & CREDIT_AG) && s < c->world; s++) {
+      if (forwarded[s] < chunks && !relay_forwards_chunk(c, s, forwarded[s])) {
+        // The other neighbor carries this chunk, so its row here is never read.
+        if (++forwarded[s] == chunks) {
+          forwarding--;
+        }
+        posted = 1;
+        continue;
+      }
       if (forwarded[s] < chunks && pipe_chunk_arrived(c, seq, s, forwarded[s])) {
         if (forward_pipe_chunk(c, seq, s, forwarded[s], total, chunk_packs) != 0) {
           return -1;

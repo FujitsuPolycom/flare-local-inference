@@ -49,14 +49,16 @@ flowchart LR
 
 Only neighboring queue pairs connect. A transfer to a neighbor uses a direct
 RDMA write. A transfer to another rank follows the shorter direction around the
-cycle; equal-length paths follow increasing rank numbers, wrapping at N.
+cycle. Equal-length paths leave an even rank clockwise and an odd rank
+counter-clockwise, so at four ranks the two far shards travel in opposite
+directions.
 
 | Transfer | Path | Forwarding |
 | --- | --- | --- |
 | Rank 0 to rank 1 | `0 → 1` | Direct |
 | Rank 0 to rank 3 | `0 → 3` | Direct |
 | Rank 0 to rank 2 | `0 → 1 → 2` | Rank 1 relays the transfer |
-| Rank 1 to rank 3 | `1 → 2 → 3` | Rank 2 relays the transfer |
+| Rank 1 to rank 3 | `1 → 0 → 3` | Rank 0 relays the transfer |
 
 Two ranks have one distinct neighbor each; three or more have two. A switch
 does not add direct connections between non-neighbors in ring mode.
