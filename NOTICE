@@ -13,10 +13,10 @@ Third-party code and attributions
 
 FlashInfer/b12x RoCE proxy
 -------------------------
-helios/native/roce_proxy.c was contributed by its original author from:
-https://github.com/local-inference-lab/flashinfer/blob/f5f5341d711f8210ce91af5731a0841570f70e53/flashinfer/experimental/b12x/comm/roce/_roce_proxy.c
-The proxy is compiled into Linux aarch64 builds. Its implementation is unchanged
-from that revision; Flare adds a license and provenance preamble.
+helios/native/roce_proxy.c was contributed by its original author from FlashInfer's
+https://github.com/local-inference-lab/flashinfer/blob/main/flashinfer/experimental/b12x/comm/roce/_roce_proxy.c
+The proxy is compiled into Linux aarch64 builds. Its implementation matches that
+file at proxy ABI 15; Flare adds a license and provenance preamble.
 The upstream Apache-2.0 license is reproduced in helios/licenses/FlashInfer.txt
 in the source tree and licenses/FlashInfer.txt in binary distributions.
 

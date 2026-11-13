@@ -416,6 +416,11 @@
     verification, and coordinated shutdown complete on that configuration.
     See roce-ring.md.
 
+[ ] Qualify proxy ABI 15 RoCE serving with the mailbox relay: GLM-5.3 Flash TP4
+    on four DGX Sparks. Close it when preparation, export, native serving,
+    signed-core verification, and coordinated shutdown complete on that
+    configuration. See roce-ring.md.
+
 [ ] Qualify x86_64 RoCE serving on RDMA hardware; its coverage is functional,
     over Soft-RoCE. See multi-host.md.
 

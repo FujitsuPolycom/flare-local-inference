@@ -241,9 +241,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if membership.is_some() {
         cluster::require_transport()?;
     }
-    let options = args.load_options();
+    let mut options = args.load_options();
     let local_devices: Vec<i32> = (0..args.gpus.len() as i32).collect();
     let shape = cluster::Shape::from_flags(args.roce_ring, args.roce_chain);
+    // A ring or chain rank's proxy allocates and registers its mailbox area at startup, outside
+    // the package's captured region, so cache sizing has to leave room for it. The shape decides
+    // how much: only a line of four or more ranks allocates the larger area.
+    options.relay_shape = shape.relays().then_some(shape);
     let rendezvous = args.rendezvous;
     // SAFETY: The trusted core owners remain live until every rank drains.
     let owner = unsafe {

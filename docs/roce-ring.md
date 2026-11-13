@@ -105,12 +105,15 @@ that receiving kernels wait for. The proxy performs transport work, not the
 model's reductions.
 
 Ring mode also allocates registered host memory on each rank at startup, sized
-for the group: about 1.004 MiB per rank in the group, so 4.02 MiB on each rank
-of a four-rank group and 16.06 MiB at sixteen ranks. This region contains
-eight relay mailboxes, acknowledgment words, and outgoing descriptors for every
-origin rank and each of two rails. It is
-separate from captured graph storage and the core's collective region.
-Relay payloads occupy at most 64 KiB per packet.
+for the group and the topology. On a ring it is about 1.004 MiB per rank in the
+group, so 4.02 MiB on each rank of a four-rank group and 16.06 MiB at sixteen
+ranks: eight relay mailboxes shared by one origin's destinations, acknowledgment
+words, and outgoing descriptors for every origin rank and each of two rails, with
+relay payloads of at most 64 KiB per packet. A line of four or more ranks
+broadcasts, which needs a 256 KiB packet and 32 slots per destination, so there
+the area is 192.19 MiB per rank at four ranks, 896.90 MiB at eight and 3.75 GiB
+at sixteen. It is separate from captured graph storage and the core's collective
+region.
 
 A transfer from rank 0 to rank 2 through rank 1 proceeds as follows:
 
@@ -125,9 +128,9 @@ A transfer from rank 0 to rank 2 through rank 1 proceeds as follows:
    The last relay waits for its send completion, then acknowledges the packet
    to the preceding hop. Longer paths pass acknowledgments back through each
    relay to the origin.
-4. Rank 0 keeps at most eight packets in flight on a rail: it reuses a mailbox
-   slot only after the acknowledgment of the packet that last used that slot
-   returns. Relay buffers and outgoing descriptors remain live until
+4. On a ring, rank 0 keeps at most eight packets in flight on a rail: it reuses
+   a mailbox slot only after the acknowledgment of the packet that last used that
+   slot returns. Relay buffers and outgoing descriptors remain live until
    downstream acknowledgment permits reuse.
 
 The acknowledgment protects data still being read by a NIC. Receiving GPU
@@ -157,11 +160,21 @@ uv sync --locked --extra prepare --extra test
 cargo build --release --manifest-path flare-cli/Cargo.toml
 ```
 
-Preparation and serving use proxy ABI 11. Its proxy holds eight packets in flight per sender and
-rail in ring mailboxes that the runtime allocates at startup, and it serves the pipelined
-reduce-scatter and shard-gather operations. Cores recording proxy ABI 9 or 10 have the same
-captured region layout, so the runtime loads cores that record ABI 9, 10 or 11. The chain topology
-is a mode of this layout, and startup rejects any other proxy ABI before replay.
+Serving uses proxy ABI 15. Preparation requires the FlashInfer dependency
+containing #106 and #107 and the same proxy source used by this runtime.
+The runtime allocates and registers its mailbox area at startup: eight slots
+per origin and rail on a closed ring or a line of two or three ranks, and
+32 slots per destination on a line of four or more ranks. Only the latter
+broadcasts pipelined all-gather chunks; one-shot payloads stay per-destination.
+It serves the pipelined reduce-scatter and shard-gather operations. Cores recording proxy ABI 9,
+10, 11, 12, 13, 14 or 15 write the same captured region layout, so the runtime loads cores that
+record an ABI from 9 through 15. The one exception is an ABI 12 core exported with two pipelined
+receive rows per peer and chunk instead of one, which makes its region larger than this layout;
+the runtime refuses that core by its recorded pipelined-row geometry rather than by the ABI
+number, so it must be re-exported. The chain topology is a mode of this layout, and startup
+rejects any other proxy ABI before replay. A relaying rank reserves its own mailbox area from the
+memory budget before the transport opens, so a cache sized under a memory limit leaves room for
+it.
 
 ### Prepare across four hosts
 
@@ -246,8 +259,8 @@ Ranks that disagree about ring mode fail during transport record exchange.
 
 Select ring mode explicitly during serving, including for a core prepared
 with the option. The serving flag chooses routing independently of the
-core's graph catalog. A core recording proxy ABI 9, 10 or 11 can use either transport
-without changing its captured addresses or collective algorithms. Preparation
+core's graph catalog. A core this runtime loads can use either transport without
+changing its captured addresses or collective algorithms. Preparation
 on a physical ring also needs `--roce-ring`, because non-neighbor direct routes
 are unavailable during warmup and capture. A chain (`--roce-chain`) uses the
 neighbor transport for collectives, and its checkpoint loading and preparation
@@ -343,11 +356,10 @@ tests additionally exercise changing
 message sizes, buffer ownership, and proxy failures during replay. Recovery
 from a failed ring neighbor is unsupported; stop and restart all ranks together.
 
-Ring transport is experimental. Qualified: GLM-5.3 Flash TP4 on four DGX
-Sparks cabled as a physical ring, covering preparation, export, native serving,
-fabric TCP checkpoint and export transfer, signed-core verification, and
-coordinated shutdown. Not qualified: other recipes, other rank counts,
-`--roce-chain`, and x86_64 hosts.
+Ring transport is experimental. CPU tests cover recorded-layout validation,
+mailbox sizing and connection refusal for geometry disagreements. This proxy
+implementation has no hardware preparation, export or native-serving
+qualification. Hardware validation requirements are listed in docs/TODO.txt.
 
 ## Protocol model and runtime checks
 
@@ -399,7 +411,7 @@ is unsupported; restarting the proxy thread alone does not reset the runtime.
 | Symptom | Check |
 | --- | --- |
 | `--roce-ring and --roce-chain require a multi-host core with 2..16 ranks` (Orbit) or `experimental RoCE ring requires 2..16 ranks` (serving rank) | Use a multi-host core with a supported rank count. The flag does not add model sharding geometries. |
-| `core RoCE kernels use proxy ABI ...` | Align the preparation dependency and native executable; re-export cores recording a proxy ABI other than 9 or 10. |
+| `core RoCE kernels use proxy ABI ...` | Align the preparation dependency and native executable; re-export cores recording a proxy ABI other than 9 through 15, or an ABI 12 core with two pipelined receive rows per peer and chunk. |
 | `RoCE rails have a link to rank ...` | Verify rank order, active ports, GIDs, and the IPv4 subnet shared by each neighbor pair. |
 | `rank R selected RoCE transport shape ... where this rank selected ...`, or `rank zero did not select --roce-ring` | Select `--roce-ring` on rank zero and use matching binaries; serving bootstrap passes its routing mode to peers. |
 | Proxy error or collective timeout | Stop the ranks together and inspect the originating rank's error. There is no automatic rerouting around a failed neighbor. |

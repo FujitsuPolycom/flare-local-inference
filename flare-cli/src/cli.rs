@@ -1206,6 +1206,9 @@ impl ServingOptions {
                 }),
             },
             cluster_rank,
+            // The rank's topology decides this; `main` sets it before loading, and the proxy's
+            // ring is reserved from the same budget the KV cache is sized from.
+            relay_shape: None,
         }
     }
 }
