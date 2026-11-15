@@ -16,6 +16,12 @@
     host memory admission. Its nine-worker assertion requires 296 GiB available
     under the 32 GiB worker allowance and 8 GiB headroom; smaller hosts admit fewer.
 
+[ ] Extend DeepSeek V4.1 row-sharded-attention validation beyond the retained
+    SM121 TP4 native profile: fresh default-dependency whole-model preparation,
+    other supported GPU/TP geometries, scored-prefill modes, and remaining
+    shard-tail capacities. Use operator-specific bounds and complete state checks.
+    See docs/model-preparation.md for the qualified execution scope.
+
 [ ] Ensure Rust bridge updates relink the WinUI executable during incremental
     builds. MSBuild can retain flare-winui.exe after the bridge library changes;
     verify loose and single-file outputs without requiring /t:Rebuild.
