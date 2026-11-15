@@ -18,6 +18,22 @@ pub(super) struct SnapshotQuote {
     rank: crate::cache::RetentionRank,
 }
 
+/// Prefix offsets into `postings` from the per-page posting counts: `starts[page]` is
+/// the first slot for `page` and `starts[page + 1]` the slot after its last. The
+/// offsets index the postings allocation, whose length is the aggregate candidate
+/// cost. Accepted alias geometries can need more postings than `u32::MAX` (65,537
+/// aliases over 65,536 free pages reach 2^32), so the offsets are pointer-sized.
+fn posting_starts(counts: &[usize]) -> Vec<usize> {
+    let mut starts = vec![0usize; counts.len() + 1];
+    for (page, &count) in counts.iter().enumerate() {
+        starts[page + 1] += count;
+    }
+    for page in 1..starts.len() {
+        starts[page] += starts[page - 1];
+    }
+    starts
+}
+
 fn select_snapshots(
     backing: &[bool],
     protected_refs: &[u32],
@@ -50,6 +66,23 @@ fn select_snapshots(
             Some((id, cost))
         })
         .collect();
+    if count == 1 {
+        // The lowest cost, ties to the lowest id, skipping candidates whose cost exceeds the
+        // spare pages. One row is the shape of a quote for an anchor-only capture, so this
+        // path avoids building the two-row index below.
+        let budget = available - keep_pages;
+        let mut best: Option<(usize, SnapshotId)> = None;
+        for (id, pages) in &candidates {
+            if best.is_some_and(|(cost, _)| pages.len() >= cost) || pages.len() > budget {
+                continue;
+            }
+            best = Some((pages.len(), *id));
+            if pages.is_empty() {
+                break;
+            }
+        }
+        return best.map(|(_, id)| vec![id]);
+    }
     if count > 2 {
         // Future capture capacity uses a conservative witness without enumerating subsets.
         let mut selected = BTreeSet::<SnapshotId>::new();
@@ -75,63 +108,58 @@ fn select_snapshots(
         }
         return Some(selected.into_iter().collect());
     }
-    fn choose(
-        candidates: &[(SnapshotId, Vec<usize>)],
-        start: usize,
-        count: usize,
-        selected: &mut Vec<SnapshotId>,
-        excluded: &BTreeSet<usize>,
-        budget: usize,
-        best: &mut Option<(usize, Vec<SnapshotId>)>,
-    ) {
-        if excluded.len() > budget {
-            return;
-        }
-        // Combinations visit snapshot IDs in lexicographic order.
-        if best.as_ref().is_some_and(|best| best.0 == 0) {
-            return;
-        }
-        if count == 0 {
-            let candidate = (excluded.len(), selected.clone());
-            if best.as_ref().is_none_or(|best| candidate < *best) {
-                *best = Some(candidate);
-            }
-            return;
-        }
-        if candidates.len().saturating_sub(start) < count {
-            return;
-        }
-        for index in start..=candidates.len() - count {
-            let (id, pages) = &candidates[index];
-            let mut union = excluded.clone();
-            union.extend(pages);
-            if best.as_ref().is_some_and(|best| union.len() > best.0) {
-                continue;
-            }
-            selected.push(*id);
-            choose(
-                candidates,
-                index + 1,
-                count - 1,
-                selected,
-                &union,
-                budget,
-                best,
-            );
-            selected.pop();
+    // Two rows: the lowest union of the two candidates' costs, ties to the lexicographically
+    // lowest ids, among pairs whose union fits the spare pages. The union is
+    // |a| + |b| - |a ∩ b|; the inverted index counts the shared pages for every pair, so
+    // the pair loop never builds or merges a set.
+    let budget = available - keep_pages;
+    let mut counts = vec![0usize; backing.len()];
+    for (_, pages) in &candidates {
+        for &page in pages {
+            counts[page] += 1;
         }
     }
-    let mut best = None;
-    choose(
-        &candidates,
-        0,
-        count,
-        &mut Vec::new(),
-        &BTreeSet::new(),
-        available - keep_pages,
-        &mut best,
-    );
-    best.map(|(_, selected)| selected)
+    let starts = posting_starts(&counts);
+    let mut next = starts.clone();
+    let mut postings = vec![0u32; starts[backing.len()]];
+    for (candidate, (_, pages)) in candidates.iter().enumerate() {
+        for &page in pages {
+            postings[next[page] as usize] = candidate as u32;
+            next[page] += 1;
+        }
+    }
+    let mut overlap = vec![0u32; candidates.len()];
+    let mut best: Option<(usize, usize, usize)> = None;
+    for a in 0..candidates.len() {
+        let pages = &candidates[a].1;
+        if pages.len() > budget {
+            continue;
+        }
+        for &page in pages {
+            for &b in &postings[starts[page] as usize..starts[page + 1] as usize] {
+                if b as usize > a {
+                    overlap[b as usize] += 1;
+                }
+            }
+        }
+        for b in a + 1..candidates.len() {
+            let union = pages.len() + candidates[b].1.len() - overlap[b] as usize;
+            if union <= budget && best.is_none_or(|(cost, _, _)| union < cost) {
+                best = Some((union, a, b));
+            }
+        }
+        for &page in pages {
+            for &b in &postings[starts[page] as usize..starts[page + 1] as usize] {
+                if b as usize > a {
+                    overlap[b as usize] -= 1;
+                }
+            }
+        }
+        if best.is_some_and(|(cost, _, _)| cost == 0) {
+            break;
+        }
+    }
+    best.map(|(_, a, b)| vec![candidates[a].0, candidates[b].0])
 }
 
 impl RequestScheduler {
@@ -153,9 +181,7 @@ impl RequestScheduler {
     }
 
     pub(super) fn available_snapshot(&self, keep_pages: usize) -> Option<SnapshotId> {
-        let backing: Vec<_> = (0..self.limits.pages)
-            .map(|page| self.free_pages.contains(&PageId(page)))
-            .collect();
+        let backing = self.free_backing();
         select_snapshots(
             &backing,
             &self.page_snapshot_refs,
@@ -226,14 +252,11 @@ impl RequestScheduler {
     ) -> Option<SnapshotQuote> {
         let keep_pages = keep_pages.max(self.decode_growth_pages());
         let mut cache = self.cache.clone();
-        let mut free_pages = self.free_pages.clone();
+        let mut backing = self.free_backing();
         let mut free_snapshots = self.free_snapshots.clone();
         let mut refs = self.page_snapshot_refs.clone();
         let mut victims = Vec::new();
         loop {
-            let backing: Vec<_> = (0..self.limits.pages)
-                .map(|page| free_pages.contains(&PageId(page)))
-                .collect();
             let candidates =
                 allowed.map(|allowed| free_snapshots.intersection(allowed).copied().collect());
             if let Some(snapshots) = select_snapshots(
@@ -257,19 +280,40 @@ impl RequestScheduler {
             cache.evict_checkpoint(id).ok()?;
             victims.push(id);
             let reusable = cache.advance_completed(self.completed).ok()?.reusable;
-            free_pages.extend(reusable.pages);
+            // Eviction only ever returns pages, so the array built once above stays exact
+            // and no per-round rescan of the free set is needed.
+            for page in reusable.pages {
+                if let Some(slot) = backing.get_mut(page.0 as usize) {
+                    *slot = true;
+                }
+            }
             for snapshot in reusable.snapshots {
                 free_snapshots.insert(snapshot);
                 if let Some(range) = self.snapshot_pages.get(snapshot.0 as usize) {
                     for page in range.clone() {
                         refs[page as usize] -= 1;
                         if refs[page as usize] == 0 {
-                            free_pages.insert(PageId(page));
+                            if let Some(slot) = backing.get_mut(page as usize) {
+                                *slot = true;
+                            }
                         }
                     }
                 }
             }
         }
+    }
+
+    /// `backing[page]` is true exactly where the free set holds that id. Filling from the
+    /// set takes one pass over the free pages; asking the set about every id takes a tree
+    /// search per page, which grows with the pool.
+    fn free_backing(&self) -> Vec<bool> {
+        let mut backing = vec![false; self.limits.pages as usize];
+        for page in &self.free_pages {
+            if let Some(slot) = backing.get_mut(page.0 as usize) {
+                *slot = true;
+            }
+        }
+        backing
     }
 
     pub(super) fn apply_snapshot_quote(
@@ -825,5 +869,600 @@ mod tests {
         assert!(s.fits_next_rounds(s.request(handle).unwrap()));
         assert_eq!(s.stats().preemptions, 0);
         s.free_pages.extend(held);
+    }
+
+    // ------------------------------------------------------------ quote parity
+    //
+    // Independent implementations of the selection and quote rules, written in the direct
+    // form: clone the free-page set, ask it about every page id, and enumerate candidate
+    // subsets. The tests below compare the scheduler's results against these, because
+    // `apply_snapshot_quote` re-quotes a stored quote and compares it, so agreement with
+    // the selection rule is a runtime contract, not only a test convenience.
+
+    fn reference_select(
+        backing: &[bool],
+        protected_refs: &[u32],
+        ranges: &[std::ops::Range<u32>],
+        candidates: &BTreeSet<SnapshotId>,
+        keep_pages: usize,
+        count: usize,
+    ) -> Option<Vec<SnapshotId>> {
+        let available = backing.iter().filter(|free| **free).count();
+        if available < keep_pages {
+            return None;
+        }
+        if count == 0 {
+            return Some(Vec::new());
+        }
+        let candidates: Vec<_> = candidates
+            .iter()
+            .copied()
+            .filter_map(|id| {
+                let mut cost = Vec::new();
+                if let Some(range) = ranges.get(id.0 as usize) {
+                    for page in range.clone() {
+                        if backing[page as usize] {
+                            cost.push(page as usize);
+                        } else if protected_refs[page as usize] == 0 {
+                            return None;
+                        }
+                    }
+                }
+                Some((id, cost))
+            })
+            .collect();
+        if count > 2 {
+            let mut selected = BTreeSet::<SnapshotId>::new();
+            let mut excluded = BTreeSet::<usize>::new();
+            for _ in 0..count {
+                let (id, pages) = candidates
+                    .iter()
+                    .filter(|(id, _)| !selected.contains(id))
+                    .min_by_key(|(id, pages)| {
+                        (
+                            pages
+                                .iter()
+                                .filter(|page| !excluded.contains(*page))
+                                .count(),
+                            *id,
+                        )
+                    })?;
+                excluded.extend(pages);
+                if excluded.len() > available - keep_pages {
+                    return None;
+                }
+                selected.insert(*id);
+            }
+            return Some(selected.into_iter().collect());
+        }
+        fn choose(
+            candidates: &[(SnapshotId, Vec<usize>)],
+            start: usize,
+            count: usize,
+            selected: &mut Vec<SnapshotId>,
+            excluded: &BTreeSet<usize>,
+            budget: usize,
+            best: &mut Option<(usize, Vec<SnapshotId>)>,
+        ) {
+            if excluded.len() > budget {
+                return;
+            }
+            if best.as_ref().is_some_and(|best| best.0 == 0) {
+                return;
+            }
+            if count == 0 {
+                let candidate = (excluded.len(), selected.clone());
+                if best.as_ref().is_none_or(|best| candidate < *best) {
+                    *best = Some(candidate);
+                }
+                return;
+            }
+            if candidates.len().saturating_sub(start) < count {
+                return;
+            }
+            for index in start..=candidates.len() - count {
+                let (id, pages) = &candidates[index];
+                let mut union = excluded.clone();
+                union.extend(pages);
+                if best.as_ref().is_some_and(|best| union.len() > best.0) {
+                    continue;
+                }
+                selected.push(*id);
+                choose(
+                    candidates,
+                    index + 1,
+                    count - 1,
+                    selected,
+                    &union,
+                    budget,
+                    best,
+                );
+                selected.pop();
+            }
+        }
+        let mut best = None;
+        choose(
+            &candidates,
+            0,
+            count,
+            &mut Vec::new(),
+            &BTreeSet::new(),
+            available - keep_pages,
+            &mut best,
+        );
+        best.map(|(_, selected)| selected)
+    }
+
+    fn reference_simulate(
+        s: &RequestScheduler,
+        rows: usize,
+        keep_pages: usize,
+        rank: crate::cache::RetentionRank,
+        allowed: Option<&BTreeSet<SnapshotId>>,
+    ) -> Option<SnapshotQuote> {
+        let keep_pages = keep_pages.max(s.decode_growth_pages());
+        let mut cache = s.cache.clone();
+        let mut free_pages = s.free_pages.clone();
+        let mut free_snapshots = s.free_snapshots.clone();
+        let mut refs = s.page_snapshot_refs.clone();
+        let mut victims = Vec::new();
+        loop {
+            let backing: Vec<_> = (0..s.limits.pages)
+                .map(|page| free_pages.contains(&PageId(page)))
+                .collect();
+            let candidates =
+                allowed.map(|allowed| free_snapshots.intersection(allowed).copied().collect());
+            if let Some(snapshots) = reference_select(
+                &backing,
+                &refs,
+                &s.snapshot_pages,
+                candidates.as_ref().unwrap_or(&free_snapshots),
+                keep_pages,
+                rows,
+            ) {
+                return Some(SnapshotQuote {
+                    witness: snapshots.clone(),
+                    snapshots,
+                    victims,
+                    planned_rows: rows,
+                    keep_pages,
+                    rank,
+                });
+            }
+            let id = cache.eviction_candidate(Some(rank), true)?;
+            cache.evict_checkpoint(id).ok()?;
+            victims.push(id);
+            let reusable = cache.advance_completed(s.completed).ok()?.reusable;
+            free_pages.extend(reusable.pages);
+            for snapshot in reusable.snapshots {
+                free_snapshots.insert(snapshot);
+                if let Some(range) = s.snapshot_pages.get(snapshot.0 as usize) {
+                    for page in range.clone() {
+                        refs[page as usize] -= 1;
+                        if refs[page as usize] == 0 {
+                            free_pages.insert(PageId(page));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn reference_quote_preserving(
+        s: &RequestScheduler,
+        rows: usize,
+        planned_rows: usize,
+        keep_pages: usize,
+        rank: crate::cache::RetentionRank,
+    ) -> Option<SnapshotQuote> {
+        if rows > planned_rows {
+            return None;
+        }
+        if rows == planned_rows {
+            return reference_simulate(s, rows, keep_pages, rank, None);
+        }
+        let future = reference_simulate(s, planned_rows, keep_pages, rank, None)?;
+        let candidates = future.snapshots.iter().copied().collect();
+        let mut current = reference_simulate(s, rows, keep_pages, rank, Some(&candidates))?;
+        current.planned_rows = planned_rows;
+        current.witness = future.snapshots;
+        Some(current)
+    }
+
+    fn lcg(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *state >> 33
+    }
+
+    /// Every quote must match the reference implementation, including states with an empty
+    /// free set, a full cache, and fragmented free pages, and including quotes that evict.
+    #[test]
+    fn snapshot_quote_matches_reference() {
+        let rng = &mut 0x5eed_1234_9abc_def0u64;
+        let (mut quoted, mut evicted, mut compared) = (0u32, 0u32, 0u32);
+        for case in 0..120 {
+            let pages = if case % 3 == 0 { 4_096u32 } else { 256 };
+            let snapshots = if case % 3 == 0 { 32u32 } else { 6 };
+            let mut s = super::super::tests::scheduler(1, pages, snapshots);
+            let aliases: Vec<_> = (0..snapshots)
+                .map(|_| {
+                    let start = (lcg(rng) % u64::from(pages)) as u32;
+                    let width = (lcg(rng) % 40) as u32;
+                    start..(start + width).min(pages)
+                })
+                .collect();
+            s.share_snapshot_pages(&aliases).unwrap();
+            let mut history = PrefixHistory::new([9; 32]);
+            history
+                .append(&(0..512u32).collect::<Vec<_>>(), &[])
+                .unwrap();
+            let mut parent = None;
+            for step in 0..(lcg(rng) % 4) {
+                let free: Vec<_> = s.free_snapshots.iter().copied().collect();
+                if free.is_empty() {
+                    break;
+                }
+                let pick = free[(lcg(rng) as usize) % free.len()];
+                s.reserve_snapshot_id(pick);
+                let endpoint = (step + 1) * 64;
+                parent = Some(
+                    s.cache
+                        .publish(
+                            &history,
+                            &Publication {
+                                parent,
+                                consumed_tokens: endpoint,
+                                tail_pages: vec![PageId(step as u32 % pages)],
+                                snapshot: StateSnapshot {
+                                    id: pick,
+                                    consumed_tokens: endpoint,
+                                },
+                                ready_after: Fence(0),
+                            },
+                        )
+                        .unwrap()
+                        .id(),
+                );
+            }
+            let taken: Vec<PageId> = s
+                .free_pages
+                .iter()
+                .copied()
+                .filter(|_| lcg(rng) % 7 == 0)
+                .collect();
+            for page in &taken {
+                s.free_pages.remove(page);
+            }
+            for _ in 0..(lcg(rng) % 8) {
+                let page = PageId((lcg(rng) % u64::from(pages)) as u32);
+                s.free_pages.insert(page);
+            }
+            if case % 11 == 0 {
+                s.free_pages.clear();
+            }
+            if case % 13 == 0 {
+                s.free_snapshots.clear();
+                s.free_pages.clear();
+            }
+            for rows in 0..=4usize {
+                for planned in [rows, rows + 1] {
+                    for keep in [0usize, 1, 4] {
+                        let rank = crate::cache::RetentionRank {
+                            use_epoch: 3,
+                            role: crate::cache::RetentionRole::Message,
+                            consumed_tokens: 64,
+                        };
+                        let actual = s.quote_snapshots_preserving(rows, planned, keep, rank);
+                        let reference = reference_quote_preserving(&s, rows, planned, keep, rank);
+                        assert_eq!(
+                            actual, reference,
+                            "case {case} rows {rows} planned {planned} keep {keep}"
+                        );
+                        compared += 1;
+                        if let Some(quote) = &actual {
+                            quoted += 1;
+                            evicted += u32::from(!quote.victims.is_empty());
+                        }
+                    }
+                }
+            }
+        }
+        println!(
+            "SNAPSHOT_QUOTE_PARITY compared={compared} quoted={quoted} with_victims={evicted}"
+        );
+        assert!(
+            quoted > compared / 10,
+            "too few successful quotes to prove equality"
+        );
+        assert!(evicted > 0, "no state exercised the eviction path");
+    }
+
+    /// The selection paths alone, on random pools, against the enumerating reference.
+    #[test]
+    fn snapshot_selection_matches_reference() {
+        let rng = &mut 0xfeed_0bad_c0de_0001u64;
+        let (mut compared, mut picked) = (0u32, 0u32);
+        for case in 0..300 {
+            let pages = 1 + (lcg(rng) % 300) as usize;
+            let snapshots = 1 + (lcg(rng) % 12) as usize;
+            let backing: Vec<bool> = (0..pages).map(|_| lcg(rng) % 3 != 0).collect();
+            let refs: Vec<u32> = (0..pages).map(|_| (lcg(rng) % 3) as u32).collect();
+            let ranges: Vec<std::ops::Range<u32>> = (0..snapshots)
+                .map(|_| {
+                    let start = (lcg(rng) % pages as u64) as u32;
+                    start..(start + (lcg(rng) % 40) as u32).min(pages as u32)
+                })
+                .collect();
+            let candidates: BTreeSet<SnapshotId> = (0..snapshots)
+                .filter(|_| lcg(rng) % 4 != 0)
+                .map(|id| SnapshotId(id as u32))
+                .collect();
+            for count in 0..=4usize {
+                for keep in [0usize, 1, 7, pages] {
+                    let actual =
+                        select_snapshots(&backing, &refs, &ranges, &candidates, keep, count);
+                    let reference =
+                        reference_select(&backing, &refs, &ranges, &candidates, keep, count);
+                    assert_eq!(actual, reference, "case {case} count {count} keep {keep}");
+                    compared += 1;
+                    picked += u32::from(actual.as_ref().is_some_and(|ids| !ids.is_empty()));
+                }
+            }
+        }
+        println!("SNAPSHOT_SELECT_PARITY compared={compared} picked={picked}");
+        assert!(picked > compared / 20);
+    }
+
+    /// Two rows on pools where candidates' alias windows overlap heavily, the case the
+    /// shared-page counts exist for.
+    #[test]
+    fn two_row_selection_matches_reference() {
+        let rng = &mut 0x00d2_c0de_1234_5678u64;
+        let (mut compared, mut picked) = (0u32, 0u32);
+        for case in 0..30 {
+            let pages = 200 + (lcg(rng) % 800) as usize;
+            let snapshots = 40 + (lcg(rng) % 160) as usize;
+            let backing: Vec<bool> = (0..pages).map(|_| lcg(rng) % 4 != 0).collect();
+            let refs: Vec<u32> = (0..pages).map(|_| (lcg(rng) % 2) as u32).collect();
+            let stride = 1 + (lcg(rng) % 12) as u32;
+            let ranges: Vec<std::ops::Range<u32>> = (0..snapshots)
+                .map(|row| {
+                    let start = (row as u32 * stride) % pages as u32;
+                    start..(start + 8 + (lcg(rng) % 24) as u32).min(pages as u32)
+                })
+                .collect();
+            let candidates: BTreeSet<SnapshotId> = (0..snapshots)
+                .filter(|_| lcg(rng) % 5 != 0)
+                .map(|id| SnapshotId(id as u32))
+                .collect();
+            for keep in [0usize, 1, 40, 200, pages] {
+                let actual = select_snapshots(&backing, &refs, &ranges, &candidates, keep, 2);
+                let reference = reference_select(&backing, &refs, &ranges, &candidates, keep, 2);
+                assert_eq!(actual, reference, "case {case} keep {keep}");
+                compared += 1;
+                picked += u32::from(actual.is_some());
+            }
+        }
+        println!("SNAPSHOT_TWO_ROW_PARITY compared={compared} picked={picked}");
+        assert!(
+            picked > compared / 4,
+            "too few two-row selections to prove equality"
+        );
+    }
+
+    /// Offsets into the two-row index are pointer-sized. `share_snapshot_pages` accepts
+    /// 65,537 aliases over 65,536 pages, and with every page free each candidate costs
+    /// the whole pool: 4,295,032,832 postings, which a 32-bit prefix sum wraps.
+    #[test]
+    fn pair_index_offsets_span_the_posting_count() {
+        const ALIASES: usize = 65_537;
+        const PAGES: usize = 65_536;
+        let counts = vec![ALIASES; PAGES];
+        let starts = posting_starts(&counts);
+        assert_eq!(starts.len(), PAGES + 1);
+        assert_eq!(starts[PAGES], ALIASES * PAGES);
+        assert!(starts[PAGES] > u32::MAX as usize);
+        assert!(starts.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+
+    /// Cache benchmark fixture: 202,183 pages of 128 KV tokens and 2,457 snapshot rows.
+    /// Aliases use contiguous windows with a 32-page overlap between neighbours,
+    /// matching the layout shape constructed by `Layout`.
+    const FIXTURE_PAGES: u32 = 202_183;
+    const FIXTURE_SNAPSHOTS: u32 = 2_457;
+
+    fn fixture_scheduler() -> RequestScheduler {
+        let mut scheduler = RequestScheduler::new(
+            [7; 32],
+            SchedulerLimits {
+                request_slots: 16,
+                max_active: 1,
+                max_sequence_tokens: 1_048_576,
+                prefill_chunk_size: 8192,
+                pages: FIXTURE_PAGES,
+                snapshots: FIXTURE_SNAPSHOTS,
+            },
+            SchedulerCapabilities {
+                completion_token_capacity: 16,
+                vocabulary: 248_320,
+                page_tokens: 128,
+                vision: crate::model::VisionCapabilities {
+                    feature_slots: 4,
+                    features_per_request: 16384,
+                    max_images: 4,
+                    patches_per_feature: 4,
+                    patch_capacities: vec![256, 1024, 4096, 16384],
+                },
+                draft_pages_per_request: 1,
+                completion_inputs: vec![],
+                speculative_allocations: vec![],
+                state_rows_per_request: None,
+            },
+        )
+        .unwrap();
+        scheduler
+            .measured_graph_durations(&super::super::tests::duration_graphs(1))
+            .unwrap();
+        let stride = FIXTURE_PAGES / FIXTURE_SNAPSHOTS;
+        let aliases: Vec<_> = (0..FIXTURE_SNAPSHOTS)
+            .map(|row| {
+                let start = row * stride;
+                start..(start + stride + 32).min(FIXTURE_PAGES)
+            })
+            .collect();
+        scheduler.share_snapshot_pages(&aliases).unwrap();
+        scheduler
+    }
+
+    /// Time quote and admission operations at the 202,183-page, 2,457-row fixture.
+    /// Report medians of five optimized samples and one timed reference call per operation.
+    /// Run explicitly in release mode with output enabled:
+    /// `cargo test -p flare-helios --release --lib -- --ignored --nocapture snapshot_quote_cost`
+    #[test]
+    #[ignore = "measures cost; run explicitly in release"]
+    fn snapshot_quote_cost_at_production_geometry() {
+        let mut scheduler = fixture_scheduler();
+        scheduler.reserve_snapshot(0).expect("anchor snapshot");
+        assert_eq!(scheduler.free_page_count() + 114, FIXTURE_PAGES as usize);
+        let rank = crate::cache::RetentionRank {
+            use_epoch: 3,
+            role: crate::cache::RetentionRole::Anchor,
+            consumed_tokens: 16_213,
+        };
+        let rounds = 5;
+        let median = |mut samples: Vec<std::time::Duration>| {
+            samples.sort_unstable();
+            samples[samples.len() / 2]
+        };
+        let mut clones = Vec::new();
+        let mut scans = Vec::new();
+        let mut single = Vec::new();
+        let mut pair = Vec::new();
+        let mut triple = Vec::new();
+        let mut available = Vec::new();
+        for _ in 0..rounds {
+            let start = std::time::Instant::now();
+            let copy = scheduler.free_pages.clone();
+            clones.push(start.elapsed());
+            std::hint::black_box(copy);
+
+            let start = std::time::Instant::now();
+            let backing: Vec<_> = (0..scheduler.limits.pages)
+                .map(|page| scheduler.free_pages.contains(&PageId(page)))
+                .collect();
+            scans.push(start.elapsed());
+            std::hint::black_box(backing);
+
+            let start = std::time::Instant::now();
+            let quote = scheduler.quote_snapshots_preserving(1, 1, 0, rank);
+            single.push(start.elapsed());
+            assert!(quote.is_some());
+
+            let start = std::time::Instant::now();
+            let quote = scheduler.quote_snapshots_preserving(1, 2, 0, rank);
+            pair.push(start.elapsed());
+            assert!(quote.is_some());
+
+            let start = std::time::Instant::now();
+            let quote = scheduler.quote_snapshots_preserving(1, 3, 0, rank);
+            triple.push(start.elapsed());
+            assert!(quote.is_some());
+
+            let start = std::time::Instant::now();
+            let id = scheduler.available_snapshot(0);
+            available.push(start.elapsed());
+            assert!(id.is_some());
+        }
+        let us = |duration: std::time::Duration| duration.as_secs_f64() * 1e6;
+        println!(
+            "SNAPSHOT_QUOTE_COST pages={} snapshots={} free_pages={}\n\
+             free_pages.clone   median {:9.1} us\n\
+             full backing scan  median {:9.1} us\n\
+             quote rows=1/1     median {:9.1} us\n\
+             quote rows=1/2     median {:9.1} us\n\
+             quote rows=1/3     median {:9.1} us\n\
+             available_snapshot median {:9.1} us",
+            scheduler.limits.pages,
+            scheduler.limits.snapshots,
+            scheduler.free_page_count(),
+            us(median(clones)),
+            us(median(scans)),
+            us(median(single)),
+            us(median(pair)),
+            us(median(triple)),
+            us(median(available)),
+        );
+
+        // The same calls through the reference implementation, once each, for comparison.
+        // Its two-row search takes seconds at this geometry.
+        let start = std::time::Instant::now();
+        assert!(reference_quote_preserving(&scheduler, 1, 1, 0, rank).is_some());
+        let reference_single = start.elapsed();
+        let start = std::time::Instant::now();
+        assert!(reference_quote_preserving(&scheduler, 1, 2, 0, rank).is_some());
+        let reference_pair = start.elapsed();
+        let start = std::time::Instant::now();
+        assert!(reference_quote_preserving(&scheduler, 1, 3, 0, rank).is_some());
+        let reference_triple = start.elapsed();
+        let start = std::time::Instant::now();
+        let backing: Vec<_> = (0..scheduler.limits.pages)
+            .map(|page| scheduler.free_pages.contains(&PageId(page)))
+            .collect();
+        let id = reference_select(
+            &backing,
+            &scheduler.page_snapshot_refs,
+            &scheduler.snapshot_pages,
+            &scheduler.free_snapshots,
+            0,
+            1,
+        );
+        let reference_available = start.elapsed();
+        assert!(id.is_some());
+        println!(
+            "SNAPSHOT_QUOTE_REFERENCE quote rows=1/1 {:9.1} us\n\
+             quote rows=1/2     {:9.1} us\n\
+             quote rows=1/3     {:9.1} us\n\
+             available_snapshot {:9.1} us",
+            us(reference_single),
+            us(reference_pair),
+            us(reference_triple),
+            us(reference_available),
+        );
+    }
+
+    /// The quoted results themselves at production geometry, against the reference
+    /// implementation. Ignored because the reference pair search takes seconds here.
+    #[test]
+    #[ignore = "reference search takes seconds at production geometry"]
+    fn production_geometry_quote_matches_reference() {
+        let mut scheduler = fixture_scheduler();
+        scheduler.reserve_snapshot(0).expect("anchor snapshot");
+        let rank = crate::cache::RetentionRank {
+            use_epoch: 3,
+            role: crate::cache::RetentionRole::Anchor,
+            consumed_tokens: 16_213,
+        };
+        for (rows, planned) in [(1usize, 1usize), (1, 2), (1, 3)] {
+            assert_eq!(
+                scheduler.quote_snapshots_preserving(rows, planned, 0, rank),
+                reference_quote_preserving(&scheduler, rows, planned, 0, rank),
+                "rows {rows} planned {planned}"
+            );
+        }
+        let backing = scheduler.free_backing();
+        assert_eq!(
+            scheduler.available_snapshot(0),
+            reference_select(
+                &backing,
+                &scheduler.page_snapshot_refs,
+                &scheduler.snapshot_pages,
+                &scheduler.free_snapshots,
+                0,
+                1,
+            )
+            .and_then(|ids| ids.first().copied())
+        );
     }
 }
