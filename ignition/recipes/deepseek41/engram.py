@@ -227,8 +227,13 @@ class PreparedEngram:
                  runtime=None, coordinator=None, examples=None, owner_rows=None, output_gather=None):
         self.pool = pool
         self.owner_rows, self.output_gather = owner_rows, output_gather
-        if (owner_rows is None) != (output_gather is None):
-            raise ValueError("owner-row Engram requires its full-output gather")
+        local_output = (isinstance(owner_rows, torch.Tensor) and isinstance(source, torch.Tensor)
+            and isinstance(output, torch.Tensor) and source.shape == output.shape == (owner_rows.numel(), 4, 5120)
+            and source.dtype == output.dtype == torch.bfloat16 and source.device == output.device
+            and output.is_contiguous())
+        if ((owner_rows is None and output_gather is not None)
+                or (owner_rows is not None and output_gather is None and not local_output)):
+            raise ValueError("owner-row Engram requires a matching owner output or its full-output gather")
         tokens, device = metadata.token_ids.numel(), source.device
         self.mask, self.gathered, self.projected = scratch.mask, scratch.gathered, scratch.projected
         self.local, self.partial = scratch.local, scratch.partial

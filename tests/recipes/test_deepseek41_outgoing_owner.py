@@ -192,6 +192,7 @@ def test_normal_decoder_handoff_preserves_selection_and_skips_only_reseed(monkey
     for index in (1,14):
         assert ("output_rows" in model.layers[index].options) is not disable
         assert model.layers[index+1].options["reseed"] is disable
-        assert model.layers[index].options["row_shard"] is None
+        assert (model.layers[index].options["row_shard"] is None) is disable
+        assert not model.layers[index].options["attention_shard"]
     move=model.layers[15].options["selection_move"]
     assert move is not None and move.selected=="full_to_shard" and move.source==14

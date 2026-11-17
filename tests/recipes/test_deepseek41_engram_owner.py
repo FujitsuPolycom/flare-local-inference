@@ -84,16 +84,16 @@ def test_owner_geometry_rejects_incompatible_declarations(declaration, change):
 
 
 @pytest.mark.parametrize("owner_rows,output_gather", ((object(), None), (None, object())))
-def test_constructor_requires_owner_rows_and_output_gather_together(owner_rows, output_gather):
+def test_constructor_rejects_unbound_owner_output(owner_rows, output_gather):
     from ignition.recipes.deepseek41.engram import PreparedEngram
-    with pytest.raises(ValueError, match="owner-row Engram requires its full-output gather"):
+    with pytest.raises(ValueError, match="owner-row Engram requires"):
         PreparedEngram(1, None, None, None, None, None, None, scratch=None,
             session=None, name="invalid-owner-pair", workspace=None,
             owner_rows=owner_rows, output_gather=output_gather)
 
 
 @pytest.mark.parametrize("scored", (False, True))
-def test_decoder_moves_only_the_eligible_predecessor_residual_gather(monkeypatch, declaration, scored):
+def test_decoder_keeps_the_eligible_predecessor_residual_and_mix_owned(monkeypatch, declaration, scored):
     from dataclasses import dataclass
     from ignition.recipes.deepseek41 import decoder
 
@@ -146,7 +146,7 @@ def test_decoder_moves_only_the_eligible_predecessor_residual_gather(monkeypatch
         if scored:
             assert handoff is None
         else:
-            assert handoff == (previous.row_shard, previous.original_gather)
+            assert handoff == (previous.row_shard, None)
             assert previous.residual_gather is None
-            assert previous.mix_gather is previous.original_gather
-        assert model.layers[index].options["row_shard"] is None
+            assert previous.mix_gather is None
+        assert (model.layers[index].options["row_shard"] is None) is scored
