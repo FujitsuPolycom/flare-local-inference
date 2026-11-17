@@ -164,6 +164,36 @@ def attention_shard_ready(scratch, shard, runtime):
                                           scratch.attention.selected.view(torch.bfloat16)))
 
 
+def outgoing_owner_ready(index, schedule, *, mode, scoring, packing, engram_layers, aux_layers, decoder_start,
+                         metadata, scratch, owner, runtime):
+    """Whether a packed full-row FFN can hand owner rows to its next layer."""
+    if (mode != "prefill" or scoring is not None or packing is None or owner is None or runtime is None
+            or index not in engram_layers or index + 1 >= len(schedule) or decoder_start is None
+            or index + 1 >= decoder_start or index in aux_layers or index + 1 in aux_layers
+            or metadata.positions.numel() != 8192 or metadata.starts.numel() != 1
+            or owner.world != 4 or runtime.world_size != owner.world or owner.rows != 2048
+            or runtime.pipe_bytes != 80 << 20 or not 0 <= owner.rank < owner.world
+            or owner.start != owner.rank * owner.rows):
+        return False
+    current, following = schedule[index], schedule[index + 1]
+    if current[0] or current[1] or not following[0] or not following[2]:
+        return False
+    device = scratch.mlp_partial.device
+    fields = ((scratch.mlp_partial, (8192, 5120), torch.bfloat16),
+              (scratch.ffn_hc.residual, (8192, 4, 5120), torch.bfloat16),
+              (scratch.ffn_hc.post, (8192, 4), torch.float32),
+              (scratch.ffn_hc.comb, (8192, 4, 4), torch.float32),
+              (scratch.pre_mix, (8192, 4), torch.float32),
+              (owner.rows_index, (2048,), torch.int64),
+              (owner.mlp_output, (2048, 5120), torch.bfloat16),
+              (owner.residual, (2048, 4, 5120), torch.bfloat16),
+              (owner.pre_mix, (2048, 4), torch.float32))
+    if any(tuple(value.shape) != shape or value.dtype != dtype or value.device != device
+           or not value.is_contiguous() for value, shape, dtype in fields):
+        return False
+    return PreparedReduceScatter.fits(runtime, scratch.mlp_partial, owner.mlp_output)
+
+
 def shard_schedule(config, stop, sharded, aux_layers=()):
     """Per-layer `(shard, defer, reseed)` for a prefill decoder whose shard exists.
 
@@ -385,9 +415,13 @@ class PreparedLayer:
                  runtime, coordinator, session, name, workspace, carry, defer_post,
                  boundary=None, replay_start=None, window_staging=None, mla_compute_mode="auto",
                  window_metadata=None, examples=None, row_shard=None, attention_shard=False,
-                 selection_move=None, reseed=False, engram_input=None):
+                 selection_move=None, reseed=False, engram_input=None, output_rows=None):
         s, text = scratch, pool.config.text
         self.scratch, self.carry, self.row_shard = s, carry, row_shard
+        self.output_row_indices = None if output_rows is None else output_rows.rows_index
+        if output_rows is not None and (row_shard is not None or defer_post or boundary is not None
+                or mode != "prefill" or weights.engram is None or metadata.positions.numel() != 8192):
+            raise ValueError("owner FFN output requires a completed packed full-row post boundary")
         self.attention_shard = attention_shard
         # A full-row layer owns the rows since this shard last ran, so the shard is refilled here.
         self.reseed = reseed and row_shard is not None
@@ -493,14 +527,21 @@ class PreparedLayer:
                 parallel_plans=(self.router_projection.plan, self.router.plan, self.experts.plan),
                 session=session, workspace=workspace,
                 defer_launch=s.ffn_hc.normalized.shape[0] > 4)
-        if row_shard is None:
+        mlp_destination = mlp_output if output_rows is None else output_rows.mlp_output
+        if row_shard is None and output_rows is None:
             self.mlp_reduce = PreparedAllReduce(s.mlp_partial, s.mlp_output, runtime=runtime,
                 coordinator=coordinator, session=session, name=name + ".mlp_reduce")
         else:
-            self.mlp_reduce = PreparedReduceScatter(s.mlp_partial, mlp_output, runtime=runtime,
+            self.mlp_reduce = PreparedReduceScatter(s.mlp_partial, mlp_destination, runtime=runtime,
                 coordinator=coordinator, session=session, name=name + ".mlp_reduce")
-        self.post = None if defer_post else PreparedMHCPost(mlp_output, ffn_scratch.residual,
-            ffn_scratch.post, ffn_scratch.comb, residual, session=session, name=name + ".post")
+        if output_rows is None:
+            self.post = None if defer_post else PreparedMHCPost(mlp_output, ffn_scratch.residual,
+                ffn_scratch.post, ffn_scratch.comb, residual, session=session, name=name + ".post")
+        else:
+            rows = output_rows.rows
+            self.post = PreparedMHCPost(mlp_destination, ffn_scratch.residual[:rows],
+                ffn_scratch.post[:rows], ffn_scratch.comb[:rows], output_rows.residual,
+                session=session, name=name + ".post")
         # A deferred post runs in the next layer's attention mHC over the same rows, so only a layer
         # that runs its own post widens this rank's four-stream residual back to every row.
         self.residual_gather = self.mix_gather = None
@@ -610,6 +651,12 @@ class PreparedLayer:
         shared = (self.shared(normalized) if self.concurrent_shared is None
                   else self.concurrent_shared.finish(pending, routed))
         output = self.mlp_reduce(routed + shared)
+        if self.output_row_indices is not None:
+            rows = self.output_row_indices
+            residual = residual.index_select(0, rows)
+            post = post.index_select(0, rows)
+            comb = comb.index_select(0, rows)
+            next_mix = next_mix.index_select(0, rows)
         incoming = ((self.post(output, residual, post, comb),) if self.post is not None
                     else (output, residual, post, comb))
         if self.mix_gather is not None:
@@ -688,6 +735,7 @@ class PreparedDecoder:
                 page_size=128 + self.output_metadata.max_query_tokens, width=128,
                 replay_start=self.packing.replay_start, ratios=set(ratios[decoder_start:]) - {0})
         self.layers, carry = [], False
+        previous_owner_output = False
         for index, layer in enumerate(weights.layers):
             boundary = replay_start = None
             layer_scratch, layer_metadata = scratch, metadata
@@ -703,6 +751,11 @@ class PreparedDecoder:
                                                       if key not in ("compressor", "index_k", "index_norm")})
             sharded, defer, reseed = schedule[index]
             sharded = self.row_shard if sharded else None
+            reseed = reseed and not previous_owner_output
+            output_rows = self.row_shard if layer.engram is not None and outgoing_owner_ready(index, schedule, mode=mode,
+                scoring=scoring, packing=self.packing, engram_layers=weights.config.text["engram_layer_ids"],
+                aux_layers=self.aux_layers, decoder_start=decoder_start,
+                metadata=layer_metadata, scratch=layer_scratch, owner=self.row_shard, runtime=runtime) else None
             engram_input = None
             if (self.packing is not None and scoring is None and index > 0 and index < decoder_start
                     and index not in self.aux_layers and layer.engram is not None and sharded is None and not carry):
@@ -718,7 +771,10 @@ class PreparedDecoder:
                 mla_compute_mode=mla_compute_mode,
                 window_metadata=(self.window_metadata if layer_metadata is metadata else self.suffix_window_metadata),
                 examples=examples, row_shard=sharded, attention_shard=self.attention_shard and sharded is not None,
-                selection_move=moves[index], reseed=reseed, **({"engram_input": engram_input} if engram_input is not None else {})))
+                selection_move=moves[index], reseed=reseed,
+                **({"engram_input": engram_input} if engram_input is not None else {}),
+                **({"output_rows": output_rows} if output_rows is not None else {})))
+            previous_owner_output = output_rows is not None
             if engram_input is not None:
                 previous.residual_gather = None
             carry = defer

@@ -98,6 +98,7 @@ def _recording_layer(scratch, *, reseed=False):
 
     shard = scratch.row_shard
     layer = object.__new__(decoder.PreparedLayer)
+    layer.output_row_indices = None
     layer.scratch, layer.row_shard, layer.reseed = scratch, shard, reseed
     layer.attention_shard, layer.selection_move = False, None
     layer.engram = layer.concurrent_shared = None

@@ -527,6 +527,7 @@ def _attention_layer(scratch):
 
     shard = scratch.row_shard
     layer = object.__new__(decoder.PreparedLayer)
+    layer.output_row_indices = None
     layer.scratch, layer.row_shard, layer.attention_shard = scratch, shard, True
     layer.reseed, layer.selection_move, layer.engram, layer.boundary = False, None, None, None
     layer.concurrent_shared = None
