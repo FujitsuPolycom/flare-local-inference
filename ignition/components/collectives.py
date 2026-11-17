@@ -285,6 +285,68 @@ class PreparedReduceScatter:
         return output
 
 
+class PreparedColumnReduceScatter:
+    """Reduce a row-major matrix into owner rows using pipe-sized column bands.
+
+    Each band packs every row before reduction. The receiver copies its complete
+    feature band into a contiguous owner-row matrix, preserving the FP32
+    rank-order accumulation and BF16 output of PreparedReduceScatter.
+    """
+
+    def __init__(self, source, output, *, runtime, session, coordinator, name, examples=None):
+        from ignition.preparation.examples import declaration_tensor
+
+        if not self.fits(runtime, source, output):
+            raise ValueError("column reduce-scatter requires contiguous BF16 matrices and a pipe-sized 16-byte row band")
+        rows, columns = source.shape
+        step = runtime.pipe_bytes // (rows * source.element_size()) // 8 * 8
+        self.bounds = [(first, min(first + step, columns)) for first in range(0, columns, step)]
+        self.parts = []
+        for index, (first, last) in enumerate(self.bounds):
+            packed = declaration_tensor(examples, "column_reduce_scatter.input", (rows, last - first),
+                                        source.dtype, source.device)
+            reduced = declaration_tensor(examples, "column_reduce_scatter.output", (output.shape[0], last - first),
+                                         output.dtype, output.device)
+            self.parts.append(PreparedReduceScatter(packed, reduced, runtime=runtime, session=session,
+                coordinator=coordinator, name=f"{name}.{index}"))
+        self.output = output
+
+    @staticmethod
+    def fits(runtime, source, output):
+        if (runtime is None or not row_shard_surfaces(runtime) or source.ndim != 2
+                or source.dtype is not torch.bfloat16 or output.dtype is not source.dtype
+                or not source.is_contiguous() or not output.is_contiguous()):
+            return False
+        rows, columns = source.shape
+        if (rows <= 0 or rows % runtime.world_size or columns <= 0 or columns % 8
+                or tuple(output.shape) != (rows // runtime.world_size, columns)):
+            return False
+        width = min(columns, runtime.pipe_bytes // (rows * source.element_size()) // 8 * 8)
+        if width < 8:
+            return False
+        packed = source.view(-1)[:rows * width].view(rows, width)
+        reduced = output.view(-1)[:output.shape[0] * width].view(output.shape[0], width)
+        return PreparedReduceScatter.fits(runtime, packed, reduced)
+
+    def functional(self, *, session):
+        if self.output is not None:
+            self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
+            self.output = None
+            for part in self.parts:
+                part.functional(session=session)
+        return self
+
+    def __call__(self, source):
+        output = self.output
+        if output is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+        for (first, last), part in zip(self.bounds, self.parts, strict=True):
+            packed = source[:, first:last].contiguous()
+            output[:, first:last].copy_(part(packed))
+        return output
+
+
 @torch.library.custom_op("flare::roce_gather_shards", mutates_args=("output",))
 def _gather_shards(source: torch.Tensor, output: torch.Tensor, handle: int) -> None:
     owner = _OWNERS[handle]

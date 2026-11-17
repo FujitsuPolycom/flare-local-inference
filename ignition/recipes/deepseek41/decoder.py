@@ -24,7 +24,7 @@ from ignition.preparation.tuning import register_finalizer
 
 from .attention import AttentionIndices, AttentionScratch, PreparedAttention, PreparedGlobalKV, Rotary, normalize
 from .decoder_prefill import PreparedDecoderSuffix
-from .engram import EngramScratch, PreparedEngram, PreparedTableRequests
+from .engram import EngramScratch, PreparedEngram, PreparedTableRequests, owner_input_fits
 
 
 # Row-shard eligibility uses 512-row blocks. This constant does not bound mHC calls;
@@ -168,7 +168,7 @@ def shard_schedule(config, stop, sharded, aux_layers=()):
     """Per-layer `(shard, defer, reseed)` for a prefill decoder whose shard exists.
 
     The layers `config.shardable_attention_layers` names keep this rank's rows. An Engram layer
-    reads and writes full rows, so it runs full-row, and the layers on either side of it change row
+    keeps attention and FFN work full-row, and the layers on either side of it change row
     dimension: a layer that lands on the far side of such a change runs its own post, so the
     full-row residual its consumer reads is complete, and the first sharded layer after a full-row
     run reseeds the shard from the rows it owns.
@@ -385,7 +385,7 @@ class PreparedLayer:
                  runtime, coordinator, session, name, workspace, carry, defer_post,
                  boundary=None, replay_start=None, window_staging=None, mla_compute_mode="auto",
                  window_metadata=None, examples=None, row_shard=None, attention_shard=False,
-                 selection_move=None, reseed=False):
+                 selection_move=None, reseed=False, engram_input=None):
         s, text = scratch, pool.config.text
         self.scratch, self.carry, self.row_shard = s, carry, row_shard
         self.attention_shard = attention_shard
@@ -397,10 +397,13 @@ class PreparedLayer:
         self.boundary = boundary
         self.engram = None
         if weights.engram is not None:
-            self.engram = PreparedEngram(index, weights.engram, tables, s.residual, s.engram_residual,
+            owner, output_gather = (None, None) if engram_input is None else engram_input
+            source = s.residual if owner is None else owner.residual
+            self.engram = PreparedEngram(index, weights.engram, tables, source, s.engram_residual,
                 metadata, pool,
                 scratch=s.engram, session=session, name=name + ".engram", workspace=workspace,
-                runtime=runtime, coordinator=coordinator, examples=examples)
+                runtime=runtime, coordinator=coordinator, examples=examples,
+                owner_rows=None if owner is None else owner.rows_index, output_gather=output_gather)
         # A row shard reduces into this rank's rows and normalizes them there; the full-size scratch
         # holds the branch input every consumer reads, which a gather fills before that consumer runs.
         attention_scratch = s.attention_hc if row_shard is None else row_shard.attention_hc
@@ -609,14 +612,14 @@ class PreparedLayer:
         output = self.mlp_reduce(routed + shared)
         incoming = ((self.post(output, residual, post, comb),) if self.post is not None
                     else (output, residual, post, comb))
-        if self.residual_gather is not None:
-            # Every row's consumer follows, so widen this rank's rows back out: the four-stream
-            # residual and the lagged mix the next layer's mHC reads.
-            residual, = incoming
+        if self.mix_gather is not None:
+            # The next full-row mHC still reads every FP32 pre-mix word.
             full_mix = torch.empty((metadata.token_ids.numel(), 4), dtype=next_mix.dtype,
                                    device=next_mix.device)
             self.mix_gather(next_mix.view(torch.bfloat16), full_mix.view(torch.bfloat16))
-            incoming, next_mix = (self.residual_gather(residual),), full_mix
+            next_mix = full_mix
+        if self.residual_gather is not None:
+            incoming = (self.residual_gather(incoming[0]),)
         observations = {"attention." + key: value for key, value in observations.items()}
         observations.update({"attention_hc.normalized": attention_normalized, "router.ids": route_ids,
                              "output": incoming[0]})
@@ -700,6 +703,13 @@ class PreparedDecoder:
                                                       if key not in ("compressor", "index_k", "index_norm")})
             sharded, defer, reseed = schedule[index]
             sharded = self.row_shard if sharded else None
+            engram_input = None
+            if (self.packing is not None and scoring is None and index > 0 and index < decoder_start
+                    and index not in self.aux_layers and layer.engram is not None and sharded is None and not carry):
+                previous = self.layers[-1]
+                if (previous.post is not None and previous.residual_gather is not None and previous.mix_gather is not None
+                        and owner_input_fits(previous.row_shard, metadata, scratch, tables, runtime)):
+                    engram_input = previous.row_shard, previous.residual_gather
             self.layers.append(PreparedLayer(index, layer, tables, layer_scratch, layer_metadata, pool, self.rotary,
                 shard=weights.shard, mode=mode, runtime=runtime,
                 coordinator=coordinator, session=session, name=f"{name}.layer{index}", workspace=workspace,
@@ -708,7 +718,9 @@ class PreparedDecoder:
                 mla_compute_mode=mla_compute_mode,
                 window_metadata=(self.window_metadata if layer_metadata is metadata else self.suffix_window_metadata),
                 examples=examples, row_shard=sharded, attention_shard=self.attention_shard and sharded is not None,
-                selection_move=moves[index], reseed=reseed))
+                selection_move=moves[index], reseed=reseed, **({"engram_input": engram_input} if engram_input is not None else {})))
+            if engram_input is not None:
+                previous.residual_gather = None
             carry = defer
         self.scoring = None if scoring is None else scoring.prepare(scratch.embedding, weights.head,
             vocabulary=129280, session=session, coordinator=coordinator, name=name + ".prompt",

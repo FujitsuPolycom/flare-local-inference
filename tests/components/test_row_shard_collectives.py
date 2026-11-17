@@ -174,3 +174,72 @@ def test_a_functional_chunked_gather_allocates_its_staging_and_output_in_the_for
     assert first.data_ptr() != second.data_ptr()
     for rank in range(world):
         assert torch.equal(second.view(world, rows, columns)[rank], shard)
+
+
+@pytest.mark.parametrize("rank", range(4))
+@pytest.mark.parametrize("band_columns", [8, 24])
+def test_column_reduce_scatter_preserves_each_owner_row_and_feature_word(prepared, rank, band_columns):
+    from ignition.components.collectives import PreparedColumnReduceScatter
+
+    rows, columns, world = 8, 40, 4
+    runtime = _runtime(world=world, pipe_bytes=rows * band_columns * 2)
+    calls = []
+    def reduce(inp, *, out, plan):
+        calls.append(tuple(inp.shape))
+        out.copy_(inp.chunk(world, dim=0)[rank])
+    runtime.reduce_scatter = reduce
+    # Distinct uint16 words test layout without depending on BF16 arithmetic.
+    source = torch.arange(rows * columns, dtype=torch.int32).to(torch.int16).view(torch.bfloat16).view(rows, columns)
+    saved = source.view(torch.int16).clone()
+    destination = torch.zeros(rows // world, columns, dtype=torch.bfloat16)
+    operation = PreparedColumnReduceScatter(source, destination, runtime=runtime,
+        session=object(), coordinator=SimpleNamespace(hosts=()), name="engram.reduce")
+    assert operation(source) is destination
+    expected = source[rank * (rows // world):(rank + 1) * (rows // world)]
+    assert torch.equal(destination.view(torch.int16), expected.view(torch.int16))
+    assert calls == [(rows, last - first) for first, last in operation.bounds]
+    assert torch.equal(source.view(torch.int16), saved)
+    assert sum(last - first for first, last in operation.bounds) == columns
+
+
+def test_functional_column_reduce_scatter_owns_each_invocations_output(prepared):
+    from ignition.components.collectives import PreparedColumnReduceScatter
+
+    source = torch.arange(8 * 40, dtype=torch.bfloat16).reshape(8, 40)
+    runtime = _runtime(pipe_bytes=8 * 8 * 2)
+    runtime.reduce_scatter = lambda inp, *, out, plan: out.copy_(inp[:2])
+    operation = PreparedColumnReduceScatter(source, torch.zeros(2, 40, dtype=torch.bfloat16),
+        runtime=runtime, session=object(), coordinator=SimpleNamespace(hosts=()), name="engram.reduce")
+    operation.functional(session=object())
+    assert operation.output is None and all(part.output is None for part in operation.parts)
+    first, second = operation(source), operation(source)
+    assert first.data_ptr() != second.data_ptr()
+    assert torch.equal(first, source[:2]) and torch.equal(second, source[:2])
+
+
+def test_full_engram_projection_requires_five_column_bands(prepared):
+    from ignition.components.collectives import PreparedColumnReduceScatter, PreparedReduceScatter
+
+    source = torch.empty((8192, 25600), dtype=torch.bfloat16, device="meta")
+    output = torch.empty((2048, 25600), dtype=torch.bfloat16, device="meta")
+    runtime = _runtime(pipe_bytes=80 << 20)
+    assert not PreparedReduceScatter.fits(runtime, source, output)
+    assert PreparedColumnReduceScatter.fits(runtime, source, output)
+    operation = PreparedColumnReduceScatter(source, output, runtime=runtime,
+        session=object(), coordinator=SimpleNamespace(hosts=()), name="engram.reduce")
+    assert operation.bounds == [(i * 5120, (i + 1) * 5120) for i in range(5)]
+
+
+def test_column_reduce_scatter_rejects_ineligible_layouts(prepared):
+    from ignition.components.collectives import PreparedColumnReduceScatter
+
+    source = torch.zeros(8, 40, dtype=torch.bfloat16)
+    output = torch.zeros(2, 40, dtype=torch.bfloat16)
+    runtime = _runtime(pipe_bytes=128)
+    assert not PreparedColumnReduceScatter.fits(None, source, output)
+    assert not PreparedColumnReduceScatter.fits(runtime, source[:7], output)
+    assert not PreparedColumnReduceScatter.fits(runtime, source[:, :7], output[:, :7])
+    assert not PreparedColumnReduceScatter.fits(runtime, source[:, ::2], output[:, ::2])
+    assert not PreparedColumnReduceScatter.fits(runtime, source, output[:1])
+    assert not PreparedColumnReduceScatter.fits(runtime, source.float(), output.float())
+    assert not PreparedColumnReduceScatter.fits(_runtime(pipe_bytes=127), source, output)

@@ -16,7 +16,7 @@ from ignition.components.engram import EngramInputs, PreparedEngramLookup, Prepa
 from ignition.components.readiness import ReadinessTimings
 from ignition.components.embedding_partition import EmbeddingHeadPartition
 from ignition.components.linear import QuantizedProjection
-from ignition.components.collectives import PreparedChunkedAllReduce
+from ignition.components.collectives import PreparedChunkedAllReduce, PreparedChunkedGatherShards, PreparedColumnReduceScatter
 from ignition.components.state import gather_rows, save_hidden
 from ignition.preparation.runtime_core import FileSource
 from ignition.preparation.persistent import persistent_copy
@@ -199,10 +199,36 @@ class EngramScratch:
         return cls(zeros(tokens, torch.bool), gathered, local, partial, projected)
 
 
+def owner_input_fits(owner, metadata, scratch, tables, runtime):
+    """Whether an 8192-row Engram projection can mix its TP4 owner's rows."""
+    if (owner is None or runtime is None or metadata.positions.numel() != 8192
+            or metadata.starts.numel() != 1 or owner.world != 4
+            or tables.shard.world_size != owner.world or runtime.world_size != owner.world
+            or runtime.pipe_bytes != 80 << 20 or owner.rows != 2048
+            or not 0 <= owner.rank < owner.world or owner.start != owner.rank * owner.rows):
+        return False
+    device = owner.residual.device
+    operands = ((owner.residual, (2048, 4, 5120), torch.bfloat16),
+                (owner.rows_index, (2048,), torch.int64),
+                (scratch.engram_residual, (8192, 4, 5120), torch.bfloat16),
+                (scratch.engram.gathered, (8192, 6144), torch.bfloat16),
+                (scratch.engram.local, (8192, 1536), torch.bfloat16),
+                (scratch.engram.partial, (8192, 25600), torch.bfloat16),
+                (scratch.engram.projected, (8192, 25600), torch.bfloat16))
+    if any(tuple(value.shape) != shape or value.dtype != dtype or value.device != device
+           or not value.is_contiguous() for value, shape, dtype in operands):
+        return False
+    return (PreparedColumnReduceScatter.fits(runtime, scratch.engram.partial, scratch.engram.projected[:owner.rows])
+            and PreparedChunkedGatherShards.fits(runtime, owner.residual, scratch.engram_residual))
+
+
 class PreparedEngram:
     def __init__(self, layer, weights, tables, source, output, metadata, pool, *, scratch, session, name, workspace,
-                 runtime=None, coordinator=None, examples=None):
+                 runtime=None, coordinator=None, examples=None, owner_rows=None, output_gather=None):
         self.pool = pool
+        self.owner_rows, self.output_gather = owner_rows, output_gather
+        if (owner_rows is None) != (output_gather is None):
+            raise ValueError("owner-row Engram requires its full-output gather")
         tokens, device = metadata.token_ids.numel(), source.device
         self.mask, self.gathered, self.projected = scratch.mask, scratch.gathered, scratch.projected
         self.local, self.partial = scratch.local, scratch.partial
@@ -223,16 +249,26 @@ class PreparedEngram:
         self.projection = QuantizedProjection(self.local, weights["projection"], self.partial,
             session=session, name=name + ".projection", workspace=workspace, activation_mode="auto",
             examples=examples, example_role="engram.projection").functional(session=session)
-        self.reduce = (PreparedChunkedAllReduce(self.partial.view(-1, 5120), self.projected.view(-1, 5120), runtime=runtime,
-            session=session, coordinator=coordinator, name=name + ".reduce").functional(session=session) if self.sharded else None)
+        mix_rows = tokens if owner_rows is None else owner_rows.numel()
+        if owner_rows is not None:
+            if (not self.sharded or owner_rows.dtype != torch.int64 or owner_rows.device != device
+                    or owner_rows.shape != (tokens // tables.shard.world_size,)
+                    or source.shape != (mix_rows, 4, 5120)):
+                raise ValueError("Engram owner rows must match the sharded residual and projection")
+            self.reduce = PreparedColumnReduceScatter(self.partial, self.projected[:mix_rows], runtime=runtime,
+                session=session, coordinator=coordinator, name=name + ".reduce", examples=examples).functional(session=session)
+        else:
+            self.reduce = (PreparedChunkedAllReduce(self.partial.view(-1, 5120), self.projected.view(-1, 5120), runtime=runtime,
+                session=session, coordinator=coordinator, name=name + ".reduce").functional(session=session) if self.sharded else None)
         self.norm_weight = weights["weight"].view(-1)
         self.eps = pool.config.text["rms_norm_eps"]
-        self.mix_plan = hyperconnection.plan(hyperconnection.Caps(device=device, max_tokens=tokens, hidden_size=5120),
+        self.mix_plan = hyperconnection.plan(hyperconnection.Caps(device=device, max_tokens=mix_rows, hidden_size=5120),
             invocation={"operation": "engram_mix", "eps": self.eps, "token_mask": True})
-        projected, mask = self.projected, self.mask
+        projected, mask = self.projected[:mix_rows], self.mask[:mix_rows]
+        mixed = output[:mix_rows]
         declare(session, (self.mix_plan.request(name=name + ".mix", prepare_call=lambda state: PreparedCall(
-            run=lambda: state.launch(source.view(tokens, -1), projected, self.norm_weight,
-                                      mask, output.view(tokens, -1), eps=self.eps))),))
+            run=lambda: state.launch(source.view(mix_rows, -1), projected, self.norm_weight,
+                                      mask, mixed.view(mix_rows, -1), eps=self.eps))),))
         self.mask = self.gathered = self.projected = self.local = self.partial = None
 
     def __call__(self, source, metadata):
@@ -241,8 +277,11 @@ class PreparedEngram:
         local = torch.index_select(gathered, 1, self.columns) if self.sharded else gathered
         projected = self.projection(local)
         if self.sharded:
-            projected = self.reduce(projected.view(-1, 5120)).view(source.shape[0], 25600)
+            projected = (self.reduce(projected) if self.owner_rows is not None else
+                         self.reduce(projected.view(-1, 5120)).view(source.shape[0], 25600))
+        if self.owner_rows is not None:
+            mask = mask.index_select(0, self.owner_rows)
         output = torch.zeros_like(source)
         hyperconnection.run_engram_mix(source.view(source.shape[0], -1), projected, self.norm_weight,
             eps=self.eps, plan=self.mix_plan, out=output.view(source.shape[0], -1), token_mask=mask)
-        return output
+        return output if self.output_gather is None else self.output_gather(output)
