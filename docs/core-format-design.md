@@ -696,6 +696,14 @@ staging, verifies the actual bytes and length, and publishes it atomically under
 the payload ID. Concurrent writers coordinate through stable lock files and reuse
 an already verified immutable object. Hardlinks connect that object to all entries
 that consume it. A store and its entries must be on the same filesystem.
+Payload-format acquisition reuses installed cache entries and payload objects without
+rehashing their contents. It authenticates signed metadata and checks required
+payload locations and lengths. Offline acquisition follows the same policy.
+Same-length corruption of cached payload bytes is detected by explicit stored-data
+verification, including serving with `--verify-weights`, rather than acquisition.
+Payloads entering the cache for the first time are hashed before publication.
+Online legacy acquisition retains whole-primary hashing to identify compatible cached
+containers; a packed legacy primary may contain weights.
 Exporting to another filesystem uses copying or a supported filesystem clone;
 an unavailable hardlink must not result in a partially published entry.
 Copies on another filesystem do not share storage with the originating cache.

@@ -1065,7 +1065,16 @@ Export always writes the directory canonical form in the cache.
 single-file core; `ignition convert CACHE_ENTRY --output DIR` writes a
 standalone directory. `CACHE_ENTRY` is the path printed by export. Both forms use
 the same metadata, payloads, signatures, and location records. Converting between them
-needs no signing key or GPU. `--output` refuses an existing destination. A
+needs no signing key or GPU. Conversion reports its work as the export does, on
+standard error with elapsed time and byte counts: `Verify core`, `Verify stored
+data`, `Write packed core` or `Write core companions`, and the final
+publication of the destination. `Verify core` checks the metadata structure,
+the commitment digests, and that every selected payload is present; conversion
+does not authenticate signatures, which the loader does. `Verify stored data`
+hashes each payload once against its signed identity and counts payload bytes.
+The write phases count every byte written to the destination, including
+container headers and alignment padding, so a finished write phase reports the
+size of the files it produced. `--output` refuses an existing destination. A
 destination on another filesystem is assembled by copying bytes, so those files
 share no storage with the cache; a destination on the cache's filesystem shares
 inodes where it can. Payload-format cores keep the semantic payload boundaries their export declared. No

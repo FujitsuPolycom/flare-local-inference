@@ -175,7 +175,7 @@ fn frontend_edits_preserve_payloads_and_source_and_verify_signatures() {
         assert_ne!(old_envelope.core_id, new_envelope.core_id);
         assert_eq!(old_envelope.ranks[0].body, new_envelope.ranks[0].body);
         let checked = Verified::open(&output, None).unwrap();
-        checked.payloads().unwrap();
+        checked.payload_files().unwrap().verify().unwrap();
         for relative in [
             "weights/layer-000.safetensors",
             "deployments/sm120-tp1/rank-0/graphs.safetensors",
@@ -241,7 +241,7 @@ fn template_payload_remains_available_to_derivations() {
     })
     .unwrap();
     let verified = Verified::open(&output, None).unwrap();
-    verified.payloads().unwrap();
+    verified.payload_files().unwrap().verify().unwrap();
     assert_eq!(
         tensor_bytes(verified.metadata.primary(), "frontend.chat-template"),
         TEMPLATE.as_bytes()
@@ -270,7 +270,8 @@ fn packed_input_keeps_stored_executable_bytes() {
     })
     .unwrap();
     let verified = Verified::open(&output, None).unwrap();
-    let payloads = verified.payloads().unwrap();
+    let payloads = verified.payload_files().unwrap();
+    payloads.verify().unwrap();
     for expected in [&source.payload, &source.stored] {
         let stored = payloads.get(PayloadId::of(expected).as_bytes()).unwrap();
         let mut actual = vec![0; expected.len()];

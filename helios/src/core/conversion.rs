@@ -15,6 +15,7 @@
 //! conversion.
 
 use std::{
+    cell::Cell,
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::Write as _,
@@ -30,12 +31,12 @@ pub use edit::{EditRequest, edit};
 
 use super::{
     PayloadId,
-    container::{self, COMPANION_TENSOR, Source, Writer},
+    container::{self, COMPANION_TENSOR, Reporting, Source, Writer},
     derivation, invalid, protection,
     reader::{self, Metadata},
     schema::{self, Catalog, wire},
 };
-use crate::{Result, runtime_core::wire as runtime};
+use crate::{Result, runtime_core::wire as runtime, startup::StartupProgress};
 use ring::digest::{Context as DigestContext, SHA256};
 
 /// Container form of a payload-format core.
@@ -150,12 +151,27 @@ fn packed_tensor_for(
 /// for a ready cache entry holding a subset. Unselected payloads may be absent;
 /// signed bodies and locations for them are preserved when present.
 pub fn pack_selected(source: &Path, output: &Path, selected: Option<&[usize]>) -> Result<()> {
+    pack_with(source, output, selected, &StartupProgress::silent())
+}
+
+/// Packs the selected deployments, reporting verification, writing, and publication phases.
+pub fn pack_with(
+    source: &Path,
+    output: &Path,
+    selected: Option<&[usize]>,
+    progress: &StartupProgress,
+) -> Result<()> {
+    let phase = progress.phase("Verify core", None);
     let verified = Verified::open(source, selected)?;
     if !directory_form(source, &verified.metadata) {
         return Err(invalid("core is already in packed form"));
     }
-    let payloads = verified.payloads()?;
-    payloads.verify()?;
+    let payloads = verified.payload_files()?;
+    // No signature is authenticated here; conversion validates structure, commitment
+    // digests, and payload closure. Authentication belongs to `protection::verify`, which
+    // the loader runs, and the next phase hashes the stored payload bytes once.
+    phase.finish("metadata and commitments");
+    verify_stored_data(&payloads, progress)?;
 
     let mut locations = Vec::with_capacity(verified.locations.locations.len());
     let mut packed = Vec::new();
@@ -207,27 +223,71 @@ pub fn pack_selected(source: &Path, output: &Path, selected: Option<&[usize]>) -
         .open(&staging)
         .map_err(|e| invalid(format!("create packed core: {e}")))?;
     let guard = TempFile::new(&staging);
-    let mut writer = Writer::new(file, verified.metadata.primary().format())?;
-    for name in verified.metadata.primary().tensor_names() {
-        if name == reader::LOCATIONS || name.starts_with(container::ALIGNMENT_PREFIX) {
-            continue;
-        }
-        let slice = verified.metadata.primary().tensor(name)?;
-        writer.add(name, slice.len(), Source::Slice(slice))?;
-    }
     let locations = rewritten.encode_to_vec();
-    writer.add(
-        reader::LOCATIONS,
+    let primary: Vec<&str> = verified
+        .metadata
+        .primary()
+        .tensor_names()
+        .filter(|name| *name != reader::LOCATIONS && !name.starts_with(container::ALIGNMENT_PREFIX))
+        .collect();
+    // The phase counts every byte the writer emits, and the expected total is
+    // the same measure: the container planner sizes the header length field,
+    // the padded header, and the alignment padding it inserts, plus the tensor
+    // payloads themselves.
+    let mut tensors: Vec<(String, u64, Source)> = Vec::new();
+    for name in primary {
+        let slice = verified.metadata.primary().tensor(name)?;
+        tensors.push((name.to_owned(), slice.len(), Source::Slice(slice)));
+    }
+    tensors.push((
+        reader::LOCATIONS.to_owned(),
         locations.len() as u64,
         Source::Bytes(locations),
-    )?;
+    ));
     for (name, id) in packed {
         let slice = payloads.get(&id)?.clone();
-        writer.add(&name, slice.len(), Source::Slice(slice))?;
+        tensors.push((name, slice.len(), Source::Slice(slice)));
+    }
+    let names: Vec<(String, u64)> = tensors
+        .iter()
+        .map(|(name, len, _)| (name.clone(), *len))
+        .collect();
+    let total = container::written_size(verified.metadata.primary().format(), &names)?;
+    let phase = progress.phase("Write packed core", Some(total));
+    let written = Cell::new(0u64);
+    let mut writer = Writer::new(
+        Reporting::new(file, |bytes| {
+            written.set(written.get() + bytes);
+            phase.advance_bytes(bytes);
+        }),
+        verified.metadata.primary().format(),
+    )?;
+    for (name, len, source) in tensors {
+        writer.add(&name, len, source)?;
     }
     writer.finish()?;
+    phase.finish(format!("{} bytes written", written.get()));
+    let phase = progress.phase("Publish packed core", None);
     publish_staged_file(&staging, output)?;
     guard.keep();
+    phase.finish(output.display().to_string());
+    Ok(())
+}
+
+fn add_bytes(total: u64, bytes: u64) -> Result<u64> {
+    total
+        .checked_add(bytes)
+        .ok_or_else(|| invalid("core byte count overflow"))
+}
+
+/// Hashes every stored payload as one phase whose detail counts the bytes read.
+fn verify_stored_data(payloads: &reader::PayloadFiles, progress: &StartupProgress) -> Result<()> {
+    let total = payloads
+        .iter()
+        .try_fold(0u64, |total, (_, slice)| add_bytes(total, slice.len()))?;
+    let phase = progress.phase("Verify stored data", Some(total));
+    payloads.verify_with_progress(&|bytes| phase.advance_bytes(bytes))?;
+    phase.finish(format!("{total} source bytes verified"));
     Ok(())
 }
 
@@ -238,12 +298,27 @@ pub fn unpack(source: &Path, output: &Path) -> Result<()> {
 
 /// Unpacks only the closure of the selected deployments.
 pub fn unpack_selected(source: &Path, output: &Path, selected: Option<&[usize]>) -> Result<()> {
+    unpack_with(source, output, selected, &StartupProgress::silent())
+}
+
+/// Unpacks the selected deployments, reporting verification, writing, and publication phases.
+pub fn unpack_with(
+    source: &Path,
+    output: &Path,
+    selected: Option<&[usize]>,
+    progress: &StartupProgress,
+) -> Result<()> {
+    let phase = progress.phase("Verify core", None);
     let verified = Verified::open(source, selected)?;
     if directory_form(source, &verified.metadata) {
         return Err(invalid("core is already in directory form"));
     }
-    let payloads = verified.payloads()?;
-    payloads.verify()?;
+    let payloads = verified.payload_files()?;
+    // No signature is authenticated here; conversion validates structure, commitment
+    // digests, and payload closure. Authentication belongs to `protection::verify`, which
+    // the loader runs, and the next phase hashes the stored payload bytes once.
+    phase.finish("metadata and commitments");
+    verify_stored_data(&payloads, progress)?;
 
     let mut locations = Vec::with_capacity(verified.locations.locations.len());
     let mut companions = Vec::new();
@@ -290,8 +365,47 @@ pub fn unpack_selected(source: &Path, output: &Path, selected: Option<&[usize]>)
     let staging = unique_staging(output, "unpack")?;
     fs::create_dir(&staging).map_err(|e| invalid(format!("create core staging: {e}")))?;
     let result = (|| {
+        let locations = rewritten.encode_to_vec();
+        let primary_names: Vec<&str> = verified
+            .metadata
+            .primary()
+            .tensor_names()
+            .filter(|name| *name != reader::LOCATIONS && primary_payload(name))
+            .collect();
+        let mut primary_tensors: Vec<(String, u64, Source)> = primary_names
+            .iter()
+            .map(|name| {
+                let slice = verified.metadata.primary().tensor(name)?;
+                Ok(((*name).to_owned(), slice.len(), Source::Slice(slice)))
+            })
+            .collect::<Result<_>>()?;
+        primary_tensors.push((
+            reader::LOCATIONS.to_owned(),
+            locations.len() as u64,
+            Source::Bytes(locations),
+        ));
+        // The phase counts every byte written to disk, and the expected total is
+        // the same measure: each companion stores a padded one-tensor container,
+        // and the primary stores its tensors and the locations in one container.
+        let mut total = 0u64;
+        for (_, _, slice) in &companions {
+            total = add_bytes(total, container::companion_written_size(slice.len())?)?;
+        }
+        let primary_layout: Vec<(String, u64)> = primary_tensors
+            .iter()
+            .map(|(name, len, _)| (name.clone(), *len))
+            .collect();
+        total = add_bytes(
+            total,
+            container::written_size(verified.metadata.primary().format(), &primary_layout)?,
+        )?;
+        let phase = progress.phase("Write core companions", Some(total));
+        let written = Cell::new(0u64);
         for (_tensor, relative, slice) in &companions {
-            container::write_payload_companion(&staging, relative, slice)?;
+            container::write_payload_companion_with(&staging, relative, slice, &mut |bytes| {
+                written.set(written.get() + bytes);
+                phase.advance_bytes(bytes);
+            })?;
         }
         let primary = staging.join("model.safetensors");
         let file = OpenOptions::new()
@@ -299,21 +413,19 @@ pub fn unpack_selected(source: &Path, output: &Path, selected: Option<&[usize]>)
             .create_new(true)
             .open(&primary)
             .map_err(|e| invalid(format!("create core primary: {e}")))?;
-        let mut writer = Writer::new(file, verified.metadata.primary().format())?;
-        for name in verified.metadata.primary().tensor_names() {
-            if name == reader::LOCATIONS || !primary_payload(name) {
-                continue;
-            }
-            let slice = verified.metadata.primary().tensor(name)?;
-            writer.add(name, slice.len(), Source::Slice(slice))?;
-        }
-        let locations = rewritten.encode_to_vec();
-        writer.add(
-            reader::LOCATIONS,
-            locations.len() as u64,
-            Source::Bytes(locations),
+        let mut writer = Writer::new(
+            Reporting::new(file, |bytes| {
+                written.set(written.get() + bytes);
+                phase.advance_bytes(bytes);
+            }),
+            verified.metadata.primary().format(),
         )?;
+        for (name, len, source) in primary_tensors {
+            writer.add(&name, len, source)?;
+        }
         writer.finish()?;
+        phase.finish(format!("{} bytes written", written.get()));
+        let phase = progress.phase("Publish core directory", None);
         container::sync_file(&primary)
             .map_err(|e| invalid(format!("sync core primary: {e}")))?;
         // Companion entries must be durable before the directory becomes visible,
@@ -326,7 +438,9 @@ pub fn unpack_selected(source: &Path, output: &Path, selected: Option<&[usize]>)
                 invalid(format!("publish core directory: {e}"))
             }
         })?;
-        sync_parent(output)
+        sync_parent(output)?;
+        phase.finish(output.display().to_string());
+        Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_dir_all(&staging);
@@ -607,14 +721,8 @@ impl Verified {
         })
     }
 
-    /// Opens and hashes every located payload against its signed identity.
-    fn payloads(&self) -> Result<reader::PayloadFiles> {
-        let payloads = self.payload_files()?;
-        payloads.verify()?;
-        Ok(payloads)
-    }
-
-    /// Opens every located payload without hashing its bytes.
+    /// Opens every located payload without hashing its bytes; `PayloadFiles::verify`
+    /// hashes them against their signed identities.
     fn payload_files(&self) -> Result<reader::PayloadFiles> {
         let ids: Vec<&[u8]> = self
             .locations
@@ -4024,6 +4132,50 @@ mod tests {
         bytes
     }
 
+    /// The stored bytes conversion hashes: the located payloads of the
+    /// selected closure, wherever they are stored.
+    fn verified_bytes(verified: &Verified) -> u64 {
+        verified
+            .locations
+            .locations
+            .iter()
+            .map(|location| {
+                if location.file.is_empty() {
+                    verified
+                        .metadata
+                        .primary()
+                        .tensor(&location.tensor)
+                        .unwrap()
+                        .len()
+                } else {
+                    let path = verified
+                        .metadata
+                        .path
+                        .parent()
+                        .unwrap_or(Path::new("."))
+                        .join(&location.file);
+                    let companion = Container::open(&path).unwrap();
+                    companion.tensor(COMPANION_TENSOR).unwrap().len()
+                }
+            })
+            .sum()
+    }
+
+    /// Total size of every regular file in a directory tree.
+    fn directory_bytes(root: &Path) -> u64 {
+        fs::read_dir(root)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    directory_bytes(&path)
+                } else {
+                    fs::metadata(path).unwrap().len()
+                }
+            })
+            .sum()
+    }
+
     fn verify(envelope: &[u8], fixture: &Fixture) {
         let verified = protect::verify(
             envelope,
@@ -4277,7 +4429,7 @@ mod tests {
         pack(&unpacked_primary, &repacked).unwrap();
         assert_eq!(Metadata::open(&repacked).unwrap().envelope, envelope);
         let verified = Verified::open(&repacked, None).unwrap();
-        verified.payloads().unwrap().verify().unwrap();
+        verified.payload_files().unwrap().verify().unwrap();
 
         // An explicit directory stays directory form even when every payload
         // is embedded in its primary; the primary file itself is true packed form.
@@ -4319,11 +4471,11 @@ mod tests {
         // check needs no signing key.
         let first = Verified::open(&packed, None).unwrap();
         let second = Verified::open(&again, None).unwrap();
-        first.payloads().unwrap().verify().unwrap();
-        second.payloads().unwrap().verify().unwrap();
+        first.payload_files().unwrap().verify().unwrap();
+        second.payload_files().unwrap().verify().unwrap();
         let summary = |verified: &Verified| -> Vec<(Vec<u8>, u64)> {
             let mut payloads: Vec<(Vec<u8>, u64)> = verified
-                .payloads()
+                .payload_files()
                 .unwrap()
                 .iter()
                 .map(|(id, slice)| (id.to_vec(), slice.len()))
@@ -4352,6 +4504,139 @@ mod tests {
         let rank = wire::RankBody::decode(envelope.ranks[0].body.as_slice()).unwrap();
         assert!(rank.prepared_weights.is_some());
         assert!(rank.compressed_prepared_weights.is_none());
+    }
+
+    #[test]
+    fn reporting_writer_forwards_bytes_and_reports_each_write() {
+        let mut written = 0u64;
+        let mut sink = Vec::new();
+        {
+            let mut writer = Reporting::new(&mut sink, |count| written += count);
+            writer.write_all(b"abc").unwrap();
+            writer.write_all(b"defgh").unwrap();
+            writer.flush().unwrap();
+        }
+        assert_eq!(sink, b"abcdefgh");
+        assert_eq!(written, 8);
+    }
+
+    #[test]
+    fn reported_pack_and_unpack_write_the_same_bytes_as_the_silent_forms() {
+        let scratch = Scratch::new("reported-roundtrip");
+        let fixture = fixture(&scratch);
+        let silent = scratch.join("silent.safetensors");
+        pack(&fixture.directory, &silent).unwrap();
+        let reported = scratch.join("reported.safetensors");
+        pack_with(&fixture.directory, &reported, None, &StartupProgress::silent()).unwrap();
+        assert_eq!(fs::read(&silent).unwrap(), fs::read(&reported).unwrap());
+
+        let unpacked = scratch.join("unpacked");
+        unpack_with(&reported, &unpacked, None, &StartupProgress::silent()).unwrap();
+        let again = scratch.join("repacked.safetensors");
+        pack(&unpacked, &again).unwrap();
+        assert_eq!(fs::read(&silent).unwrap(), fs::read(&again).unwrap());
+    }
+
+    #[test]
+    fn reported_phases_count_physical_bytes_from_prediction_to_completion() {
+        let scratch = Scratch::new("reported-counters");
+        let fixture = fixture(&scratch);
+        let (progress, observation) = StartupProgress::observed();
+
+        let packed = scratch.join("packed.safetensors");
+        pack_with(&fixture.directory, &packed, None, &progress).unwrap();
+        let packed_len = fs::metadata(&packed).unwrap().len();
+        let [verify_core, verify_data, write_packed, publish] = &observation.completed_phases()[..] else {
+            panic!("pack must complete four phases");
+        };
+        assert_eq!(verify_core.label, "Verify core");
+        assert_eq!(verify_core.detail, "metadata and commitments");
+        assert_eq!(verify_data.label, "Verify stored data");
+        // The phase reports the bytes it hashed: the located payloads of the
+        // selected closure, whether embedded in the primary or stored in
+        // companions.
+        let verified = Verified::open(&fixture.directory, None).unwrap();
+        let source_bytes = verified_bytes(&verified);
+        assert_eq!(verify_data.total, Some(source_bytes));
+        assert_eq!(verify_data.completed, source_bytes);
+        assert_eq!(
+            verify_data.detail,
+            format!("{source_bytes} source bytes verified")
+        );
+        assert_eq!(write_packed.label, "Write packed core");
+        assert_eq!(write_packed.total, Some(packed_len));
+        assert_eq!(write_packed.completed, packed_len);
+        assert_eq!(write_packed.detail, format!("{packed_len} bytes written"));
+        assert_eq!(publish.label, "Publish packed core");
+
+        let unpacked = scratch.join("unpacked");
+        let after_pack = observation.completed_phases().len();
+        unpack_with(&packed, &unpacked, None, &progress).unwrap();
+        let unpacked_len = directory_bytes(&unpacked);
+        let [verify_core, verify_data, write_companions, publish] =
+            &observation.completed_phases()[after_pack..]
+        else {
+            panic!("unpack must complete four phases");
+        };
+        assert_eq!(verify_core.detail, "metadata and commitments");
+        // Unpacking a packed core hashes every payload from its primary, so the
+        // closure's bytes are the same set the pack direction reported.
+        assert_eq!(verify_data.total, Some(source_bytes));
+        assert_eq!(verify_data.completed, source_bytes);
+        assert_eq!(
+            verify_data.detail,
+            format!("{source_bytes} source bytes verified")
+        );
+        assert_eq!(write_companions.label, "Write core companions");
+        assert_eq!(write_companions.total, Some(unpacked_len));
+        assert_eq!(write_companions.completed, unpacked_len);
+        assert_eq!(
+            write_companions.detail,
+            format!("{unpacked_len} bytes written")
+        );
+        assert_eq!(publish.label, "Publish core directory");
+    }
+
+    #[test]
+    fn reported_pack_counts_padding_written_between_misaligned_tensors() {
+        let scratch = Scratch::new("reported-padding");
+        let mut payload = vec![7u8; 3];
+        payload.extend((0..9000u32).map(|value| value as u8));
+        let fixture = fixture_with(&scratch, &payload, 4_096, 64);
+        let (progress, observation) = StartupProgress::observed();
+        let packed = scratch.join("misaligned.safetensors");
+        pack_with(&fixture.directory, &packed, None, &progress).unwrap();
+        let packed_len = fs::metadata(&packed).unwrap().len();
+        // The misaligned tensors force the writer to insert zero padding between
+        // them; the counted bytes include it, and the output contains it.
+        let container = Container::open(&packed).unwrap();
+        let padding: u64 = container
+            .tensor_names()
+            .filter(|name| name.starts_with(container::ALIGNMENT_PREFIX))
+            .map(|name| container.tensor(name).unwrap().len())
+            .sum();
+        assert!(padding > 0);
+        let logical: u64 = container
+            .tensor_names()
+            .filter(|name| !name.starts_with(container::ALIGNMENT_PREFIX))
+            .map(|name| container.tensor(name).unwrap().len())
+            .sum();
+        // The first tensor's file offset is the header prefix; the file holds
+        // the prefix, the logical payloads, and the inserted padding.
+        let prefix = container
+            .tensor_names()
+            .map(|name| container.tensor(name).unwrap().offset())
+            .min()
+            .unwrap();
+        assert_eq!(packed_len, prefix + logical + padding);
+        let phase = observation
+            .completed_phases()
+            .into_iter()
+            .find(|phase| phase.label == "Write packed core")
+            .unwrap();
+        assert_eq!(phase.total, Some(packed_len));
+        assert_eq!(phase.completed, packed_len);
+        assert_eq!(phase.detail, format!("{packed_len} bytes written"));
     }
 
     #[test]

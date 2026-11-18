@@ -420,7 +420,8 @@ def summarize_group(group, observations, before, after, memory):
               "no_runtime_failure": delta.get("flare_requests_failed_total") == 0,
               "no_cancellation": delta.get("flare_requests_cancelled_total") == 0,
               "idle_after": is_idle(after),
-              "pages_conserved": after.get("flare_free_kv_pages", -1) + after.get("flare_cached_kv_pages", -1) == memory["pages"],
+              "pages_conserved": after.get("flare_free_kv_pages", -1) + after.get("flare_snapshot_backing_pages", -1)
+                                 + after.get("flare_cached_kv_pages", -1) == memory["pages"],
               "snapshots_conserved": after.get("flare_free_snapshots", -1) + after.get("flare_cached_checkpoints", -1) == memory["snapshot_capacity"]}
     analyses = [o["analysis"] for o in observations]
     reuse = [a["reused_prompt_tokens"] for a in analyses]

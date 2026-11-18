@@ -20,7 +20,7 @@ from types import MethodType, SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from qualify.server import Run, comparable_message, digest, metric_delta, write_json
+from qualify.server import Run, comparable_message, digest, metric_delta, resource_totals, write_json
 
 
 SEEDS = (13, 29, 47, 71)
@@ -230,9 +230,9 @@ def main():
         before = run.metrics("aggregate-before")
         run.results["idle_before"] = before
         memory = json.loads(args.memory_report.read_text())
-        run.check("aggregate.idle_capacity", before["flare_free_request_slots"] == 4
-            and before["flare_free_kv_pages"] + before["flare_cached_kv_pages"] == memory["pages"]
-            and before["flare_free_snapshots"] + before["flare_cached_checkpoints"] == memory["snapshot_capacity"])
+        totals = resource_totals(before)
+        run.check("aggregate.idle_capacity", totals["slots"] == 4 and totals["pages"] == memory["pages"]
+            and totals["snapshots"] == memory["snapshot_capacity"])
         previous = before
         choices = []
         for index, stream in enumerate((False, False, True)):

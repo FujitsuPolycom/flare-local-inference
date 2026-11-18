@@ -1131,7 +1131,8 @@ class PreparedAllGather:
 @torch.library.custom_op("flare::roce_all_gather_varlen", mutates_args=("output",))
 def _all_gather_varlen(source: torch.Tensor, counts: torch.Tensor, output: torch.Tensor, handle: int) -> None:
     owner = _OWNERS[handle]
-    owner.runtime.all_gather_varlen(source, counts, out=output, plan=owner.plan)
+    # Rank-local slicing stays inside the opaque call so every rank shares the compiled input layout.
+    owner.runtime.all_gather_varlen(source[owner.local_rank], counts, out=output, plan=owner.plan)
 
 
 @_all_gather_varlen.register_fake
@@ -1180,7 +1181,7 @@ class PreparedVarlenGather:
     def __call__(self, output=None, counts=None):
         output = self.output if output is None else output
         counts = self.counts if counts is None else counts
-        _all_gather_varlen(output[self.local_rank], counts, output, self.handle)
+        _all_gather_varlen(output, counts, output, self.handle)
         return output
 
 

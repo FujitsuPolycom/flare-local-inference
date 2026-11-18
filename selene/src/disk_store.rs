@@ -59,6 +59,8 @@ pub const WINDOWS_IN_FLIGHT: usize = crate::shared::WINDOW_CREDITS as usize;
 /// are skipped and further `fetch` calls refused until one completes, so GPU
 /// pins and ticket ids held for the store stay bounded.
 pub const RECORDS_IN_FLIGHT: usize = 8;
+/// Leave room in the sharded transport's backlog for stores and fetches.
+const MAINTENANCE_IN_FLIGHT: usize = crate::shard::BACKLOG / 2;
 
 /// A record file as the disk index sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2073,7 +2075,11 @@ impl DiskStore {
     }
 
     pub(crate) fn thin_rows(&mut self) {
-        for key in std::mem::take(&mut self.thinning) {
+        let mut thinning = std::mem::take(&mut self.thinning).into_iter();
+        while self.maintenance.len() < MAINTENANCE_IN_FLIGHT {
+            let Some(key) = thinning.next() else {
+                break;
+            };
             if !self.index.row_redundant(&key, true) || !self.index[&key].row {
                 continue;
             }
@@ -2085,6 +2091,7 @@ impl DiskStore {
                 self.stats.rows_thinned[1] += 1;
             }
         }
+        self.thinning.extend(thinning);
     }
 
     /// Evict until `bytes` more fit under the limit; false when nothing
@@ -2955,6 +2962,69 @@ mod tests {
         ));
         store.poll(&mut Vec::new()).unwrap();
         assert_eq!(store.stats().rows_thinned, [0, 1]);
+    }
+
+    #[test]
+    fn recovered_row_thinning_waits_for_maintenance_completions() {
+        let maintenance_limit = crate::shard::BACKLOG / 2;
+        let records = 200;
+        let full = history(records * PAGE_TOKENS);
+        let headers: Vec<_> = (1..=records)
+            .map(|i| {
+                header(
+                    &geometry(),
+                    &full,
+                    i * PAGE_TOKENS,
+                    (i > 1).then(|| (i - 1) * PAGE_TOKENS),
+                )
+            })
+            .collect();
+        let recovered = headers
+            .iter()
+            .map(|header| scanned(&directory(), header.clone(), 0, true))
+            .collect();
+        let (mut store, log) = store_with(recovered, 1 << 30);
+        store.poll(&mut Vec::new()).unwrap();
+        assert_eq!(store.maintenance.len(), maintenance_limit);
+        assert_eq!(log.borrow().calls.len(), maintenance_limit);
+        assert_eq!(store.stats().rows_thinned[1], maintenance_limit as u64);
+        store.poll(&mut Vec::new()).unwrap();
+        assert_eq!(log.borrow().calls.len(), maintenance_limit);
+        assert_eq!(store.stats().rows_thinned[1], maintenance_limit as u64);
+        let id = *store.maintenance.keys().next().unwrap();
+        log.borrow_mut()
+            .events
+            .push(TransportEvent::Truncated { id, result: Ok(()) });
+        store.poll(&mut Vec::new()).unwrap();
+        assert_eq!(store.maintenance.len(), maintenance_limit);
+        assert_eq!(log.borrow().calls.len(), maintenance_limit + 1);
+        for _ in 0..records {
+            log.borrow_mut().events.extend(
+                store
+                    .maintenance
+                    .keys()
+                    .map(|&id| TransportEvent::Truncated { id, result: Ok(()) }),
+            );
+            store.poll(&mut Vec::new()).unwrap();
+            assert!(store.maintenance.len() <= maintenance_limit);
+            if store.thinning.is_empty() && store.maintenance.is_empty() {
+                break;
+            }
+        }
+        assert!(store.thinning.is_empty());
+        assert!(store.maintenance.is_empty());
+        assert_eq!(log.borrow().calls.len() as u64, records - 2);
+        assert_eq!(store.stats().rows_thinned[1], records - 2);
+        assert_eq!(
+            store.used(),
+            headers.iter().map(|header| header.row_segment).sum::<u64>() + 2 * ROW_RECORD
+        );
+        for (i, header) in headers.iter().enumerate() {
+            assert_eq!(
+                store.index[&header.key].row,
+                i == 0 || i == headers.len() - 1
+            );
+        }
     }
 
     #[test]

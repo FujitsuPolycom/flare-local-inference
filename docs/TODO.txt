@@ -176,6 +176,18 @@
     autotuning against existing collectives. Cover graph replay, concurrent
     channels, rollover, and complete-collective latency on the target topology.
 
+[ ] Test Kimi K3.1 latent-column reduce-scatter plus one FP32 RMS-statistic
+    all-reduce per token before other MoE collective changes. Compare against
+    the latent all-reduce at TP16, prefill 4096, context 0. Preserve BF16
+    normalization rounding and validate numerical agreement and complete graph
+    latency. The candidate reduces latent replication but adds a serial
+    collective stage.
+
+[ ] Honor --expert-scale-compression native in Kimi K3 and K3.1 preparation
+    and report the default encoding accurately. The shared loader always uses
+    CSF, and the declared resident weight estimate already includes compression.
+    Wire the option through loading and add native-scale memory costs and tests.
+
 [ ] Review fusion of pooled DeepSeek V4.1 indexer lengths: captured graphs split
     clamp from amax and retain explicit copy kernels. Measure complete GPU steps
     before changing shared storage lowering.
@@ -493,6 +505,11 @@
 [ ] Publish Debian packages with releases and update the APT repository from
     them. release.yml builds no .deb, and no tracked tool builds or signs an
     APT index. See debian.md and release.md.
+
+[ ] Repair runtime collective-policy fixtures in tests/cli/test_planning.py.
+    test_every_recipe_passes_collective_policy_to_preparation rewrites a TP4
+    ladder to DeepSeek V4.1 TP3 or Muse Spark TP8; b12x rejects those gather
+    and word-exchange candidates before the preparation handoff is tested.
 
 [ ] Qualify row-sharded prefill at three ranks. The DeepSeek V4.1 recipe's
     4,096-row chunk has no per-rank block at three ranks, though a 6,144-row

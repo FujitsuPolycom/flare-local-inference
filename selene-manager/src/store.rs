@@ -429,6 +429,7 @@ fn finish_record(
 #[derive(Default)]
 pub struct Metrics {
     pub dropped: u64,
+    /// Operations stopped by cancel before becoming terminal, excluding committed puts.
     pub cancels: u64,
     pub puts_ok: u64,
     pub puts_error: u64,
@@ -1504,6 +1505,9 @@ impl Store {
         require_durable: bool,
         excluded: &[Key],
     ) -> Option<Extent> {
+        if bytes.max(4096).checked_next_power_of_two()? > self.memory.capacity() {
+            return None;
+        }
         loop {
             if let Some(extent) = self.memory.allocate(bytes) {
                 return Some(extent);
@@ -1560,7 +1564,7 @@ impl Store {
         if disk {
             let node = &mut self.namespaces.get_mut(&id).unwrap().tree[&key];
             node.location.memory = None;
-            node.location.bytes = record_charge(&node.location.header, false);
+            node.location.bytes = node.location.header.length(node.row);
             self.charged = self.charged - old + node.location.bytes;
             self.delta(id, CatalogKind::Changed, key);
             return true;
@@ -2865,9 +2869,9 @@ impl Store {
             return;
         }
         let old = node.location.bytes;
+        let new = extent.capacity() as u64;
         node.location.memory = Some(extent);
-        node.location.bytes = record_charge(header, true);
-        let new = node.location.bytes;
+        node.location.bytes = new;
         self.charged = self.charged - old + new;
         self.delta(id, CatalogKind::Changed, header.key);
     }
@@ -2909,7 +2913,6 @@ impl Store {
     // ----------------------------------------------------------- Cancel, close
 
     fn cancel(&mut self, connection: u64, transfer: u64) {
-        self.metrics.cancels += 1;
         // A Begin that has not reached dispatch yet must be withdrawn too.
         let mut removed_pending = false;
         if let Some(queue) = self.pending_puts.get_mut(&connection) {
@@ -2933,6 +2936,7 @@ impl Store {
             }
         }
         if removed_pending {
+            self.metrics.cancels += 1;
             return;
         }
         let Some(open) = self
@@ -2947,12 +2951,18 @@ impl Store {
                 if put.committed {
                     return;
                 }
+                if !put.terminal {
+                    self.metrics.cancels += 1;
+                }
                 put.cancelled = true;
                 put.terminal = true;
                 put.blocked.clear();
                 put.outbox.clear();
             }
             Operation::Get(get) => {
+                if !get.terminal {
+                    self.metrics.cancels += 1;
+                }
                 get.cancelled = true;
                 get.terminal = true;
                 get.outbox.clear();
@@ -5484,6 +5494,57 @@ mod tests {
     }
 
     #[test]
+    fn cancels_count_only_the_operations_they_stop() {
+        let (mut refused_store, directory) = idle_put("cancel-refused");
+        refused_store.window_filled(1, 1, 0, Vec::new(), None).unwrap();
+        let put = put_of(&mut refused_store);
+        assert!(put.terminal);
+        assert!(!put.cancelled);
+        assert!(matches!(put.outbox.back(), Some(Ok(PutAnswer::Refused(_)))));
+        refused_store.flush_outboxes();
+        assert!(refused_store.sessions[&1].ops.contains_key(&1));
+        assert_eq!(refused_store.metrics.cancels, 0);
+        // The pool cancels a refused put to finish its cleanup.
+        refused_store.cancel(1, 1);
+        assert_eq!(refused_store.metrics.cancels, 0);
+        drop(refused_store);
+        let _ = fs::remove_dir_all(directory);
+
+        let (mut store, directory) = store("cancel-count");
+        let value = descriptor();
+        store.register_namespace(value.clone()).unwrap();
+        store.hello(1, std::process::id(), value).unwrap();
+        // Cleanup of an operation that is not there: not a cancellation.
+        store.cancel(1, 99);
+        assert_eq!(store.metrics.cancels, 0);
+        let (put_events, _put_receiver) = tokio::sync::mpsc::channel(4);
+        store.submit_put(
+            1,
+            1,
+            PutRequest {
+                namespace: store.namespace_id().unwrap(),
+                key: Key {
+                    consumed_tokens: 128,
+                    digest: [8; 16],
+                },
+                published_parent: None,
+                bucket: [0; 16],
+                chain_pages: 2,
+                published_tail_pages: 2,
+                row: true,
+            },
+            put_events,
+        );
+        store.cancel(1, 1);
+        assert_eq!(store.metrics.cancels, 1);
+        // The pool's cleanup Cancel for the same, already withdrawn put.
+        store.cancel(1, 1);
+        assert_eq!(store.metrics.cancels, 1);
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn committed_streamed_put_finishes_on_its_closed_connection() {
         let (mut store, base, directory) = store_with_root("closed-commit", 4096);
         let value = descriptor();
@@ -5740,6 +5801,87 @@ mod tests {
         assert!(put.blocked.is_empty());
         store.pump_chunks();
         assert!(store.jobs.keys().all(|job| *job != 999));
+        drop(store);
+        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn impossible_read_fill_preserves_warm_records() {
+        let (mut store, base, directory) = store_with_root("oversize-read-fill", 96 * 1024);
+        let descriptor = descriptor();
+        store
+            .hello(1, std::process::id(), descriptor.clone())
+            .unwrap();
+        let id = store.sessions[&1].namespace;
+        let key = Key {
+            consumed_tokens: 64,
+            digest: [1; 16],
+        };
+        let extent = store.memory.allocate(16 * 1024).unwrap();
+        insert_memory_node(&mut store, id, &descriptor, key, None, 1, extent);
+        let node = store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .node_mut(&key)
+            .unwrap();
+        node.location.disk = Some(Arc::new(DiskExtent::new(base.join("warm.ckpt"))));
+        node.location.durable = true;
+        let used = store.memory.used();
+
+        assert!(store.memory_room(80 * 1024, true).is_none());
+        assert_eq!(store.memory.used(), used);
+        assert!(store.namespaces[&id].tree[&key].location.memory.is_some());
+
+        drop(store);
+        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_compacted_records_disk_charge_survives_promotion_and_eviction() {
+        let (mut store, base, directory) = store_with_root("compacted-read-fill", 64 * 1024);
+        let descriptor = descriptor();
+        store
+            .hello(1, std::process::id(), descriptor.clone())
+            .unwrap();
+        let id = store.sessions[&1].namespace;
+        let key = Key {
+            consumed_tokens: 64,
+            digest: [1; 16],
+        };
+        let extent = store.memory.allocate(16 * 1024).unwrap();
+        insert_memory_node(&mut store, id, &descriptor, key, None, 1, extent);
+        let node = store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .node_mut(&key)
+            .unwrap();
+        let header = node.location.header.clone();
+        node.row = false;
+        node.location.disk = Some(Arc::new(DiskExtent::new(base.join("compacted.ckpt"))));
+        node.location.durable = true;
+        node.location.memory = None;
+        node.location.bytes = header.length(false);
+        store.charged = node.location.bytes;
+
+        let extent = Arc::new(
+            store
+                .memory
+                .allocate(header.length(false) as usize)
+                .unwrap(),
+        );
+        let charge = extent.capacity() as u64;
+        store.get_filled(id, &header, extent);
+        assert!(store.namespaces[&id].tree[&key].location.memory.is_some());
+        assert_eq!(store.charge_total(), charge);
+        assert!(store.evict_memory(id, key));
+        assert_eq!(store.charge_total(), header.length(false));
+
         drop(store);
         let _ = fs::remove_dir_all(base);
         let _ = fs::remove_dir_all(directory);

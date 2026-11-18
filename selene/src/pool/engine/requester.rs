@@ -890,15 +890,6 @@ impl Engine {
                 wire::ClaimReason::try_from(terminal.reason)
             ));
             self.fail_restore(restore, Some(id), error, wire::CopyOutcome::CopyAbandoned);
-            if terminal.reason == wire::ClaimReason::NoHeadroom as i32
-                && let Some(failure) = self
-                    .requester
-                    .restores
-                    .get_mut(&restore)
-                    .and_then(|r| r.failure.as_mut())
-            {
-                failure.no_headroom = true;
-            }
         }
         self.drive_claim(id);
     }
@@ -1030,7 +1021,10 @@ impl Engine {
         restore.failure.get_or_insert(FetchFailure {
             error,
             source,
-            no_headroom: false,
+            no_headroom: culprit
+                .and_then(|claim| self.requester.claims.get(&claim))
+                .and_then(|claim| claim.terminal.as_ref())
+                .is_some_and(|terminal| terminal.reason == wire::ClaimReason::NoHeadroom as i32),
         });
         let claims: Vec<u64> = self
             .requester

@@ -103,9 +103,8 @@ impl Core {
 
     pub(super) fn store_send(&self, command: StoreCommand) {
         if let Some(store) = &self.store {
-            // A full queue means the store is busy; the pool retries nothing here because
-            // every use is a release the store also performs when the connection ends.
-            let _ = store.commands.try_send(command);
+            // Release commands must reach the store even when its queue is full.
+            tokio::task::block_in_place(|| store.commands.blocking_send(command)).ok();
         }
     }
 
@@ -652,13 +651,10 @@ impl Core {
             return;
         };
         if self.holders(&rec.parties, None, rec.mp.passes) == Party::Drained {
-            if let Some(store) = &self.store {
-                let command = StoreCommand::Cancel {
-                    connection: rec.link.connection,
-                    transfer: key.2,
-                };
-                tokio::task::block_in_place(|| store.commands.blocking_send(command)).ok();
-            }
+            self.store_send(StoreCommand::Cancel {
+                connection: rec.link.connection,
+                transfer: key.2,
+            });
             self.puts.remove(&key);
         }
     }
@@ -1258,6 +1254,43 @@ fn set_checksums(metadata: &mut [u8], header: &Header, pages: &[u64], row: Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn store_cancel_reaches_the_owner_when_the_queue_is_full() {
+        let (commands, mut receiver) = mpsc::channel(1);
+        commands.try_send(StoreCommand::Tick).unwrap();
+        let (core, _handle, _events) = Core::new(
+            Default::default(),
+            Default::default(),
+            crate::arena::Arena::new(4096).unwrap(),
+            Some(commands),
+        );
+        let (waiting, entered) = std::sync::mpsc::channel();
+        let (sent, returned) = std::sync::mpsc::channel();
+        let sender = std::thread::spawn(move || {
+            waiting.send(()).unwrap();
+            core.store_send(StoreCommand::Cancel {
+                connection: 1,
+                transfer: 2,
+            });
+            sent.send(()).unwrap();
+        });
+        entered
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let returned_while_full = returned.recv_timeout(std::time::Duration::from_millis(100));
+        assert!(matches!(receiver.try_recv(), Ok(StoreCommand::Tick)));
+        sender.join().unwrap();
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(StoreCommand::Cancel {
+                connection: 1,
+                transfer: 2
+            })
+        ));
+        assert!(returned_while_full.is_err());
+    }
 
     #[test]
     fn duplicate_put_logs_are_aggregated_at_doubling_totals() {
