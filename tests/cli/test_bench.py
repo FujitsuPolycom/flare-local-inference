@@ -16,6 +16,46 @@ def settings(*flags):
     return Settings.from_args(_parser().parse_args(["bench", *flags]))
 
 
+def test_bench_rejects_image_slots_for_qwen_dense_when_it_plans(monkeypatch, tmp_path):
+    """The benchmark prepares text graphs only, so a plan with image slots is a usage error."""
+    from ignition import planning
+    from ignition.cli import bench
+    from ignition.cli.preparation import Host
+    from ignition.recipes import ResolvedModel
+    from ignition.recipes.qwen38_dense.recipe import RECIPE
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    gpus = (planning.Gpu(0, "NVIDIA RTX PRO 6000 Blackwell", "GPU-0000", 96 << 30, 90 << 30, (12, 0)),)
+    monkeypatch.setattr(bench.Host, "discover", classmethod(lambda cls: Host(gpus, None)))
+    monkeypatch.setattr(bench, "resolve_model",
+        lambda configuration, name: ResolvedModel(RECIPE, RECIPE.checkpoints[0]))
+
+    class Planned(Exception):
+        pass
+
+    def fetch(model, hub_cache, progress_bars):
+        raise Planned
+
+    monkeypatch.setattr(bench, "fetch", fetch)
+    config = tmp_path / "config.toml"
+
+    def run(text, *flags):
+        config.write_text(text)
+        return bench.run(_parser().parse_args(["bench", "qwen3.8-27b", "--config", str(config), *flags]))
+
+    # Planning succeeds without image slots and the command goes on to the download.
+    with pytest.raises(Planned):
+        run("")
+    with pytest.raises(Planned):
+        run("[defaults]\nimage_concurrency = 4\n")
+    section = '[models."qwen3.8-27b"]\nimage_concurrency = 2\n'
+    with pytest.raises(Planned):
+        run(section, "--image-concurrency", "0")
+    for text, flags in (("", ("--image-concurrency", "2")), (section, ())):
+        with pytest.raises(UsageError, match="benchmark graphs prepare no vision encoder"):
+            run(text, *flags)
+
+
 def test_default_matrix_and_measurement_counts():
     value = settings()
     assert value.batches == (1, 2, 4)

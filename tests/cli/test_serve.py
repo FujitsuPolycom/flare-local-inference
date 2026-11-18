@@ -647,6 +647,40 @@ def test_reuse_weights_requires_cached_version_before_preparation(host, capsys):
     assert 'prepared' not in host
 
 
+def _dense_export(monkeypatch, name="model.visual.merger.ln_q.weight"):
+    """Export Qwen3.8 27B through the host's stand-in preparation; its snapshot stores tensor ``name``."""
+    stand_in = serve.resolve_model(None, None).recipe
+    model = resolve("qwen3.8-27b")
+    recipe = replace(model.recipe, prepare=stand_in.prepare, usage=stand_in.usage)
+    monkeypatch.setattr(serve, "resolve_model", lambda configuration, name: ResolvedModel(recipe, model.checkpoint))
+    snapshot = model.snapshot(Configuration.load().directory("hub_cache"))
+    snapshot.mkdir(parents=True)
+    header = json.dumps({name: {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}}).encode()
+    header += b" " * (-len(header) % 8)
+    (snapshot / "model.safetensors").write_bytes(len(header).to_bytes(8, "little") + header + b"\0")
+    (snapshot / "model.safetensors.index.json").write_text(json.dumps({
+        "metadata": {"total_size": 1}, "weight_map": {name: "model.safetensors"}}))
+    return snapshot
+
+
+@pytest.mark.parametrize("cached", [True, False])
+def test_export_rejects_image_slots_without_vision_weights_before_preparation(host, monkeypatch, capsys, cached):
+    """A downloaded snapshot reaches the outcome of a cached one, before any weight loads."""
+    _dense_export(monkeypatch, name="model.language_model.norm.weight")
+    state = {"cached": cached, "fetched": 0}
+    monkeypatch.setattr(ResolvedModel, "cached", lambda self, hub_cache: state["cached"])
+
+    def fetch(model, hub_cache, progress_bars):
+        state.update(cached=True, fetched=state["fetched"] + 1)
+
+    monkeypatch.setattr(serve, "fetch", fetch)
+    assert export("qwen3.8-27b", "--image-concurrency", "2") == 2
+    assert ("--image-concurrency: qwen3.8-27b's checkpoint carries no model.visual. weights"
+            in capsys.readouterr().err)
+    assert state["fetched"] == (0 if cached else 1) and "prepared" not in host
+    assert export("qwen3.8-27b") == 0 and host["plan"].image_concurrency == 0
+
+
 def test_reuse_weights_passes_cached_metadata_through_export(host, monkeypatch, tmp_path):
     import flare_heliopause
     from ignition.preparation.core_snapshot import _OPTIONS

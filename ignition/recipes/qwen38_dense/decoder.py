@@ -17,6 +17,7 @@ from ignition.components.head_gate import PreparedHeadGate
 from ignition.components.linear import QuantizedProjection, prepare_projection
 from ignition.components.gdn_recovery import GDNLayerRecords, PreparedGDNCommit
 from ignition.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
+from ignition.components.paged_batch import rotary_offset_region, rotary_positions
 from ignition.components.recurrent import DeltaMetadata, _commit_convolution
 from ignition.components.rms_norm import PreparedRMSNorm
 from ignition.components.head_norm_rope import head_norm_rope
@@ -24,7 +25,7 @@ from ignition.components.tensor_fp8 import TensorFP8Projection, TensorFP8Weight
 from ignition.components.vocabulary import PreparedVocabularyProjection
 from ignition.preparation.quantization import linear_format
 
-from .config import PAGE_TOKENS
+from .config import PAGE_TOKENS, rotary_axes, rotary_sections
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,46 @@ class Projection(torch.nn.Module):
 
     def forward(self, source):
         return self.operation(source)
+
+
+def rotary_embeddings(positions, inverse_frequency, axes=None, position_axes=None):
+    """Cosine and sine tables for token or per-axis rotary positions.
+
+    One-dimensional ``positions`` hold one position per token, and every
+    frequency pair rotates at it. Two-dimensional ``positions`` supply one column
+    per declared axis, or one column that every axis reuses; ``axes`` names the
+    axis of each frequency pair and ``position_axes`` counts the declared axes.
+    """
+    if positions.ndim == 1:
+        frequency = positions.float()[:, None] * inverse_frequency[None, :]
+    else:
+        columns = positions.expand(-1, position_axes) if positions.shape[1] == 1 else positions
+        frequency = columns[:, axes].float() * inverse_frequency[None, :]
+    embedding = torch.cat((frequency, frequency), dim=-1)
+    return embedding.cos().bfloat16(), embedding.sin().bfloat16()
+
+
+class PrefillInjection:
+    """Hand one prefill forward's media validation errors to its embedding injection.
+
+    Batch validation calls ``validate_prefill`` before decoder state is gathered,
+    and the decoder calls ``inject`` after token embedding in the same forward.
+    The error tensor the validation kernel writes is an input of the injection
+    kernel; it is held here between the two calls and released by ``inject``.
+    """
+
+    def __init__(self, injection):
+        self.injection, self.errors = injection, None
+
+    def validate_prefill(self, tokens, lengths):
+        self.errors = self.injection.validate()
+        return self.errors == 0
+
+    def inject(self, embedding):
+        if self.errors is None:
+            raise RuntimeError("media injection requires the prefill validation of the same forward")
+        errors, self.errors = self.errors, None
+        self.injection.inject(embedding, errors)
 
 
 def _uses_fused_swiglu(activation, down_weight, device):
@@ -295,8 +336,10 @@ class FullAttention(torch.nn.Module):
 
 class PreparedDecoder:
     def __init__(self, weights, scratch, metadata, pool, *, mode, vocabulary_runtime,
-                 coordinator, session, name, workspace, scoring=None, records=None):
+                 coordinator, session, name, workspace, scoring=None, records=None,
+                 embedding_injection=None):
         self.weights, self.scratch, self.metadata, self.pool = weights, scratch, metadata, pool
+        self.embedding_injection = embedding_injection
         self.embedding = PreparedEmbedding(weights.tree.embed_tokens.weight, metadata.token_ids,
             scratch.activations, num_rows=metadata.live_counts[:1], session=session, name=name + ".embedding").functional(session=session, dynamic_inputs=True)
         self.delta = DeltaMetadata.allocate(metadata.starts.numel(), scratch.activations.device,
@@ -394,6 +437,12 @@ class PreparedDecoder:
 
         self.inverse_frequency = persistent_copy(1.0 / (rotary["rope_theta"] ** (
             torch.arange(0, dim, 2, device=source.device, dtype=torch.float32) / dim)))
+        # Per-axis positions exist only for a pool that declares a rotary offset region;
+        # a text-only preparation rotates at token positions and holds no axis table.
+        self.rope_axes = self.position_axes = None
+        if rotary_offset_region(pool) is not None:
+            self.rope_axes = persistent_copy(rotary_axes(rotary, dim // 2).to(source.device))
+            self.position_axes = len(rotary_sections(rotary))
         self.scoring = None if scoring is None else scoring.prepare(scratch.activations, weights.head,
             vocabulary=weights.config.text["vocab_size"], session=session, coordinator=coordinator,
             name=name + ".prompt")
@@ -458,10 +507,11 @@ class PreparedDecoder:
         if metadata is None:
             raise ValueError("dense decoder requires metadata")
         m, d = metadata, self._delta_metadata(metadata)
-        frequency = m.positions.float()[:, None] * self.inverse_frequency[None, :]
-        embedding = torch.cat((frequency, frequency), dim=-1)
-        position_embeddings = embedding.cos().bfloat16(), embedding.sin().bfloat16()
+        position_embeddings = rotary_embeddings(rotary_positions(m), self.inverse_frequency,
+            self.rope_axes, self.position_axes)
         hidden = self.embedding(token_ids=m.token_ids, num_rows=m.live_counts[:1])
+        if self.embedding_injection is not None:
+            self.embedding_injection.inject(hidden)
         records = (GDNLayerRecords.allocate(self.record_layers, self.record_rows, hidden.device,
             key_heads=16, value_heads=48, width=self.record_width) if self.record_layers else None)
         if self.context_capture is not None:

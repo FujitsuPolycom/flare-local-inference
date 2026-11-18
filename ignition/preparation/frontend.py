@@ -77,7 +77,12 @@ def _expected(config, values, label):
             raise ValueError(f"unsupported {label} {key}")
 
 
-def image_settings(config, model, profile):
+def image_settings(config, model, profile, qwen_model_type="qwen4_exp"):
+    """Resolve the image settings the native frontend consumes for ``profile``.
+
+    The Qwen profile serves two checkpoint families with one processor; ``qwen_model_type``
+    is the ``model_type`` the preparing recipe requires of its checkpoint.
+    """
     if profile == "padded_grid":
         # Inkling 2 ships the processor in processor_config.json; `size` is the token cell, not a resize target.
         _expected(config, {"processor_class": "Inkling2Processor"}, "padded-grid processor")
@@ -154,7 +159,7 @@ def image_settings(config, model, profile):
     optional = {"resample": 3, "rescale_factor": 1 / 255,
         "do_resize": True, "do_rescale": True, "do_normalize": True, "do_convert_rgb": True}
     _expected(config, {key: value for key, value in optional.items() if key in config}, "image processor")
-    _expected(model, {"model_type": "qwen4_exp" if qwen else "mimo_v2"}, "model configuration")
+    _expected(model, {"model_type": qwen_model_type if qwen else "mimo_v2"}, "model configuration")
     vision = model["vision_config"]
     _expected(vision, {"patch_size": 16, "temporal_patch_size": 2, "spatial_merge_size": 2}, "vision configuration")
     if qwen:
@@ -203,7 +208,7 @@ def _native_image_placeholder(snapshot, model, encoder):
 
 
 def prepare_frontend(snapshot, *, eos_token_ids, image_profile=None, preprocessor=None,
-                     prompt_encoder=PromptEncoder.PROMPT_JINJA):
+                     prompt_encoder=PromptEncoder.PROMPT_JINJA, qwen_model_type="qwen4_exp"):
     """Resolve checkpoint structure during preparation; sampling is recipe-owned."""
     if not isinstance(prompt_encoder, PromptEncoder):
         raise ValueError("prompt_encoder must be a PromptEncoder")
@@ -228,5 +233,6 @@ def prepare_frontend(snapshot, *, eos_token_ids, image_profile=None, preprocesso
                 snapshot, json.loads((snapshot / "config.json").read_text()), prompt_encoder)
         path = snapshot / "preprocessor_config.json" if preprocessor is None else Path(preprocessor)
         result["image"] = image_settings({} if image_profile == "deepseek_row_major" else json.loads(path.read_text()),
-            json.loads((snapshot / "config.json").read_text()), image_profile)
+            json.loads((snapshot / "config.json").read_text()), image_profile,
+            qwen_model_type=qwen_model_type)
     return result

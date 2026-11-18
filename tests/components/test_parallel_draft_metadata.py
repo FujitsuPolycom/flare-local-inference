@@ -153,3 +153,106 @@ def test_verification_passes_local_metadata_through_commit_and_preserves_inactiv
     assert torch.equal(pool.last_hidden[3], hidden[1])
     assert torch.equal(pool.last_hidden[:3], torch.full((3, 2), -3.))
     assert operation.metadata is None and operation.candidates is None
+
+
+def test_rotary_offsets_follow_the_layout_declaration():
+    """A declared layout region selects offsets; every other pool keeps token positions."""
+    import pytest
+    from ignition.components.paged_batch import Metadata, rotary_offset_region
+    from ignition.components.state import StateLayout
+
+    region = torch.tensor([[0], [3], [7]], dtype=torch.int64)
+    # A layout that stores the region but declares no rotary region keeps indices.
+    undeclared = StateLayout.from_specs((("rope_delta", (1,), torch.int64),))
+    flash = SimpleNamespace(layout=undeclared, region=lambda name: region)
+    assert rotary_offset_region(flash) is None
+    # Storage without a state layout holds no offsets.
+    assert rotary_offset_region(SimpleNamespace(memory_capacity=torch.tensor([5, 16]))) is None
+    declared = StateLayout.from_specs((("rope_delta", (1,), torch.int64),),
+        rotary_region="rope_delta")
+    assert rotary_offset_region(SimpleNamespace(layout=declared, region=lambda name: region)) is region
+    with pytest.raises(ValueError, match="not in the layout"):
+        StateLayout.from_specs((("consumed_tokens", (1,), torch.int64),), rotary_region="rope_delta")
+    without = Metadata.pack(torch.tensor([5], dtype=torch.int64), torch.tensor([3], dtype=torch.int32),
+        torch.tensor([1], dtype=torch.int64), torch.zeros((1, 1), dtype=torch.int32),
+        torch.zeros((1, 3), dtype=torch.int64), torch.ones(1, dtype=torch.int32), token_capacity=3)
+    assert without.rope_positions is None and without.positions.tolist() == [5, 6, 7]
+
+
+def test_verification_rotates_target_rows_at_the_offsets_its_proposal_carries():
+    """Proposals carry each row's rotary offset from the proposing round's batch to verification."""
+    import pytest
+    from ignition.components.parallel_draft import DraftProposalState
+
+    proposal = DraftProposalState(torch.tensor([9, 3]), torch.tensor([True, False]),
+        torch.tensor([[3, 6, 5], [1, 0, 0]]), torch.tensor([[6, 5], [0, 0]]),
+        torch.tensor([[True, True], [False, False]]), torch.tensor([0, 40]), None,
+        rotary_offsets=torch.tensor([7, 0]))
+    inputs = SimpleNamespace(row_slot_ids=torch.tensor([2, 0]), query_lengths=torch.tensor([3, 1]),
+        request_state_rows=torch.tensor([[1], [2], [3]]), page_tables=torch.tensor([[0], [1], [2]]),
+        live_rows=torch.tensor([2], dtype=torch.int32))
+    observed = []
+
+    class Decoder:
+        def __call__(self, metadata):
+            observed.append(metadata)
+            raise StopIteration
+
+    operation = object.__new__(PreparedParallelDraftRound)
+    operation.owner = SimpleNamespace(inputs=inputs, requests=SimpleNamespace(capacity=3))
+    operation.batch, operation.width, operation.target_token_capacity = 2, 3, 4
+    operation.operations = None, (), None, None
+    operation.decoder = Decoder()
+    with pytest.raises(StopIteration):
+        operation.verify(probabilities=torch.full((2, 2, 8), .125), proposal=proposal)
+    metadata, = observed
+    assert metadata.positions.tolist() == [9, 10, 11, -1]
+    assert metadata.rope_positions[:, 0].tolist() == [16, 17, 18, -1]
+
+
+def test_draft_round_builds_its_batch_and_metadata_from_the_layout_declaration(monkeypatch):
+    import ignition.components.parallel_draft as module
+    import ignition.components.paged_batch as batch_module
+    from ignition.components.paged_batch import BatchInputs, PreparedBatch, RotaryBatch
+    from ignition.components.sampling import DeviceRequestState
+    from ignition.components.state import StateLayout
+
+    monkeypatch.setattr(module, "PreparedAllReduce", lambda *args, **options: None)
+
+    class TokenState:
+        def __init__(self, *args, **options):
+            pass
+
+        def prepare(self):
+            return self
+
+        def functional(self):
+            return self
+
+    monkeypatch.setattr(batch_module, "PreparedTokenState", TokenState)
+
+    def owner(layout):
+        region = torch.zeros((2, 1), dtype=torch.int64)
+        pool = SimpleNamespace(layout=layout, backing=torch.zeros(2, 1),
+            memory_capacity=torch.tensor([5, 16]), region=lambda name: region)
+        return SimpleNamespace(
+            pool=pool, inputs=BatchInputs.allocate(4, 1, "cpu", capacity=2),
+            requests=DeviceRequestState.allocate("cpu", vocab_size=8, capacity=2),
+            weights=SimpleNamespace(shard=SimpleNamespace(world_size=1),
+                config=SimpleNamespace(draft=SimpleNamespace(noise_token=0))),
+            tables=None, scratch=None, draft_scratch=None,
+            forwards=SimpleNamespace(markov=None), collectives={"runtime": None, "coordinator": None},
+            session=None, page_tokens=64, block_size=4,
+        )
+
+    def build(layout):
+        return module.PreparedParallelDraftRound(owner(layout), 2, 4, "round",
+            generate_proposals=False, proposal_only=True)
+
+    undeclared = build(StateLayout.from_specs((("rope_delta", (1,), torch.int64),)))
+    assert type(undeclared.validator) is PreparedBatch
+    assert undeclared.metadata.rope_positions is None
+    declared = build(StateLayout.from_specs((("rope_delta", (1,), torch.int64),),
+        rotary_region="rope_delta"))
+    assert type(declared.validator) is RotaryBatch
+    assert declared.metadata.rope_positions.shape == (8, 3)

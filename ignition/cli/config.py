@@ -62,6 +62,21 @@ def parse_size(text: str, what: str = "memory size") -> int:
     return int(float(match[1]) * (1 << 10 * " KMGT".index((match[2] or " ").upper())))
 
 
+def _prepares_images_on_request(section: str) -> bool:
+    """Whether `section` configures a model whose recipe declares zero default image slots.
+
+    Zero image slots in such a model's section selects its text-only preparation.
+    """
+    match = re.fullmatch(r'models\."(.+)"', section)
+    if match is None:
+        return False
+    from ignition.recipes import recipes
+
+    return any(recipe.default_image_slots == 0
+               and match[1] in {checkpoint.alias for checkpoint in recipe.checkpoints}
+               for recipe in recipes())
+
+
 @dataclass(frozen=True)
 class Setting:
     value: object
@@ -138,6 +153,8 @@ class Configuration:
                 raise UsageError(f"{path}: thinking_token_budget in [{section}] must be a positive 32-bit integer")
             if key in ("max_concurrency", "image_concurrency", "speculative_token_capacity",
                        "speculative_graph_budget", "compile_workers") and value < 1:
+                if key == "image_concurrency" and value == 0 and _prepares_images_on_request(section):
+                    continue
                 raise UsageError(f"{path}: {key} in [{section}] must be at least 1")
 
     def get(self, key: str, flag=None) -> Setting:

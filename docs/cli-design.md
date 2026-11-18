@@ -407,7 +407,7 @@ serving. `export` accepts neither option, and `--direct` rejects history draftin
 | `--port N` | Listening port. `debug-serve` only. | `server.port`, else `8000` |
 | `--verbose` | Per-phase detail on stderr | off |
 | `--config PATH` | Configuration file | `~/.config/flare/config.toml` |
-| `--image-concurrency N` | Maximum active image requests, 1 through the concurrency limit; vision recipes only | `image_concurrency` in `[models."MODEL"]`, then `[defaults]`, else the smaller of 4 and the concurrency limit |
+| `--image-concurrency N` | Maximum active image requests, 1 through the concurrency limit; vision recipes only. A recipe that prepares images only when asked also accepts 0, its text-only preparation | `image_concurrency` in `[models."MODEL"]`, then `[defaults]`, else the recipe's declared default: the smaller of 4 and the concurrency limit. A recipe that prepares images only when asked defaults to zero and reads `[models."MODEL"]` only |
 | `--no-weights` | Export only when exact stored-data blobs are cached. `export` only. | Off |
 | `--reuse-weights` | Reuse the cached default version's weight hashes and mappings without reading live or cached weight payloads; requires matching checkpoint and prepared layouts. `export` only. | Off |
 | `--publisher-key PATH` | Public publisher profile authenticating the cached weight source; repeatable. `export` only. | Embedded profiles and the local development profile |
@@ -1388,7 +1388,7 @@ Configuration assigns each decision to one owner:
 | Checkpoint and revision | `MODEL`, including a local directory or `org/name@revision` |
 | GPUs and TP size | `--gpus`; rank count follows the selected list |
 | Concurrent requests | `--max-concurrency` |
-| Active image requests and feature slots | `--image-concurrency`, then model/default configuration, otherwise `min(4, max_concurrency)` for vision recipes |
+| Active image requests and feature slots | `--image-concurrency`, then model/default configuration, otherwise the recipe's declared default (`min(4, max_concurrency)`); a recipe that prepares images only when asked defaults to zero and reads the flag and its model section only |
 | Listener | Ignition and native Flare `--host` and `--port` |
 | Context limit | Checkpoint maximum; admission still requires sufficient shared cache capacity |
 | KV pages and GPU prefix-cache rows | Derived from available memory, graph cost, and concurrency |

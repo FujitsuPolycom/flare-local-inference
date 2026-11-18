@@ -213,6 +213,239 @@ def test_image_concurrency_defaults_and_explicit_capacity():
         image_plan(1, model=SOLO)
 
 
+def test_declared_default_image_slots_select_a_text_plan():
+    dense = replace(SOLO, max_images=4, default_image_slots=0)
+    settings = dict(concurrency=4, reserve_bytes=0, speculation=None, selected=None,
+                    image_concurrency=None)
+    text = planning.plan(dense, dense.checkpoints[0], (gpu(0, 95),), **settings)
+    assert (text.image_concurrency, text.max_images) == (0, 0)
+    image = planning.plan(dense, dense.checkpoints[0], (gpu(0, 95),),
+                          **(settings | {"image_concurrency": 2}))
+    assert (image.image_concurrency, image.max_images) == (2, 4)
+
+
+def test_dense_default_plan_is_the_text_only_plan():
+    from ignition.recipes.qwen38_dense import contract
+    from ignition.recipes.qwen38_dense.recipe import RECIPE
+
+    plan = planning.plan(RECIPE, RECIPE.checkpoints[0], (gpu(0, 30),), selected=None,
+                         concurrency=4, reserve_bytes=0, speculation=None)
+    # The values `planning.plan` computes at commit 5fd4070d of this repository for these options,
+    # 30 GiB of free device memory, and this module's 4 GiB headroom.
+    assert plan.image_concurrency == 0 and plan.max_images == 0
+    assert plan.costs.state_row_bytes == 158_148_864
+    assert plan.weights_bytes == 20_458_440_840
+    assert plan.graph_bytes == 4_294_967_296
+    assert plan.fixed_bytes == 25_544_152_456
+    assert plan.pages == 565 and plan.cache_states == 15 and plan.fits
+    # The text-only continuation, contract, and identity are pinned by
+    # test_qwen38_dense_text_only.py; this plan selects that path.
+    frontend = contract.frontend(vision=plan.image_concurrency > 0)
+    assert frontend["image_tokens"] is None and frontend["position_dimensions"] == 0
+    drafting = planning.plan(RECIPE, RECIPE.checkpoints[0], (gpu(0, 36),), selected=None,
+                             concurrency=4, reserve_bytes=0, speculation=RECIPE.speculation)
+    # The text-only plan with DFlash2 and 36 GiB free.
+    assert drafting.image_concurrency == 0 and drafting.costs.state_row_bytes == 193_865_984
+    assert drafting.graph_bytes == 4_294_967_296
+    assert drafting.pages == 1116 and drafting.cache_states == 24
+
+
+def test_dense_image_concurrency_prepares_the_image_frontend():
+    from ignition.recipes.qwen38_dense import contract
+    from ignition.recipes.qwen38_dense.recipe import RECIPE
+
+    plan = planning.plan(RECIPE, RECIPE.checkpoints[0], (gpu(0, 36),), selected=None,
+                         concurrency=4, reserve_bytes=0, speculation=None, image_concurrency=4)
+    assert plan.image_concurrency == 4 and plan.max_images == 4
+    assert plan.costs.state_row_bytes == 158_149_120
+    assert plan.graph_bytes == 4_294_967_296 + 2_997_599_804
+    assert plan.pages == 1387
+    frontend = contract.frontend(vision=plan.image_concurrency > 0)
+    assert frontend["image_tokens"] == dict(feature_token=248056, span=None)
+
+
+def test_flash_recipe_keeps_the_shared_image_default():
+    from ignition.recipes.qwen38.recipe import RECIPE
+
+    pair = (gpu(0, 95), gpu(1, 95))
+    def planned(concurrency):
+        return planning.plan(RECIPE, RECIPE.checkpoints[0], pair, selected=(0, 1),
+                             concurrency=concurrency, reserve_bytes=0, speculation=None)
+    assert planned(4).image_concurrency == 4
+    assert planned(2).image_concurrency == 2
+    assert planned(4).max_images == 4
+
+
+def _configuration(tmp_path, text=""):
+    from ignition.cli.config import Configuration
+
+    path = tmp_path / "config.toml"
+    path.write_text(text)
+    return Configuration.load(path)
+
+
+def _dense_model(tmp_path, *tensors):
+    """The Qwen3.8 27B recipe with a local single-file snapshot that stores ``tensors``."""
+    import torch
+    from safetensors.torch import save_file
+    from ignition.recipes.qwen38_dense.recipe import RECIPE
+
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    save_file({name: torch.zeros(1) for name in tensors}, str(snapshot / "model.safetensors"))
+    return ResolvedModel(RECIPE, RECIPE.checkpoints[0], snapshot)
+
+
+def _planned(configuration, model, *, free_gib=36, **options):
+    """The planning call that export, debug-serve, and bench share."""
+    from ignition.cli.preparation import plan_with_rules
+
+    return plan_with_rules(configuration, model, (gpu(0, free_gib),), concurrency=4, reserve_bytes=0,
+                           speculation=None, **options)
+
+
+TEXT_TENSOR, VISION_TENSOR = "model.language_model.norm.weight", "model.visual.merger.ln_q.weight"
+
+
+MODEL_KEY = 'image_concurrency in [models."qwen3.8-27b"]'
+
+
+def _model_section(count):
+    return f'[models."qwen3.8-27b"]\nimage_concurrency = {count}\n'
+
+
+def test_dense_image_slots_come_from_the_flag_or_the_model_section(tmp_path):
+    model = _dense_model(tmp_path, TEXT_TENSOR, VISION_TENSOR)
+    default = _planned(_configuration(tmp_path), model)
+    assert default.image_concurrency == 0
+    # A `[defaults]` key written for other models leaves the text-only plan in place.
+    assert _planned(_configuration(tmp_path, f"[defaults]\nimage_concurrency = 4\n"), model) == default
+    assert _planned(_configuration(tmp_path, _model_section(2)), model).image_concurrency == 2
+    assert _planned(_configuration(tmp_path, _model_section(0)), model) == default
+    # The flag wins over the model section, and zero selects the text-only plan.
+    configured = _configuration(tmp_path, _model_section(2))
+    assert _planned(configured, model, image_concurrency=3).image_concurrency == 3
+    assert _planned(configured, model, image_concurrency=0) == default
+    with pytest.raises(UsageError, match=r"--image-concurrency for qwen3.8-27b must be 0 through max concurrency"):
+        _planned(configured, model, image_concurrency=5)
+    with pytest.raises(UsageError, match=re.escape(MODEL_KEY) + " for qwen3.8-27b must be 0 through"):
+        _planned(_configuration(tmp_path, _model_section(9)), model)
+
+
+def test_defaults_key_applies_to_a_recipe_that_prepares_images_by_default(tmp_path):
+    from ignition.recipes.qwen38.recipe import RECIPE
+
+    model = ResolvedModel(RECIPE, RECIPE.checkpoints[0])
+    pair = (gpu(0, 95), gpu(1, 95))
+
+    def planned(configuration, **options):
+        from ignition.cli.preparation import plan_with_rules
+
+        return plan_with_rules(configuration, model, pair, selected=(0, 1), concurrency=4,
+                               reserve_bytes=0, speculation=None, **options)
+
+    assert planned(_configuration(tmp_path)).image_concurrency == 4
+    assert planned(_configuration(tmp_path, f"[defaults]\nimage_concurrency = 2\n")).image_concurrency == 2
+    with pytest.raises(UsageError, match="--image-concurrency requires a vision model and must be 1 through"):
+        planned(_configuration(tmp_path), image_concurrency=0)
+
+
+def test_language_model_only_with_dense_image_slots_names_what_asked(tmp_path):
+    model = _dense_model(tmp_path, TEXT_TENSOR, VISION_TENSOR)
+    text_only = _planned(_configuration(tmp_path), model, language_model_only=True)
+    assert text_only.image_concurrency == 0 and text_only.language_model_only
+    with pytest.raises(UsageError, match="^--image-concurrency requires the vision encoder that"
+                                         " --language-model-only leaves unloaded"):
+        _planned(_configuration(tmp_path), model, language_model_only=True, image_concurrency=2)
+    with pytest.raises(UsageError, match="^" + re.escape(MODEL_KEY) + " requires the vision encoder"):
+        _planned(_configuration(tmp_path, _model_section(2)), model, language_model_only=True)
+    # Zero slots and a `[defaults]` key ask for no vision encoder.
+    for configuration, flag in ((_configuration(tmp_path, _model_section(0)), None),
+                                (_configuration(tmp_path, _model_section(2)), 0),
+                                (_configuration(tmp_path, f"[defaults]\nimage_concurrency = 4\n"), None)):
+        assert _planned(configuration, model, language_model_only=True, image_concurrency=flag) == text_only
+
+
+def test_dense_image_slots_require_the_snapshot_vision_weights(tmp_path):
+    model = _dense_model(tmp_path, TEXT_TENSOR)
+    default = _planned(_configuration(tmp_path), model)
+    weights = r"qwen3\.8-27b's checkpoint carries no model\.visual\. weights"
+    with pytest.raises(UsageError, match="^--image-concurrency: " + weights):
+        _planned(_configuration(tmp_path), model, image_concurrency=2)
+    with pytest.raises(UsageError, match="^" + re.escape(MODEL_KEY) + ": " + weights):
+        _planned(_configuration(tmp_path, _model_section(2)), model)
+    # Zero slots, a `[defaults]` key, and --language-model-only plan the text-only snapshot.
+    assert _planned(_configuration(tmp_path, _model_section(0)), model) == default
+    assert _planned(_configuration(tmp_path, _model_section(2)), model, image_concurrency=0) == default
+    assert _planned(_configuration(tmp_path, f"[defaults]\nimage_concurrency = 4\n"), model) == default
+    assert _planned(_configuration(tmp_path), model, language_model_only=True).image_concurrency == 0
+
+
+def test_snapshot_rules_reject_image_slots_once_the_snapshot_is_present(tmp_path, monkeypatch):
+    """A command that downloads after planning reaches the outcome of a cached snapshot."""
+    from ignition.cli.preparation import snapshot_rules
+
+    model = _dense_model(tmp_path, TEXT_TENSOR)
+    configuration = _configuration(tmp_path, _model_section(2))
+    present = {"cached": False}
+    monkeypatch.setattr(ResolvedModel, "cached", lambda self, hub_cache: present["cached"])
+    plan = _planned(configuration, model)
+    assert plan.image_concurrency == 2 and snapshot_rules(configuration, model, plan) == plan
+    present["cached"] = True
+    with pytest.raises(UsageError, match="^" + re.escape(MODEL_KEY) + ": qwen3"):
+        snapshot_rules(configuration, model, plan)
+    with pytest.raises(UsageError, match="^" + re.escape(MODEL_KEY) + ": qwen3"):
+        _planned(configuration, model)
+
+
+def test_derive_plans_every_other_vision_recipe_as_planning_plan_does(tmp_path, monkeypatch):
+    """`derive` is the planning call of export and bench.
+
+    Each model has a cached local snapshot; planning a recipe other than Qwen3.8 27B
+    reads no snapshot and reports the plan `planning.plan` computes for the same options.
+    """
+    import numpy
+    from safetensors.numpy import save_file
+    from ignition.cli.config import Configuration, Setting
+    from ignition.cli import preparation
+    from ignition.preparation import checkpoint
+
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    save_file({TEXT_TENSOR: numpy.zeros(1, dtype=numpy.float32)}, str(snapshot / "model.safetensors"))
+
+    def inspect(directory):
+        raise AssertionError("planning must not read this recipe's snapshot")
+
+    monkeypatch.setattr(checkpoint, "inspect_indexed_checkpoint", inspect)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    configuration = Configuration(tmp_path / "config.toml", {"defaults": {"image_concurrency": 3}}, exists=True)
+    planned = []
+    for recipe in recipes():
+        if recipe.name == "qwen38_dense" or not recipe.max_images:
+            continue
+        world = recipe.tensor_parallel[0]
+        gpus = tuple(planning.Gpu(index, "Blackwell", f"GPU-{index}", 1024 * GIB, 1000 * GIB, (12, 0))
+                     for index in range(world))
+        model = ResolvedModel(recipe, recipe.checkpoints[0], snapshot)
+        assert model.cached(configuration.directory("hub_cache"))
+        plan = preparation.derive(configuration, model, preparation.Host(gpus, None),
+            gpus=f"0-{world - 1}" if world > 1 else "0", concurrency=Setting(4, "test"),
+            speculation=recipe.speculation)
+        expected = planning.plan(recipe, recipe.checkpoints[0], gpus, selected=tuple(range(world)),
+            concurrency=4, reserve_bytes=configuration.reserve_bytes, speculation=recipe.speculation,
+            image_concurrency=3)
+        assert plan.image_concurrency == 3 and plan.max_images == recipe.max_images, recipe.name
+        assert plan.costs is recipe.costs(world, recipe.speculation, recipe.checkpoints[0]), recipe.name
+        report, wanted = plan.to_dict(), expected.to_dict()
+        assert set(report) == set(wanted), recipe.name
+        for key in ("image_concurrency", "weights_bytes", "graph_bytes", "live_bytes", "prefix_cache_states",
+                    "snapshot_virtual_bytes", "pages", "page_bytes", "tokens", "supply_bytes"):
+            assert report[key] == wanted[key], (recipe.name, key)
+        planned.append(recipe.name)
+    assert "qwen38" in planned and len(planned) > 4
+
+
 def test_expert_scale_compression_changes_weight_budget_and_preserves_native_default():
     import pickle
 

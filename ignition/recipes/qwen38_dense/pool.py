@@ -6,6 +6,7 @@
 import torch
 
 from ignition.components.gated_delta import GDNState
+from ignition.components.paged_batch import ROTARY_OFFSET
 from ignition.components.paged_state import PagedStateStorage
 from ignition.components.state import StateLayout
 
@@ -24,9 +25,17 @@ def page_bytes(config, *, mtp=False):
     return sum(shape[0] for _, shape in page_specs(config, mtp=mtp))
 
 
-def continuation_layout(config, *, mtp=False, verification_width=8):
+def continuation_layout(config, *, mtp=False, verification_width=8, rotary_offset=False):
+    """Continuation regions; ``rotary_offset`` adds a request's three-axis offset.
+
+    A text-only preparation has no per-axis prompt positions, so every position
+    is its token index and no continuation region stores an offset. The region
+    exists only for a preparation that declares three-axis positions.
+    """
     if type(verification_width) is not int or not 1 <= verification_width <= 16:
         raise ValueError("Qwen verification capacity must be an integer in [1,16]")
+    if type(rotary_offset) is not bool:
+        raise TypeError("rotary offset selection must be a boolean")
     regions = []
     for index, kind in enumerate(config.layers):
         if kind == "linear_attention":
@@ -40,13 +49,20 @@ def continuation_layout(config, *, mtp=False, verification_width=8):
         regions.extend(draft_context_specs(config.draft, TensorParallelShard(0, 1)))
     regions.extend((("last_hidden", (config.hidden,), torch.bfloat16),
                     ("consumed_tokens", (1,), torch.int64)))
-    return StateLayout.from_specs(regions)
+    if rotary_offset:
+        regions.append((ROTARY_OFFSET, (1,), torch.int64))
+    # The layout declares which region its batch and draft rounds read for
+    # per-row positions; a text-only layout declares none.
+    return StateLayout.from_specs(regions,
+        rotary_region=ROTARY_OFFSET if rotary_offset else None)
 
 
 class ContinuationPool(PagedStateStorage):
     @classmethod
-    def for_model(cls, config, slots, pages, device, *, mtp=False, verification_width=8, **kwargs):
-        return cls.allocate(continuation_layout(config, mtp=mtp, verification_width=verification_width), page_specs(config, mtp=mtp), slots, pages, device, **kwargs)
+    def for_model(cls, config, slots, pages, device, *, mtp=False, verification_width=8,
+                  rotary_offset=False, **kwargs):
+        return cls.allocate(continuation_layout(config, mtp=mtp, verification_width=verification_width,
+            rotary_offset=rotary_offset), page_specs(config, mtp=mtp), slots, pages, device, **kwargs)
 
     def partial_pages(self):
         return tuple(self.pages.items())

@@ -173,6 +173,13 @@ assert not {'torch', 'transformers', 'flare_heliopause', 'huggingface_hub', 'pyn
     assert result.returncode == 0, result.stderr
 
 
+def test_qwen_dense_help_reports_the_text_only_image_default(capsys):
+    with pytest.raises(SystemExit) as error:
+        main(["export", "qwen3.8-27b", "--help"])
+    assert error.value.code == 0
+    assert "--image-concurrency: 0..max concurrency; default 0." in capsys.readouterr().out
+
+
 @pytest.mark.parametrize("command", ["export", "debug-serve"])
 def test_deepseek41_help_reports_packed_gpu_recipe_defaults(command, capsys):
     with pytest.raises(SystemExit) as error:

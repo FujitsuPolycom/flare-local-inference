@@ -172,6 +172,21 @@ class RankCosts:
     graph_bytes: int
     # Global positions per page when ranks share each page's context; the recipe's page size otherwise.
     page_tokens: int | None = None
+    # Additional costs of a plan with image slots, for a recipe whose plans without
+    # them prepare no vision encoder. `vision_bytes` holds the image tower and its
+    # captured forward storage for four feature slots, `vision_slot_bytes` each slot
+    # beyond four, and `image_state_row_bytes` the continuation row that replaces
+    # `state_row_bytes`; None keeps the same row.
+    vision_bytes: int = 0
+    vision_slot_bytes: int = 0
+    image_state_row_bytes: int | None = None
+
+    def with_image_slots(self, slots: int) -> "RankCosts":
+        """Costs of a plan with `slots` image slots: the image row, and the vision storage as graph bytes."""
+        if not slots or (self.image_state_row_bytes is None and not self.vision_bytes):
+            return self
+        return replace(self, state_row_bytes=self.image_state_row_bytes or self.state_row_bytes,
+            graph_bytes=self.graph_bytes + self.vision_bytes + max(0, slots - 4) * self.vision_slot_bytes)
 
 
 @dataclass(frozen=True)
@@ -215,6 +230,10 @@ class Recipe:
     prepared metadata so an explicit precision choice retains its meaning.
     `language_model_only` states that a plan may prepare the recipe without its vision
     encoder, rejecting images and leaving the encoder's memory to KV pages.
+    `default_image_slots` states how many image request slots a plan of the recipe
+    prepares when neither the command line nor the configuration file asks for any;
+    None keeps the four-slot default bounded by request concurrency, and zero plans a
+    text-only preparation with no vision encoder.
     `mla_compute_modes` declares the attention arithmetic constraints a plan may select,
     independently of KV storage encoding and kernel tuning. `mla_compute_mode` and
     `expert_scale_compression` supply defaults when their preparation flags are omitted.
@@ -241,6 +260,7 @@ class Recipe:
     mapped_host_name: str = ""
     max_images: int = 0
     image_bytes: int = 0
+    default_image_slots: int | None = None
     speculation: Speculation | None = None
     speculative_methods: Mapping[str, SpeculativeMethod] = field(default_factory=lambda: MappingProxyType({}))
     plain_ranks: Mapping[int, RankCosts] = field(default_factory=lambda: MappingProxyType({}))
@@ -252,6 +272,8 @@ class Recipe:
     online_mxfp8_scopes: tuple[str, ...] = ("all",)
     language_model_only: bool = False
     b12x_environment: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
+    # Tensor-name prefixes whose presence means the checkpoint carries the recipe's vision encoder.
+    vision_prefixes: tuple[str, ...] = ()
     mla_compute_modes: tuple[str, ...] = ("auto",)
     mla_compute_mode: str = "auto"
     expert_scale_compression: str | None = None

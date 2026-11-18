@@ -353,7 +353,8 @@ For concurrency 32 with seven draft tokens per request, use
 
 ## Qwen3.8 27B
 
-`qwen3.8-27b` prepares `nvidia/Qwen3.8-27B-NVFP4` for text generation on one GPU.
+`qwen3.8-27b` prepares `nvidia/Qwen3.8-27B-NVFP4` for text generation and Qwen
+image requests on one GPU.
 It uses the canonical Qwen3.5 dense decoder with tensor-scaled FP8 attention
 projections and NVFP4 MLP and vocabulary weights. FP8 KV pages and Gated DeltaNet
 continuations reside in device memory. The pinned BF16
@@ -366,8 +367,51 @@ to seven draft tokens with adaptive packed verification capped at 128 physical
 target rows and a 64-graph budget. Accepted GDN corrections commit into one
 recurrent row per request. Five 2,048-token FP8 draft KV rings per continuation
 track target consumption without lag and survive prefix snapshot/restore.
-The recipe has no host-mapped tables or vision graphs. Prepare on the same GPU
-architecture as the serving device:
+The recipe has no host-mapped tables.
+
+A plan that requests image slots loads the snapshot's `model.visual.*` vision
+tower and captures Qwen image graphs for 256, 1,024, 4,096, and 16,384 patches.
+Each captured vision graph validates and sanitizes its patch window, encodes it,
+and publishes complete image features for one request. Prefill replaces the
+embeddings at image-token positions, token 248056, with the published rows. Each
+feature slot holds 16,384 BF16 vectors of width 5,120, or 160 MiB; four slots
+reserve 640 MiB. A plan with image slots reserves 2,997,599,804 bytes beyond the
+text catalog: the four slots, the captured encoder scratch for patch capacities
+256 through 16,384, the float32 patch upload, per-graph handoff metadata, the
+921,460,192-byte BF16 tower, and 490,733,568 bytes as the unfused bound of
+graph-private forward temporaries at 16,384 patches. `--image-concurrency N`
+selects one through `max_concurrency` feature slots and adds 167,772,160 bytes
+for each slot beyond four; `image_concurrency` in the `[models."qwen3.8-27b"]`
+section selects them when the flag is absent. The `[defaults]` key does not apply
+to this recipe, so a configuration written for other models leaves its text-only
+export in place, and `--image-concurrency 0` or `image_concurrency = 0` in the
+model section selects the text-only preparation. A plan with no image slots
+reserves none of the image storage. The recipe declares zero image slots for a
+plan that asks for none, so `ignition export qwen3.8-27b` without the flag prepares the
+text-only catalog: no vision tower loads, no image front end or prompt positions
+are declared, the continuation row is 158,148,864 bytes (193,865,984 with
+DFlash2), and the tuning identity names the `qwen38-dense.graph-inputs.v1` graph
+inputs. A preparation with image slots stores a 256-byte larger row, and its
+identity names `qwen38-dense.graph-inputs.v2` with the slot count and patch
+capacities.
+`--language-model-only` is accepted because the recipe declares
+`language_model_only=True`, and it prepares the same text-only catalog. A
+nonzero image slot count is a usage error when combined with
+`--language-model-only`, when the snapshot carries no `model.visual.*` weights,
+and for `ignition bench`, whose graphs prepare no vision encoder. The first two
+errors name what asked for the slots, the flag or the model section's key; the
+benchmark error names the flag that requests none. A snapshot that is downloaded
+by the command is checked after the download and before any weight loads.
+
+The decoder reads three-axis prompt positions from the frontend contract and
+assigns the checkpoint's 11/11/10 interleaved sections to its 32 rotary
+frequency pairs. A text-only preparation declares no prompt positions and rotates
+every token at its own index. When a preparation declares three-axis positions,
+each continuation row stores the offset between a request's rotary position and
+its token index; decode, the DFlash2 draft, and snapshot/restore reuse that
+offset, while KV page addressing keeps the token index.
+
+Prepare on the same GPU architecture as the serving device:
 
 ```sh
 .venv/bin/ignition export qwen3.8-27b --gpus 0
@@ -496,8 +540,12 @@ Replicated execution is the default: the compute savings must outweigh the extra
 fresh export; `--reuse-weights` requires matching prepared weight layouts.
 
 Vision recipes accept `--image-concurrency N`, independently of
-`--max-concurrency`. It defaults to `min(4, max_concurrency)` and can also be set
-as `image_concurrency` in `[defaults]` or a model's configuration section.
+`--max-concurrency`. It defaults to the recipe's declared image-slot default:
+the smaller of four and `--max-concurrency`, or zero for a recipe that prepares
+images only when asked, such as Qwen3.8-27B. It can also be set as
+`image_concurrency` in `[defaults]` or a model's configuration section; a
+recipe that prepares images only when asked reads its model section only and
+accepts zero there and on the flag.
 Explicit flags override configuration. Text-only recipes ignore the configured
 image default and reject an explicit image-concurrency flag.
 Helios reserves a feature slot when a request needs vision computation. Requests

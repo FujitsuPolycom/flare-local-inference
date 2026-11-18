@@ -510,3 +510,29 @@
     helios/src/output/xtml.rs fails the call with "invalid XTML JSON argument".
     Close when XTML retains the text with tests, or docs/api.md states that the
     difference is intended.
+
+[ ] Qualify Qwen3.8 27B image input on SM120 with the recipe's declared
+    storage. On a 32 GiB RTX 5090 the planner refuses an image plan with DFlash2
+    at four requests; a core exported with the declared graph and vision storage
+    lowered served image prompts. Remove this entry when an image core exported
+    with the declared storage has served image prompts on SM120. See
+    model-preparation.md "Qwen3.8 27B".
+
+[ ] Qualify Qwen3.8 27B vision projections that carry bias on SM103.
+    `recipes/qwen38/vision.py` binds checkpoint BF16 projections through
+    `UnquantizedProjection`, whose bias keeps them off the SM103 dense GEMM path
+    in `ignition/components/linear.py`; SM103 execution is unqualified.
+
+[ ] Compare published image features and prompt logits of a served Qwen3.8 27B
+    core with the Transformers reference. Neither comparison has run on SM120
+    or SM121. Remove this entry when both comparisons pass on both device
+    classes.
+
+[ ] Measure Qwen3.8 27B image preparation memory and latency on DGX Spark,
+    including four populated 16,384-patch vision graphs and all four feature slots.
+
+[ ] Fix Qwen image resize for an axis below half the merge factor: the reference
+    rounds such an axis to zero before the pixel-budget branches, while
+    `PatchProcessor::geometry` clamps it to the factor first, so
+    tests/frontend/qwen38_images.json case 3200x16 reports 32x3200 instead of the
+    reference 32x3648.

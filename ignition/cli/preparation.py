@@ -42,6 +42,76 @@ def resolve_model(configuration: Configuration, name: str | None) -> ResolvedMod
     return model
 
 
+def image_slot_request(configuration: Configuration, model: ResolvedModel, flag: int | None = None):
+    """The image slot count a plan was asked for and what asked for it, or (None, None).
+
+    ``--image-concurrency`` wins over the configuration file. A recipe that prepares
+    images by default takes a configured count from its model section, then from
+    ``[defaults]``. A recipe that declares zero default image slots takes one from its
+    own model section only, so a ``[defaults]`` key written for other models leaves
+    its text-only preparation in place.
+    """
+    recipe, alias = model.recipe, model.checkpoint.alias
+    setting = configuration.model_setting(alias, "image_concurrency", None)
+    if recipe.default_image_slots == 0:
+        if flag is not None:
+            return flag, "--image-concurrency"
+        if setting.source != f'[models."{alias}"]':
+            return None, None
+        return setting.value, f"image_concurrency in {setting.source}"
+    slots = image_capacity_setting(configuration, model, flag)
+    if slots is None:
+        return None, None
+    return slots, "--image-concurrency" if flag is not None else f"image_concurrency in {setting.source}"
+
+
+def plan_with_rules(configuration: Configuration, model: ResolvedModel, gpus, *, selected=None,
+                    image_concurrency: int | None = None, language_model_only: bool = False,
+                    **settings) -> planning.Plan:
+    """Plan with the image-slot rules shared by export, debug-serve, and bench.
+
+    `image_slot_request` resolves the image slots. For a recipe that declares zero
+    default image slots, zero selects the text-only preparation, and a count that is
+    out of range or meets ``--language-model-only`` is a usage error that names the
+    flag or configuration key that asked for it. Other recipes plan as `planning.plan`
+    validates them. `snapshot_rules` applies the rules that read a cached snapshot.
+    """
+    recipe = model.recipe
+    slots, source = image_slot_request(configuration, model, image_concurrency)
+    if slots is not None and recipe.default_image_slots == 0:
+        if type(slots) is not int or not 0 <= slots <= settings["concurrency"]:
+            raise UsageError(f"{source} for {model.checkpoint.alias} must be 0 through max concurrency")
+        if slots and language_model_only:
+            raise UsageError(f"{source} requires the vision encoder that --language-model-only leaves unloaded")
+    result = planning.plan(recipe, model.checkpoint, gpus, selected=selected,
+        image_concurrency=slots, language_model_only=language_model_only, **settings)
+    return snapshot_rules(configuration, model, result, image_concurrency=image_concurrency)
+
+
+def snapshot_rules(configuration: Configuration, model: ResolvedModel, plan: planning.Plan, *,
+                   image_concurrency: int | None = None) -> planning.Plan:
+    """Apply the image rules that read the checkpoint's files; without a cached snapshot the plan is unchanged.
+
+    A plan with image slots requires the vision tensors of a recipe that declares
+    their prefixes; the usage error names what asked for the slots and the missing
+    weights. Planning applies the rules to a cached snapshot, and
+    a command that downloads the snapshot after planning applies them again, so the
+    outcome does not depend on whether the snapshot was cached.
+    """
+    recipe, hub_cache = model.recipe, configuration.directory("hub_cache")
+    if not plan.image_concurrency or not recipe.vision_prefixes or not model.cached(hub_cache):
+        return plan
+    snapshot = model.snapshot(hub_cache)
+    if recipe.vision_prefixes:
+        from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+
+        if not any(name.startswith(recipe.vision_prefixes) for name in inspect_indexed_checkpoint(snapshot).tensors):
+            _, source = image_slot_request(configuration, model, image_concurrency)
+            raise UsageError(f"{source}: {model.checkpoint.alias}'s checkpoint carries no"
+                             f" {', '.join(recipe.vision_prefixes)} weights")
+    return plan
+
+
 def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gpus: str | None,
            concurrency: Setting, speculation: Speculation | None, prefill_chunk: int | None = None,
            context_parallel: bool = True, context_parallel_size: int | None = None,
@@ -59,13 +129,13 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
     mode = collective_tuning_mode(configuration, model, collective_tuning)
     ladder = resolve_ladder(mode, collective_ladder)
     workers = compiler_workers(configuration, compile_workers)
-    result = planning.plan(
-        model.recipe, model.checkpoint, host.gpus, selected=None if gpus is None else planning.parse_gpus(gpus),
+    result = plan_with_rules(
+        configuration, model, host.gpus, selected=None if gpus is None else planning.parse_gpus(gpus),
         concurrency=concurrency.value, reserve_bytes=configuration.reserve_bytes, speculation=speculation,
         prefill_chunk=prefill_chunk, context_parallel=context_parallel, context_parallel_size=context_parallel_size,
         stream_overlap=stream_overlap, roce_ring=roce_ring, roce_chain=roce_chain,
         mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs, expert_scale_compression=expert_scale_compression,
-        image_concurrency=image_capacity_setting(configuration, model, image_concurrency),
+        image_concurrency=image_concurrency,
         online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope, language_model_only=language_model_only, mla_compute_mode=mla_compute_mode)
     result = replace(result, compile_workers=workers, hub_cache=configuration.directory("hub_cache"),
                      autotune_effort=tuning_effort(configuration, autotune_effort),

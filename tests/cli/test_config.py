@@ -134,6 +134,16 @@ def test_image_concurrency_configuration_is_scoped_to_vision_and_flags_win(tmp_p
         load(tmp_path, '[defaults]\nimage_concurrency = 0\n')
 
 
+def test_zero_image_slots_are_accepted_for_a_model_that_prepares_images_on_request(tmp_path):
+    """Zero selects the text-only preparation of a recipe that declares zero default image slots."""
+    configuration = load(tmp_path, '[models."qwen3.8-27b"]\nimage_concurrency = 0\n')
+    assert configuration.model_setting("qwen3.8-27b", "image_concurrency", None) == Setting(
+        0, '[models."qwen3.8-27b"]')
+    for section in ('models."qwen3.8-flash"', 'models."not-a-model"', "defaults"):
+        with pytest.raises(UsageError, match="image_concurrency in .* must be at least 1"):
+            load(tmp_path, f'[{section}]\nimage_concurrency = 0\n')
+
+
 def test_compiler_worker_flag_overrides_configured_host_budget(tmp_path):
     from ignition.cli.preparation import compiler_workers
 

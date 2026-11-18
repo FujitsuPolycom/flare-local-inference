@@ -17,7 +17,7 @@ from ignition.preparation.collective_ladder import resolve as resolve_collective
 
 from . import display, environment
 
-from .preparation import (Host, collective_tuning_mode, compiler_workers, context_parallel, derive, fetch, image_capacity_setting, resolve_model, speculation,
+from .preparation import (Host, collective_tuning_mode, compiler_workers, context_parallel, derive, fetch, plan_with_rules, resolve_model, snapshot_rules, speculation,
                           stream_overlap, tuning_devices, tuning_effort)
 from .config import Configuration
 
@@ -190,9 +190,9 @@ def _export_hosts(args):
     with phase(progress, "Wait for tensor-parallel hosts") as stage:
         topologies = rendezvous.accept(report=stage.update)
     gpus = tuple(topology_gpu(topology, index) for index, topology in enumerate(topologies))
-    plan = planning.plan(model.recipe, model.checkpoint, gpus, selected=tuple(range(len(gpus))),
+    plan = plan_with_rules(configuration, model, gpus, selected=tuple(range(len(gpus))),
                          concurrency=concurrency.value, reserve_bytes=configuration.reserve_bytes,
-                         image_concurrency=image_capacity_setting(configuration, model, args.image_concurrency),
+                         image_concurrency=args.image_concurrency,
                          speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
                          context_parallel=context_parallel(args, model), context_parallel_size=getattr(args, "dcp_size", None),
                          stream_overlap=stream_overlap(args, model),
@@ -322,6 +322,7 @@ def _prepare(args):
         with phase(progress, "Download checkpoint"):
             fetch(model, hub_cache, progress_bars=False)
             model.verify(hub_cache)
+        plan = snapshot_rules(configuration, model, plan, image_concurrency=args.image_concurrency)
 
     environment.apply(configuration, plan.gpus, plan.recipe.b12x_environment)
     import flare_heliopause
@@ -456,10 +457,10 @@ def debug_serve(args) -> int:
         with phase(progress, "Wait for tensor-parallel hosts") as stage:
             topologies = rendezvous.accept(report=stage.update)
         gpus = tuple(topology_gpu(topology, index) for index, topology in enumerate(topologies))
-    plan = planning.plan(model.recipe, model.checkpoint, gpus,
+    plan = plan_with_rules(configuration, model, gpus,
                          selected=None if args.ranks == 1 and args.gpus is None else tuple(range(len(gpus))),
                          concurrency=concurrency.value, reserve_bytes=configuration.reserve_bytes,
-                         image_concurrency=image_capacity_setting(configuration, model, args.image_concurrency),
+                         image_concurrency=args.image_concurrency,
                          speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
                          context_parallel=context_parallel(args, model), context_parallel_size=getattr(args, "dcp_size", None),
                          stream_overlap=stream_overlap(args, model),

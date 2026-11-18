@@ -179,6 +179,51 @@ def test_complete_draft_rings_snapshot_branch_and_restore(weights, endpoint):
 
 @CUDA
 @torch.no_grad()
+def test_rotary_offset_follows_snapshot_branch_and_restore(weights):
+    """The continuation row of an image preparation carries its rotary offset through state transfers."""
+    from ignition.components.sampling import DeviceRequestState
+    from ignition.components.state_transfer import PreparedStateTransfer, StateCommands
+    from ignition.recipes.qwen38_dense.pool import ContinuationPool
+
+    endpoint = 129
+    pool = ContinuationPool.for_model(weights.config, 4, 36, "cuda", mtp=True, rotary_offset=True)
+    commands = StateCommands.allocate("cuda", capacity=2)
+    tables = torch.arange(36, device="cuda", dtype=torch.int32).view(2, 18)
+    requests = DeviceRequestState.allocate("cuda", vocab_size=128, capacity=2)
+    requests.consumed_tokens.fill_(endpoint)
+    transfer = PreparedStateTransfer(pool, commands, tables, pages=pool.partial_pages(), page_tokens=128,
+        state_rows=torch.tensor([[1] * 8, [2] * 8], device="cuda"), requests=requests)
+    transfer.prepare()
+    pool.backing[1].random_(0, 256)
+    pool.region("consumed_tokens")[1] = endpoint
+    pool.region("rope_delta")[1] = 23
+    for page in pool.pages.values():
+        page.random_(0, 256)
+    commands.request_slots[0] = 0
+    commands.source_slots[0], commands.destination_slots[0] = 1, 3
+    commands.expected_consumed[0], commands.num_ops[0] = endpoint, 1
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        transfer.validate()
+        transfer.apply()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert not commands.errors.count_nonzero()
+    for region in pool.layout.regions:
+        if region.name not in pool.pages:
+            assert torch.equal(pool.region(region.name)[3].view(torch.uint8), pool.region(region.name)[1].view(torch.uint8)), region.name
+    assert pool.region("rope_delta")[3, 0].item() == 23
+    commands.request_slots[0] = 1
+    commands.source_slots[0], commands.destination_slots[0] = 3, 2
+    graph.replay()
+    torch.cuda.synchronize()
+    assert not commands.errors.count_nonzero()
+    assert pool.region("rope_delta")[2, 0].item() == 23
+    graph.reset()
+
+
+@CUDA
+@torch.no_grad()
 def test_checkpoint_non_square_qkv_and_replicated_weights_are_exact(weights):
     from safetensors import safe_open
     with safe_open(DRAFT / "model.safetensors", framework="pt", device="cpu") as source:

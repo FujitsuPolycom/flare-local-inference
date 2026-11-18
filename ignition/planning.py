@@ -198,6 +198,7 @@ class Plan:
     hub_cache: Path | None = None
     tuning_gpus: tuple[Gpu, ...] = ()
     tuning_replica: TuningReplica | None = None
+    # Image request slots. Zero prepares no vision encoder, image graphs, or image storage.
     image_concurrency: int = 0
     # The recipe's eligible BF16 projections load as MXFP8 when the plan asks for it.
     online_mxfp8: bool = False
@@ -229,6 +230,9 @@ class Plan:
                 raise UsageError("benchmark graph preparation requires Qwen3.8-27B or Nemotron Bolt on one GPU, or Kimi K3.1 Pro on sixteen GPUs")
             if selection.speculation_study and self.recipe.name != "qwen38_dense":
                 raise UsageError("speculation studies require Qwen3.8-27B DFlash2")
+            if self.image_concurrency and self.recipe.name == "qwen38_dense":
+                raise UsageError("Qwen3.8-27B benchmark graphs prepare no vision encoder;"
+                                 " request no image slots (--image-concurrency 0)")
             required_widths = (8,) if selection.speculation_study else selection.selected_verification_widths
             if not selection.prefill_chunk and (self.speculation is None
                     or not set(required_widths) <= set(self.speculation.widths)):
@@ -282,7 +286,7 @@ class Plan:
 
     @property
     def max_images(self) -> int:
-        return 0 if self.language_model_only else self.recipe.max_images
+        return self.recipe.max_images if self.image_concurrency and not self.language_model_only else 0
 
     @property
     def speculative_token_capacity(self) -> int:
@@ -293,7 +297,8 @@ class Plan:
 
     @property
     def costs(self):
-        return self.recipe.costs(self.world_size, self.speculation, self.checkpoint)
+        return self.recipe.costs(self.world_size, self.speculation, self.checkpoint).with_image_slots(
+            self.image_concurrency)
 
     @property
     def live_rows(self) -> int:
@@ -488,6 +493,17 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
                                       speculation.token_capacity, speculation.graph_budget)
         except ValueError as error:
             raise UsageError(f"--speculative-graph-budget: {error}") from error
+    # Language-only plans prepare no vision encoder, so no image feature slots. Without
+    # a requested count, a vision recipe prepares its declared default, or four slots
+    # when it declares none, bounded by the request concurrency.
+    if language_model_only:
+        images = 0
+    elif image_concurrency is not None:
+        images = image_concurrency
+    elif not recipe.max_images:
+        images = 0
+    else:
+        images = min(4 if recipe.default_image_slots is None else recipe.default_image_slots, concurrency)
     costs = recipe.costs(len(gpus), speculation, checkpoint)
     if recipe.name == "kimi31" and len(gpus) == 16 and context_parallel_size == 8:
         # The DCP-only reduction shrinks from 14 MiB to 512 KiB at C4/W8. Two
@@ -495,6 +511,8 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         # planner consume only 64 pages of that saving and retain the rest as headroom.
         credit = min(849_346_560, 64 * costs.page_bytes)
         costs = replace(costs, graph_bytes=costs.graph_bytes - credit)
+    # A plan with image slots uses the recipe's image continuation row and vision storage.
+    costs = costs.with_image_slots(images)
     plan = Plan(recipe, checkpoint, gpus, concurrency, recipe.prefill_chunk if prefill_chunk is None else prefill_chunk,
                 speculation, 0, 0, 0, reserve_bytes,
                 recipe.weights_bytes(checkpoint, len(gpus), speculation, expert_scale_compression), costs.graph_bytes,
@@ -503,9 +521,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
                 stream_overlap=stream_overlap and recipe.stream_overlap, mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
                 expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
                 mla_compute_mode=mla_compute_mode,
-                # Language-only plans prepare no vision encoder, so no image feature slots.
-                image_concurrency=0 if language_model_only else (min(4, concurrency) if recipe.max_images else 0)
-                    if image_concurrency is None else image_concurrency, online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope,
+                image_concurrency=images, online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope,
                 language_model_only=language_model_only)
     available = plan.supply_bytes - plan.fixed_bytes
     target = min(CACHE_STATES_PER_REQUEST * concurrency, max(1, available // costs.state_row_bytes))
@@ -585,10 +601,12 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
         raise UsageError(f"--language-model-only: {checkpoint.alias} prepares no separable vision encoder")
     if not 1 <= concurrency <= recipe.max_concurrency:
         raise UsageError(f"--max-concurrency for {checkpoint.alias} must be 1 through {recipe.max_concurrency}")
+    # Zero image slots select the text-only preparation of a recipe that declares it as its default.
+    fewest = 0 if recipe.default_image_slots == 0 else 1
     if image_concurrency is not None and (not recipe.max_images or type(image_concurrency) is not int
-                                         or not 1 <= image_concurrency <= concurrency):
-        raise UsageError("--image-concurrency requires a vision model and must be 1 through max concurrency")
-    if language_model_only and image_concurrency is not None:
+                                         or not fewest <= image_concurrency <= concurrency):
+        raise UsageError(f"--image-concurrency requires a vision model and must be {fewest} through max concurrency")
+    if language_model_only and image_concurrency:
         raise UsageError("--image-concurrency requires the vision encoder that --language-model-only leaves unloaded")
     chunk = recipe.prefill_chunk if prefill_chunk is None else prefill_chunk
     if chunk % 64 or not 64 <= chunk <= recipe.context:

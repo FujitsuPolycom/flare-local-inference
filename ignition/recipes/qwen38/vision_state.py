@@ -25,7 +25,6 @@ VISION_ERROR_BASE = 128
 INJECTION_ERROR_BASE = 256
 
 _JIT_FEATURES = tl.constexpr(FEATURES)
-_JIT_WIDTH = tl.constexpr(WIDTH)
 _JIT_PATCHES = tl.constexpr(PATCHES)
 _JIT_VISION_ERROR_BASE = tl.constexpr(VISION_ERROR_BASE)
 _JIT_INJECTION_ERROR_BASE = tl.constexpr(INJECTION_ERROR_BASE)
@@ -41,12 +40,14 @@ class VisionFeatureState:
     feature_slot: torch.Tensor
 
     @classmethod
-    def allocate(cls, device, *, capacity=4, image_slots=None, feature_slot=None):
+    def allocate(cls, device, *, capacity=4, image_slots=None, feature_slot=None, width=WIDTH):
         from ignition.components.capacity import image_capacity
 
+        if type(width) is not int or width < 1:
+            raise ValueError("vision feature width must be a positive integer")
         slots = image_capacity(capacity, image_slots)
         return cls(
-            torch.empty((slots, FEATURES, WIDTH), dtype=torch.bfloat16, device=device),
+            torch.empty((slots, FEATURES, width), dtype=torch.bfloat16, device=device),
             torch.zeros(capacity, dtype=torch.int64, device=device),
             torch.zeros(capacity, dtype=torch.int32, device=device),
             torch.full((1,), -1, dtype=torch.int32, device=device) if feature_slot is None else feature_slot,
@@ -199,10 +200,10 @@ def _vision_sanitize(
 
 
 @triton.jit
-def _feature_validate(Output, Num, Errors, CAPACITY: tl.constexpr, BLOCK: tl.constexpr):
+def _feature_validate(Output, Num, Errors, CAPACITY: tl.constexpr, WIDTH: tl.constexpr, BLOCK: tl.constexpr):
     index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     count = tl.minimum(tl.maximum(tl.load(Num), 0), CAPACITY) // 4
-    valid = (tl.load(Errors) == 0) & (index < count * _JIT_WIDTH)
+    valid = (tl.load(Errors) == 0) & (index < count * WIDTH)
     value = tl.load(Output + index, valid, other=0.0).to(tl.float32)
     bad = valid & ~(tl.abs(value) < float("inf"))
     if tl.sum(bad.to(tl.int32), 0) > 0:
@@ -218,6 +219,7 @@ def _feature_copy(
     Offset,
     Errors,
     CAPACITY: tl.constexpr,
+    WIDTH: tl.constexpr,
     BLOCK: tl.constexpr,
     SLOTS: tl.constexpr = 4,
 ):
@@ -231,10 +233,10 @@ def _feature_copy(
         (tl.load(Errors) == 0)
         & (slot >= 0)
         & (slot < SLOTS)
-        & (index < count // 4 * _JIT_WIDTH)
+        & (index < count // 4 * WIDTH)
     )
     value = tl.load(Output + index, valid, other=0)
-    tl.store(Arena + (slot * _JIT_FEATURES + offset) * _JIT_WIDTH + index, value, valid)
+    tl.store(Arena + (slot * _JIT_FEATURES + offset) * WIDTH + index, value, valid)
 
 
 @triton.jit
@@ -310,8 +312,9 @@ class PreparedVisionHandoff:
         pixels,
     ):
         device = features.arena.device
-        if device.type != "cuda" or output.ndim != 2 or output.shape[1] != WIDTH:
-            raise ValueError("vision handoff requires CUDA BF16 [features,2560] output")
+        width = features.arena.shape[2]
+        if device.type != "cuda" or output.ndim != 2 or output.shape[1] != width:
+            raise ValueError("vision handoff requires CUDA BF16 [features,feature_width] output")
         capacity = output.shape[0] * 4
         if capacity not in (256, 1024, 4096, PATCHES):
             raise ValueError(
@@ -319,7 +322,7 @@ class PreparedVisionHandoff:
             )
         _require(
             features.arena,
-            (features.arena.shape[0], FEATURES, WIDTH),
+            (features.arena.shape[0], FEATURES, width),
             torch.bfloat16,
             device,
             "feature arena",
@@ -330,7 +333,7 @@ class PreparedVisionHandoff:
         _require(features.generation, (requests.capacity,), torch.int64, device, "feature generation")
         _require(features.count, (requests.capacity,), torch.int32, device, "feature count")
         _require(
-            output, (capacity // 4, WIDTH), torch.bfloat16, device, "vision output"
+            output, (capacity // 4, width), torch.bfloat16, device, "vision output"
         )
         _require(pixels, (capacity, 1536), torch.bfloat16, device, "vision patch staging")
         shapes = (
@@ -415,8 +418,8 @@ class PreparedVisionHandoff:
             ),
             (
                 _feature_validate,
-                (output, i.vision_num_patches, self.errors, capacity, 1024),
-                (triton.cdiv(capacity // 4 * WIDTH, 1024), 1, 1),
+                (output, i.vision_num_patches, self.errors, capacity, width, 1024),
+                (triton.cdiv(capacity // 4 * width, 1024), 1, 1),
             ),
             (
                 _feature_copy,
@@ -428,9 +431,10 @@ class PreparedVisionHandoff:
                     i.vision_feature_offset,
                     self.errors,
                     capacity,
+                    width,
                     1024,
                 ),
-                (triton.cdiv(capacity // 4 * WIDTH, 1024), 1, 1),
+                (triton.cdiv(capacity // 4 * width, 1024), 1, 1),
             ),
             (
                 _vision_finish,
@@ -584,6 +588,7 @@ def _inject(
     FeatureSlot,
     Errors,
     TOKENS: tl.constexpr,
+    WIDTH: tl.constexpr,
     BLOCK: tl.constexpr,
     SLOTS: tl.constexpr = 4,
     FEATURE_SLOTS: tl.constexpr = 4,
@@ -611,13 +616,13 @@ def _inject(
     channel = tile * BLOCK + tl.arange(0, BLOCK)
     value = tl.load(
         Arena
-        + (feature_slot.to(tl.int64) * _JIT_FEATURES + feature.to(tl.int64)) * _JIT_WIDTH
+        + (feature_slot.to(tl.int64) * _JIT_FEATURES + feature.to(tl.int64)) * WIDTH
         + channel,
-        valid & (channel < _JIT_WIDTH),
+        valid & (channel < WIDTH),
         other=0,
     )
     tl.store(
-        Embedding + row * _JIT_WIDTH + channel, value, valid & (channel < _JIT_WIDTH)
+        Embedding + row * WIDTH + channel, value, valid & (channel < WIDTH)
     )
 
 
@@ -646,11 +651,12 @@ class PreparedEmbeddingInjection:
         rows: int = 1,
     ):
         device = features.arena.device
+        width = features.arena.shape[2]
         if (
             rows != 1
             or device.type != "cuda"
             or embedding.ndim != 2
-            or embedding.shape[1] != WIDTH
+            or embedding.shape[1] != width
         ):
             raise ValueError(
                 "vision embedding injection requires one CUDA prefill request"
@@ -658,7 +664,7 @@ class PreparedEmbeddingInjection:
         tokens = embedding.shape[0]
         if tokens <= 0:
             raise ValueError("vision embedding injection requires a positive prefill capacity")
-        _require(embedding, (tokens, WIDTH), torch.bfloat16, device, "embedding")
+        _require(embedding, (tokens, width), torch.bfloat16, device, "embedding")
         _require(
             vision_token_indices, (tokens,), torch.int32, device, "vision token indices"
         )
@@ -708,11 +714,12 @@ class PreparedEmbeddingInjection:
             f.feature_slot,
             self.errors,
             tokens,
+            width,
             512,
             requests.capacity,
             f.arena.shape[0],
         )
-        self._grid = (tokens, triton.cdiv(WIDTH, 512), 1)
+        self._grid = (tokens, triton.cdiv(width, 512), 1)
 
     def prepare(self):
         self._validate = _compile(_injection_validate, self._validate_args, (1, 1, 1))

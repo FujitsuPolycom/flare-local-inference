@@ -2,12 +2,39 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Single-GPU Qwen3.8-27B NVFP4 text preparation without host-mapped storage."""
+"""Single-GPU Qwen3.8-27B NVFP4 text and image preparation without host-mapped storage."""
 
 from types import MappingProxyType
 from pathlib import Path
 
 from ignition.recipes.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults, SamplingRange, Speculation
+
+
+# Image feature slot: 16,384 BF16 vectors at the language-model width 5,120.
+VISION_SLOT_BYTES = 16_384 * 5_120 * 2  # 167,772,160
+VISION_FEATURE_BYTES = 4 * VISION_SLOT_BYTES  # 671,088,640
+# Captured encoder scratch for patch capacities 256, 1,024, 4,096, and 16,384.
+# `VisionScratch` holds 18,640 BF16 elements per patch across its eleven tensors:
+# patches 1,536 + hidden 1,152 + qkv 3,456 + q/k/v 3 * 16 * 72 + attention
+# 1,152 + projected 1,152 + intermediate 4,304 + merger 1,152 + output 1,280.
+VISION_SCRATCH_BYTES = (256 + 1_024 + 4_096 + 16_384) * 18_640 * 2  # 811,212,800
+# Float32 patch upload and its interpolation, position, and counter metadata.
+VISION_INPUT_BYTES = 101_711_900
+# Per captured handoff: `VisionMetadata` (64 bytes per patch plus 12) and the
+# 4-byte error scalar. The sanitized patch staging is the scratch `patches`
+# tensor above, not a second copy. Summed over the four capacities:
+# 1,392,688 + 16.
+VISION_HANDOFF_BYTES = 1_392_704
+# BF16 vision tower weights under `model.visual.*` in the NVFP4 checkpoint.
+VISION_TOWER_BYTES = 921_460_192
+# Graph-private temporaries of the 16,384-patch forward. Its largest live set is
+# the position-embedding path: the [16384, 4, 1152] BF16 gather (150,994,944),
+# the [16384, 4, 1152] FP32 weighted product (301,989,888), and the BF16
+# [16384, 1152] rounded positions (37,748,736). Inductor may reuse part of that
+# set; this reservation keeps the unfused bound.
+VISION_GRAPH_BYTES = 150_994_944 + 301_989_888 + 37_748_736  # 490,733,568
+VISION_BYTES = (VISION_FEATURE_BYTES + VISION_SCRATCH_BYTES + VISION_INPUT_BYTES
+                + VISION_HANDOFF_BYTES + VISION_TOWER_BYTES + VISION_GRAPH_BYTES)
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
@@ -34,6 +61,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         online_mxfp8=plan.online_mxfp8,
         lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
         max_active=plan.concurrency if selection is None else selection.max_batch, context=plan.context,
+        image_concurrency=plan.image_concurrency,
         prefill_chunk_size=plan.prefill_chunk,
         snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, compile_decoder=compile_forwards,
@@ -67,7 +95,14 @@ RECIPE = Recipe(
     speculation=Speculation(draft_tokens=7, token_capacity=128, packed_verification=True, graph_budget=64,
                             method="dflash2"), max_draft_tokens=15, verification_rows=0,
     online_mxfp8=True, draft_head_quantizations=("mxfp8", "nvfp4"),
+    max_images=4, image_bytes=32 << 20, language_model_only=True, default_image_slots=0,
     # Reserve continuation memory for the supported sixteen-token verification capacity.
-    ranks=MappingProxyType({1: RankCosts(193_865_984, 4_194_304, 4 << 30)}),
-    plain_ranks=MappingProxyType({1: RankCosts(158_148_864, 4_194_304, 4 << 30)}),
+    # A plan with image slots stores the three-axis rotary offset in a row 256 bytes larger.
+    ranks=MappingProxyType({1: RankCosts(193_865_984, 4_194_304, 4 << 30,
+        vision_bytes=VISION_BYTES, vision_slot_bytes=VISION_SLOT_BYTES,
+        image_state_row_bytes=193_866_240)}),
+    plain_ranks=MappingProxyType({1: RankCosts(158_148_864, 4_194_304, 4 << 30,
+        vision_bytes=VISION_BYTES, vision_slot_bytes=VISION_SLOT_BYTES,
+        image_state_row_bytes=158_149_120)}),
+    vision_prefixes=("model.visual.",),
 )
