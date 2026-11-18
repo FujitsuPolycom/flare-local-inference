@@ -96,7 +96,7 @@ class PreparedMHC:
 
     def __init__(self, inputs, weights: MHCWeights, scratch: MHCScratch, *,
                  session, name, workspace, rms_eps, hc_eps, sinkhorn_iters, norm_eps,
-                 pre_mix=None, pre_out=None, max_rows_per_call=None):
+                 pre_mix=None, pre_out=None, max_rows_per_call=None, tuning_config=None):
         if max_rows_per_call is not None and (type(max_rows_per_call) is not int
                                               or max_rows_per_call <= 0):
             raise ValueError("mHC row capacity per call must be a positive integer")
@@ -122,6 +122,8 @@ class PreparedMHC:
         declaration_options = dict(self.options)
         self.composed = self.row_calls = None
         if pre_mix is None and tokens > mhc_sm103.MIN_ROWS and sm103.is_sm103(residual.device):
+            if tuning_config is not None:
+                raise ValueError("a b12x mHC configuration requires the b12x preparation path")
             # SM103 prefill composes FlashInfer's mHC kernels; b12x's fused launches stay for decode.
             self.composed = mhc_sm103.ComposedMHC(self.operation, weights, scratch, rms_eps=rms_eps,
                 hc_eps=hc_eps, sinkhorn_iters=sinkhorn_iters, norm_eps=norm_eps)
@@ -136,7 +138,7 @@ class PreparedMHC:
                     rms_eps=rms_eps, hc_eps=hc_eps, sinkhorn_iters=sinkhorn_iters,
                     norm_eps=norm_eps,
                     pre_mix=None if pre_mix is None else pre_mix[start:end],
-                    pre_out=None if pre_out is None else pre_out[start:end])
+                    pre_out=None if pre_out is None else pre_out[start:end], tuning_config=tuning_config)
                 self.row_calls.append((start, end, call))
             return
         self.plan = mhc.plan(mhc.Caps(device=residual.device, max_tokens=tokens, hidden_size=hidden),
@@ -144,7 +146,7 @@ class PreparedMHC:
                 "norm_weight_dtype": str(weights.norm.dtype).removeprefix("torch."),
                 "expanded_residual": self.operation == "pre",
                 "rms_eps": rms_eps, "hc_eps": hc_eps, "sinkhorn_iters": sinkhorn_iters, "norm_eps": norm_eps,
-                "lagged_mix": pre_mix is not None})
+                "lagged_mix": pre_mix is not None}, override=tuning_config)
         parameters = (weights.fn, weights.scale, weights.base)
 
         def call(state, values, buffers, fixture=None):

@@ -24,7 +24,7 @@ from ignition.preparation.tuning import register_finalizer
 
 from .attention import AttentionIndices, AttentionScratch, PreparedAttention, PreparedGlobalKV, Rotary, normalize
 from .decoder_prefill import PreparedDecoderSuffix
-from .engram import EngramScratch, PreparedEngram, PreparedTableRequests
+from .engram import EngramScratch, PreparedEngram, PreparedTableRequests, owner_input_fits
 
 
 # Row-shard eligibility uses 512-row blocks. This constant does not bound mHC calls;
@@ -164,11 +164,41 @@ def attention_shard_ready(scratch, shard, runtime):
                                           scratch.attention.selected.view(torch.bfloat16)))
 
 
+def outgoing_owner_ready(index, schedule, *, mode, scoring, packing, engram_layers, aux_layers, decoder_start,
+                         metadata, scratch, owner, runtime):
+    """Whether a packed full-row FFN can hand owner rows to its next layer."""
+    if (mode != "prefill" or scoring is not None or packing is None or owner is None or runtime is None
+            or index not in engram_layers or index + 1 >= len(schedule) or decoder_start is None
+            or index + 1 >= decoder_start or index in aux_layers or index + 1 in aux_layers
+            or metadata.positions.numel() != 8192 or metadata.starts.numel() != 1
+            or owner.world != 4 or runtime.world_size != owner.world or owner.rows != 2048
+            or runtime.pipe_bytes != 80 << 20 or not 0 <= owner.rank < owner.world
+            or owner.start != owner.rank * owner.rows):
+        return False
+    current, following = schedule[index], schedule[index + 1]
+    if current[0] or current[1] or not following[0] or not following[2]:
+        return False
+    device = scratch.mlp_partial.device
+    fields = ((scratch.mlp_partial, (8192, 5120), torch.bfloat16),
+              (scratch.ffn_hc.residual, (8192, 4, 5120), torch.bfloat16),
+              (scratch.ffn_hc.post, (8192, 4), torch.float32),
+              (scratch.ffn_hc.comb, (8192, 4, 4), torch.float32),
+              (scratch.pre_mix, (8192, 4), torch.float32),
+              (owner.rows_index, (2048,), torch.int64),
+              (owner.mlp_output, (2048, 5120), torch.bfloat16),
+              (owner.residual, (2048, 4, 5120), torch.bfloat16),
+              (owner.pre_mix, (2048, 4), torch.float32))
+    if any(tuple(value.shape) != shape or value.dtype != dtype or value.device != device
+           or not value.is_contiguous() for value, shape, dtype in fields):
+        return False
+    return PreparedReduceScatter.fits(runtime, scratch.mlp_partial, owner.mlp_output)
+
+
 def shard_schedule(config, stop, sharded, aux_layers=()):
     """Per-layer `(shard, defer, reseed)` for a prefill decoder whose shard exists.
 
     The layers `config.shardable_attention_layers` names keep this rank's rows. An Engram layer
-    reads and writes full rows, so it runs full-row, and the layers on either side of it change row
+    keeps attention and FFN work full-row, and the layers on either side of it change row
     dimension: a layer that lands on the far side of such a change runs its own post, so the
     full-row residual its consumer reads is complete, and the first sharded layer after a full-row
     run reseeds the shard from the rows it owns.
@@ -385,9 +415,18 @@ class PreparedLayer:
                  runtime, coordinator, session, name, workspace, carry, defer_post,
                  boundary=None, replay_start=None, window_staging=None, mla_compute_mode="auto",
                  window_metadata=None, examples=None, row_shard=None, attention_shard=False,
-                 selection_move=None, reseed=False):
+                 selection_move=None, reseed=False, engram_input=None, output_rows=None):
         s, text = scratch, pool.config.text
         self.scratch, self.carry, self.row_shard = s, carry, row_shard
+        self.output_row_indices = None if output_rows is None or row_shard is not None else output_rows.rows_index
+        if output_rows is not None and ((row_shard is not None and row_shard is not output_rows)
+                or defer_post or boundary is not None or mode != "prefill"
+                or weights.engram is None or metadata.positions.numel() != 8192):
+            raise ValueError("owner FFN output requires a completed packed post boundary")
+        if weights.engram is not None and row_shard is not None and (
+                engram_input is None or engram_input[0] is not row_shard or engram_input[1] is not None
+                or output_rows is not row_shard or attention_shard or carry or reseed):
+            raise ValueError("owner Engram mHC requires owner input and output with full-row attention")
         self.attention_shard = attention_shard
         # A full-row layer owns the rows since this shard last ran, so the shard is refilled here.
         self.reseed = reseed and row_shard is not None
@@ -396,11 +435,16 @@ class PreparedLayer:
                            if mode == "prefill" and weights.experts.vision_correction is not None else None)
         self.boundary = boundary
         self.engram = None
+        engram_output = None
         if weights.engram is not None:
-            self.engram = PreparedEngram(index, weights.engram, tables, s.residual, s.engram_residual,
+            engram_output = s.engram_residual if row_shard is None else s.engram_residual[:row_shard.rows]
+            owner, output_gather = (None, None) if engram_input is None else engram_input
+            source = s.residual if owner is None else owner.residual
+            self.engram = PreparedEngram(index, weights.engram, tables, source, engram_output,
                 metadata, pool,
                 scratch=s.engram, session=session, name=name + ".engram", workspace=workspace,
-                runtime=runtime, coordinator=coordinator, examples=examples)
+                runtime=runtime, coordinator=coordinator, examples=examples,
+                owner_rows=None if owner is None else owner.rows_index, output_gather=output_gather)
         # A row shard reduces into this rank's rows and normalizes them there; the full-size scratch
         # holds the branch input every consumer reads, which a gather fills before that consumer runs.
         attention_scratch = s.attention_hc if row_shard is None else row_shard.attention_hc
@@ -410,13 +454,27 @@ class PreparedLayer:
         residual = s.residual if row_shard is None else row_shard.residual
         attention_output = s.attention_output if row_shard is None else row_shard.attention_output
         mlp_output = s.mlp_output if row_shard is None else row_shard.mlp_output
-        source = s.engram_residual if self.engram is not None else residual
+        source = engram_output if self.engram is not None else residual
         options = dict(rms_eps=text["rms_norm_eps"], norm_eps=text["rms_norm_eps"], hc_eps=text["hc_eps"],
                        sinkhorn_iters=text["hc_sinkhorn_iters"])
+        attention_options = ffn_options = options
+        if self.engram is not None and row_shard is not None:
+            from b12x.norm.mhc import MhcConfig
+
+            # Match the full-row TF32 projection accumulation at the Engram boundary.
+            # The 2,048-row queries retain their own binding and scratch capacities.
+            common = dict(backend="tf32_tma", projection_num_n_warps=1, projection_k_splits=1,
+                          lagged_prepare=False, partials_per_cta=4)
+            attention_options = dict(options, tuning_config=MhcConfig(
+                projection_tile_m=128, projection_tile_n=32, projection_tile_k=128,
+                projection_num_stages=2, projection_num_m_warps=8, **common))
+            ffn_options = dict(options, tuning_config=MhcConfig(
+                projection_tile_m=192, projection_tile_n=32, projection_tile_k=64,
+                projection_num_stages=3, projection_num_m_warps=12, **common))
         incoming = ((mlp_output, ffn_scratch.residual, ffn_scratch.post, ffn_scratch.comb) if carry else (source,))
         self.attention_hc = None if boundary is not None else PreparedMHC(
             incoming, _mhc_weights(weights, "attn", "attn_norm"), attention_scratch,
-            session=session, name=name + ".attn_hc", workspace=workspace, pre_mix=pre_mix, pre_out=attn_mix, **options)
+            session=session, name=name + ".attn_hc", workspace=workspace, pre_mix=pre_mix, pre_out=attn_mix, **attention_options)
         # Row-sharded attention reads and writes only this rank's rows, computes every head and
         # output group, and therefore needs neither the branch-input gather nor a reduction.
         attention_source = attention_scratch.normalized if attention_shard else s.attention_hc.normalized
@@ -453,7 +511,7 @@ class PreparedLayer:
                 coordinator=coordinator, session=session, name=name + ".attention_reduce")
         self.ffn_hc = PreparedMHC((attention_output, attention_scratch.residual, attention_scratch.post,
             attention_scratch.comb), _mhc_weights(weights, "ffn", "ffn_norm"), ffn_scratch, session=session,
-            name=name + ".ffn_hc", workspace=workspace, pre_mix=attn_mix, pre_out=pre_mix, **options)
+            name=name + ".ffn_hc", workspace=workspace, pre_mix=attn_mix, pre_out=pre_mix, **ffn_options)
         self.ffn_gather = None if row_shard is None else PreparedGatherShards(
             ffn_scratch.normalized, s.ffn_hc.normalized, runtime=runtime, coordinator=coordinator,
             session=session, name=name + ".ffn_gather")
@@ -490,18 +548,25 @@ class PreparedLayer:
                 parallel_plans=(self.router_projection.plan, self.router.plan, self.experts.plan),
                 session=session, workspace=workspace,
                 defer_launch=s.ffn_hc.normalized.shape[0] > 4)
-        if row_shard is None:
+        mlp_destination = mlp_output if output_rows is None else output_rows.mlp_output
+        if row_shard is None and output_rows is None:
             self.mlp_reduce = PreparedAllReduce(s.mlp_partial, s.mlp_output, runtime=runtime,
                 coordinator=coordinator, session=session, name=name + ".mlp_reduce")
         else:
-            self.mlp_reduce = PreparedReduceScatter(s.mlp_partial, mlp_output, runtime=runtime,
+            self.mlp_reduce = PreparedReduceScatter(s.mlp_partial, mlp_destination, runtime=runtime,
                 coordinator=coordinator, session=session, name=name + ".mlp_reduce")
-        self.post = None if defer_post else PreparedMHCPost(mlp_output, ffn_scratch.residual,
-            ffn_scratch.post, ffn_scratch.comb, residual, session=session, name=name + ".post")
+        if output_rows is None or row_shard is not None:
+            self.post = None if defer_post else PreparedMHCPost(mlp_output, ffn_scratch.residual,
+                ffn_scratch.post, ffn_scratch.comb, residual, session=session, name=name + ".post")
+        else:
+            rows = output_rows.rows
+            self.post = PreparedMHCPost(mlp_destination, ffn_scratch.residual[:rows],
+                ffn_scratch.post[:rows], ffn_scratch.comb[:rows], output_rows.residual,
+                session=session, name=name + ".post")
         # A deferred post runs in the next layer's attention mHC over the same rows, so only a layer
         # that runs its own post widens this rank's four-stream residual back to every row.
         self.residual_gather = self.mix_gather = None
-        if row_shard is not None and not defer_post:
+        if row_shard is not None and not defer_post and output_rows is None:
             self.residual_gather = PreparedChunkedGatherShards(row_shard.residual, s.residual, runtime=runtime,
                 session=session, coordinator=coordinator, name=name + ".residual_gather")
             # A BF16 view gathers the FP32 lagged mix through the same prepared surface.
@@ -607,16 +672,22 @@ class PreparedLayer:
         shared = (self.shared(normalized) if self.concurrent_shared is None
                   else self.concurrent_shared.finish(pending, routed))
         output = self.mlp_reduce(routed + shared)
+        if self.output_row_indices is not None:
+            rows = self.output_row_indices
+            residual = residual.index_select(0, rows)
+            post = post.index_select(0, rows)
+            comb = comb.index_select(0, rows)
+            next_mix = next_mix.index_select(0, rows)
         incoming = ((self.post(output, residual, post, comb),) if self.post is not None
                     else (output, residual, post, comb))
-        if self.residual_gather is not None:
-            # Every row's consumer follows, so widen this rank's rows back out: the four-stream
-            # residual and the lagged mix the next layer's mHC reads.
-            residual, = incoming
+        if self.mix_gather is not None:
+            # The next full-row mHC still reads every FP32 pre-mix word.
             full_mix = torch.empty((metadata.token_ids.numel(), 4), dtype=next_mix.dtype,
                                    device=next_mix.device)
             self.mix_gather(next_mix.view(torch.bfloat16), full_mix.view(torch.bfloat16))
-            incoming, next_mix = (self.residual_gather(residual),), full_mix
+            next_mix = full_mix
+        if self.residual_gather is not None:
+            incoming = (self.residual_gather(incoming[0]),)
         observations = {"attention." + key: value for key, value in observations.items()}
         observations.update({"attention_hc.normalized": attention_normalized, "router.ids": route_ids,
                              "output": incoming[0]})
@@ -685,6 +756,7 @@ class PreparedDecoder:
                 page_size=128 + self.output_metadata.max_query_tokens, width=128,
                 replay_start=self.packing.replay_start, ratios=set(ratios[decoder_start:]) - {0})
         self.layers, carry = [], False
+        previous_owner_output = False
         for index, layer in enumerate(weights.layers):
             boundary = replay_start = None
             layer_scratch, layer_metadata = scratch, metadata
@@ -700,6 +772,23 @@ class PreparedDecoder:
                                                       if key not in ("compressor", "index_k", "index_norm")})
             sharded, defer, reseed = schedule[index]
             sharded = self.row_shard if sharded else None
+            layer_attention_shard = self.attention_shard and sharded is not None
+            reseed = reseed and not previous_owner_output
+            output_rows = self.row_shard if layer.engram is not None and outgoing_owner_ready(index, schedule, mode=mode,
+                scoring=scoring, packing=self.packing, engram_layers=weights.config.text["engram_layer_ids"],
+                aux_layers=self.aux_layers, decoder_start=decoder_start,
+                metadata=layer_metadata, scratch=layer_scratch, owner=self.row_shard, runtime=runtime) else None
+            engram_input = None
+            if (self.packing is not None and scoring is None and index > 0 and index < decoder_start
+                    and index not in self.aux_layers and layer.engram is not None and sharded is None and not carry):
+                previous = self.layers[-1]
+                if (previous.post is not None and previous.residual_gather is not None and previous.mix_gather is not None
+                        and owner_input_fits(previous.row_shard, metadata, scratch, tables, runtime)):
+                    engram_input = previous.row_shard, previous.residual_gather
+            if engram_input is not None and output_rows is not None:
+                # The residual and mHC stay owned while attention keeps its full-row selection.
+                sharded = engram_input[0]
+                engram_input = sharded, None
             self.layers.append(PreparedLayer(index, layer, tables, layer_scratch, layer_metadata, pool, self.rotary,
                 shard=weights.shard, mode=mode, runtime=runtime,
                 coordinator=coordinator, session=session, name=f"{name}.layer{index}", workspace=workspace,
@@ -707,8 +796,15 @@ class PreparedDecoder:
                 window_staging=None if self.window_commit is None else self.window_commit.staging[index],
                 mla_compute_mode=mla_compute_mode,
                 window_metadata=(self.window_metadata if layer_metadata is metadata else self.suffix_window_metadata),
-                examples=examples, row_shard=sharded, attention_shard=self.attention_shard and sharded is not None,
-                selection_move=moves[index], reseed=reseed))
+                examples=examples, row_shard=sharded, attention_shard=layer_attention_shard,
+                selection_move=moves[index], reseed=reseed,
+                **({"engram_input": engram_input} if engram_input is not None else {}),
+                **({"output_rows": output_rows} if output_rows is not None else {})))
+            previous_owner_output = output_rows is not None
+            if engram_input is not None:
+                previous.residual_gather = None
+                if sharded is not None:
+                    previous.mix_gather = None
             carry = defer
         self.scoring = None if scoring is None else scoring.prepare(scratch.embedding, weights.head,
             vocabulary=129280, session=session, coordinator=coordinator, name=name + ".prompt",
