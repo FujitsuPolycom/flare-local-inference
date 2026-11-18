@@ -12,6 +12,7 @@ import torch
 
 from ignition.components import paged_batch, token_state
 from ignition.components.paged_batch import BatchInputs, Metadata, PreparedBatch
+from ignition.components.state import StateLayout
 from ignition.components.sampling import DeviceRequestState, ERROR, RUNNING
 from ignition.preparation.triton import PreparedTriton
 
@@ -124,6 +125,57 @@ def _make_batch(mode):
     return PreparedBatch(inputs, requests, metadata, mode=mode,
                          shard=SimpleNamespace(world_size=2),
                          pool=SimpleNamespace(memory_capacity=torch.tensor([5, 16])))
+
+
+def _rotary_pool(declared):
+    """Storage with a ``rotary_offset`` region whose row ``r`` holds the offset ``10 r``."""
+    region = torch.arange(5, dtype=torch.int64).reshape(5, 1) * 10
+    layout = StateLayout.from_specs((("rotary_offset", (1,), torch.int64),),
+        rotary_region="rotary_offset" if declared else None)
+    return SimpleNamespace(layout=layout, region=lambda name: region, memory_capacity=torch.tensor([5, 16]))
+
+
+def test_layout_declaration_selects_the_rotary_batch(cpu_token_kernels):
+    """A layout selects offsets by declaring ``rotary_region``, not by a region's name."""
+    template = _make_batch("decode")
+    inputs = paged_batch.RotaryBatchInputs(**template.inputs.buffers(),
+        prefill_positions=torch.zeros((template.tokens, 3), dtype=torch.int64))
+
+    def batch(pool):
+        return paged_batch.prepare_batch(inputs, template.requests, template.metadata, mode="decode",
+            shard=template.shard, pool=pool)
+
+    for pool in (_rotary_pool(False), SimpleNamespace(memory_capacity=torch.tensor([5, 16]))):
+        plain = batch(pool)
+        assert type(plain) is PreparedBatch
+        validation, present = plain.validate()
+        metadata = plain.begin(validation * plain.shard.world_size, present=present)
+        assert metadata.rotary_positions is None and paged_batch.row_rotary_offsets(metadata) is None
+    assert type(batch(_rotary_pool(True))) is paged_batch.RotaryBatch
+
+
+def test_rotary_batch_reads_offsets_only_through_sanitized_state_rows(cpu_token_kernels):
+    """Rows that are inactive or fail validation read the reserved row zero.
+
+    Row 1 belongs to a running slot whose state row lies outside the pool, which
+    validation reports as error 32; row 2 names a slot with a stale generation. An
+    out-of-range gather index raises on this device.
+    """
+    template = _make_batch("decode")
+    inputs, requests = template.inputs, template.requests
+    inputs.request_state_rows[3, 0] = 1 << 40
+    inputs.request_state_rows[0, 0] = -7
+    requests.generation[0] = 8
+    batch = paged_batch.prepare_batch(inputs, requests, template.metadata, mode="decode",
+        shard=template.shard, pool=_rotary_pool(True))
+    validation, present = batch.validate()
+    metadata = batch.begin(validation * batch.shard.world_size, present=present)
+    assert requests.status.tolist() == [RUNNING, RUNNING, RUNNING, ERROR]
+    assert requests.error_code[3].item() == 32
+    assert metadata.lengths.tolist() == [1, 0, 0, 1] and metadata.state_rows.tolist() == [2, 0, 0, 3]
+    assert metadata.positions.tolist() == [127, 255, -1, -1]
+    assert metadata.rotary_positions[:, 0].tolist() == [147, 285, -1, -1]
+    assert paged_batch.row_rotary_offsets(metadata).tolist() == [20, 0, 0, 30]
 
 
 @pytest.mark.parametrize("mode", ["prefill", "decode"])

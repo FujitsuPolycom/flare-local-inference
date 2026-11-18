@@ -9,10 +9,6 @@ from dataclasses import dataclass
 
 import torch
 from b12x.preparation import PreparationSession
-from transformers.models.qwen4_exp.modeling_qwen4_exp import (
-    Qwen4ExpVisionRotaryEmbedding,
-    apply_rotary_pos_emb_vision,
-)
 
 from ignition.components.linear import QuantizedProjection, UnquantizedProjection
 from ignition.components.varlen_attention import PreparedVarlenAttention
@@ -55,7 +51,7 @@ class VisionScratch:
     output: torch.Tensor
 
     @classmethod
-    def allocate(cls, patches: int, device: torch.device) -> VisionScratch:
+    def allocate(cls, patches: int, device: torch.device, out_hidden_size: int = 2560) -> VisionScratch:
         if patches <= 0 or patches % 4:
             raise ValueError("vision patch capacity must be positive and divisible by four")
         def zeros(*shape):
@@ -64,7 +60,7 @@ class VisionScratch:
         query, key, value = (zeros(patches, 16, 72) for _ in range(3))
         return cls(zeros(patches, 1536), hidden, zeros(patches, 3456), query, key, value,
                    zeros(patches, 1152), projected, zeros(patches, 4304),
-                   zeros(patches // 4, 4608), zeros(patches // 4, 2560))
+                   zeros(patches // 4, 4608), zeros(patches // 4, out_hidden_size))
 
     def rows(self, patches: int) -> VisionScratch:
         if patches <= 0 or patches % 4 or patches > self.patches.shape[0]:
@@ -94,6 +90,33 @@ class VisionWeights:
         return cls(parameters, projections)
 
 
+def _vision_rotation(module):
+    """Return the rotary module type and rotation function of the vision model's checkpoint family.
+
+    The family is read from the model class. `vision_config.model_type` is not a reliable key:
+    the Qwen3.8 Flash-Next checkpoint stores `qwen4_exp` there, the name of its language model.
+    """
+    from transformers.models.qwen3_5 import modeling_qwen3_5
+    from transformers.models.qwen4_exp import modeling_qwen4_exp
+
+    if isinstance(module, modeling_qwen3_5.Qwen3_5VisionModel):
+        return modeling_qwen3_5.Qwen3_5VisionRotaryEmbedding, modeling_qwen3_5.apply_rotary_pos_emb_vision
+    if isinstance(module, modeling_qwen4_exp.Qwen4ExpVisionModel):
+        return modeling_qwen4_exp.Qwen4ExpVisionRotaryEmbedding, modeling_qwen4_exp.apply_rotary_pos_emb_vision
+    raise ValueError(f"unsupported vision model {type(module).__name__}")
+
+
+def _bind_projection(source, weight, output, *, session, name, bias, **options):
+    """Bind a projection in the checkpoint's stored weight representation.
+
+    The direct loader returns a packed b12x weight for a quantized checkpoint
+    projection and a plain BF16 tensor when the checkpoint declares none.
+    """
+    if isinstance(weight, torch.Tensor):
+        return UnquantizedProjection(source, weight, output, session=session, name=name, bias=bias)
+    return QuantizedProjection(source, weight, output, session=session, name=name, bias=bias, **options)
+
+
 class _Linear(torch.nn.Module):
     def __init__(self, projection, bias=None):
         super().__init__()
@@ -109,12 +132,14 @@ class _Linear(torch.nn.Module):
 
 class _Attention(torch.nn.Module):
     def __init__(self, module, scratch, metadata, weights, *, session, name, shared=None,
-                 projection_workspace=None, attention_workspace=None, attention_math_mode="flash"):
+                 projection_workspace=None, attention_workspace=None, attention_math_mode="flash",
+                 rope):
         super().__init__()
         self.scratch = scratch
-        self.qkv = QuantizedProjection(scratch.hidden, weights["qkv"], scratch.qkv,
+        self.rope = rope
+        self.qkv = _bind_projection(scratch.hidden, weights["qkv"], scratch.qkv,
             session=session, name=f"{name}.qkv", bias=module.qkv.bias, workspace=projection_workspace)
-        self.proj = QuantizedProjection(scratch.attention, weights["proj"], scratch.projected,
+        self.proj = _bind_projection(scratch.attention, weights["proj"], scratch.projected,
             session=session, name=f"{name}.proj", bias=module.proj.bias, workspace=projection_workspace)
         self.attention = shared.attention if shared is not None else PreparedVarlenAttention(
             scratch.query, scratch.key, scratch.value, metadata.cu_seqlens,
@@ -123,7 +148,7 @@ class _Attention(torch.nn.Module):
 
     def forward(self, hidden_states, cu_seqlens, position_embeddings=None, **kwargs):
         projected = self.qkv(hidden_states).view(-1, 3, 16, 72)
-        query, key = apply_rotary_pos_emb_vision(projected[:, 0], projected[:, 1], *position_embeddings)
+        query, key = self.rope(projected[:, 0], projected[:, 1], *position_embeddings)
         query = query.contiguous()
         key = key.contiguous()
         value = projected[:, 2].contiguous()
@@ -151,6 +176,10 @@ class PreparedVision:
         config = module.config
         if (config.hidden_size, config.num_heads, config.intermediate_size, config.depth) != (1152, 16, 4304, 27):
             raise ValueError("vision geometry differs from the checkpoint contract")
+        if scratch.output.shape[1] != config.out_hidden_size:
+            raise ValueError(f"vision scratch output width {scratch.output.shape[1]} differs from"
+                             f" the module out_hidden_size {config.out_hidden_size}")
+        rotary, rope = _vision_rotation(module)
         self.module, self.scratch, self.metadata = module, scratch, metadata
         capacity, device = scratch.hidden.shape[0], scratch.hidden.device
         if metadata.interpolation_indices.shape[0] != capacity:
@@ -164,25 +193,25 @@ class PreparedVision:
         self.patch_embed = _Linear(UnquantizedProjection(scratch.patches,
             module.patch_embed.proj.weight.flatten(1), scratch.hidden,
             session=session, name=f"{name}.patch_embed"), module.patch_embed.proj.bias)
-        module.rotary_pos_emb = Qwen4ExpVisionRotaryEmbedding(config).to(device)
+        module.rotary_pos_emb = rotary(config).to(device)
         for i, block in enumerate(module.blocks):
             prefix = f"blocks.{i}"
             block.attn = _Attention(block.attn, scratch, metadata,
                 {key: weights.projections[f"{prefix}.attn.{key}"] for key in ("qkv", "proj")},
                 session=session, name=f"{name}.blocks.{i}.attn",
                 shared=module.blocks[0].attn if i else None, projection_workspace=projection_workspace,
-                attention_workspace=attention_workspace, attention_math_mode=attention_math_mode)
+                attention_workspace=attention_workspace, attention_math_mode=attention_math_mode, rope=rope)
             for key, source, destination in (("linear_fc1", scratch.hidden, scratch.intermediate),
                                               ("linear_fc2", scratch.intermediate, scratch.projected)):
                 original = getattr(block.mlp, key)
-                setattr(block.mlp, key, _Linear(QuantizedProjection(source,
+                setattr(block.mlp, key, _Linear(_bind_projection(source,
                     weights.projections[f"{prefix}.mlp.{key}"], destination, session=session,
                     name=f"{name}.blocks.{i}.mlp.{key}", activation_mode="a16", bias=original.bias,
                     workspace=projection_workspace)))
         for key, source, destination in (("linear_fc1", scratch.hidden.view(capacity // 4, 4608), scratch.merger_intermediate),
                                          ("linear_fc2", scratch.merger_intermediate, scratch.output)):
             original = getattr(module.merger, key)
-            setattr(module.merger, key, _Linear(QuantizedProjection(source,
+            setattr(module.merger, key, _Linear(_bind_projection(source,
                 weights.projections[f"merger.{key}"], destination, session=session,
                 name=f"{name}.merger.{key}", activation_mode="a16", bias=original.bias,
                 workspace=projection_workspace)))

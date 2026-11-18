@@ -213,6 +213,77 @@ def test_image_concurrency_defaults_and_explicit_capacity():
         image_plan(1, model=SOLO)
 
 
+def test_dense_default_plan_prepares_image_slots_and_language_model_only_drops_them():
+    from ignition.recipes.qwen38_dense import contract
+    from ignition.recipes.qwen38_dense.recipe import RECIPE, VISION_BYTES, VISION_SLOT_BYTES
+
+    # Default preparation uses the shared vision-recipe rule: min(4, concurrency) image slots.
+    image = planning.plan(RECIPE, RECIPE.checkpoints[0], (gpu(0, 48),), selected=None,
+                          concurrency=4, reserve_bytes=0, speculation=None)
+    assert (image.image_concurrency, image.max_images, image.language_model_only) == (4, 4, False)
+    assert image.costs.state_row_bytes == 158_149_120
+    assert image.graph_bytes == (4 << 30) + VISION_BYTES + 4 * VISION_SLOT_BYTES
+    assert contract.frontend(vision=True)["image_tokens"] == dict(feature_token=248056, span=None)
+    # Concurrency clamps the default image slot count.
+    narrow = planning.plan(RECIPE, RECIPE.checkpoints[0], (gpu(0, 48),), selected=None,
+                           concurrency=2, reserve_bytes=0, speculation=None)
+    assert narrow.image_concurrency == 2
+    assert image.graph_bytes - narrow.graph_bytes == 2 * VISION_SLOT_BYTES
+    # --language-model-only prepares text graphs only with the text-only continuation row.
+    text = planning.plan(RECIPE, RECIPE.checkpoints[0], (gpu(0, 30),), selected=None,
+                         concurrency=4, reserve_bytes=0, speculation=None, language_model_only=True)
+    assert (text.image_concurrency, text.max_images, text.language_model_only) == (0, 0, True)
+    assert text.costs.state_row_bytes == 158_148_864
+    assert text.weights_bytes == 20_458_440_840
+    assert text.graph_bytes == 4 << 30
+    assert text.fits
+    assert contract.frontend(vision=False)["image_tokens"] is None
+    drafting = planning.plan(RECIPE, RECIPE.checkpoints[0], (gpu(0, 36),), selected=None,
+                             concurrency=4, reserve_bytes=0, speculation=RECIPE.speculation,
+                             language_model_only=True)
+    assert drafting.image_concurrency == 0 and drafting.costs.state_row_bytes == 193_865_984
+    assert drafting.graph_bytes == 4 << 30
+
+
+def test_dense_derive_uses_standard_image_settings_and_language_model_only_overrides_config(tmp_path):
+    from ignition.cli import preparation
+    from ignition.cli.config import Configuration, Setting
+    from ignition.recipes.qwen38_dense.recipe import RECIPE
+
+    model = ResolvedModel(RECIPE, RECIPE.checkpoints[0])
+    host = preparation.Host((gpu(0, 95),), None)
+
+    def planned(text="", **options):
+        path = tmp_path / "config.toml"
+        path.write_text(text)
+        configuration = Configuration.load(path)
+        return preparation.derive(configuration, model, host, gpus="0",
+            concurrency=Setting(8, "test"), speculation=None, **options)
+
+    assert planned().image_concurrency == 4
+    assert planned("[defaults]\nimage_concurrency = 2\n").image_concurrency == 2
+    assert planned('[models."qwen3.8-27b"]\nimage_concurrency = 6\n').image_concurrency == 6
+    assert planned("[defaults]\nimage_concurrency = 2\n", image_concurrency=3).image_concurrency == 3
+    # --language-model-only ignores configured image_concurrency while rejecting an explicit flag.
+    for text in ("", "[defaults]\nimage_concurrency = 2\n", '[models."qwen3.8-27b"]\nimage_concurrency = 6\n'):
+        plan = planned(text, language_model_only=True)
+        assert (plan.language_model_only, plan.image_concurrency, plan.max_images) == (True, 0, 0)
+    with pytest.raises(UsageError, match="--image-concurrency requires the vision encoder"):
+        planned("", language_model_only=True, image_concurrency=2)
+
+
+def test_flash_recipe_keeps_the_shared_image_default():
+    from ignition.recipes.qwen38.recipe import RECIPE
+
+    pair = (gpu(0, 95), gpu(1, 95))
+    def planned(concurrency):
+        return planning.plan(RECIPE, RECIPE.checkpoints[0], pair, selected=(0, 1),
+                             concurrency=concurrency, reserve_bytes=0, speculation=None)
+    assert planned(4).image_concurrency == 4
+    assert planned(2).image_concurrency == 2
+    assert planned(4).max_images == 4
+
+
 def test_expert_scale_compression_changes_weight_budget_and_preserves_native_default():
     import pickle
 

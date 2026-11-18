@@ -16,6 +16,75 @@ def settings(*flags):
     return Settings.from_args(_parser().parse_args(["bench", *flags]))
 
 
+def test_bench_plans_qwen_dense_text_only_and_rejects_image_concurrency(monkeypatch, tmp_path):
+    """Benchmarking Qwen3.8 27B plans text graphs only and rejects --image-concurrency."""
+    from ignition import planning
+    from ignition.cli import bench
+    from ignition.cli.preparation import Host
+    from ignition.recipes import ResolvedModel
+    from ignition.recipes.qwen38_dense.recipe import RECIPE
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    gpus = (planning.Gpu(0, "NVIDIA RTX PRO 6000 Blackwell", "GPU-0000", 96 << 30, 90 << 30, (12, 0)),)
+    monkeypatch.setattr(bench.Host, "discover", classmethod(lambda cls: Host(gpus, None)))
+    monkeypatch.setattr(bench, "resolve_model",
+        lambda configuration, name: ResolvedModel(RECIPE, RECIPE.checkpoints[0]))
+
+    class Planned(Exception):
+        pass
+
+    def fetch(model, hub_cache, progress_bars):
+        raise Planned
+
+    monkeypatch.setattr(bench, "fetch", fetch)
+    config = tmp_path / "config.toml"
+
+    def run(text, *flags):
+        config.write_text(text)
+        return bench.run(_parser().parse_args(["bench", "qwen3.8-27b", "--config", str(config), *flags]))
+
+    # Planning succeeds as text-only even when config.toml configures image_concurrency.
+    for text in ("", "[defaults]\nimage_concurrency = 4\n", '[models."qwen3.8-27b"]\nimage_concurrency = 2\n'):
+        with pytest.raises(Planned):
+            run(text)
+    with pytest.raises(UsageError, match="--image-concurrency does not apply"):
+        run("", "--image-concurrency", "2")
+
+
+def test_bench_leaves_non_qwen_dense_image_options_untouched(monkeypatch, tmp_path):
+    """Scoping language_model_only and --image-concurrency rejection to qwen38_dense leaves kimi31 alone."""
+    from ignition import planning
+    from ignition.cli import bench
+    from ignition.cli.preparation import Host
+    from ignition.recipes import resolve
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    model = resolve("kimi-k3.1-pro")
+    gpus = tuple(planning.Gpu(index, "NVIDIA B200", f"GPU-{index}", 192 << 30, 188 << 30, (10, 0))
+                 for index in range(16))
+    monkeypatch.setattr(bench.Host, "discover", classmethod(lambda cls: Host(gpus, None)))
+    monkeypatch.setattr(bench, "resolve_model", lambda configuration, name: model)
+
+    seen = {}
+
+    class StopAfterDerive(Exception):
+        pass
+
+    def fake_derive(*args, **kwargs):
+        seen.update(kwargs)
+        raise StopAfterDerive
+
+    monkeypatch.setattr(bench, "derive", fake_derive)
+    config = tmp_path / "config.toml"
+    config.write_text("")
+    with pytest.raises(StopAfterDerive):
+        bench.run(_parser().parse_args(["bench", "kimi-k3.1-pro", "--config", str(config),
+            "--gpus", "0-15", "--image-concurrency", "2"]))
+    assert seen["language_model_only"] is False
+    assert seen["image_concurrency"] == 2
+
+
+
 def test_default_matrix_and_measurement_counts():
     value = settings()
     assert value.batches == (1, 2, 4)

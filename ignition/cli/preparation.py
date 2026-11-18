@@ -65,7 +65,8 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
         prefill_chunk=prefill_chunk, context_parallel=context_parallel, context_parallel_size=context_parallel_size,
         stream_overlap=stream_overlap, roce_ring=roce_ring, roce_chain=roce_chain,
         mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs, expert_scale_compression=expert_scale_compression,
-        image_concurrency=image_capacity_setting(configuration, model, image_concurrency),
+        image_concurrency=image_capacity_setting(configuration, model, image_concurrency,
+                                                 language_model_only=language_model_only),
         online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope, language_model_only=language_model_only, mla_compute_mode=mla_compute_mode)
     result = replace(result, compile_workers=workers, hub_cache=configuration.directory("hub_cache"),
                      autotune_effort=tuning_effort(configuration, autotune_effort),
@@ -76,8 +77,8 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
     return tuning_devices(result, host, tuning_gpus)
 
 
-def image_capacity_setting(configuration, model, flag=None):
-    if not model.recipe.max_images and flag is None:
+def image_capacity_setting(configuration, model, flag=None, *, language_model_only=False):
+    if (not model.recipe.max_images or language_model_only) and flag is None:
         return None
     return configuration.model_setting(model.checkpoint.alias, "image_concurrency", None, flag).value
 

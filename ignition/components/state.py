@@ -5,7 +5,7 @@
 """Aligned slot storage for immutable continuation states and live model state."""
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import triton
@@ -28,9 +28,12 @@ class StateRegion:
 class StateLayout:
     regions: tuple[StateRegion, ...]
     row_bytes: int
+    # Name of the region holding each row's rotary offset for batch and draft
+    # rounds; None rotates at token indices.
+    rotary_region: str | None = field(default=None, kw_only=True)
 
     @classmethod
-    def from_specs(cls, specifications):
+    def from_specs(cls, specifications, *, rotary_region=None):
         regions, names, offset = [], set(), 0
         for name, shape, dtype in specifications:
             if not isinstance(name, str) or not name or name in names:
@@ -47,7 +50,9 @@ class StateLayout:
             offset += region.nbytes
         if not regions:
             raise ValueError("state storage requires at least one region")
-        return cls(tuple(regions), (offset + 255) // 256 * 256)
+        if rotary_region is not None and rotary_region not in names:
+            raise ValueError("declared rotary region is not in the layout")
+        return cls(tuple(regions), (offset + 255) // 256 * 256, rotary_region=rotary_region)
 
     def region(self, name):
         for region in self.regions:

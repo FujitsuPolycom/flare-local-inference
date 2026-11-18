@@ -356,7 +356,8 @@ For concurrency 32 with seven draft tokens per request, use
 
 ## Qwen3.8 27B
 
-`qwen3.8-27b` prepares `nvidia/Qwen3.8-27B-NVFP4` for text generation on one GPU.
+`qwen3.8-27b` prepares `nvidia/Qwen3.8-27B-NVFP4` for text generation and Qwen
+image requests on one GPU.
 It uses the canonical Qwen3.5 dense decoder with tensor-scaled FP8 attention
 projections and NVFP4 MLP and vocabulary weights. FP8 KV pages and Gated DeltaNet
 continuations reside in device memory. The pinned BF16
@@ -369,8 +370,59 @@ to seven draft tokens with adaptive packed verification capped at 128 physical
 target rows and a 64-graph budget. Accepted GDN corrections commit into one
 recurrent row per request. Five 2,048-token FP8 draft KV rings per continuation
 track target consumption without lag and survive prefix snapshot/restore.
-The recipe has no host-mapped tables or vision graphs. Prepare on the same GPU
-architecture as the serving device:
+The recipe has no host-mapped tables.
+
+Image preparation loads the snapshot's `model.visual.*` BF16 vision tower and
+captures Qwen image graphs for 256, 1,024, 4,096, and 16,384 patches. Each
+captured vision graph validates and sanitizes its patch window, encodes it, and
+publishes image features into the shared `VisionState` feature arena through
+`PreparedFeaturePublication`. Prefill replaces the embeddings at image-token
+positions (token 248056) with the published rows. Each feature slot holds
+16,384 BF16 vectors of width 5,120 (167,772,160 bytes, or 160 MiB).
+`--image-concurrency` defaults to the smaller of four and `--max-concurrency`,
+and can also be set via `image_concurrency` in `[defaults]` or
+`[models."qwen3.8-27b"]`. Fixed persistent vision storage declares
+1,023,172,092 bytes (the 921,460,192-byte BF16 vision tower plus 101,711,900
+bytes of float32 patch upload and handoff metadata), and each feature slot adds
+167,772,160 bytes (1,694,260,732 bytes declared for four slots). Vision scratch
+is released before graph capture; on DGX Spark GB10 (SM121) at concurrency 4,
+a four-slot DFlash2 image export retains 25.15 GiB (27,000,832,000 bytes, 103
+graphs) of fixed device storage versus 23.56 GiB (25,302,138,880 bytes, 99
+graphs) for `--language-model-only` (+1,620.00 MiB).
+
+`--language-model-only` omits the vision tower, image graphs, and vision
+storage, producing the text-only catalog: no image frontend or three-axis prompt
+positions are declared, the continuation row is 158,148,864 bytes (193,865,984
+with DFlash2), and the tuning identity names `qwen38-dense.graph-inputs.v1`. An
+image-enabled preparation stores a 256-byte larger row (158,149,120 bytes, or
+193,866,240 with DFlash2) for the per-request rotary offset and names
+`qwen38-dense.graph-inputs.v2` with the slot count and patch capacities. Because
+default `qwen3.8-27b` and `qwen3.8-27b-qad` plans reserve image storage (for
+four image slots on one 32 GiB SM120 GPU at four requests, fixed storage rises
+from 27.64 GiB to 29.22 GiB), the planner refuses the default four-request
+DFlash2 image plan on a 32 GiB RTX 5090; pass `--language-model-only` to retain
+the 27.64 GiB text-only footprint, or lower `--max-concurrency` / `--no-mtp`.
+Combining `--language-model-only` with `--image-concurrency`, requesting image
+preparation against a snapshot without `model.visual.*` weights, or requesting
+image slots in `qwen3.8-27b` `ignition bench` is a usage error.
+
+The decoder reads three-axis prompt positions from the frontend contract and
+assigns the checkpoint's 11/11/10 interleaved sections to its 32 rotary
+frequency pairs. A text-only preparation declares no prompt positions and rotates
+every token at its own index. When a preparation declares three-axis positions,
+each continuation row stores the offset between a request's rotary position and
+its token index; decode, the DFlash2 draft, and snapshot/restore reuse that
+offset, while KV page addressing keeps the token index.
+
+Image export and serving with declared storage are qualified for `qwen3.8-27b`
+on DGX Spark GB10 (SM121), including single-image, multi-image, and
+restored-prefix image requests with DFlash2 enabled and disabled, and published
+feature and prompt/decode logit comparison against the BF16-dequantized
+Transformers reference. Image export for `qwen3.8-27b-qad`, image export with
+declared storage on SM120, and biased BF16 vision projections on SM103 are not
+yet qualified (see `docs/TODO.txt`).
+
+Prepare on the same GPU architecture as the serving device:
 
 ```sh
 .venv/bin/ignition export qwen3.8-27b --gpus 0
@@ -397,16 +449,18 @@ Width-one rounds retain draft context so adaptive verification can resume wider
 rounds. The proposal block, GDN correction records, and convolution rollback
 storage derive from the configured maximum verification width. Packed target
 capacity remains independent of the logical request-by-width sampling capacity.
-Planning reserves 193,865,984 continuation bytes per row, the supported
+Planning reserves 193,866,240 continuation bytes per row for image-enabled
+preparations (193,865,984 with `--language-model-only`), the supported
 sixteen-position maximum; narrower preparations allocate their exact smaller
 continuation layout.
 
-For eight concurrent requests with fifteen drafts and a 64-token packed target
-budget:
+For eight concurrent text-only requests on `qwen3.8-27b-qad` with fifteen drafts
+and a 64-token packed target budget (omit `--language-model-only` only when
+testing unqualified QAD image preparation):
 
 ```sh
-.venv/bin/ignition export qwen3.8-27b-qad --gpus 0 --max-concurrency 8 \
-  --prefill-chunk-size 4096 --mtp-draft-tokens 15 \
+.venv/bin/ignition export qwen3.8-27b-qad --gpus 0 --language-model-only \
+  --max-concurrency 8 --prefill-chunk-size 4096 --mtp-draft-tokens 15 \
   --speculative-token-capacity 64 --speculative-graph-budget 64 \
   --online-mxfp8 --draft-head-quantization mxfp8
 ```
@@ -517,7 +571,7 @@ tokens may exceed the buffer's capacity; each image must fit one window and a
 captured patch capacity. HTTP body and total context limits also apply.
 PNG, JPEG, static WebP, and non-animated GIF data URLs are accepted.
 
-For Qwen, each feature slot holds 16,384 BF16 vectors of width 2,560: 80 MiB per
+For Qwen3.8 Flash, each feature slot holds 16,384 BF16 vectors of width 2,560: 80 MiB per
 rank. Four image slots therefore reserve 320 MiB even with 32 active request slots.
 
 N-gram tables use indirect delivery exclusively: every graph consumes compact

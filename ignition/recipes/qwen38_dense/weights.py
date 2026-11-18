@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Canonical dense decoder parameters and checkpoint-calibrated projections."""
+"""Canonical dense decoder and vision parameters with checkpoint-calibrated projections."""
 
 from dataclasses import dataclass, replace
 
@@ -45,13 +45,14 @@ class ModelWeights:
     shard: TensorParallelShard = TensorParallelShard(0, 1)
     draft: object = None
     draft_head: object = None
+    vision: object = None
 
     @classmethod
     def load(cls, manifest, device, *, progress=None, mtp=False, draft_snapshot=None,
-             online_mxfp8=False, draft_head_quantization=None):
+             online_mxfp8=False, draft_head_quantization=None, vision=False):
         from transformers import Qwen3_5TextConfig, Qwen3_5TextModel
 
-        config = ModelConfig.load(manifest.snapshot)
+        config = ModelConfig.load(manifest.snapshot, vision=vision)
         if draft_head_quantization is not None and "lm_head" in config.quantization:
             raise ValueError("draft head conversion requires BF16 checkpoint vocabulary weights")
         if mtp:
@@ -176,6 +177,19 @@ class ModelWeights:
                                 [module.out_features for module in modules]), strict=True):
                             module.weight = torch.nn.Parameter(tensor, requires_grad=False)
                 projections[name] = combined
+        vision_weights = None
+        if vision:
+            if not any(name.startswith("model.visual.") for name in manifest.tensors):
+                raise ValueError("image slots requested but the checkpoint has no model.visual.* weights")
+            from transformers import Qwen3_5VisionConfig, Qwen3_5VisionModel
+            from ignition.recipes.qwen38.vision import VisionWeights
+
+            with torch.device("meta"):
+                module = Qwen3_5VisionModel(Qwen3_5VisionConfig.from_dict(config.vision))
+            module.eval().requires_grad_(False)
+            with DirectWeightLoader(manifest, device, prefixes=("model.visual.",),
+                                    progress=progress) as loader:
+                vision_weights = VisionWeights.load(module, loader)
         draft = None
         draft_head = None
         if mtp:
@@ -190,4 +204,4 @@ class ModelWeights:
                 converters = {"mxfp8": mxfp8_draft_head, "nvfp4": nvfp4_draft_head}
                 draft_head = converters[draft_head_quantization](head)
         return cls(config, tree, projections, head, allocated_tensor_bytes(device) - before,
-                   draft=draft, draft_head=draft_head)
+                   draft=draft, draft_head=draft_head, vision=vision_weights)

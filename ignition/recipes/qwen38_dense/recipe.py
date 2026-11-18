@@ -2,12 +2,23 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Single-GPU Qwen3.8-27B NVFP4 text preparation without host-mapped storage."""
+"""Single-GPU Qwen3.8-27B NVFP4 text and image preparation without host-mapped storage."""
 
 from types import MappingProxyType
 from pathlib import Path
 
 from ignition.recipes.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults, SamplingRange, Speculation
+
+
+# Image feature slot: 16,384 BF16 vectors at the language-model width 5,120.
+VISION_SLOT_BYTES = 16_384 * 5_120 * 2  # 167,772,160
+# Float32 patch upload and its interpolation, position, and counter metadata.
+VISION_INPUT_BYTES = 101_711_900
+# BF16 vision tower weights under `model.visual.*` in the NVFP4 checkpoint.
+VISION_TOWER_BYTES = 921_460_192
+# Fixed persistent vision storage (weights and upload buffers); per-slot feature
+# arenas scale with `VISION_SLOT_BYTES` via `RankCosts.with_image_slots`.
+VISION_BYTES = VISION_TOWER_BYTES + VISION_INPUT_BYTES
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
@@ -34,6 +45,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         online_mxfp8=plan.online_mxfp8,
         lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
         max_active=plan.concurrency if selection is None else selection.max_batch, context=plan.recipe.context,
+        image_concurrency=0 if selection is not None else plan.image_concurrency,
         prefill_chunk_size=plan.prefill_chunk,
         snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, compile_decoder=compile_forwards,
@@ -68,7 +80,13 @@ RECIPE = Recipe(
                             method="dflash2"), max_draft_tokens=15, verification_rows=0,
     online_mxfp8=True, draft_head_quantizations=("mxfp8", "nvfp4"),
     benchmark_world_sizes=(1,), speculation_study=True,
+    max_images=4, image_bytes=32 << 20, language_model_only=True,
     # Reserve continuation memory for the supported sixteen-token verification capacity.
-    ranks=MappingProxyType({1: RankCosts(193_865_984, 4_194_304, 4 << 30)}),
-    plain_ranks=MappingProxyType({1: RankCosts(158_148_864, 4_194_304, 4 << 30)}),
+    # A plan with image slots stores the three-axis rotary offset in a row 256 bytes larger.
+    ranks=MappingProxyType({1: RankCosts(193_865_984, 4_194_304, 4 << 30,
+        vision_bytes=VISION_BYTES, vision_slot_bytes=VISION_SLOT_BYTES,
+        image_state_row_bytes=193_866_240)}),
+    plain_ranks=MappingProxyType({1: RankCosts(158_148_864, 4_194_304, 4 << 30,
+        vision_bytes=VISION_BYTES, vision_slot_bytes=VISION_SLOT_BYTES,
+        image_state_row_bytes=158_149_120)}),
 )

@@ -53,6 +53,63 @@ def checkpoint(tmp_path, monkeypatch):
     return manifest, sources, copies
 
 
+def test_text_only_load_ignores_an_unsupported_vision_configuration(tmp_path):
+    from transformers import Qwen3_5TextConfig
+    from ignition.recipes.qwen38_dense.config import ModelConfig
+
+    text = Qwen3_5TextConfig(hidden_size=128, intermediate_size=256, num_hidden_layers=1,
+        layer_types=["linear_attention"], num_attention_heads=1, num_key_value_heads=1,
+        linear_num_key_heads=16, linear_num_value_heads=48, vocab_size=128, head_dim=256)
+    raw = dict(architectures=["Qwen3_5ForConditionalGeneration"], text_config=text.to_dict(),
+        quantization_config=dict(quant_method="modelopt", quant_algo="MIXED_PRECISION",
+                                 quantized_layers={}),
+        vision_config=dict(model_type="some_other_vision"))
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    # A text-only preparation reads neither vision_config nor the position sections; an
+    # image preparation requires the qwen3_5_vision family and interleaved sections that
+    # cover every frequency pair.
+    assert ModelConfig.load(tmp_path).vision is None
+    with pytest.raises(ValueError, match="qwen3_5_vision"):
+        ModelConfig.load(tmp_path, vision=True)
+    raw["text_config"]["rope_parameters"] = {**raw["text_config"]["rope_parameters"],
+                                            "mrope_interleaved": False}
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    assert ModelConfig.load(tmp_path).vision is None
+    with pytest.raises(ValueError, match="interleaved"):
+        ModelConfig.load(tmp_path, vision=True)
+    raw["text_config"]["rope_parameters"] = {**raw["text_config"]["rope_parameters"],
+        "mrope_interleaved": True, "mrope_section": [1, 1, 1]}
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    assert ModelConfig.load(tmp_path).vision is None
+    with pytest.raises(ValueError, match="rotary sections"):
+        ModelConfig.load(tmp_path, vision=True)
+
+
+def test_image_slots_require_vision_config_and_weights(checkpoint):
+    manifest, _, _ = checkpoint
+    with pytest.raises(ValueError, match="qwen3_5_vision"):
+        weights.ModelWeights.load(manifest, "cpu", vision=True)
+    path = manifest.snapshot / "config.json"
+    raw = json.loads(path.read_text())
+    raw["vision_config"] = dict(
+        model_type="qwen3_5_vision",
+        hidden_size=1152,
+        num_heads=16,
+        intermediate_size=4304,
+        depth=27,
+        out_hidden_size=128,
+        num_position_embeddings=2304,
+    )
+    raw["text_config"]["rope_parameters"] = {
+        **raw["text_config"]["rope_parameters"],
+        "mrope_interleaved": True,
+        "mrope_section": [11, 11, 10],
+    }
+    path.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match=r"model\.visual\.\* weights"):
+        weights.ModelWeights.load(manifest, "cpu", vision=True)
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_grouped_ba_loads_each_source_once_and_shares_canonical_views(checkpoint, dtype):
     manifest, sources, copies = checkpoint

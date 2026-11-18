@@ -3,6 +3,7 @@
 
 """DFlash2 proposal scratch for attention widths distinct from model hidden widths."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 import copy
 
@@ -94,3 +95,68 @@ def test_checkpoint_geometry_drives_shared_context_storage(model, world):
     with pytest.raises(ValueError, match="does not match the target"):
         DFlash2Config.from_dict(text, target_hidden=hidden, target_vocabulary=248320,
             target_layers=layers + 1, expected=profile)
+
+
+KEY, VALUE, WINDOW = 8, 4, 2048
+
+
+def _context(compact):
+    """A draft context whose projections are identities and whose writer records its inputs."""
+    from ignition.components.dflash2 import PreparedContext
+
+    written = []
+    context = object.__new__(PreparedContext)
+    context.compact, context.window = compact, WINDOW
+    context.weights = SimpleNamespace(shard=None, config=SimpleNamespace(draft=SimpleNamespace(
+        attention=SimpleNamespace(local=lambda shard: (1, 1), key_dim=KEY, value_dim=VALUE))))
+    context.project = context.gather = context.norm = context.project_kv = lambda value: value
+    context.inverse = 1.0 / (10000 ** (torch.arange(0, KEY, 2, dtype=torch.float32) / KEY))
+    context.layers = [(lambda value: value, lambda key, value, slots: written.append((key, value, slots)))]
+    return context, written
+
+
+def _chunk_metadata(chunk, three_axis):
+    from ignition.components.paged_batch import Metadata
+
+    metadata = Metadata.allocate(chunk, 1, 1, "cpu")
+    metadata.set(torch.zeros(1, dtype=torch.int64), torch.full((1,), chunk, dtype=torch.int32),
+        torch.ones(1, dtype=torch.int64), torch.zeros((1, 1), dtype=torch.int32),
+        torch.arange(chunk, dtype=torch.int64).reshape(1, chunk), torch.ones(1, dtype=torch.int32))
+    if three_axis:
+        positions = metadata.positions
+        return replace(metadata, rotary_positions=torch.stack(
+            (positions + 7, positions + 100, positions + 200), dim=1))
+    return metadata
+
+
+@pytest.mark.parametrize("chunk", [1024, 2560, 4096])
+@pytest.mark.parametrize("metadata_type", ["paged", "plain", "three_axis"])
+def test_context_rotates_and_places_retained_tokens(chunk, metadata_type):
+    """Non-compact chunks write every token; compact chunks keep the trailing window.
+
+    Each written row rotates at its own position: the token index for plain or
+    paged metadata (even when a recipe-specific ``rope_positions`` attribute is
+    present) and the temporal column when ``rotary_positions`` is supplied.
+    """
+    from ignition.components.dflash2 import _rotary
+
+    compact = chunk > WINDOW
+    rows = WINDOW if compact else chunk
+    three_axis = metadata_type == "three_axis"
+    metadata = _chunk_metadata(chunk, three_axis)
+    if metadata_type == "plain":
+        metadata = SimpleNamespace(positions=metadata.positions, starts=metadata.starts,
+            requests=metadata.requests, state_rows=metadata.state_rows,
+            query_start_loc=metadata.query_start_loc, rope_positions="recipe-specific")
+    counts = torch.tensor([chunk], dtype=torch.int32)
+    auxiliary = torch.randn((rows, KEY + VALUE), generator=torch.Generator().manual_seed(2)).bfloat16()
+    context, written = _context(compact)
+    context(auxiliary, counts, metadata)
+    (key, value, slots), = written
+    retained = torch.arange(chunk - rows, chunk)
+    assert slots.tolist() == (WINDOW + retained.remainder(WINDOW)).tolist()
+    source = auxiliary[:, :KEY].view(rows, 1, KEY)
+    assert torch.equal(key, _rotary(source, retained + 7 if three_axis else retained, context.inverse))
+    if compact:
+        assert not torch.equal(key, _rotary(source, torch.arange(rows), context.inverse))
+    assert torch.equal(value, auxiliary[:, KEY:].view(rows, 1, VALUE))

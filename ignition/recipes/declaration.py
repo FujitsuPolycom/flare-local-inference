@@ -172,6 +172,21 @@ class RankCosts:
     graph_bytes: int
     # Global positions per page when ranks share each page's context; the recipe's page size otherwise.
     page_tokens: int | None = None
+    # Additional costs of a plan with image slots, for a recipe whose language-only
+    # plans prepare no vision encoder. `vision_bytes` holds the fixed image tower
+    # and upload storage, `vision_slot_bytes` each feature slot, and
+    # `image_state_row_bytes` the continuation row that replaces `state_row_bytes`;
+    # None keeps the same row.
+    vision_bytes: int = 0
+    vision_slot_bytes: int = 0
+    image_state_row_bytes: int | None = None
+
+    def with_image_slots(self, slots: int) -> "RankCosts":
+        """Costs of a plan with `slots` image slots: the image row, and the vision storage as graph bytes."""
+        if not slots or (self.image_state_row_bytes is None and not self.vision_bytes and not self.vision_slot_bytes):
+            return self
+        return replace(self, state_row_bytes=self.image_state_row_bytes or self.state_row_bytes,
+            graph_bytes=self.graph_bytes + self.vision_bytes + slots * self.vision_slot_bytes)
 
 
 @dataclass(frozen=True)

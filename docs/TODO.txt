@@ -668,3 +668,31 @@
     tensor. The TP4 overlap decode case also fails runs_concurrently, and its cause
     is not found. Close when the test passes in every case or each remaining
     failure has a stated cause.
+
+[ ] Qualify Qwen3.8 27B image input on SM120 with the recipe's declared
+    storage. On a 32 GiB RTX 5090 the planner refuses an image plan with DFlash2
+    at four requests; use `--language-model-only` for text-only preparation or
+    lower `--max-concurrency` / `--no-mtp`. Remove this entry when an image core
+    exported with the declared storage has served image prompts on SM120. See
+    model-preparation.md "Qwen3.8 27B".
+
+[ ] Qualify Qwen3.8 27B QAD (`qwen3.8-27b-qad`) image input. The checkpoint
+    shares the `qwen38_dense` recipe and defaults to four image slots, but only
+    `qwen3.8-27b` (`nvidia/Qwen3.8-27B-NVFP4`) has been exported and served with
+    images. Remove this entry when a `qwen3.8-27b-qad` image core has been
+    exported and served.
+
+[ ] Qualify Qwen3.8 27B vision projections that carry bias on SM103.
+    `recipes/qwen38/vision.py` binds checkpoint BF16 projections through
+    `UnquantizedProjection`, whose bias keeps them off the SM103 dense GEMM path
+    in `ignition/components/linear.py`; SM103 execution is unqualified.
+
+[ ] Compare published image features and prompt logits of Qwen3.8 27B with the
+    Transformers reference on SM120. The comparison passed on DGX Spark GB10
+    (SM121); remove this entry when it also passes on SM120.
+
+[ ] Fix Qwen image resize for an axis below half the merge factor: the reference
+    rounds such an axis to zero before the pixel-budget branches, while
+    `PatchProcessor::geometry` clamps it to the factor first, so
+    tests/frontend/qwen38_images.json case 3200x16 reports 32x3200 instead of the
+    reference 32x3648.

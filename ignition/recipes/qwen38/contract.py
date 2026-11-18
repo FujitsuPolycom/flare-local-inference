@@ -9,13 +9,26 @@ from ignition.preparation import runtime_core_pb2 as p
 
 VOCABULARY = 248320
 INPUT_VOCABULARY = 248320
-VISION = {'features_per_request': 16384, 'max_images': 4, 'patches_per_feature': 4, 'patch_capacities': [256, 1024, 4096, 16384]}
-FRONTEND = c.frontend(tools=p.QWEN_CODER, wrapping_newlines=1, terminal_markers=["<tool_call>"],
-    assistant_marker="<|im_start|>assistant\n", message_end_markers=["<|im_end|>"],
-    prefix_boundary=c.prefix_boundary(["system", "developer"], append_role="user", minimum_messages=0,
-        required_start="<|im_start|>system\n", required_marker="<|im_end|>"),
-    image_tokens=dict(feature_token=248056, span=None),
-    image_preparation=p.QWEN_IMAGE_PREPARATION, image_layout=p.QWEN_IMAGE_LAYOUT, position_dimensions=3)
+FEATURE_TOKEN = 248056
+PATCH_CAPACITIES = (256, 1024, 4096, 16384)
+VISION = {'features_per_request': 16384, 'max_images': 4, 'patches_per_feature': 4,
+          'patch_capacities': list(PATCH_CAPACITIES)}
+
+
+def frontend(vision=True):
+    """Qwen chat markers; with ``vision``, Qwen image preparation and feature placement."""
+    images = {}
+    if vision:
+        images = dict(image_tokens=dict(feature_token=FEATURE_TOKEN, span=None),
+                      image_preparation=p.QWEN_IMAGE_PREPARATION, image_layout=p.QWEN_IMAGE_LAYOUT)
+    return c.frontend(tools=p.QWEN_CODER, wrapping_newlines=1, terminal_markers=["<tool_call>"],
+        assistant_marker="<|im_start|>assistant\n", message_end_markers=["<|im_end|>"],
+        prefix_boundary=c.prefix_boundary(["system", "developer"], append_role="user", minimum_messages=0,
+            required_start="<|im_start|>system\n", required_marker="<|im_end|>"),
+        position_dimensions=3 if vision else 0, **images)
+
+
+FRONTEND = frontend(vision=True)
 
 
 def prepare(signatures, buffers, pool, *, image_slots=4, page_tokens, draft_lag, rows=1, embedding_tables=(), regions=()):

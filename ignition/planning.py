@@ -198,6 +198,7 @@ class Plan:
     hub_cache: Path | None = None
     tuning_gpus: tuple[Gpu, ...] = ()
     tuning_replica: TuningReplica | None = None
+    # Image request slots. Zero prepares no vision encoder, image graphs, or image storage.
     image_concurrency: int = 0
     # The recipe's eligible BF16 projections load as MXFP8 when the plan asks for it.
     online_mxfp8: bool = False
@@ -224,6 +225,8 @@ class Plan:
             raise UsageError("online MXFP8 scope is not supported by the recipe")
         if self.online_mxfp8_scope != "all" and not self.online_mxfp8:
             raise UsageError("online MXFP8 scope requires --online-mxfp8")
+        if self.language_model_only and self.image_concurrency:
+            raise UsageError("--image-concurrency requires the vision encoder that --language-model-only leaves unloaded")
         if self.benchmark_selection is not None:
             selection = self.benchmark_selection
             if not isinstance(selection, BenchmarkSelection):
@@ -299,7 +302,8 @@ class Plan:
 
     @property
     def costs(self):
-        return self.recipe.costs(self.world_size, self.speculation, self.checkpoint)
+        return self.recipe.costs(self.world_size, self.speculation, self.checkpoint).with_image_slots(
+            self.image_concurrency)
 
     @property
     def live_rows(self) -> int:
@@ -497,12 +501,19 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
                                       speculation.token_capacity, speculation.graph_budget)
         except ValueError as error:
             raise UsageError(f"--speculative-graph-budget: {error}") from error
+    if language_model_only and image_concurrency is not None:
+        raise UsageError("--image-concurrency requires the vision encoder that --language-model-only leaves unloaded")
+    # Language-only plans prepare no vision encoder, so no image feature slots.
+    images = (0 if language_model_only else (min(4, concurrency) if recipe.max_images else 0)
+              if image_concurrency is None else image_concurrency)
     costs = recipe.costs(len(gpus), speculation, checkpoint)
     graph_credit = recipe.hybrid_context_parallel_graph_credits.get((len(gpus), context_parallel_size))
     if graph_credit is not None:
         max_bytes, max_pages = graph_credit
         credit = min(max_bytes, max_pages * costs.page_bytes)
         costs = replace(costs, graph_bytes=costs.graph_bytes - credit)
+    # A plan with image slots uses the recipe's image continuation row and vision storage.
+    costs = costs.with_image_slots(images)
     plan = Plan(recipe, checkpoint, gpus, concurrency, recipe.prefill_chunk if prefill_chunk is None else prefill_chunk,
                 speculation, 0, 0, 0, reserve_bytes,
                 recipe.weights_bytes(checkpoint, len(gpus), speculation, expert_scale_compression), costs.graph_bytes,
@@ -511,9 +522,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
                 stream_overlap=stream_overlap and recipe.stream_overlap, mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
                 expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
                 mla_compute_mode=mla_compute_mode,
-                # Language-only plans prepare no vision encoder, so no image feature slots.
-                image_concurrency=0 if language_model_only else (min(4, concurrency) if recipe.max_images else 0)
-                    if image_concurrency is None else image_concurrency, online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope,
+                image_concurrency=images, online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope,
                 language_model_only=language_model_only)
     available = plan.supply_bytes - plan.fixed_bytes
     target = min(CACHE_STATES_PER_REQUEST * concurrency, max(1, available // costs.state_row_bytes))
@@ -632,14 +641,16 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
     elif len(supported) < world_sizes[0]:
         raise CapacityError(f"{checkpoint.alias} needs {sizes} {SUPPORTED_ARCHITECTURES} GPUs; this host has {len(supported)}")
 
-    def fitted(group, *, concurrency=concurrency, reserve_bytes=reserve_bytes, speculation=speculation):
+    def fitted(group, *, concurrency=concurrency, reserve_bytes=reserve_bytes, speculation=speculation,
+               language_model_only=language_model_only, image_concurrency=image_concurrency):
         return fit(recipe, checkpoint, group, concurrency=concurrency, reserve_bytes=reserve_bytes,
                    speculation=speculation, prefill_chunk=chunk, context_parallel=context_parallel,
                    context_parallel_size=context_parallel_size,
                    stream_overlap=stream_overlap, cache_states=cache_states,
                    mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
                    expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
-                   image_concurrency=None if image_concurrency is None else min(image_concurrency, concurrency),
+                   image_concurrency=(None if language_model_only
+                                      else (None if image_concurrency is None else min(image_concurrency, concurrency))),
                    online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope, language_model_only=language_model_only,
                    mla_compute_mode=mla_compute_mode)
 
@@ -678,8 +689,16 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
         if attempt(concurrency=limit) is not None:
             options.append(f"--max-concurrency {limit}")
             break
+    if image_concurrency is not None:
+        for slots in range(min(image_concurrency, concurrency) - 1, 0, -1):
+            if attempt(image_concurrency=slots) is not None:
+                options.append(f"--image-concurrency {slots}")
+                break
     if speculation is not None and attempt(speculation=None) is not None:
         options.append("--no-mtp")
+    if (not language_model_only and recipe.language_model_only and image_concurrency is None
+            and attempt(language_model_only=True) is not None):
+        options.append("--language-model-only")
     if chosen is not None:
         for size in world_sizes:
             if len(chosen) < size <= len(supported) and (larger := automatic(size)).fits:
