@@ -128,7 +128,7 @@ def metric_delta(before: dict, after: dict) -> dict:
 
 
 def resource_totals(metrics: dict) -> dict:
-    return {"pages": metrics["flare_free_kv_pages"] + metrics["flare_cached_kv_pages"],
+    return {"pages": metrics["flare_free_kv_pages"] + metrics["flare_snapshot_backing_pages"] + metrics["flare_cached_kv_pages"],
         "snapshots": metrics["flare_free_snapshots"] + metrics["flare_cached_checkpoints"],
         "slots": metrics["flare_free_request_slots"]}
 
@@ -274,8 +274,9 @@ class Run:
                     connection.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_WINDOW_CLAMP, receive_buffer)
                 record["socket_receive_buffer_bytes"] = connection.sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
             encoded = json.dumps(body, ensure_ascii=False).encode() if body is not None else None
+            accept = "text/plain" if path == "/metrics" else ("text/event-stream" if stream else "application/json")
             connection.request(record["method"], self.url.path.rstrip("/") + path, body=encoded,
-                headers={"Content-Type": "application/json", "Accept": "text/event-stream" if stream else "application/json"})
+                headers={"Content-Type": "application/json", "Accept": accept})
             response = connection.getresponse()
             record.update(status=response.status, headers=dict(response.getheaders()), headers_seconds=time.monotonic() - started)
             sse = stream and response.status == 200 and response.getheader("Content-Type", "").startswith("text/event-stream")
@@ -356,7 +357,7 @@ class Run:
             for line in record["body"]["prometheus"].splitlines():
                 if line and not line.startswith("#"):
                     key, value = line.rsplit(" ", 1)
-                    metrics[key] = int(value)
+                    metrics[key] = int(value) if value.isdigit() else float(value)
             required = ["flare_active_requests", "flare_retiring_request_slots", "flare_pending_requests", "flare_http_inflight_requests"]
             if not wait_idle or all(metrics[key] == 0 for key in required):
                 return metrics

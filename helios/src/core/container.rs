@@ -399,60 +399,140 @@ impl<'a, W: Write> Writer<'a, W> {
     }
 
     pub fn finish(mut self) -> Result<()> {
-        let mut cursor = 0u64;
-        let mut layout: Vec<(String, u64, u64, Source<'a>)> =
-            Vec::with_capacity(self.entries.len());
-        let mut padding = 0usize;
-        for (name, len, source) in std::mem::take(&mut self.entries) {
-            let pad = (ALIGNMENT - cursor % ALIGNMENT) % ALIGNMENT;
-            if pad > 0 {
-                let name = loop {
-                    let candidate = format!("{ALIGNMENT_PREFIX}{padding:06}");
-                    padding += 1;
-                    if !self.names.contains(&candidate) {
-                        break candidate;
-                    }
-                };
-                self.names.insert(name.clone());
-                layout.push((name, cursor, pad, Source::Zero(pad)));
-                cursor += pad;
+        let names: Vec<(String, u64)> = self
+            .entries
+            .iter()
+            .map(|(name, len, _)| (name.clone(), *len))
+            .collect();
+        let planned = planned_layout(&self.format, &names, &mut self.names)?;
+        let mut writes: Vec<(String, u64, Source<'a>)> = Vec::with_capacity(planned.entries.len());
+        let mut sources = std::mem::take(&mut self.entries).into_iter();
+        for entry in planned.entries {
+            if entry.alignment {
+                writes.push((entry.name, entry.len, Source::Zero(entry.len)));
+            } else {
+                let source = sources
+                    .next()
+                    .map(|(_, _, source)| source)
+                    .ok_or_else(|| invalid("container layout lost a tensor source"))?;
+                writes.push((entry.name, entry.len, source));
             }
-            layout.push((name, cursor, len, source));
-            cursor = cursor
-                .checked_add(len)
-                .ok_or_else(|| invalid("container payload overflow"))?;
         }
-        if cursor == 0 {
-            return Err(invalid("container requires at least one payload tensor"));
-        }
-        let header = header_bytes(&self.format, &layout)?;
         self.output
-            .write_all(&((header.len() as u64).to_le_bytes()))
+            .write_all(&(planned.header.len() as u64).to_le_bytes())
             .map_err(|e| io("write container header length", e))?;
         self.output
-            .write_all(&header)
+            .write_all(&planned.header)
             .map_err(|e| io("write container header", e))?;
         let mut buffer = vec![0u8; IO_CHUNK];
-        for (name, _, len, mut source) in layout {
+        for (name, len, mut source) in writes {
             write_source(&mut self.output, &name, len, &mut source, &mut buffer)?;
         }
         self.output.flush().map_err(|e| io("flush container", e))
     }
 }
 
-fn header_json(format: &str, layout: &[(String, u64, u64, Source<'_>)]) -> Result<Vec<u8>> {
+/// One tensor in the deterministic write order of a container.
+struct PlannedEntry {
+    name: String,
+    offset: u64,
+    len: u64,
+    /// Whether the writer inserts this entry as zero padding between payloads.
+    alignment: bool,
+}
+
+struct PlannedLayout {
+    entries: Vec<PlannedEntry>,
+    /// The padded header, whose length the container stores in its first
+    /// eight bytes.
+    header: Vec<u8>,
+    /// Every byte the writer emits: the header length field, the padded
+    /// header, and all tensor bytes.
+    total: u64,
+}
+
+/// The deterministic write order and size of a container with these tensors in
+/// this order. Shared by the writer and by callers that must predict a
+/// container's written size exactly; a caller passes the tensor names it will
+/// add, in the order it will add them. Padding entries take names outside
+/// `reserved`. `Writer::add` rejects tensor names with the alignment prefix, so
+/// the padding names, and with them the header length, are the same whether
+/// `reserved` holds the tensor names or is empty.
+fn planned_layout(
+    format: &str,
+    entries: &[(String, u64)],
+    reserved: &mut BTreeSet<String>,
+) -> Result<PlannedLayout> {
+    let mut cursor = 0u64;
+    let mut layout: Vec<PlannedEntry> = Vec::with_capacity(entries.len() + 1);
+    let mut padding = 0usize;
+    for (name, len) in entries {
+        let pad = (ALIGNMENT - cursor % ALIGNMENT) % ALIGNMENT;
+        if pad > 0 {
+            let name = loop {
+                let candidate = format!("{ALIGNMENT_PREFIX}{padding:06}");
+                padding += 1;
+                if !reserved.contains(&candidate) {
+                    break candidate;
+                }
+            };
+            reserved.insert(name.clone());
+            layout.push(PlannedEntry {
+                name,
+                offset: cursor,
+                len: pad,
+                alignment: true,
+            });
+            cursor = cursor
+                .checked_add(pad)
+                .ok_or_else(|| invalid("container payload overflow"))?;
+        }
+        layout.push(PlannedEntry {
+            name: name.clone(),
+            offset: cursor,
+            len: *len,
+            alignment: false,
+        });
+        cursor = cursor
+            .checked_add(*len)
+            .ok_or_else(|| invalid("container payload overflow"))?;
+    }
+    if cursor == 0 {
+        return Err(invalid("container requires at least one payload tensor"));
+    }
+    let header = header_bytes(format, &layout)?;
+    let total = 8u64
+        .checked_add(header.len() as u64)
+        .and_then(|prefix| prefix.checked_add(cursor))
+        .ok_or_else(|| invalid("container payload overflow"))?;
+    Ok(PlannedLayout {
+        entries: layout,
+        header,
+        total,
+    })
+}
+
+/// The exact number of bytes `Writer::finish` writes for these tensors in this
+/// order: the header length field, the padded header, and every tensor byte
+/// including the alignment padding the writer inserts.
+pub(crate) fn written_size(format: &str, tensors: &[(String, u64)]) -> Result<u64> {
+    planned_layout(format, tensors, &mut BTreeSet::new()).map(|planned| planned.total)
+}
+
+fn header_json(format: &str, layout: &[PlannedEntry]) -> Result<Vec<u8>> {
     let mut tensors: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     tensors.insert(
         "__metadata__".into(),
         serde_json::json!({ "format": format }),
     );
-    for (name, offset, len, _) in layout {
-        let end = offset
-            .checked_add(*len)
+    for entry in layout {
+        let end = entry
+            .offset
+            .checked_add(entry.len)
             .ok_or_else(|| invalid("container tensor overflow"))?;
         tensors.insert(
-            name.clone(),
-            serde_json::json!({ "dtype": "U8", "shape": [len], "data_offsets": [offset, end] }),
+            entry.name.clone(),
+            serde_json::json!({ "dtype": "U8", "shape": [entry.len], "data_offsets": [entry.offset, end] }),
         );
     }
     serde_json::to_vec(&tensors).map_err(|e| invalid(format!("encode container header: {e}")))
@@ -471,7 +551,7 @@ fn padded_header_len(json: u64) -> Result<u64> {
     Ok(length)
 }
 
-fn header_bytes(format: &str, layout: &[(String, u64, u64, Source<'_>)]) -> Result<Vec<u8>> {
+fn header_bytes(format: &str, layout: &[PlannedEntry]) -> Result<Vec<u8>> {
     let mut header = header_json(format, layout)?;
     let length = padded_header_len(header.len() as u64)?;
     header.resize(length as usize, b' ');
@@ -484,10 +564,10 @@ pub(crate) fn companion_prefix(nbytes: u64) -> Result<Vec<u8>> {
     if nbytes == 0 {
         return Err(invalid("core payload tensors must not be empty"));
     }
-    let layout = [(COMPANION_TENSOR.to_owned(), 0, nbytes, Source::Zero(nbytes))];
-    let header = header_bytes(PAYLOAD_FORMAT, &layout)?;
-    let mut prefix = (header.len() as u64).to_le_bytes().to_vec();
-    prefix.extend_from_slice(&header);
+    let layout = [(COMPANION_TENSOR.to_owned(), nbytes)];
+    let planned = planned_layout(PAYLOAD_FORMAT, &layout, &mut BTreeSet::new())?;
+    let mut prefix = (planned.header.len() as u64).to_le_bytes().to_vec();
+    prefix.extend_from_slice(&planned.header);
     Ok(prefix)
 }
 
@@ -544,15 +624,55 @@ fn write_source<W: Write>(
     }
 }
 
-/// Writes the deterministic one-payload companion wrapper for `payload`.
-pub fn write_companion(output: &mut impl Write, payload: &Slice) -> Result<()> {
-    let mut writer = Writer::new(&mut *output, PAYLOAD_FORMAT)?;
+/// Writes the deterministic one-payload companion wrapper for `payload`,
+/// reporting the size of every write to `report`.
+pub fn write_companion_with(
+    output: &mut impl Write,
+    payload: &Slice,
+    report: &mut dyn FnMut(u64),
+) -> Result<()> {
+    let mut writer = Writer::new(Reporting::new(&mut *output, report), PAYLOAD_FORMAT)?;
     writer.add(
         COMPANION_TENSOR,
         payload.len(),
         Source::Slice(payload.clone()),
     )?;
     writer.finish()
+}
+
+/// Writes the deterministic one-payload companion wrapper for `payload`.
+pub fn write_companion(output: &mut impl Write, payload: &Slice) -> Result<()> {
+    write_companion_with(output, payload, &mut |_| {})
+}
+
+/// The exact number of bytes the companion wrapper for `nbytes` payload bytes
+/// occupies on disk: the padded header and the payload itself.
+pub(crate) fn companion_written_size(nbytes: u64) -> Result<u64> {
+    written_size(PAYLOAD_FORMAT, &[(COMPANION_TENSOR.to_owned(), nbytes)])
+}
+
+/// Forwards writes to `inner` and reports the size of each write.
+pub(crate) struct Reporting<W: Write, F: FnMut(u64)> {
+    inner: W,
+    report: F,
+}
+
+impl<W: Write, F: FnMut(u64)> Reporting<W, F> {
+    pub(crate) fn new(inner: W, report: F) -> Self {
+        Self { inner, report }
+    }
+}
+
+impl<W: Write, F: FnMut(u64)> Write for Reporting<W, F> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let count = self.inner.write(buffer)?;
+        (self.report)(count as u64);
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Maps a companion path to its packed tensor name.
@@ -979,14 +1099,25 @@ pub fn pack(
     writer.finish()
 }
 
-/// Write one payload slice as a canonical companion at `relative`.
-pub fn write_payload_companion(root: &Path, relative: &str, payload: &Slice) -> Result<()> {
+/// Write one payload slice as a canonical companion at `relative`, reporting
+/// the size of every write to `report`.
+pub fn write_payload_companion_with(
+    root: &Path,
+    relative: &str,
+    payload: &Slice,
+    report: &mut dyn FnMut(u64),
+) -> Result<()> {
     validate_relative_path(relative)?;
     let (_, mut file) = create_relative(root, relative)?;
-    write_companion(&mut file, payload)?;
+    write_companion_with(&mut file, payload, report)?;
     file.sync_all()
         .map_err(|e| io("sync core companion", e))?;
     Ok(())
+}
+
+/// Write one payload slice as a canonical companion at `relative`.
+pub fn write_payload_companion(root: &Path, relative: &str, payload: &Slice) -> Result<()> {
+    write_payload_companion_with(root, relative, payload, &mut |_| {})
 }
 
 /// Writes deterministic companion files extracted from a packed container.

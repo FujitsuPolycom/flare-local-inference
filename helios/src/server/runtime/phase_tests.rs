@@ -257,6 +257,7 @@ impl Fixture {
                 pool_lookup_started: None,
                 host_lookup_outcome: None,
                 pool_plan: None,
+                restore_wait: RestoreWait::default(),
             },
             Generation {
                 events: receiver,
@@ -1781,7 +1782,11 @@ fn packed_dashboard_depth_uses_allocated_prefixes_and_live_request_count() {
 fn shared_decoded_history_reaches_copy_and_mtp_uploads_after_response_completion() {
     use crate::model::contract::{GraphOperation, InputIndexing, ValueSource};
     use crate::scheduler::speculation::ProposalSource;
-    for source in [ProposalSource::Copy, ProposalSource::Mtp] {
+    for (source, output_limit, expected_copies) in [
+        (ProposalSource::Copy, 16, 2),
+        (ProposalSource::Mtp, 16, 2),
+        (ProposalSource::Mtp, 3, 1),
+    ] {
         let mut fixture = Fixture::new();
         fixture.config.speculative_widths = vec![1, 8];
         fixture.config.speculative_fixed_width = Some(8);
@@ -1847,26 +1852,34 @@ fn shared_decoded_history_reaches_copy_and_mtp_uploads_after_response_completion
         }
         worker.publish().unwrap();
         assert!(worker.active.iter().all(Option::is_none));
-        let (incoming, _second_output) = fixture.incoming(vec![4, 0, 1, 2], 16);
+        let (incoming, _second_output) = fixture.incoming(vec![4, 0, 1, 2], output_limit);
         sender.send(vec![incoming]).unwrap();
         assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
         advance(&mut worker, GraphKind::Init, 10, None);
         advance(&mut worker, GraphKind::Prefill, 11, Some(3));
         advance(&mut worker, GraphKind::Snapshot, 12, None);
         let step = planned(&mut worker, GraphKind::Speculative, 13);
+        if output_limit == 3 {
+            assert_eq!(step.token_capacity, 8);
+            assert_eq!(step.lanes[0].tokens, 2);
+        }
         let live = worker.scheduler.request(step.lanes[0].request).unwrap();
         let uploads = worker.inputs.as_ref().unwrap().uploads();
         let bytes = |name| uploads.iter().find(|u| u.buffer == name).unwrap().bytes;
         assert_eq!(
             i32::from_le_bytes(bytes("copy_count").try_into().unwrap()),
-            2
+            expected_copies
         );
         assert_eq!(
             bytes("copy_ids")
                 .chunks_exact(8)
                 .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
                 .collect::<Vec<_>>(),
-            [4, 2, -1, -1, -1, -1, -1]
+            if expected_copies == 1 {
+                [4, -1, -1, -1, -1, -1, -1]
+            } else {
+                [4, 2, -1, -1, -1, -1, -1]
+            }
         );
         assert_eq!(
             i64::from_le_bytes(bytes("copy_consumed").try_into().unwrap()),
@@ -2424,6 +2437,242 @@ fn host_hit_recomputes_when_snapshot_backing_would_prevent_admission() {
     assert_eq!(worker.scheduler.free_page_count(), 14);
     assert_eq!(worker.scheduler.free_snapshot_count(), 16);
     assert!(fake_store(&mut worker).fetched.is_empty());
+}
+
+#[test]
+fn host_hit_waits_for_snapshot_backing_held_by_a_running_request() {
+    for pooled in [false, true] {
+        let fixture = Fixture::new();
+        let (sender, receiver) = mpsc::channel();
+        let mut worker = fixture.worker(receiver);
+        // Every snapshot row aliases pages reserved by the running request.
+        worker
+            .scheduler
+            .share_snapshot_pages(&vec![0..2; 16])
+            .unwrap();
+        let (running, running_generation) = fixture.incoming(vec![7; 70], 4);
+        sender.send(vec![running]).unwrap();
+        assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+        let (requests, _generations): (Vec<_>, Vec<_>) =
+            (0..2).map(|_| fixture.incoming(vec![0; 70], 4)).unzip();
+        let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+        history.append(&requests[0].prompt.tokens, &[]).unwrap();
+        let mut store = FakeStore::new(Some(host_hit(&history, 70)));
+        store.pooled = pooled;
+        worker.attach_store(Some(Box::new(store)));
+        worker.prefill_rate = 1.0;
+        sender.send(requests).unwrap();
+        assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+        assert_eq!(worker.pending.len(), 2);
+        assert_eq!(worker.scheduler.stats().host_lookups, 0);
+        assert!(fake_store(&mut worker).fetched.is_empty());
+        for incoming in &worker.pending {
+            assert!(incoming.restore_wait.started.is_some());
+            assert_eq!(incoming.pool_plan.is_some(), pooled);
+        }
+        let attempts = fake_store(&mut worker).tickets_seen.len();
+        assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(false));
+        assert_eq!(fake_store(&mut worker).tickets_seen.len(), attempts);
+
+        running_generation.cancelled.store(true, Ordering::Release);
+        assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+        assert!(worker.pending.is_empty());
+        for active in worker.active.iter().flatten() {
+            let live = worker.scheduler.request(active.request).unwrap();
+            assert_eq!(
+                (
+                    live.phase,
+                    live.consumed_tokens,
+                    live.reused_prompt_tokens()
+                ),
+                (RequestPhase::Inbound, 70, 70)
+            );
+            assert!(active.incoming.restore_wait.started.is_none());
+        }
+        assert_eq!(worker.scheduler.stats().host_lookups, 2);
+        assert_eq!(worker.scheduler.stats().inbound_waiting, 2);
+        let store = fake_store(&mut worker);
+        assert_eq!(store.fetched.len(), 1);
+        assert!(store.tickets_seen.iter().all(|seen| *seen == pooled));
+        assert_eq!(store.begun.len(), if pooled { 2 } else { 0 });
+    }
+}
+
+#[test]
+fn host_restore_wait_expires_without_a_resource_change() {
+    let fixture = Fixture::new();
+    let (sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    worker
+        .scheduler
+        .share_snapshot_pages(&vec![0..2; 16])
+        .unwrap();
+    let (running, _running_generation) = fixture.incoming(vec![7; 70], 4);
+    sender.send(vec![running]).unwrap();
+    let _ = worker.admit().unwrap();
+    let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
+    let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+    history.append(&incoming.prompt.tokens, &[]).unwrap();
+    worker.attach_store(Some(Box::new(FakeStore::new(Some(host_hit(&history, 70))))));
+    worker.prefill_rate = 1.0;
+    sender.send(vec![incoming]).unwrap();
+    let _ = worker.admit().unwrap();
+    assert_eq!(worker.pending.len(), 1);
+    let expired = std::time::Instant::now() - std::time::Duration::from_secs(60);
+    worker.pending[0].restore_wait.started = Some(expired);
+    worker.pending[0].restore_wait.retry_at = Some(expired);
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+    assert!(worker.pending.is_empty());
+    let active = worker.active[1].as_ref().unwrap();
+    assert_eq!(
+        worker.scheduler.request(active.request).unwrap().phase,
+        RequestPhase::Initialize
+    );
+    assert!(matches!(
+        active.incoming.host_lookup_outcome,
+        Some(crate::offload::LookupOutcome::CapacityRejected)
+    ));
+    assert!(fake_store(&mut worker).fetched.is_empty());
+}
+
+#[test]
+fn host_restore_wait_does_not_block_other_requests_or_cancellation() {
+    let fixture = Fixture::new();
+    let (sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    worker
+        .scheduler
+        .share_snapshot_pages(&vec![0..2; 16])
+        .unwrap();
+    let (running, _running_generation) = fixture.incoming(vec![7; 70], 4);
+    sender.send(vec![running]).unwrap();
+    let _ = worker.admit().unwrap();
+    let (waiting, waiting_generation) = fixture.incoming(vec![0; 70], 4);
+    let (unrelated, _unrelated_generation) = fixture.incoming(vec![1; 70], 4);
+    let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+    history.append(&waiting.prompt.tokens, &[]).unwrap();
+    let mut store = FakeStore::new(Some(host_hit(&history, 70)));
+    store.pooled = true;
+    let withdrawn = store.withdrawn.clone();
+    worker.attach_store(Some(Box::new(store)));
+    worker.prefill_rate = 1.0;
+    sender.send(vec![waiting, unrelated]).unwrap();
+    let _ = worker.admit().unwrap();
+    assert_eq!(worker.pending.len(), 1);
+    assert_eq!(worker.scheduler.stats().active_requests, 2);
+    assert_eq!(withdrawn.load(Ordering::Relaxed), 1);
+    waiting_generation.cancelled.store(true, Ordering::Release);
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+    assert!(worker.pending.is_empty());
+    assert_eq!(withdrawn.load(Ordering::Relaxed), 2);
+    assert_eq!(worker.scheduler.stats().active_requests, 2);
+    assert!(fake_store(&mut worker).fetched.is_empty());
+}
+
+#[test]
+fn host_restore_wait_expires_once_when_recomputation_also_needs_capacity() {
+    let mut fixture = Fixture::new();
+    fixture.config.limits.pages = 3;
+    let (sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let (running, _running_generation) = fixture.incoming(vec![7; 70], 4);
+    sender.send(vec![running]).unwrap();
+    let _ = worker.admit().unwrap();
+    let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
+    let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+    history.append(&incoming.prompt.tokens, &[]).unwrap();
+    worker.attach_store(Some(Box::new(FakeStore::new(Some(host_hit(&history, 70))))));
+    worker.prefill_rate = 1.0;
+    sender.send(vec![incoming]).unwrap();
+    let _ = worker.admit().unwrap();
+    let expired = std::time::Instant::now() - std::time::Duration::from_secs(60);
+    worker.pending[0].restore_wait.started = Some(expired);
+    worker.pending[0].restore_wait.retry_at = Some(expired);
+    let attempts = fake_store(&mut worker).tickets_seen.len();
+    let _ = worker.admit().unwrap();
+    assert_eq!(fake_store(&mut worker).tickets_seen.len(), attempts + 1);
+    assert_eq!(worker.pending.len(), 1);
+    assert!(worker.pending[0].restore_wait.retry_at.is_none());
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(false));
+    assert_eq!(fake_store(&mut worker).tickets_seen.len(), attempts + 1);
+}
+
+#[test]
+fn host_restore_waits_for_a_transfer_after_its_last_waiter_is_cancelled() {
+    for success in [false, true] {
+        let mut fixture = Fixture::new();
+        fixture.config.limits.snapshots = 1;
+        let (sender, receiver) = mpsc::channel();
+        let mut worker = fixture.worker(receiver);
+        let (first, first_generation) = fixture.incoming(vec![1; 70], 4);
+        let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+        history.append(&first.prompt.tokens, &[]).unwrap();
+        worker.attach_store(Some(Box::new(FakeStore::new(Some(host_hit(&history, 70))))));
+        worker.prefill_rate = 1.0;
+        sender.send(vec![first]).unwrap();
+        let _ = worker.admit().unwrap();
+        let (_, ticket) = fake_store(&mut worker).fetched.pop().unwrap();
+        first_generation.cancelled.store(true, Ordering::Release);
+        let _ = worker.admit().unwrap();
+        assert_eq!(worker.scheduler.stats().active_requests, 0);
+        assert_eq!(worker.scheduler.free_snapshot_count(), 0);
+
+        let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
+        let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+        history.append(&incoming.prompt.tokens, &[]).unwrap();
+        fake_store(&mut worker).hit = Some(host_hit(&history, 70));
+        sender.send(vec![incoming]).unwrap();
+        let _ = worker.admit().unwrap();
+        assert_eq!(worker.pending.len(), 1);
+        assert_eq!(worker.scheduler.stats().active_requests, 0);
+        fake_store(&mut worker)
+            .events
+            .push_back(flare_selene::StoreEvent::Fetched {
+                key: ticket.key,
+                result: if success {
+                    Ok(1 << 20)
+                } else {
+                    Err("transfer failed".into())
+                },
+            });
+        worker.service_store().unwrap();
+        let _ = worker.admit().unwrap();
+        assert!(worker.pending.is_empty());
+        assert_eq!(worker.scheduler.stats().inbound_waiting, 1);
+        assert_eq!(fake_store(&mut worker).fetched.len(), 1);
+    }
+}
+
+#[test]
+fn host_restore_waits_for_a_copyout_pin_without_live_requests() {
+    let mut fixture = Fixture::new();
+    fixture.config.limits.snapshots = 1;
+    let (sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store
+        .store_outcomes
+        .push_back(flare_selene::StoreOutcome::Queued);
+    worker.attach_store(Some(Box::new(store)));
+    let id = unpinned_checkpoint(&mut worker, 1, 64);
+    worker.service_store().unwrap();
+    assert_eq!(pins(&worker, id), 1);
+    assert_eq!(worker.scheduler.stats().active_requests, 0);
+    let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
+    let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+    history.append(&incoming.prompt.tokens, &[]).unwrap();
+    fake_store(&mut worker).hit = Some(host_hit(&history, 70));
+    worker.prefill_rate = 1.0;
+    sender.send(vec![incoming]).unwrap();
+    let _ = worker.admit().unwrap();
+    assert_eq!(worker.pending.len(), 1);
+    assert!(fake_store(&mut worker).fetched.is_empty());
+    complete_store(&mut worker, id, true);
+    worker.service_store().unwrap();
+    let _ = worker.admit().unwrap();
+    assert!(worker.pending.is_empty());
+    assert_eq!(worker.scheduler.stats().inbound_waiting, 1);
+    assert_eq!(fake_store(&mut worker).fetched.len(), 1);
 }
 
 #[test]

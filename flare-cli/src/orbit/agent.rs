@@ -135,8 +135,9 @@ fn download(
     .map_err(|e| e.to_string())?;
     // The response names a cache entry the controller will transfer from, so the
     // lease must outlive this request rather than dropping with the Entry.
-    let directory = path.directory().to_path_buf();
-    Ok((serde_json::to_vec(&json!({"path": directory}))?, path))
+    let root = crate::cache_support::model_root(request.options.core_cache.as_deref())?;
+    let primary = flare_helios::core::cache::Root::open(root)?.primary(&path)?;
+    Ok((serde_json::to_vec(&json!({"path": primary}))?, path))
 }
 
 /// How often a watched download samples its counters. Progress is advisory and
@@ -1882,12 +1883,28 @@ pub mod tests {
         let mut session = pair_accept_first(&harness);
         let reply: Value =
             serde_json::from_slice(&session.request(frame::DOWNLOAD, &request).unwrap()).unwrap();
-        assert_eq!(reply["path"], entry.directory().to_str().unwrap());
+        let primary = root.primary(&entry).unwrap();
+        assert_eq!(reply["path"], primary.to_str().unwrap());
         assert!(reply["downloaded"].is_u64());
         assert!(reply["verified"].is_u64());
         assert!(reply["total"].is_null());
         assert!(reply["storage"]["transport_free"].is_u64());
         assert!(reply["storage"]["core_cache_free"].is_u64());
+        let stat: Value = serde_json::from_slice(
+            &session
+                .request(frame::STAT, &json!({"path": reply["path"]}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stat["size"], fs::metadata(&primary).unwrap().len());
+        let header = session
+            .request(
+                frame::GET,
+                &json!({"path": reply["path"], "offset": 0, "nbytes": 8}),
+            )
+            .unwrap();
+        assert_eq!(header, fs::read(&primary).unwrap()[..8]);
+        assert!(u64::from_le_bytes(header.try_into().unwrap()) > 0);
 
         // A controller that does not negotiate progress receives the original
         // reply shape and no progress frames.
@@ -1897,7 +1914,7 @@ pub mod tests {
         exchange_hello(&mut legacy, &hello).unwrap();
         let old: Value =
             serde_json::from_slice(&legacy.request(frame::DOWNLOAD, &request).unwrap()).unwrap();
-        assert_eq!(old["path"], entry.directory().to_str().unwrap());
+        assert_eq!(old["path"], primary.to_str().unwrap());
         assert!(old.get("downloaded").is_none());
     }
 
@@ -2610,7 +2627,7 @@ pub mod tests {
             &mut session,
             "core",
             "export-13-rank1/model.safetensors",
-            b"core bytes",
+            b"fixture bytes",
             Some(&[(0, 5), (8, 5)]),
         );
         let grant = grant_for(&harness, 1, None);
@@ -2706,7 +2723,7 @@ pub mod tests {
             &mut session,
             "core",
             "export-13/model.safetensors",
-            b"core bytes",
+            b"fixture bytes",
             None,
         );
         let [a, b] = [

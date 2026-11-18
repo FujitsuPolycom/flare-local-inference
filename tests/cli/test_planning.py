@@ -511,6 +511,42 @@ def test_cli_plan_resolves_recipe_configuration_and_flag_defaults(tmp_path, mode
     assert record["speculation"]["draft_prefix_selection"] == model.recipe.speculation.draft_prefix_selection
 
 
+@pytest.mark.parametrize("model", [
+    pytest.param(ResolvedModel(recipe, checkpoint), id=checkpoint.alias)
+    for recipe in recipes() if recipe.name in ("kimi3", "kimi31") for checkpoint in recipe.checkpoints
+])
+@pytest.mark.parametrize("compression", [("--expert-scale-compression",), ("--expert-scale-compression", "csf")],
+                         ids=["bare-csf", "explicit-csf"])
+@pytest.mark.parametrize("drafting", [False, True])
+def test_kimi_expert_scale_compression_preserves_cli_plan_capacity(tmp_path, model, compression, drafting):
+    from ignition.cli import _parser, preparation
+    from ignition.cli.config import Configuration
+
+    path = tmp_path / "flare.toml"
+    path.write_text("")
+    configuration = Configuration.load(path)
+    alias = model.checkpoint.alias
+    flags = ["--speculative-token-capacity", "64"] if drafting else ["--no-mtp"]
+    args = _parser().parse_args(["export", alias, "--gpus", "0-15", "--max-concurrency", "8",
+        "--prefill-chunk-size", "4096", *flags, *compression])
+    devices = tuple(replace(gpu(i, 95), total_bytes=256 * GIB, free_bytes=255 * GIB) for i in range(16))
+    settings = dict(gpus=args.gpus,
+        concurrency=configuration.max_concurrency(alias, model.recipe.concurrency, args.max_concurrency),
+        speculation=preparation.speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size)
+    host = preparation.Host(devices, None)
+    default = preparation.derive(configuration, model, host, **settings)
+    plan = preparation.derive(configuration, model, host,
+        expert_scale_compression=args.expert_scale_compression, **settings)
+
+    assert plan.expert_scale_compression == plan.to_dict()["expert_scale_compression"] == "csf"
+    assert (plan.world_size, plan.concurrency, plan.prefill_chunk) == (16, 8, 4096)
+    assert (plan.speculation is not None) is drafting
+    if drafting:
+        assert plan.speculative_token_capacity == 64
+    assert (plan.weights_bytes, plan.pages, plan.cache_states) == (
+        default.weights_bytes, default.pages, default.cache_states)
+
+
 @pytest.mark.parametrize("alias,scope", [("kimi-k3", "all"), ("kimi-k3.1-pro", "kda-input")])
 @pytest.mark.parametrize("online", [False, True])
 @pytest.mark.parametrize("drafting", [False, True])

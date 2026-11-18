@@ -1136,6 +1136,15 @@ impl RequestScheduler {
     pub fn free_snapshot_count(&self) -> usize {
         self.free_snapshots.len()
     }
+    /// Whether requests, transfers, or retirement fences may release admission resources.
+    #[cfg(feature = "server")]
+    pub(crate) fn resources_in_flight(&self) -> bool {
+        self.slots.iter().any(|slot| slot.request.is_some() || slot.retiring)
+            || !self.cache.pending_retirement().is_empty()
+            || !self.retired.is_empty()
+            || !self.tickets.is_empty()
+            || self.cache.has_pins()
+    }
     pub fn has_available_slot(&self) -> bool {
         self.slots.iter().any(|slot| {
             slot.request.is_none() && !slot.retiring && slot.generation < i64::MAX as u64
@@ -2864,6 +2873,11 @@ impl RequestScheduler {
             },
             ready_after: request.last_use,
         });
+        let refresh_recency = !request.preempted
+            && request.error_code.is_none()
+            && (publish || request.consumed_tokens > request.admission_reused_tokens
+                || request.generated_tokens > 0);
+        let prefix = request.prefix;
         let result = match &publication {
             Some(proposal) => {
                 let history = request.history.clone();
@@ -2871,6 +2885,16 @@ impl RequestScheduler {
             }
             None => None,
         };
+        // Completed work is conversation activity, including a client stop after progress.
+        // Preemption and cancellation before inference must not advance cache recency.
+        if refresh_recency && let Some(id) = result.map(PublishResult::id).or(prefix) {
+            let epoch = self.cache.new_use_epoch()?;
+            self.cache.touch(id, epoch)?;
+            // Duplicate publication can retain a different parent than the request's prefix.
+            if result.is_some() && let Some(parent) = self.cache.checkpoint(id)?.parent() {
+                self.cache.touch(parent, epoch)?;
+            }
+        }
         let mut request = self.slots[handle.slot as usize].request.take().unwrap();
         if let Some(guard) = request.anchor_guard.take() { self.release_snapshot(guard); }
         let mut snapshot = request.terminal_snapshot;

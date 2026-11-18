@@ -984,7 +984,6 @@ impl NativeModel {
             }
         }
         let phase = progress.phase("Allocate cache", Some(gpu_bytes));
-        let contexts: Vec<_> = self.ranks.iter().map(|rank| rank.context).collect();
         for (((rank, core), geometry), layout) in self
             .ranks
             .iter_mut()
@@ -993,13 +992,7 @@ impl NativeModel {
             .zip(&layouts)
         {
             unsafe {
-                rank.allocate_shared_cache(
-                    core,
-                    geometry,
-                    layout,
-                    &contexts,
-                    progress.is_enabled(),
-                )?;
+                rank.allocate_shared_cache(core, geometry, layout)?;
             }
         }
         // Publish capacities only after every rank has mapped and granted its cache.

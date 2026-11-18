@@ -970,6 +970,13 @@ static int ring_service(roce_ctx_t* c) {
     for (int rail = 0; rail < c->n_rail; rail++) {
       int ready[RING_WINDOW], count = 0;
       uint64_t serials[RING_WINDOW];
+      // The slot loads below are not one snapshot: a later packet can land between them. A packet
+      // read here as unarrived but whose successor is read as arrived would be forwarded after it,
+      // and the successor of a stripe's last chunk carries the receiver's readiness flag. The first
+      // pass bounds the forwarded serials by the newest arrival it observed. Packets from one origin
+      // on one rail reach this relay through one queue pair in posting order, so every earlier
+      // packet had landed before that load and the second pass sees each of them.
+      uint64_t bound = 0;
       for (int slot = 0; slot < RING_WINDOW; slot++) {
         if (c->ring_pending[origin][rail][slot]) {
           if (ring_service_slot(c, origin, rail, slot) < 0) return -1;
@@ -977,7 +984,13 @@ static int ring_service(roce_ctx_t* c) {
         }
         uint64_t serial = __atomic_load_n(&ring_inbox(c, origin, rail, slot)->descriptor.serial,
                                           __ATOMIC_ACQUIRE);
-        if (serial == c->ring_seen[origin][rail][slot]) continue;
+        if (serial != c->ring_seen[origin][rail][slot] && serial > bound) bound = serial;
+      }
+      for (int slot = 0; bound != 0 && slot < RING_WINDOW; slot++) {
+        if (c->ring_pending[origin][rail][slot]) continue;
+        uint64_t serial = __atomic_load_n(&ring_inbox(c, origin, rail, slot)->descriptor.serial,
+                                          __ATOMIC_ACQUIRE);
+        if (serial == c->ring_seen[origin][rail][slot] || serial > bound) continue;
         int at = count++;
         while (at > 0 && serials[at - 1] > serial) {
           serials[at] = serials[at - 1];

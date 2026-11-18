@@ -84,7 +84,7 @@ def geometry_inputs(snapshots=12, draft=False):
         "page_bytes": 100, "kv_bytes": 819200, "snapshot_capacity": snapshots}
     if draft:
         memory["mtp_weights_bytes"] = 1
-    metrics = {"flare_free_kv_pages": 8000, "flare_cached_kv_pages": 192,
+    metrics = {"flare_free_kv_pages": 7998, "flare_cached_kv_pages": 2, "flare_snapshot_backing_pages": 192,
         "flare_free_snapshots": snapshots - 2, "flare_cached_checkpoints": 2,
         "flare_free_request_slots": 4}
     return memory, metrics

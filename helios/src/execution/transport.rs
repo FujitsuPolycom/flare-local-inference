@@ -15,7 +15,7 @@ use crate::{
 use super::{ExecutionManifest, GraphKind, DEFAULT_COMPLETION_TOKEN_CAPACITY, REQUEST_LANES, COMPLETION_METADATA_FIELDS, ReadinessIntervals};
 
 /// Frame-completion wake for threads that would otherwise poll a running frame in a
-/// `sched_yield` loop. On aarch64 cores with FEAT_WFxT (HWCAP2_WFXT, e.g. the Cortex-X925/A725
+/// `sched_yield` loop. On Linux aarch64 cores with FEAT_WFxT (HWCAP2_WFXT, e.g. the Cortex-X925/A725
 /// cores of GB10), the copy stream writes each frame's fence to a mapped host word right after
 /// the frame's `transferred` event, and [`GraphExecutor::park`] waits in WFET with the exclusive
 /// monitor armed on that word. The event query in [`GraphExecutor::poll`] stays the only
@@ -27,7 +27,7 @@ struct CompletionWake {
     device: usize,
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 mod host_wait {
     use std::sync::OnceLock;
 
@@ -81,6 +81,7 @@ mod host_wait {
 /// Longest intentional wait per park. The GPU's wake-word write may end it early; anything that
 /// cannot touch the word (a peer's socket message, a new request, a deadline check) waits for the
 /// deadline, GB10's ~100-130 us WFE event stream, or a spurious wake, whichever comes first.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 const PARK_LIMIT_US: u64 = 100;
 
 pub struct Upload<'a> {
@@ -536,7 +537,7 @@ impl GraphExecutor {
             })
         };
         let frames = [frame()?, frame()?];
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
         let wake = if host_wait::available() {
             let word = copy.mapped_host_buffer(64)?;
             let device = copy.mapped_address(&word)?;
@@ -546,7 +547,7 @@ impl GraphExecutor {
         } else {
             None
         };
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
         let wake = None;
         let engram = manifest
             .engram
@@ -685,7 +686,7 @@ impl GraphExecutor {
     /// without waiting, when no frame is pending, the wake word already reached the frame, or
     /// this CPU has no WFxT; the caller then keeps its own polling step.
     pub fn park(&self) -> bool {
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
         {
             let Some(resources) = self.resources.as_ref() else { return false };
             let Some(wake) = resources.wake.as_ref() else { return false };
@@ -710,7 +711,7 @@ impl GraphExecutor {
             unsafe { host_wait::wait_change(word, seen, deadline) };
             true
         }
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
         false
     }
 

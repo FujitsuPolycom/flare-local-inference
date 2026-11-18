@@ -201,6 +201,31 @@ struct Incoming {
     /// Replaced on readmission and counted once when this request ends.
     host_lookup_outcome: Option<crate::offload::LookupOutcome>,
     pool_plan: Option<crate::scheduler::AdmissionPlan>,
+    restore_wait: RestoreWait,
+}
+
+/// Capacity waiting is charged once per admission episode. Expiry wakes a blocked request
+/// once; a failed recompute admission still waits for resources instead of polling lookups.
+#[derive(Default)]
+struct RestoreWait {
+    started: Option<std::time::Instant>,
+    retry_at: Option<std::time::Instant>,
+}
+
+impl RestoreWait {
+    fn defer(&mut self, gained: u64, transfer_seconds: f64, prefill_rate: f64) -> bool {
+        let now = std::time::Instant::now();
+        let started = *self.started.get_or_insert(now);
+        let waited = now.duration_since(started).as_secs_f64();
+        let budget = 0.5 * gained as f64 / prefill_rate.max(1.0) - transfer_seconds;
+        self.retry_at = None;
+        if flare_selene::worth_transfer(gained, transfer_seconds + waited, prefill_rate)
+            && let Ok(remaining) = std::time::Duration::try_from_secs_f64(budget - waited)
+        {
+            self.retry_at = now.checked_add(remaining);
+        }
+        self.retry_at.is_some()
+    }
 }
 impl Drop for Incoming {
     fn drop(&mut self) {
@@ -231,6 +256,13 @@ impl Incoming {
             })
         {
             self.pool_lookup_started = None;
+            self.blocked = None;
+        }
+    }
+
+    fn poll_restore_wait(&mut self, now: std::time::Instant) {
+        if self.restore_wait.retry_at.is_some_and(|deadline| now >= deadline) {
+            self.restore_wait.retry_at = None;
             self.blocked = None;
         }
     }
@@ -853,6 +885,7 @@ impl ModelRuntime {
                 pool_lookup_started: None,
                 host_lookup_outcome: None,
                 pool_plan: None,
+                restore_wait: RestoreWait::default(),
             };
             let enqueue_ns = observation
                 .filter(|timestamps| *timestamps)
@@ -1281,11 +1314,13 @@ impl<'a> Worker<'a> {
             }
         }
         while self.scheduler.has_available_slot() {
+            let now = std::time::Instant::now();
             for incoming in self.pending.iter_mut().chain(self.parked.iter_mut().map(|(incoming, _)| incoming)) {
                 if let Some(store) = self.store.as_mut().filter(|store| store.pooled()) {
                     begin_pool_lookup(&mut self.scheduler, store.as_mut(), incoming);
                 }
                 incoming.poll_pool_lookup();
+                incoming.poll_restore_wait(now);
             }
             let stats = self.scheduler.stats();
             let resources = (
@@ -1341,6 +1376,7 @@ impl<'a> Worker<'a> {
                     checkpoint_accounting,
                     self.prefill_rate,
                     self.metrics,
+                    &mut incoming.restore_wait,
                 )
                 .map(|(handle, outcome)| {
                     if outcome.is_some() {
@@ -1458,6 +1494,7 @@ impl<'a> Worker<'a> {
                 incoming.pool_lookup = None;
                 incoming.pool_plan = None;
             }
+            incoming.restore_wait = RestoreWait::default();
             incoming.notify_admission(Ok(()));
             self.active[slot] = Some(Active {
                 request: handle,
@@ -2267,6 +2304,9 @@ impl<'a> Worker<'a> {
                 }
                 StoreEvent::Fetched { key, result } => {
                     requeued.extend(self.scheduler.finish_inbound(key, result.is_ok())?);
+                    // A ticket without waiters can become an evictable checkpoint without
+                    // changing free counts. Its completion must still wake admissions.
+                    released = true;
                 }
                 StoreEvent::ExportRequested {
                     export,
@@ -2623,6 +2663,7 @@ fn admit_with_host_store(
     accounting: Option<crate::scheduler::CheckpointAccounting>,
     prefill_rate: f64,
     metrics: &super::metrics::Metrics,
+    restore_wait: &mut RestoreWait,
 ) -> Result<(RequestHandle, Option<crate::offload::LookupOutcome>)> {
     let plan = match queued_plan {
         Some(plan) => scheduler.refresh_admission_plan(plan)?,
@@ -2662,9 +2703,18 @@ fn admit_with_host_store(
             consumed_tokens: hit.consumed_tokens,
             pages: hit.pages,
         };
+        let gained = hit.consumed_tokens - plan.resident_tokens();
         let admitted = match scheduler.admit_planned_with_checkpoint_accounting(spec.clone(), plan, Some(inbound), accounting.clone()) {
             Ok(admitted) => admitted,
-            Err(Error::Admission(AdmissionError::Capacity(_))) => {
+            Err(Error::Admission(AdmissionError::Capacity(failure))) => {
+                // Resource holders may release snapshot backing without another admission.
+                // Bound that wait by the restore's estimated advantage over prefill.
+                if scheduler.resources_in_flight()
+                    && restore_wait.defer(gained, hit.estimated_seconds, prefill_rate)
+                {
+                    return Err(Error::Admission(AdmissionError::Capacity(failure)));
+                }
+                restore_wait.retry_at = None;
                 let handle = admit_with_checkpoint_accounting(scheduler, spec, accounting.clone())?;
                 scheduler.record_host_lookup();
                 return Ok((handle, Some(LookupOutcome::CapacityRejected)));
@@ -3088,6 +3138,7 @@ mod tests {
             pool_lookup_started: None,
             host_lookup_outcome: None,
             pool_plan: None,
+            restore_wait: RestoreWait::default(),
         };
         (
             incoming,
