@@ -1143,6 +1143,7 @@ fn concurrent_identical_terminal_publications_release_duplicate_resources() {
     let second = scheduler.admit(spec(64, 1)).unwrap();
     init(&mut scheduler, 1);
     let mut checkpoint = None;
+    let mut completion_epoch = 0;
     for (handle, fence) in [(first, 2), (second, 4)] {
         let step = scheduler.plan().unwrap();
         assert_eq!(step.lanes[0].request, handle);
@@ -1156,6 +1157,9 @@ fn concurrent_identical_terminal_publications_release_duplicate_resources() {
             .unwrap();
         freeze(&mut scheduler, handle, fence + 1);
         let result = scheduler.finish(handle).unwrap();
+        let epoch = scheduler.cache().checkpoint(result.unwrap()).unwrap().retention_rank().use_epoch;
+        assert!(epoch > completion_epoch);
+        completion_epoch = epoch;
         if checkpoint.is_none() {
             checkpoint = result;
         } else {
@@ -1173,6 +1177,326 @@ fn concurrent_identical_terminal_publications_release_duplicate_resources() {
     assert_eq!(scheduler.stats().snapshot_evictions, 1);
     assert_eq!(scheduler.stats().cached_checkpoints, 0);
     scheduler.admit(unrelated).unwrap();
+}
+
+#[test]
+fn snapshot_pressure_reclaims_untouched_ancestors_of_a_reused_prefix() {
+    capture_under_reused_chain_pressure(0);
+}
+
+#[test]
+fn page_pressure_reclaims_untouched_ancestors_of_a_reused_prefix() {
+    capture_under_reused_chain_pressure(16);
+}
+
+fn capture_under_reused_chain_pressure(alias_pages: u32) {
+    let rows = if alias_pages == 0 { 9 } else { 10 };
+    let mut scheduler = scheduler(2, 64.max(32 + rows * alias_pages), rows);
+    scheduler.enable_publications();
+    scheduler.enable_evictions();
+    scheduler
+        .share_snapshot_pages(
+            &(0..rows)
+                .map(|row| 32 + row * alias_pages..32 + (row + 1) * alias_pages)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let long_history = history(512);
+    let mut chain = Vec::new();
+    for index in 0..8 {
+        let epoch = scheduler.cache.new_use_epoch().unwrap();
+        let snapshot = scheduler.reserve_snapshot(0).unwrap();
+        let page = scheduler.free_pages.pop_first().unwrap();
+        let consumed = (index + 1) * 64;
+        let id = scheduler
+            .cache
+            .publish_with_retention(
+                &long_history,
+                &Publication {
+                    parent: chain.last().copied(),
+                    consumed_tokens: consumed,
+                    tail_pages: vec![page],
+                    snapshot: StateSnapshot {
+                        id: snapshot,
+                        consumed_tokens: consumed,
+                    },
+                    ready_after: Fence(0),
+                },
+                RetentionRole::Anchor,
+                epoch,
+            )
+            .unwrap()
+            .id();
+        scheduler.record_publication(id);
+        chain.push(id);
+    }
+    let tip = *chain.last().unwrap();
+    let pages = scheduler.cache.page_chain(tip).unwrap();
+    let mut pending_spec = spec(64, 1);
+    pending_spec.prompt.fill(999);
+    let pending = scheduler.admit(pending_spec).unwrap();
+    let mut other_history = PrefixHistory::new([9; 32]);
+    other_history.append(&[888; 64], &[]).unwrap();
+    let epoch = scheduler.cache.new_use_epoch().unwrap();
+    let snapshot = scheduler.reserve_snapshot(0).unwrap();
+    let page = scheduler.free_pages.pop_first().unwrap();
+    let other = scheduler
+        .cache
+        .publish_with_retention(
+            &other_history,
+            &Publication {
+                parent: None,
+                consumed_tokens: 64,
+                tail_pages: vec![page],
+                snapshot: StateSnapshot {
+                    id: snapshot,
+                    consumed_tokens: 64,
+                },
+                ready_after: Fence(0),
+            },
+            RetentionRole::Endpoint,
+            epoch,
+        )
+        .unwrap()
+        .id();
+    let hot = scheduler.admit(spec(512, 1536)).unwrap();
+    assert_eq!(scheduler.request(hot).unwrap().prefix, Some(tip));
+    // The remaining free row aliases live output pages when rows share KV backing.
+    assert_eq!(
+        scheduler.free_snapshot_count(),
+        usize::from(alias_pages != 0)
+    );
+    assert!(scheduler.available_snapshot(0).is_none());
+    let capture = scheduler.allocate_terminal_capture(pending).unwrap();
+    assert!(
+        capture.is_some(),
+        "older interior rows must fund the pending capture"
+    );
+    assert_eq!(scheduler.stats().checkpoint_skip_storage, 0);
+    assert!(scheduler.cache.checkpoint(chain[0]).is_err());
+    assert!(scheduler.cache.checkpoint(other).is_ok());
+    assert_eq!(scheduler.cache.page_chain(tip).unwrap(), pages);
+    assert_eq!(
+        scheduler.cache.lookup(&long_history).unwrap().checkpoint,
+        Some(tip)
+    );
+    assert_eq!(
+        scheduler.cache.lookup(&other_history).unwrap().checkpoint,
+        Some(other)
+    );
+    let evictions = scheduler.take_evictions();
+    assert_eq!(evictions.len(), 1);
+    let heir = evictions[0].heir.as_ref().unwrap();
+    assert_eq!(heir.parent, None);
+    assert_eq!(heir.chain_pages, pages[..2]);
+    scheduler.release_snapshot(capture.unwrap());
+    scheduler.cancel(pending).unwrap();
+    scheduler.cancel(hot).unwrap();
+}
+
+#[test]
+fn completion_refreshes_terminal_and_prompt_recency_after_other_requests_finish() {
+    let mut scheduler = scheduler(2, 8, 4);
+    let long = scheduler.admit(spec(64, 2)).unwrap();
+    let mut other = spec(64, 1);
+    other.prompt[0] = 999;
+    let short = scheduler.admit(other).unwrap();
+    init(&mut scheduler, 1);
+    let step = scheduler.plan().unwrap();
+    assert_eq!(
+        (step.kind, step.lanes[0].request),
+        (GraphKind::Prefill, long)
+    );
+    scheduler.commit(&step, Fence(2)).unwrap();
+    scheduler
+        .complete(
+            Fence(2),
+            &records(long, 2, 64, 1, 88, 1),
+            Default::default(),
+        )
+        .unwrap();
+    let step = scheduler.plan().unwrap();
+    assert_eq!(
+        (step.kind, step.lanes[0].request),
+        (GraphKind::Prefill, short)
+    );
+    scheduler.commit(&step, Fence(3)).unwrap();
+    scheduler
+        .complete(
+            Fence(3),
+            &records(short, 3, 64, 1, 89, 2),
+            Default::default(),
+        )
+        .unwrap();
+    freeze(&mut scheduler, short, 4);
+    let short_checkpoint = scheduler.finish(short).unwrap().unwrap();
+    let step = scheduler.plan().unwrap();
+    assert_eq!(
+        (step.kind, step.lanes[0].request),
+        (GraphKind::Snapshot, long)
+    );
+    scheduler.commit(&step, Fence(5)).unwrap();
+    scheduler
+        .complete(
+            Fence(5),
+            &state_records(&scheduler, &step, 5),
+            Default::default(),
+        )
+        .unwrap();
+    let step = scheduler.plan().unwrap();
+    assert_eq!(
+        (step.kind, step.lanes[0].request),
+        (GraphKind::Decode, long)
+    );
+    scheduler.commit(&step, Fence(6)).unwrap();
+    scheduler
+        .complete(
+            Fence(6),
+            &records(long, 6, 65, 2, 90, 2),
+            Default::default(),
+        )
+        .unwrap();
+    freeze(&mut scheduler, long, 7);
+    let prompt = scheduler.request(long).unwrap().prefix.unwrap();
+    let prompt_epoch = scheduler
+        .cache()
+        .checkpoint(prompt)
+        .unwrap()
+        .retention_rank()
+        .use_epoch;
+    let long_checkpoint = scheduler.finish(long).unwrap().unwrap();
+    let pages = scheduler.cache().page_chain(long_checkpoint).unwrap();
+    let completed_epoch = scheduler
+        .cache()
+        .checkpoint(long_checkpoint)
+        .unwrap()
+        .retention_rank()
+        .use_epoch;
+    assert!(completed_epoch > prompt_epoch);
+    assert_eq!(
+        scheduler
+            .cache()
+            .checkpoint(prompt)
+            .unwrap()
+            .retention_rank()
+            .use_epoch,
+        completed_epoch
+    );
+    // Both useful endpoints outlive a conversation that completed while this request ran.
+    assert_eq!(
+        scheduler.cache().eviction_candidate(None, false),
+        Some(short_checkpoint)
+    );
+    assert!(
+        scheduler
+            .cache()
+            .checkpoint(long_checkpoint)
+            .unwrap()
+            .retention_rank()
+            > scheduler
+                .cache()
+                .checkpoint(short_checkpoint)
+                .unwrap()
+                .retention_rank()
+    );
+    let evicted = scheduler.evict(EvictionTarget {
+        pages: 0,
+        snapshots: 1,
+    });
+    assert_eq!(evicted.retired[0].checkpoint, short_checkpoint);
+    assert_eq!(
+        scheduler.cache().lookup(&history(64)).unwrap().checkpoint,
+        Some(prompt)
+    );
+    assert_eq!(
+        scheduler.cache().page_chain(long_checkpoint).unwrap(),
+        pages
+    );
+}
+
+#[test]
+fn cancellation_before_inference_and_preemption_preserve_checkpoint_demand_recency() {
+    for preempted in [false, true] {
+        let mut scheduler = scheduler(1, 8, 4);
+        let handle = scheduler.admit(spec(64, 4)).unwrap();
+        init(&mut scheduler, 1);
+        let step = scheduler.plan().unwrap();
+        scheduler.commit(&step, Fence(2)).unwrap();
+        scheduler
+            .complete(
+                Fence(2),
+                &records(handle, 2, 64, 1, 88, 1),
+                Default::default(),
+            )
+            .unwrap();
+        retain_prompt(&mut scheduler, 3);
+        let id = scheduler.request(handle).unwrap().prefix.unwrap();
+        let rank;
+        if preempted {
+            rank = scheduler.cache().checkpoint(id).unwrap().retention_rank();
+            scheduler.finish_early(handle, true).unwrap();
+            scheduler.finish(handle).unwrap();
+        } else {
+            scheduler.cancel(handle).unwrap();
+            let handle = scheduler.admit(spec(64, 4)).unwrap();
+            rank = scheduler.cache().checkpoint(id).unwrap().retention_rank();
+            scheduler.cancel(handle).unwrap();
+        }
+        assert_eq!(
+            scheduler.cache().checkpoint(id).unwrap().retention_rank(),
+            rank
+        );
+    }
+}
+
+#[test]
+fn completion_and_client_stop_refresh_the_retained_prefix_only_without_execution_errors() {
+    for (failed, cancelled) in [(false, false), (false, true), (true, false), (true, true)] {
+        let mut scheduler = scheduler(1, 8, 4);
+        let handle = scheduler.admit(spec(64, 4)).unwrap();
+        init(&mut scheduler, 1);
+        let step = scheduler.plan().unwrap();
+        scheduler.commit(&step, Fence(2)).unwrap();
+        scheduler
+            .complete(
+                Fence(2),
+                &records(handle, 2, 64, 1, 88, 1),
+                Default::default(),
+            )
+            .unwrap();
+        retain_prompt(&mut scheduler, 3);
+        let id = scheduler.request(handle).unwrap().prefix.unwrap();
+        let epoch = scheduler
+            .cache()
+            .checkpoint(id)
+            .unwrap()
+            .retention_rank()
+            .use_epoch;
+        if failed {
+            scheduler.request_mut(handle).unwrap().error_code = Some(1);
+        }
+        // Finishing at the retained endpoint needs no additional snapshot.
+        if cancelled {
+            scheduler.cancel(handle).unwrap();
+        } else {
+            scheduler.finish_early(handle, false).unwrap();
+            assert!(
+                scheduler
+                    .request(handle)
+                    .unwrap()
+                    .terminal_snapshot
+                    .is_none()
+            );
+            assert_eq!(scheduler.finish(handle).unwrap(), Some(id));
+        }
+        let completed_epoch = scheduler
+            .cache()
+            .checkpoint(id)
+            .unwrap()
+            .retention_rank()
+            .use_epoch;
+        assert_eq!(completed_epoch > epoch, !failed);
+    }
 }
 
 #[test]

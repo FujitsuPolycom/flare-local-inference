@@ -881,10 +881,10 @@ flare run ORG/MODEL@gb202 --filename model.safetensors --gpus 0,1,2,3
 
 These examples use `ORG/MODEL` as a repository placeholder. Repositories contain
 prepared Flare cores, not source Transformers checkpoints. Hardware variants
-are separate Hugging Face revisions named `gb10`, `gb202`, and `gb300`. Automatic selection
+are separate Hugging Face revisions named `ga102`, `gb10`, `gb202`, and `gb300`. Automatic selection
 queries the selected GPUs' PCI device identifiers through NVML without initializing
 CUDA. GB10 selects `gb10`; known GB202 devices, including RTX PRO
-6000 Blackwell, select `gb202`; GB300 selects `gb300`. All selected GPUs must belong to the same family.
+6000 Blackwell, select `gb202`; GB300 selects `gb300`; known GA102 devices select `ga102`. All selected GPUs must belong to the same family.
 An unknown identifier or a driver unable to report it requires an explicit
 revision. GPU selection follows `CUDA_VISIBLE_DEVICES` for both commands.
 Revision detection runs in a short-lived process so NVML's worker threads cannot
@@ -915,7 +915,7 @@ Both commands accept these download options:
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--revision REVISION` | Explicit Hub branch, tag, or commit | Recorded model origin, otherwise detected `gb10`, `gb202`, or `gb300` |
+| `--revision REVISION` | Explicit Hub branch, tag, or commit | Recorded model origin, otherwise detected `ga102`, `gb10`, `gb202`, or `gb300` |
 | `--filename FILE` | Repository-relative prepared core filename | Sole primary `.safetensors` file |
 | `--cache-dir PATH` | Parent for the shared Hugging Face download transport cache | Flare model cache |
 | `--token-file PATH` | File containing a Hub token for gated or private repositories | No authentication |
@@ -1064,7 +1064,16 @@ Export always writes the directory canonical form in the cache.
 single-file core; `ignition convert CACHE_ENTRY --output DIR` writes a
 standalone directory. `CACHE_ENTRY` is the path printed by export. Both forms use
 the same metadata, payloads, signatures, and location records. Converting between them
-needs no signing key or GPU. `--output` refuses an existing destination. A
+needs no signing key or GPU. Conversion reports its work as the export does, on
+standard error with elapsed time and byte counts: `Verify core`, `Verify stored
+data`, `Write packed core` or `Write core companions`, and the final
+publication of the destination. `Verify core` checks the metadata structure,
+the commitment digests, and that every selected payload is present; conversion
+does not authenticate signatures, which the loader does. `Verify stored data`
+hashes each payload once against its signed identity and counts payload bytes.
+The write phases count every byte written to the destination, including
+container headers and alignment padding, so a finished write phase reports the
+size of the files it produced. `--output` refuses an existing destination. A
 destination on another filesystem is assembled by copying bytes, so those files
 share no storage with the cache; a destination on the cache's filesystem shares
 inodes where it can. Payload-format cores keep the semantic payload boundaries their export declared. No

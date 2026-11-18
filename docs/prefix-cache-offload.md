@@ -257,9 +257,16 @@ unrestorable.
 
 GPU eviction ranks eligible checkpoints by logical-request demand epoch,
 retention role, consumed-token count, and identity, as specified in
-[checkpoint lifetime](core-design.md#branching-and-lifetime). Host-store eviction
-independently removes the least recently used unpinned leaf; when every leaf is
-pinned, it compacts the least recently used unpinned single-child ancestor by
+[checkpoint lifetime](core-design.md#branching-and-lifetime). GPU demand recency
+belongs to the selected snapshot, not every ancestor supplying its pages.
+Successful terminal retirement also refreshes its direct parent, including a
+shared or host-restored checkpoint, without refreshing earlier ancestors.
+Pressure can compact an older single-child ancestor while preserving the reused
+descendant's complete page chain and reporting its compaction heir. Direct
+copy-out pins and outstanding GPU-use fences still protect transfer resources.
+Host-store eviction independently removes the least recently used unpinned leaf;
+when every leaf is pinned, it compacts the least recently used unpinned
+single-child ancestor by
 dropping its row and keeping its pages. A compacted host node stays in the tree
 as page-only, no longer matches lookups, and continues to supply chain pages.
 A node is evictable only when its store's policy allows it: the memory store standalone evicts any unpinned node, the
@@ -271,7 +278,11 @@ pages. DRAM retains these redundant rows while its free retention space exceeds
 two continuation rows. Reserved transfer intake does not count as retention
 headroom. When that threshold is reached, or an incoming record needs more
 space than is free, DRAM reclaims eligible redundant rows before evicting other
-records. Readers and spills delay row removal until their pins are released.
+records. It reclaims them in least-recently-used order and stops once the
+headroom is restored: a single child does not show that its parent's row is
+unused, because a request that branches from the parent leaves that row as the
+only resume point of the conversation it branched from. Readers and spills
+delay row removal until their pins are released.
 DRAM releases row slots, disk truncates at the row segment, and later spills
 omit removed rows. A rewind or later fork restores its retained endpoint when
 available; otherwise it restores the nearest row-bearing ancestor and
@@ -653,8 +664,19 @@ call from the worker returns without waiting.
 
 Admission consults the store after `plan_admission`: `lookup` runs above the
 GPU hit, the policy in section 2.10 decides whether to fetch, and
-`admit_planned` receives the inbound request. A newly created ticket starts
-the inbound job through `fetch`. On inbound failure the worker cancels each
+`admit_planned` receives the inbound request. If capacity prevents reserving
+the restore's pages and snapshot row, admission waits while existing requests,
+inbound tickets, checkpoint pins, or fenced retirement may release resources.
+Waiting plus estimated transfer time must remain below half the estimated
+prefill time of the tokens gained. The worker retries after resource changes,
+pin release, transfer completion, or wait-budget expiry; expiry is checked even
+when resource counts stay unchanged. Other eligible requests can be admitted during this wait.
+If no resource holder remains or the budget expires, admission tries recomputation.
+If recomputation also lacks capacity, it waits for resource changes without
+repeated timeout retries. A successful admission clears the wait accounting so
+readmission after preemption starts a separate wait. Pooled lookups keep their
+ticket and validated history across retries and recheck GPU residency.
+A newly created ticket starts the inbound job through `fetch`. On inbound failure the worker cancels each
 waiter and pushes its `Incoming` to the front of the pending queue with host
 lookup disabled for that attempt.
 

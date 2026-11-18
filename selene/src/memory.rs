@@ -720,14 +720,34 @@ impl Core {
         {
             return;
         }
-        for key in std::mem::take(&mut self.thinning) {
+        // A single child does not prove its parent's row useless: a request that
+        // branches from the parent (a side request, or history the client renders
+        // differently) leaves the parent as the only resume point of the main
+        // conversation. Reclaim the least recently used rows first, and only as
+        // many as the headroom needs, so recently used parents keep theirs.
+        let mut queued: Vec<_> = std::mem::take(&mut self.thinning)
+            .into_iter()
+            .filter_map(|key| self.index.node(&key).map(|node| (node.accessed(), key)))
+            .collect();
+        queued.sort_unstable();
+        let mut queued = queued.into_iter();
+        for (_, key) in queued.by_ref() {
             if !self.index.row_redundant(&key, false) {
                 continue;
             }
             if !self.thin(&key) {
                 self.thinning.insert(key);
             }
+            if self
+                .pool
+                .free_slots()
+                .saturating_sub(self.pool.intake_slots())
+                > headroom
+            {
+                break;
+            }
         }
+        self.thinning.extend(queued.map(|(_, key)| key));
     }
 
     fn mark_durable(&mut self, key: &PrefixKey) -> Result<()> {
@@ -2030,6 +2050,40 @@ mod tests {
             assert!(core.pool.free_slots() >= core.pool.intake_slots());
             assert_clean_slots(&core);
         }
+    }
+
+    #[test]
+    fn pressure_keeps_the_row_of_a_recently_used_parent_whose_child_branched_away() {
+        let mut core = store_core(4, 6, false);
+        let main = history(256, 1);
+        let root = published(&main, 64, None, 0, 1);
+        let older = published(&main, 128, Some(64), 0, 2);
+        let resume = published(&main, 192, Some(128), 0, 3);
+        for checkpoint in [&root, &older, &resume] {
+            assert!(core.store(checkpoint).unwrap());
+            finish(&mut core);
+        }
+        // A side request reuses the main conversation's last checkpoint and
+        // then diverges, so its record cannot resume the main conversation.
+        core.reused(&resume.key);
+        let mut branch = PrefixHistory::new(IDENTITY);
+        let shared: Vec<u32> = (0..192u32)
+            .map(|t| t.wrapping_mul(2654435761).wrapping_add(1))
+            .collect();
+        branch.append(&shared, &[]).unwrap();
+        branch
+            .append(&(0..64u32).map(|t| 7_000_000 + t).collect::<Vec<_>>(), &[])
+            .unwrap();
+        let side = published(&branch, 256, Some(192), 0, 4);
+        assert!(core.store(&side).unwrap());
+        finish(&mut core);
+        assert!(!core.index[&older.key].row, "the older redundant row is reclaimed first");
+        assert!(core.index[&resume.key].row, "the recently used parent keeps its row");
+        assert_eq!(
+            core.lookup(&main, 0, u64::MAX).map(|hit| hit.key),
+            Some(resume.key)
+        );
+        assert_clean_slots(&core);
     }
 
     #[test]

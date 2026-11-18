@@ -116,6 +116,48 @@ def test_cli_validation_precedes_runtime_and_output_creation(
         assert not artifacts.exists()
 
 
+def serve(monkeypatch, tmp_path, raw, content_type):
+    """Replace the HTTP connection with one that answers every request with raw."""
+
+    class Response(io.BytesIO):
+        status = 200
+
+        def getheaders(self):
+            return [("Content-Type", content_type)]
+
+        def getheader(self, name, default=None):
+            return dict(self.getheaders()).get(name, default)
+
+    connections = []
+
+    class Connection:
+        def __init__(self, host, port, *, timeout):
+            self.endpoint = (host, port, timeout)
+            self.closed = False
+            connections.append(self)
+
+        def request(self, method, path, *, body, headers):
+            self.sent = (method, path, body, headers)
+
+        def getresponse(self):
+            return Response(raw)
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(server.http.client, "HTTPConnection", Connection)
+    args = SimpleNamespace(
+        base_url="http://127.0.0.1:1/api/",
+        timeout=17,
+        max_response_bytes=4096,
+        require_metrics=True,
+        cases=None,
+        artifacts=tmp_path,
+        output=tmp_path / "unused.json",
+    )
+    return server.Run(args), connections, args
+
+
 @pytest.mark.parametrize("stream", [False, True])
 def test_http_request_bytes_and_results_preserve_utf8_and_sse(
     tmp_path, monkeypatch, stream
@@ -166,43 +208,7 @@ def test_http_request_bytes_and_results_preserve_utf8_and_sse(
     )
     content_type = "text/event-stream; charset=utf-8" if stream else "application/json"
 
-    class Response(io.BytesIO):
-        status = 200
-
-        def getheaders(self):
-            return [("Content-Type", content_type)]
-
-        def getheader(self, name, default=None):
-            return dict(self.getheaders()).get(name, default)
-
-    connections = []
-
-    class Connection:
-        def __init__(self, host, port, *, timeout):
-            self.endpoint = (host, port, timeout)
-            self.closed = False
-            connections.append(self)
-
-        def request(self, method, path, *, body, headers):
-            self.sent = (method, path, body, headers)
-
-        def getresponse(self):
-            return Response(raw)
-
-        def close(self):
-            self.closed = True
-
-    monkeypatch.setattr(server.http.client, "HTTPConnection", Connection)
-    args = SimpleNamespace(
-        base_url="http://127.0.0.1:1/api/",
-        timeout=17,
-        max_response_bytes=4096,
-        require_metrics=True,
-        cases=None,
-        artifacts=tmp_path,
-        output=tmp_path / "unused.json",
-    )
-    run = server.Run(args)
+    run, connections, args = serve(monkeypatch, tmp_path, raw, content_type)
     record = run.request("completion", body, stream=stream)
     expected_body = {**body, "stream": stream}
     (connection,) = connections
@@ -244,3 +250,29 @@ def test_http_request_bytes_and_results_preserve_utf8_and_sse(
         assert all(check["passed"] for check in run.results["checks"])
     assert not args.output.exists()
     assert run.results["requests"] == [record]
+
+
+def test_metrics_request_asks_for_text_and_parses_integer_and_float_gauges(
+    tmp_path, monkeypatch
+):
+    raw = (
+        b"# TYPE flare_active_requests gauge\n"
+        b"flare_active_requests 0\n"
+        b"flare_retiring_request_slots 0\n"
+        b"flare_pending_requests 0\n"
+        b"flare_http_inflight_requests 0\n"
+        b"flare_free_kv_pages 7998\n"
+        b"flare_first_response_median_seconds 0.0123\n"
+    )
+    run, connections, _ = serve(monkeypatch, tmp_path, raw, "text/plain; version=0.0.4")
+    metrics = run.metrics("idle")
+    (connection,) = connections
+    assert (connection.sent[1], connection.sent[3]["Accept"]) == (
+        "/api/metrics",
+        "text/plain",
+    )
+    assert (
+        metrics["flare_free_kv_pages"] == 7998
+        and type(metrics["flare_free_kv_pages"]) is int
+    )
+    assert metrics["flare_first_response_median_seconds"] == 0.0123

@@ -137,17 +137,14 @@ def virtual_device_memory(device, group=None, *, tuning_replica=None):
 
 
 def worker_limit(limit, *, pools=1, available=None, device_bytes=0, headroom_bytes=0):
-    """Bound worker RAM after the greater of system headroom and the requested reserve."""
+    """Estimate a worker cap from RAM after headroom, with at least one worker per pool."""
     if limit <= 0 or pools <= 0 or device_bytes < 0 or headroom_bytes < 0:
         raise ValueError("compiler and pool limits must be positive; device bytes and headroom must be nonnegative")
     available = available_bytes() if available is None else available
     headroom = max(_HEADROOM_BYTES, headroom_bytes)
     worker_bytes = _WORKER_BYTES + device_bytes
     capacity = (available - headroom) // (pools * worker_bytes)
-    if capacity < 1:
-        raise MemoryError(f"preparation requires at least {(headroom + pools * worker_bytes) >> 20} MiB "
-                          f"available host memory; found {available >> 20} MiB")
-    return min(limit, capacity)
+    return min(limit, max(1, capacity))
 
 
 def candidate_scratch_limit(device, *, pools=1, headroom_bytes=0, pending_persistent_bytes=0):

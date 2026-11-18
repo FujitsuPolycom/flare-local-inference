@@ -828,14 +828,13 @@ impl Root {
                 continue;
             };
             if let Ok(Some(object)) = self.payload(identity) {
-                let compared = object.length() == length;
-                let valid = validate_hit(&object, identity, length, progress.as_ref()).is_ok();
-                if compared && let Some(progress) = &progress {
+                if object.length() != length {
+                    continue;
+                }
+                if let Some(progress) = &progress {
                     progress.record_local_source_bytes(length);
                 }
-                if valid {
-                    available.insert(identity, object);
-                }
+                available.insert(identity, object);
             }
         }
         let available_ids: BTreeSet<PayloadId> = available.keys().copied().collect();
@@ -1007,7 +1006,7 @@ impl Root {
 
     /// Install one resolved acquisition plan. No cached payload's source file is
     /// opened; remote and local locations are read only when installation needs
-    /// their bytes, and cached objects carry their verified leases into the entry.
+    /// their bytes. Cached objects retain their leases through entry publication.
     pub fn install_planned(
         &self,
         plan: AcquisitionPlan<'_>,
@@ -1529,8 +1528,8 @@ impl Root {
         result
     }
 
-    /// Insert an optional retention source while distinguishing a corrupt
-    /// source from publication failure. A missing/corrupt source yields
+    /// Insert an optional retention source while distinguishing an invalid
+    /// source from publication failure. A missing/invalid source yields
     /// `Ok(None)`; object-store or staging I/O errors are returned.
     fn insert_optional_payload(
         &self,
@@ -1551,8 +1550,7 @@ impl Root {
         }
         match self.payload(declared) {
             Ok(Some(object)) => {
-                let valid = validate_hit(&object, declared, length, progress).is_ok();
-                if valid {
+                if object.length() == length {
                     return Ok(Some((object, false)));
                 }
                 return Ok(None);
@@ -1733,9 +1731,7 @@ impl Root {
 
     /// Verify that an existing entry holds the requested ready closure.
     ///
-    /// Every payload the selected deployments require must be present at its
-    /// recorded companion path (or its derived path) with the signed length and
-    /// digest; existence alone never satisfies a warm hit.
+    /// Every selected payload is checked against its signed length and digest.
     pub fn verify_ready(&self, entry: &Entry, source: &CoreSource<'_>) -> Result<()> {
         self.verify_ready_with(entry, source, None)
     }
@@ -1748,6 +1744,28 @@ impl Root {
         source: &CoreSource<'_>,
         progress: Option<&progress::AcquisitionProgress>,
     ) -> Result<()> {
+        let files = self.ready_payloads(entry, source)?;
+        for (id, slice) in files.iter() {
+            let identity = PayloadId::from_bytes(
+                id.try_into()
+                    .map_err(|_| "payload identity is not 32 bytes".to_string())?,
+            );
+            verify_slice(slice, identity, progress)?;
+        }
+        Ok(())
+    }
+
+    /// Check a published entry's signed envelope, payload locations, and lengths.
+    /// Immutable cached payload bytes are reused without hashing them again.
+    pub fn check_ready(&self, entry: &Entry, source: &CoreSource<'_>) -> Result<()> {
+        self.ready_payloads(entry, source).map(|_| ())
+    }
+
+    fn ready_payloads(
+        &self,
+        entry: &Entry,
+        source: &CoreSource<'_>,
+    ) -> Result<reader::PayloadFiles> {
         // The entry must be the same signed core. Its physical locations may
         // be normalized, but its signed envelope may not change.
         let installed = reader::Metadata::open(entry.directory())?;
@@ -1799,9 +1817,8 @@ impl Root {
                 )
                 .into());
             }
-            verify_slice(&slice, identity, progress)?;
         }
-        Ok(())
+        Ok(files)
     }
 
     /// Select an already leased entry; callers retain the lease through loading.
@@ -2620,9 +2637,9 @@ impl Root {
 
     /// Install one selected deployment's ready closure as a directory cache entry.
     ///
-    /// Every required payload is hashed against its signed identity before the entry
-    /// becomes ready, absent payloads are streamed into the object store once, and
-    /// the entry primary is rebuilt from pinned metadata tensors with locations
+    /// Absent payloads are hashed against their signed identities while entering
+    /// the object store. Cached immutable payloads are reused after length checks.
+    /// The entry primary is rebuilt from pinned metadata tensors with locations
     /// rewritten to the entry-relative companions. The returned entry stays leased
     /// until the caller drops it, so the ref switch and a subsequent load cannot race
     /// eviction.
@@ -6413,9 +6430,10 @@ mod tests {
             Some(entry.id()),
             "successful warm installation must update the default"
         );
-        assert!(
-            progress.snapshot().verification_bytes >= target.len() as u64,
-            "the cached required target must still be hashed"
+        assert_eq!(
+            progress.snapshot().verification_bytes,
+            0,
+            "immutable cached targets must be reused without hashing"
         );
     }
 
@@ -6726,6 +6744,45 @@ mod tests {
     }
 
     #[test]
+    fn check_ready_reuses_payload_bytes_while_explicit_verification_hashes_them() {
+        let temporary = Temporary::new();
+        let root = temporary.root();
+        let directory = temporary.0.join("check-ready-payload");
+        let target = b"TTTTtttt";
+        let target_id = PayloadId::of(target);
+        let publisher = publish_fixture(&directory, &[("target", target)], &[(target_id, 0)]);
+        let source = core_source(&directory, &publisher);
+        let entry = root
+            .install_core(core_source(&directory, &publisher), "check-ready-model", "entry")
+            .unwrap();
+        root.check_ready(&entry, &source).unwrap();
+
+        let object = root.payload(target_id).unwrap().unwrap();
+        let path = object.path();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(path, permissions).unwrap();
+        let mut wrapper = fs::read(path).unwrap();
+        let last = wrapper.len() - 1;
+        wrapper[last] ^= 0xff;
+        fs::write(path, wrapper).unwrap();
+
+        root.check_ready(&entry, &source).unwrap();
+        assert!(root.verify_ready(&entry, &source).is_err());
+
+        fs::remove_file(path).unwrap();
+        let location = reader::Metadata::open(entry.directory())
+            .unwrap()
+            .locations
+            .locations
+            .into_iter()
+            .find(|location| location.payload_id == target_id.as_bytes().to_vec())
+            .unwrap();
+        fs::remove_file(entry.directory().join(location.file)).unwrap();
+        assert!(root.check_ready(&entry, &source).is_err());
+    }
+
+    #[test]
     fn verify_ready_hashes_embedded_primary_payloads() {
         let temporary = Temporary::new();
         let root = temporary.root();
@@ -6790,7 +6847,7 @@ mod tests {
     }
 
     #[test]
-    fn verified_cache_hit_is_counted_once_and_not_rehashed_on_install() {
+    fn cached_payload_reuse_does_not_hash_on_planning_or_install() {
         let temporary = Temporary::new();
         let root = temporary.root();
         let directory = temporary.0.join("planned-hit-progress");
@@ -6829,13 +6886,14 @@ mod tests {
                 Some(&progress),
             )
             .unwrap();
-        let verified = canonical.len() as u64 + graph_len;
-        assert_eq!(progress.snapshot().verification_bytes, verified);
+        let reused = canonical.len() as u64 + graph_len;
+        assert_eq!(progress.snapshot().local_source_bytes, reused);
+        assert_eq!(progress.snapshot().verification_bytes, 0);
         let _entry = root.install_planned(plan, "planned-hit", "entry").unwrap();
         assert_eq!(
             progress.snapshot().verification_bytes,
-            verified,
-            "installation must reuse the verified payload bytes"
+            0,
+            "installation must reuse immutable cached payloads without hashing"
         );
         let slice = root.payload(canonical_id).unwrap().unwrap().slice().clone();
         let digest_progress = progress::AcquisitionProgress::new();

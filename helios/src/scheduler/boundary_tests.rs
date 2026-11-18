@@ -237,6 +237,175 @@ fn duplicate_finished_boundary_needs_no_terminal_snapshot() {
 }
 
 #[test]
+fn completion_refreshes_only_terminal_and_canonical_parent_for_duplicate_publications() {
+    let mut s = scheduler(8, false);
+    let first = s.admit(spec(Some(70), 140, 3)).unwrap();
+    let second = s.admit(spec(Some(70), 140, 3)).unwrap();
+    let demand_epoch = s.request(second).unwrap().checkpoints.demand_epoch;
+    let terminal = finish(&mut s, first);
+    let parent = s.cache.checkpoint(terminal).unwrap().parent().unwrap();
+    let ancestor = s.cache.checkpoint(parent).unwrap().parent().unwrap();
+    let first_epoch = s
+        .cache
+        .checkpoint(terminal)
+        .unwrap()
+        .retention_rank()
+        .use_epoch;
+    assert_eq!(
+        s.cache.checkpoint(parent).unwrap().prefix().consumed_tokens,
+        140
+    );
+    assert_eq!(
+        s.cache
+            .checkpoint(parent)
+            .unwrap()
+            .retention_rank()
+            .use_epoch,
+        first_epoch
+    );
+    for _ in 0..250 {
+        if s.request(second).unwrap().phase == RequestPhase::Finishing {
+            break;
+        }
+        run_step(&mut s);
+    }
+    // Duplicate boundary publication keeps the second request's private page layout.
+    assert_ne!(s.request(second).unwrap().prefix, Some(parent));
+    let pages = s.cache.page_chain(terminal).unwrap();
+    assert_eq!(finish(&mut s, second), terminal);
+    let epoch = s
+        .cache
+        .checkpoint(terminal)
+        .unwrap()
+        .retention_rank()
+        .use_epoch;
+    assert!(epoch > first_epoch);
+    assert_eq!(
+        s.cache
+            .checkpoint(parent)
+            .unwrap()
+            .retention_rank()
+            .use_epoch,
+        epoch
+    );
+    assert!(
+        s.cache
+            .checkpoint(ancestor)
+            .unwrap()
+            .retention_rank()
+            .use_epoch
+            <= demand_epoch
+    );
+    let evicted = s.evict(EvictionTarget {
+        pages: 0,
+        snapshots: 1,
+    });
+    assert_eq!(evicted.retired[0].checkpoint, ancestor);
+    assert_eq!(evicted.retired[0].heir, Some(parent));
+    assert_eq!(s.cache.page_chain(terminal).unwrap(), pages);
+    assert_eq!(
+        s.cache.lookup(&history(140)).unwrap().checkpoint,
+        Some(parent)
+    );
+}
+
+#[test]
+fn completion_refreshes_restored_parent_without_refreshing_its_ancestors() {
+    let mut s = scheduler(8, false);
+    let seed = s.admit(spec(Some(70), 140, 3)).unwrap();
+    finish(&mut s, seed);
+    let request = spec(Some(70), 200, 5);
+    let plan = s.plan_admission(&request).unwrap();
+    let ancestor = plan.lookup.checkpoint.unwrap();
+    let key = history(200).key_at(200).unwrap();
+    let pages = 200 / 64 - plan.lookup.consumed_tokens as usize / 64;
+    let admitted = s
+        .admit_planned(
+            request,
+            plan,
+            Some(InboundRequest {
+                key,
+                consumed_tokens: 200,
+                pages,
+            }),
+        )
+        .unwrap();
+    let ancestor_rank = s.cache.checkpoint(ancestor).unwrap().retention_rank();
+    s.finish_inbound(key, true).unwrap();
+    let parent = s.request(admitted.handle).unwrap().prefix.unwrap();
+    let restored_epoch = s
+        .cache
+        .checkpoint(parent)
+        .unwrap()
+        .retention_rank()
+        .use_epoch;
+    assert_eq!(run_step(&mut s).kind, GraphKind::Restore);
+    assert_eq!(run_step(&mut s).kind, GraphKind::Resume);
+    assert_eq!(run_step(&mut s).kind, GraphKind::Decode);
+    s.finish_early(admitted.handle, false).unwrap();
+    let terminal = finish(&mut s, admitted.handle);
+    let epoch = s
+        .cache
+        .checkpoint(terminal)
+        .unwrap()
+        .retention_rank()
+        .use_epoch;
+    assert_eq!(s.cache.checkpoint(terminal).unwrap().parent(), Some(parent));
+    assert!(epoch > restored_epoch);
+    assert_eq!(
+        s.cache
+            .checkpoint(parent)
+            .unwrap()
+            .retention_rank()
+            .use_epoch,
+        epoch
+    );
+    assert_eq!(
+        s.cache.checkpoint(ancestor).unwrap().retention_rank(),
+        ancestor_rank
+    );
+}
+
+#[test]
+fn preemption_and_client_stop_do_not_refresh_ancestors_of_the_retained_prefix() {
+    for cancelled in [false, true] {
+        let mut s = scheduler(8, false);
+        let handle = s.admit(spec(Some(70), 140, 5)).unwrap();
+        stop_at_capture(&mut s, handle, 140);
+        run_step(&mut s);
+        let parent = s.request(handle).unwrap().prefix.unwrap();
+        let ancestor = s.cache.checkpoint(parent).unwrap().parent().unwrap();
+        let parent_rank = s.cache.checkpoint(parent).unwrap().retention_rank();
+        let ancestor_rank = s.cache.checkpoint(ancestor).unwrap().retention_rank();
+        assert_eq!(run_step(&mut s).kind, GraphKind::Decode);
+        if cancelled {
+            s.cancel(handle).unwrap();
+            assert!(s.cache.checkpoint(parent).unwrap().retention_rank() > parent_rank);
+        } else {
+            s.finish_early(handle, true).unwrap();
+            let terminal = finish(&mut s, handle);
+            assert_eq!(s.cache.checkpoint(terminal).unwrap().parent(), Some(parent));
+            assert_eq!(
+                s.cache.checkpoint(parent).unwrap().retention_rank(),
+                parent_rank
+            );
+            assert_eq!(
+                s.cache
+                    .checkpoint(terminal)
+                    .unwrap()
+                    .retention_rank()
+                    .use_epoch,
+                parent_rank.use_epoch
+            );
+        }
+        assert_eq!(
+            s.cache.checkpoint(ancestor).unwrap().retention_rank(),
+            ancestor_rank
+        );
+    }
+}
+
+#[test]
 fn requests_finish_when_no_checkpoint_storage_is_available() {
     let mut s = scheduler(0, false);
     let handle = s.admit(spec(Some(10), 70, 3)).unwrap();

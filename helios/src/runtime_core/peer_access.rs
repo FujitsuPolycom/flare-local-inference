@@ -7,7 +7,7 @@
 
 use super::{
     NativeResources,
-    driver::{Access, Handle, Location},
+    driver::{Access, Location},
 };
 use crate::Result;
 
@@ -54,82 +54,6 @@ impl NativeResources {
                 )
             },
         )
-    }
-
-    /// Cache grants run serially with all contexts alive and no replay in flight.
-    pub(super) unsafe fn grant_cache_access(
-        &self,
-        name: &str,
-        contexts: &[Handle],
-        log: bool,
-    ) -> Result<()> {
-        let storage = &self.allocations[name];
-        let Some(readers) = self
-            .peer_readers
-            .get(&storage.address)
-            .filter(|r| r.len() > 1)
-        else {
-            return unsafe { self.grant_storage_access(name) };
-        };
-        unsafe {
-            let before = self.peer_free_memory(contexts, readers)?;
-            let grant = self.grant_storage_access(name);
-            // Query even after a failed grant, but retain the original range-specific error.
-            let after = self.peer_free_memory(contexts, readers);
-            if log {
-                match &after {
-                    Ok(after) => {
-                        let used_delta: Vec<_> = before
-                            .iter()
-                            .zip(after)
-                            .map(|(&before, &after)| before as i128 - after as i128)
-                            .collect();
-                        eprintln!(
-                            "Cache peer access: owner_rank={} allocation={name:?} address={:#x} bytes={} mappings={} readers(rank,device)={readers:?} success={} free_before_bytes={before:?} free_after_bytes={after:?} used_delta_bytes={used_delta:?}",
-                            self.rank,
-                            storage.address,
-                            storage.nbytes,
-                            storage.mappings.len(),
-                            grant.is_ok(),
-                        );
-                    }
-                    Err(error) => eprintln!(
-                        "Cache peer access: owner_rank={} allocation={name:?} free_before_bytes={before:?} post-grant measurement failed: {error}",
-                        self.rank,
-                    ),
-                }
-            }
-            grant?;
-            after?;
-        }
-        Ok(())
-    }
-
-    unsafe fn peer_free_memory(
-        &self,
-        contexts: &[Handle],
-        readers: &[(usize, i32)],
-    ) -> Result<Vec<usize>> {
-        unsafe {
-            let result = readers
-                .iter()
-                .map(|&(rank, _)| {
-                    self.driver
-                        .check("cuCtxSetCurrent", (self.driver.context_set)(contexts[rank]))?;
-                    let (mut free, mut total) = (0, 0);
-                    self.driver.check(
-                        "cuMemGetInfo_v2",
-                        (self.driver.memory_info)(&mut free, &mut total),
-                    )?;
-                    Ok(free)
-                })
-                .collect();
-            let restored = self
-                .driver
-                .check("cuCtxSetCurrent", (self.driver.context_set)(self.context));
-            restored?;
-            result
-        }
     }
 }
 

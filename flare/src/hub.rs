@@ -401,10 +401,8 @@ fn download_for_model_at(
                 }
             }
         } else {
-            // Planning validates cached entries and relocates sources; install
-            // materializes and verifies payloads. Each row meters one counter, so
-            // verification is presented while planning and materialization while
-            // installing.
+            // Planning checks signed metadata and cached payload geometry;
+            // installation materializes and verifies missing payloads.
             check_cancel(Some(&report.progress))?;
 
             match plan_payload_acquisition(
@@ -1845,7 +1843,7 @@ fn verify_offline_entry(
     publishers: &[flare_helios::runtime_core::Publisher],
 ) -> Result<()> {
     use flare_helios::{
-        core::{conversion, reader},
+        core::{cache, conversion, reader},
         runtime_core::VerifiedCore,
     };
     let primary = entry_primary(entry)?;
@@ -1859,15 +1857,15 @@ fn verify_offline_entry(
         if !options.tensor_parallel.is_empty() || gpu_count > 0 {
             enforce_legacy_tensor_parallel(&verified, &sizes)?;
         }
-        verified.verify_stored_data()?;
     } else {
         let metadata = reader::Metadata::open(&primary)?;
         let selections = crate::cache_support::select_deployments(&metadata, publishers, &sizes)
             .map_err(|error| error.to_string())?;
-        for selection in selections {
-            VerifiedCore::open_selected(&primary, publishers, selection)?
-                .verify_stored_data()?;
-        }
+        let source = cache::CoreSource::open(&primary, publishers, selections[0])?
+            .union(publishers, &selections)?;
+        let model_root = crate::cache_support::model_root(options.core_cache.as_deref())
+            .map_err(|error| error.to_string())?;
+        cache::Root::open(&model_root)?.check_ready(entry, &source)?;
     }
     Ok(())
 }
@@ -2118,7 +2116,7 @@ fn plan_payload_acquisition<'a>(
                 continue;
             };
             if stored_revision == commit
-                && store.verify_ready_with(&entry, &source, progress).is_ok()
+                && store.check_ready(&entry, &source).is_ok()
             {
                 return Ok(PayloadAcquisition::Ready(entry));
             }
@@ -2211,7 +2209,7 @@ fn legacy_warm_entry(
                             || entry_verified
                                 .identity()
                                 .is_ok_and(|identity| sizes == [identity.tensor_parallel]);
-                        if tp_ok && entry_verified.verify_stored_data().is_ok() {
+                        if tp_ok {
                             return Ok(Some(entry));
                         }
                     }
@@ -2256,7 +2254,7 @@ fn legacy_warm_entry(
                 || entry_verified
                     .identity()
                     .is_ok_and(|identity| sizes == [identity.tensor_parallel]);
-            if tp_ok && entry_verified.verify_stored_data().is_ok() {
+            if tp_ok {
                 return Ok(Some(entry));
             }
         }
@@ -5045,6 +5043,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn warm_payload_download_does_not_rehash_installed_payloads() {
+        let temp = tempfile::tempdir().unwrap();
+        let (core, _profile, publisher, _commit) = signed_payload_fixture(temp.path());
+        let options = HubOptions {
+            revision: Some("gb10".into()),
+            tensor_parallel: vec![1],
+            core_cache: Some(temp.path().join("models")),
+            ..Default::default()
+        };
+        let (_, selected) =
+            counted_download(&core, "owner/reuse", "gb10", &options, &publisher);
+        let routes = core_routes(&core, "owner/reuse", "gb10");
+        let (endpoint, worker, _log) = mock_hub_counted(routes);
+        let progress = flare_helios::core::progress::AcquisitionProgress::new();
+        let entry = download_with_token_at(
+            &endpoint,
+            "owner/reuse@gb10",
+            &options,
+            1,
+            None,
+            &[],
+            None,
+            std::slice::from_ref(&publisher),
+            Some(progress.clone()),
+        )
+        .unwrap();
+        assert_eq!(entry.id(), selected);
+        assert_eq!(progress.snapshot().verification_bytes, 0);
+        drop(entry);
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn offline_resolution_rejects_corrupt_embedded_payload_before_default_update() {
         let (_source_scratch, primary, publishers) = selected_tp_core();
         let source_root = primary.parent().unwrap();
@@ -7791,7 +7822,18 @@ pub(crate) mod tests {
         let mut corrupted = std::fs::read(&payload).unwrap();
         *corrupted.last_mut().unwrap() ^= 1;
         std::fs::write(&payload, corrupted).unwrap();
-        assert!(verify_offline_entry(&entry, &offline, 1, &[publisher]).is_err());
+        verify_offline_entry(&entry, &offline, 1, std::slice::from_ref(&publisher)).unwrap();
+        let verified = flare_helios::runtime_core::VerifiedCore::open_selected(
+            &entry_primary(&entry).unwrap(),
+            &[publisher],
+            flare_helios::core::protection::Selection::Deployment {
+                deployment: 0,
+                rank: None,
+            },
+        )
+        .unwrap();
+        assert!(verified.verify_stored_data().is_err());
+        drop(verified);
 
         let store = flare_helios::core::cache::Root::open(&model_root).unwrap();
         assert!(store.evict(entry.model(), entry.id()).is_err());

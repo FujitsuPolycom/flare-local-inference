@@ -725,8 +725,12 @@ Admission reserves the request's KV pages. System, prompt, and terminal snapshot
 acquire backing at their capture boundaries, evicting unpinned checkpoints when
 needed. If active requests or transfers hold all suitable backing, optional
 retention is skipped. An inbound host restore reserves both its row and pages
-before transfer; if its snapshot prevents admission, the request recomputes its
-prompt. Snapshot and page ownership remain exclusive through graph
+before transfer. A capacity-blocked restore waits while requests, transfers,
+or fenced retirement may release backing and its accumulated wait plus estimated
+transfer time remains below half the estimated prefill time it replaces. Wait-budget expiry
+permits a recompute attempt even without resource progress. With no remaining
+resource holder, admission tries recomputation immediately.
+Snapshot and page ownership remain exclusive through graph
 and transfer completion, including cancellation and duplicate publication.
 Once generation drains, unused output-page reservations are released before
 retaining the final checkpoint.

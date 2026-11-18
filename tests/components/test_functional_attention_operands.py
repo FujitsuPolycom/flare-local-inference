@@ -168,7 +168,7 @@ def test_varlen_gather_source_alias_is_explicit(monkeypatch):
     output = torch.arange(24).view(3, 8)
     counts = torch.tensor([16, 32, 16], dtype=torch.int64)
     assert op(output, counts) is output
-    assert calls[0][0].data_ptr() == output[1].data_ptr()
+    assert calls[0][0] is output
     assert calls[0][1] is counts and calls[0][2] is output
     assert op.source is op.counts is op.output is None
 
