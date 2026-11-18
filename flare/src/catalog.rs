@@ -559,7 +559,7 @@ mod tests {
                 }
             }
             let refs = serde_json::from_value(json!({"branches": [
-                {"name": "gb10-tp1"}, {"name": "gb202"}, {"name": "gb300-tp8"}
+                {"name": "ga102-tp1"}, {"name": "gb10-tp1"}, {"name": "gb202"}, {"name": "gb300-tp8"}
             ]})).unwrap();
             let mut entry = CatalogEntry::default();
             let branches = apply_refs(&mut entry, refs, Some(target));

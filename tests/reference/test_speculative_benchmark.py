@@ -198,7 +198,7 @@ def test_actual_prepared_arm_must_match_fixed_width_and_catalog():
 def metrics(admitted=0):
     return {"flare_active_requests": 0, "flare_pending_requests": 0,
             "flare_free_request_slots": 4, "flare_retiring_request_slots": 0,
-            "flare_free_kv_pages": 90, "flare_cached_kv_pages": 10,
+            "flare_free_kv_pages": 88, "flare_cached_kv_pages": 2, "flare_snapshot_backing_pages": 10,
             "flare_free_snapshots": 9, "flare_cached_checkpoints": 1,
             "flare_requests_admitted_total": admitted, "flare_requests_completed_total": admitted,
             "flare_requests_failed_total": 0, "flare_requests_cancelled_total": 0,

@@ -26,23 +26,12 @@ jobs:
       - name: Resolve the release version
         id: version
         run: |
-          crate_version() {
-            cargo metadata --no-deps --format-version 1 --manifest-path "$1" |
-              jq -er --arg name "$2" '.packages[] | select(.name == $name) | .version'
-          }
           if [[ "$GITHUB_EVENT_NAME" == push ]]; then
             version=${GITHUB_REF_NAME#v}
           else
-            version=$(crate_version flare-cli/Cargo.toml flare-cli)
+            version=0.0.0
           fi
-          for crate in flare-cli/Cargo.toml:flare-cli flare-winui/bridge/Cargo.toml:flare-winui-bridge \
-            flare-winui/launcher/Cargo.toml:flare-launcher; do
-            found=$(crate_version "${crate%%:*}" "${crate##*:}")
-            if [[ "$found" != "$version" ]]; then
-              echo "::error::${crate%%:*} has version $found; the release version is $version."
-              exit 1
-            fi
-          done
+          python3 scripts/set_release_version.py --check 0.0.0
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
   linux:
@@ -71,6 +60,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends build-essential cmake nasm pkg-config protobuf-compiler ${{ matrix.build-packages }}
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rust-docs
           rustup default "$RUST_TOOLCHAIN"
+      - name: Set the release version
+        run: python3 scripts/set_release_version.py "$VERSION"
       - name: Build the CLI
         run: cargo build --locked --release --manifest-path flare-cli/Cargo.toml --bin flare
       - name: Package the CLI and license notices
@@ -131,6 +122,7 @@ jobs:
       run:
         shell: powershell
     env:
+      VERSION: ${{ needs.version.outputs.version }}
       ARCHIVE: flare-windows-${{ matrix.arch }}.zip
     steps:
       - uses: actions/checkout@v4
@@ -143,6 +135,10 @@ jobs:
               throw "The shell runs as $env:PROCESSOR_ARCHITECTURE; this job builds on ${{ matrix.machine }}."
           }
           ./scripts/setup_windows.ps1 -RustToolchain $env:RUST_TOOLCHAIN -BuildToolsOnly
+      - name: Set the release version
+        run: |
+          python scripts/set_release_version.py "$env:VERSION"
+          if ($LASTEXITCODE -ne 0) { throw 'Release version update failed.' }
       - name: Build the desktop client
         run: ./scripts/build_winui.ps1 -Platform ${{ matrix.platform }} -SingleFile
       - name: Package the desktop client and license notices

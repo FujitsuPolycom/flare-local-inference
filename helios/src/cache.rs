@@ -249,6 +249,11 @@ impl PrefixCheckpointCache {
         })
     }
 
+    #[cfg(feature = "server")]
+    pub(crate) fn has_pins(&self) -> bool {
+        self.nodes.values().any(|node| node.direct_pins != 0)
+    }
+
     pub(crate) fn single_child(&self, id: CheckpointId) -> Option<CheckpointId> {
         if self.nodes.get(&id)?.child_count != 1 {
             return None;
@@ -301,11 +306,11 @@ impl PrefixCheckpointCache {
         Ok(self.clock)
     }
 
+    /// Refresh this snapshot's demand; sharing ancestor pages does not reuse their snapshots.
     pub fn touch(&mut self, id: CheckpointId, use_epoch: u64) -> Result<()> {
-        for ancestor in self.chain(id)? {
-            let node = self.nodes.get_mut(&ancestor).unwrap();
-            node.accessed = node.accessed.max(use_epoch);
-        }
+        self.checkpoint(id)?;
+        let node = self.nodes.get_mut(&id).unwrap();
+        node.accessed = node.accessed.max(use_epoch);
         Ok(())
     }
 

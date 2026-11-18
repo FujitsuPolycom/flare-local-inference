@@ -39,11 +39,13 @@ acceptance follows [signing](signing.md) as it does for a source build.
 
 ## Publish a release
 
-1. Set the same `version` in `flare-cli/Cargo.toml`,
-   `flare-winui/bridge/Cargo.toml`, and `flare-winui/launcher/Cargo.toml`,
-   update the three `Cargo.lock` files, and merge the change to the default
-   branch.
-2. Tag that commit `vMAJOR.MINOR.PATCH` with the same version and push the tag.
+Development checkouts use `0.0.0` in the three release manifests and their
+lockfiles. Do not commit a release-version bump. Tag the intended commit
+`vMAJOR.MINOR.PATCH` and push the tag. The build jobs use
+`scripts/set_release_version.py` to apply the tag's version to
+`flare-cli/Cargo.toml`, `flare-winui/bridge/Cargo.toml`,
+`flare-winui/launcher/Cargo.toml`, and their lockfiles in each runner's
+checkout.
 
 The workflow publishes to the repository that received the tag. Running it
 through `workflow_dispatch` performs every build and check and uploads the four
@@ -60,8 +62,9 @@ All builds use Rust 1.94.1 and the locked Cargo manifests. Every job must pass
 before anything is published; no target can be skipped.
 
 - **Version.** A tag push requires the tagged commit to be an ancestor of the
-  default branch. The three crate versions listed above must equal the tag's
-  version. A dispatched run takes the version from `flare-cli/Cargo.toml`.
+  default branch and all three release manifests and lockfiles to contain
+  `0.0.0`. Each build job applies the tag's version before compiling. A
+  dispatched run builds `0.0.0` without publishing a release.
 - **Linux.** The runner builds `flare` with
   `cargo build --locked --release --manifest-path flare-cli/Cargo.toml` and
   packages it with `packaging/archive.py`. The extracted archive then runs in

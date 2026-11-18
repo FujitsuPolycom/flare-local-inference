@@ -13,7 +13,7 @@ use std::{
 
 use super::{
     NativeResources, Storage,
-    driver::{AllocationProperties, Handle, Location},
+    driver::{AllocationProperties, Location},
     format::{Core, Memory, invalid},
 };
 use crate::Result;
@@ -641,7 +641,7 @@ mod tests {
                     );
                 }
                 owner
-                    .allocate_shared_cache(&core, &geometry, &layout, &[], false)
+                    .allocate_shared_cache(&core, &geometry, &layout)
                     .unwrap();
                 // Distinct bytes within each row detect repeated or misplaced
                 // backing, not just writes crossing snapshot boundaries.
@@ -800,8 +800,6 @@ impl NativeResources {
         core: &Core,
         geometry: &CacheGeometry,
         layout: &Layout,
-        contexts: &[Handle],
-        log_peer_access: bool,
     ) -> Result<()> {
         unsafe {
             self.driver
@@ -849,7 +847,7 @@ impl NativeResources {
                 self.map_cache_chunk(chunk.bytes, &mappings)?;
             }
             for plane in std::iter::once(&geometry.row).chain(&geometry.planes) {
-                self.grant_cache_access(&plane.name, contexts, log_peer_access)?;
+                self.grant_storage_access(&plane.name)?;
             }
             // Zero each physical byte once, before any graph or transfer can read an alias.
             self.driver.check(

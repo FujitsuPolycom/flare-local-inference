@@ -115,17 +115,22 @@ def test_compiler_pools_leave_host_headroom(pools, gib):
     assert pools * workers * (2 << 30) + (8 << 30) <= gib << 30
 
 
-def test_insufficient_host_ram_fails_before_workers_start():
-    with pytest.raises(MemoryError, match="available host memory"):
-        worker_limit(8, pools=4, available=15 << 30)
+@pytest.mark.parametrize("limit,pools,available", [
+    (8, 4, 15 << 30),
+    (1, 16, 19903 << 20),
+    (8, 16, 19903 << 20),
+    (8, 16, 7 << 30),
+    (8, 16, 0),
+])
+def test_low_host_ram_keeps_one_compiler_per_pool(limit, pools, available):
+    assert worker_limit(limit, pools=pools, available=available) == 1
 
 
 def test_unified_memory_budgets_host_and_device_storage_together():
     assert worker_limit(8, available=24 << 30) == 8
     assert worker_limit(8, available=24 << 30, device_bytes=2 << 30) == 4
     assert worker_limit(8, pools=2, available=24 << 30, device_bytes=2 << 30) == 2
-    with pytest.raises(MemoryError, match="available host memory"):
-        worker_limit(8, available=11 << 30, device_bytes=2 << 30)
+    assert worker_limit(8, available=11 << 30, device_bytes=2 << 30) == 1
 
 
 @pytest.mark.parametrize("platform", ["posix", "nt"])
@@ -216,6 +221,17 @@ def test_discrete_small_workloads_keep_a_positive_race_budget_without_workers(mo
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (768 << 20, 24 << 30))
     monkeypatch.setattr(host_memory, "available_bytes", lambda: pytest.fail("no compiler pool needs host RAM"))
     assert host_memory.tuning_limits("cuda:0", 0, headroom_bytes=1 << 30) == (0, 1)
+
+
+@pytest.mark.parametrize("race_budget,expected_race", [(None, 512 << 20), (1 << 20, 1 << 20)])
+def test_discrete_tuning_keeps_one_worker_per_rank_with_low_host_ram(monkeypatch, race_budget, expected_race):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=False))
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (4 << 30, 96 << 30))
+    monkeypatch.setattr(host_memory, "available_bytes", lambda: 19903 << 20)
+    assert host_memory.tuning_limits("cuda:0", 1, pools=16,
+        headroom_bytes=1 << 30, race_budget=race_budget) == (1, expected_race)
 
 
 @pytest.mark.parametrize("pools", [1, 2, 4])

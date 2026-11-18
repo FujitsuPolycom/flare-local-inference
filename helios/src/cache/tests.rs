@@ -1144,18 +1144,127 @@ fn retention_prioritizes_demand_epoch_before_role_and_promotes_duplicates() {
 }
 
 #[test]
-fn lookup_is_read_only_and_admission_touch_refreshes_ancestors() {
+fn lookup_is_read_only_and_touch_refreshes_only_the_selected_snapshot() {
     let mut cache = cache();
     let history = history(2, 0);
-    let parent = cache.publish_with_retention(&history, &proposal(None, 64, &[0], 0, 0), RetentionRole::Anchor, 1).unwrap().id();
-    let child = cache.publish_with_retention(&history, &proposal(Some(parent), 128, &[1], 1, 0), RetentionRole::Endpoint, 1).unwrap().id();
+    let parent = cache
+        .publish_with_retention(
+            &history,
+            &proposal(None, 64, &[0], 0, 0),
+            RetentionRole::Anchor,
+            1,
+        )
+        .unwrap()
+        .id();
+    let child = cache
+        .publish_with_retention(
+            &history,
+            &proposal(Some(parent), 128, &[1], 1, 0),
+            RetentionRole::Endpoint,
+            1,
+        )
+        .unwrap()
+        .id();
     cache.lookup(&history).unwrap();
-    assert_eq!(cache.checkpoint(child).unwrap().retention_rank().use_epoch, 1);
+    assert_eq!(
+        cache.checkpoint(child).unwrap().retention_rank().use_epoch,
+        1
+    );
     cache.new_use_epoch().unwrap();
     let epoch = cache.new_use_epoch().unwrap();
     cache.touch(child, epoch).unwrap();
-    assert_eq!(cache.checkpoint(parent).unwrap().retention_rank().use_epoch, epoch);
-    assert_eq!(cache.checkpoint(child).unwrap().retention_rank().use_epoch, epoch);
+    assert_eq!(
+        cache.checkpoint(parent).unwrap().retention_rank().use_epoch,
+        1
+    );
+    assert_eq!(
+        cache.checkpoint(child).unwrap().retention_rank().use_epoch,
+        epoch
+    );
+    cache.touch(child, 1).unwrap();
+    assert_eq!(
+        cache.checkpoint(child).unwrap().retention_rank().use_epoch,
+        epoch
+    );
+    assert!(cache.touch(CheckpointId::new(999), epoch).is_err());
+}
+
+#[test]
+fn duplicate_publication_and_promotion_do_not_refresh_ancestor_snapshots() {
+    for page_tokens in [64, 128, 256, 2048] {
+        let mut cache = PrefixCheckpointCache::new([7; 32], 32, 32, page_tokens).unwrap();
+        let history = history((2 * page_tokens / 64) as u32, 0);
+        let endpoint = page_tokens as u64;
+        let parent = cache
+            .publish_with_retention(
+                &history,
+                &proposal(None, endpoint, &[0], 0, 0),
+                RetentionRole::Anchor,
+                1,
+            )
+            .unwrap()
+            .id();
+        let child = cache
+            .publish_with_retention(
+                &history,
+                &proposal(Some(parent), 2 * endpoint, &[1], 1, 0),
+                RetentionRole::Endpoint,
+                2,
+            )
+            .unwrap()
+            .id();
+        let duplicate = cache
+            .publish_with_retention(
+                &history,
+                &proposal(Some(parent), 2 * endpoint, &[2], 2, 5),
+                RetentionRole::Message,
+                3,
+            )
+            .unwrap();
+        assert_eq!(duplicate.id(), child);
+        assert_eq!(
+            cache.checkpoint(parent).unwrap().retention_rank().use_epoch,
+            1
+        );
+        cache.promote(child, RetentionRole::Anchor, 4).unwrap();
+        cache.promote(child, RetentionRole::Endpoint, 2).unwrap();
+        assert_eq!(
+            cache.checkpoint(parent).unwrap().retention_rank().use_epoch,
+            1
+        );
+        assert_eq!(
+            cache.checkpoint(child).unwrap().retention_rank(),
+            RetentionRank {
+                use_epoch: 4,
+                role: RetentionRole::Anchor,
+                consumed_tokens: 2 * endpoint,
+            }
+        );
+        // Recency is local to the snapshot; outstanding GPU reads still protect shared pages.
+        let retired = cache.evict(EvictionTarget {
+            pages: 0,
+            snapshots: 1,
+        });
+        assert_eq!(retired.retired[0].checkpoint, parent);
+        assert_eq!(retired.retired[0].retire_after, Fence(5));
+        assert_eq!(cache.page_chain(child).unwrap(), [PageId(0), PageId(1)]);
+        assert!(
+            cache
+                .advance_completed(Fence(4))
+                .unwrap()
+                .reusable
+                .snapshots
+                .is_empty()
+        );
+        assert_eq!(
+            cache
+                .advance_completed(Fence(5))
+                .unwrap()
+                .reusable
+                .snapshots,
+            [SnapshotId(0)]
+        );
+    }
 }
 
 #[test]

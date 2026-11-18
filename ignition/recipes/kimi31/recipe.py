@@ -38,7 +38,8 @@ RECIPE = Recipe(
         stored_bytes=1_561_217_377_280,
         # K3's matching target layout plus 357,052,416 BF16 indexer bytes replicated on sixteen ranks.
         device_bytes=1_491_026_420_236 + 16 * 357_052_416 + 8_558_149_632,
-        draft_bytes=8_558_149_632),),
+        draft_bytes=8_558_149_632,
+        scale_compressed_device_bytes={"csf": 1_491_026_420_236 + 16 * 357_052_416 + 8_558_149_632}),),
     context=1048576, page_tokens=128, concurrency=32, max_concurrency=64, prefill_chunk=4096,
     speculation=Speculation(draft_tokens=7, token_capacity=128, packed_verification=True, graph_budget=64),
     max_draft_tokens=7, verification_rows=0, max_images=4, image_bytes=32 << 20,

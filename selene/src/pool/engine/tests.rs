@@ -1182,6 +1182,33 @@ fn a_busy_source_retries_until_the_scaled_restore_deadline() {
     assert!(rig.engine.requester.is_empty());
 }
 
+#[test]
+fn a_refusal_for_missing_headroom_reaches_the_store_as_no_headroom() {
+    let mut rig = Rig::new();
+    rig.open();
+    let fetch = single_part();
+    let source = (fetch.part.candidate.source.clone(), fetch.part.candidate.tier);
+    let claim = pick!(rig.command(Command::Fetch(fetch)), Claim)[0].claim_id;
+    rig.send(terminal(
+        claim,
+        wire::ClaimState::Failed,
+        wire::ClaimReason::NoHeadroom,
+        false,
+    ));
+    let events = rig.events();
+    assert_eq!(events.len(), 1);
+    let PoolEvent::Fetched {
+        id,
+        result: Err(failure),
+    } = &events[0] else {
+        panic!("expected a failed restore");
+    };
+    assert_eq!(*id, 1);
+    assert_eq!(failure.source.as_ref(), Some(&source));
+    assert!(failure.no_headroom, "the source lacked headroom");
+    assert!(rig.engine.requester.is_empty());
+}
+
 // ---- exports ----------------------------------------------------------------
 
 pub(super) fn export_request(id: u64, reserved: u64) -> In {

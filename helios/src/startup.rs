@@ -92,22 +92,42 @@ pub struct StartupSnapshot {
 
 /// A bounded observation independent of terminal rendering or event consumers.
 #[derive(Clone, Default)]
-pub struct StartupObservation(Arc<Mutex<Option<StartupSnapshot>>>);
+pub struct StartupObservation {
+    latest: Arc<Mutex<Option<StartupSnapshot>>>,
+    /// The final snapshot of every phase that completed, oldest first. Only
+    /// unit tests record and read these, to check each phase's reported text
+    /// and counters; other builds retain the latest snapshot alone.
+    #[cfg(test)]
+    completed: Arc<Mutex<Vec<StartupSnapshot>>>,
+}
 
 impl StartupObservation {
     pub fn snapshot(&self) -> Option<StartupSnapshot> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.latest.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The final snapshots of the phases that completed, in completion order.
+    /// A phase dropped without finishing is absent; `snapshot` shows it as a
+    /// failure.
+    #[cfg(test)]
+    pub fn completed_phases(&self) -> Vec<StartupSnapshot> {
+        self.completed.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn publish(&self, state: &State, status: StartupStatus) {
-        let mut latest = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut latest = self.latest.lock().unwrap_or_else(|e| e.into_inner());
         let sequence = latest.as_ref().map_or(1, |last| last.sequence.saturating_add(1));
-        *latest = Some(StartupSnapshot {
+        let snapshot = StartupSnapshot {
             sequence, stage: state.stage, status,
             label: state.label.chars().take(512).collect(),
             detail: state.detail.chars().take(512).collect(),
             completed: state.completed, total: state.total, elapsed: state.started.elapsed(),
-        });
+        };
+        #[cfg(test)]
+        if status == StartupStatus::Complete {
+            self.completed.lock().unwrap_or_else(|e| e.into_inner()).push(snapshot.clone());
+        }
+        *latest = Some(snapshot);
     }
 }
 

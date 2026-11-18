@@ -842,6 +842,15 @@ fn test<'a>(name: &str, v: &Value<'a>, args: &[Value<'a>]) -> Result<bool> {
     })
 }
 
+/// Text compared by `sort`, `dictsort` and `unique`: lowercased unless the filter is case sensitive.
+fn folded(text: &str, case_sensitive: bool) -> String {
+    if case_sensitive {
+        text.to_string()
+    } else {
+        text.to_lowercase()
+    }
+}
+
 fn filter<'a>(
     name: &str,
     v: Value<'a>,
@@ -964,6 +973,28 @@ fn filter<'a>(
             )
             .map_err(|e| Error::new(e.to_string()))?,
         )),
+        "unique" => {
+            if !args.is_empty() {
+                return Err(Error::new("unique accepts only keyword arguments"));
+            }
+            let option = |name: &str| kw.iter().find(|(k, _)| *k == name).map(|(_, v)| v);
+            let case_sensitive = option("case_sensitive").is_some_and(|v| v.truthy());
+            let attr = option("attribute").and_then(Value::as_str);
+            let mut seen = Vec::<Value>::new();
+            let mut items = Vec::new();
+            for item in v.iter()? {
+                let key = attr.map_or_else(|| item.clone(), |k| item.attr(k));
+                let key = match key.as_str() {
+                    Some(text) => Value::string(folded(text, case_sensitive)),
+                    None => key,
+                };
+                if !seen.iter().any(|value| value.equals(&key)) {
+                    seen.push(key);
+                    items.push(item);
+                }
+            }
+            Ok(Value::list(items))
+        }
         "sort" => {
             let mut items = v.iter()?;
             let attr = kw
@@ -976,13 +1007,17 @@ fn filter<'a>(
                 .map(|(_, v)| v.truthy())
                 .or_else(|| args.first().map(Value::truthy))
                 .unwrap_or(false);
+            let case_sensitive = kw
+                .iter()
+                .find(|(k, _)| *k == "case_sensitive")
+                .is_some_and(|(_, v)| v.truthy());
             items.sort_by(|a, b| {
                 let a = attr.map_or_else(|| a.clone(), |k| a.attr(k));
                 let b = attr.map_or_else(|| b.clone(), |k| b.attr(k));
                 let order = if let (Some(a), Some(b)) = (a.number(), b.number()) {
                     a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
                 } else {
-                    a.text().to_lowercase().cmp(&b.text().to_lowercase())
+                    folded(&a.text(), case_sensitive).cmp(&folded(&b.text(), case_sensitive))
                 };
                 if reverse { order.reverse() } else { order }
             });
@@ -1003,25 +1038,16 @@ fn filter<'a>(
                 },
             };
             let reverse = option("reverse").is_some_and(|v| v.truthy());
-            let text = |v: &Value| {
-                if case_sensitive {
-                    v.text()
-                } else {
-                    v.text().to_lowercase()
-                }
-            };
             let mut pairs = v.pairs()?;
             pairs.sort_by(|(ak, av), (bk, bv)| {
                 let order = if by_value {
                     if let (Some(a), Some(b)) = (av.number(), bv.number()) {
                         a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
                     } else {
-                        text(av).cmp(&text(bv))
+                        folded(&av.text(), case_sensitive).cmp(&folded(&bv.text(), case_sensitive))
                     }
-                } else if case_sensitive {
-                    ak.cmp(bk)
                 } else {
-                    ak.to_lowercase().cmp(&bk.to_lowercase())
+                    folded(ak, case_sensitive).cmp(&folded(bk, case_sensitive))
                 };
                 if reverse { order.reverse() } else { order }
             });
