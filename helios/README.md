@@ -700,8 +700,13 @@ retain encoded sources and replan from the restored endpoint. See
 alpha and CMYK data where preprocessing consumes them. Semantic identities
 include these channels and resize mode as applicable. Encoded-source keys
 include the declared media type, source bytes, and processor settings.
-Animation, video, and remote URL fetching are unsupported. Decoding and
-preprocessing execute in Rust.
+Animation and remote URL fetching are unsupported. A video part supplies frames
+the client extracted and their sampling rate. With prepared video settings, the
+Qwen profile pairs the frames into temporal patches, resizes every frame of a
+clip to one target derived from the clip's frame count and prepared pixel budget,
+and expands each patch into its own vision window behind the checkpoint
+processor's timestamp marker. A core without those settings rejects video parts.
+Decoding and preprocessing execute in Rust.
 
 The resize coefficient generator and integer convolution follow PyTorch
 [`UpSampleKernel.cpp`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/aten/src/ATen/native/cpu/UpSampleKernel.cpp)
@@ -736,3 +741,20 @@ native tensor bytes. Fixtures contain fingerprints rather than the full
 100 MiB largest patch tensor; the generator's `--binary-dir` records full
 reference tensors for diagnosis. These checks qualify CPU preparation; vision
 graph execution and decoder consumption require separate model integration.
+
+`tests/frontend/test_qwen38_video.py` compares video preparation with the
+checkpoint's video processor: it computes the reference values, prepares the same
+request through the native request path with the `test_qwen_video` tool, and
+requires equal prompt tokens, prompt positions, window grids and token spans,
+pixel patches, vision positions, and interpolation taps. Cases cover even and odd
+frame counts, half-even temporal rounding in both directions, clips the pixel
+budget shrinks, minimum-pixel growth with and without upscaling, frames smaller
+than one merged patch, two clips in one prompt, and an image with a clip. The
+reference runs with `do_sample_frames=False` because the client supplies the
+sampled frames. The test builds the tool with Cargo and skips without the
+checkpoint variable.
+
+```bash
+FLARE_QWEN38_VIDEO_SNAPSHOT="$SNAPSHOT" .venv/bin/python -m pytest \
+  tests/frontend/test_qwen38_video.py -q
+```

@@ -10,7 +10,7 @@ mod decode;
 pub(in crate::server) mod decisions;
 mod encode;
 use super::{inference, observation::ObservationOptions};
-pub(super) use decode::decode;
+pub(super) use decode::{decode, decode_with};
 pub(super) use encode::{Encoder, Frame, PromptUsage};
 use serde_json::Value;
 

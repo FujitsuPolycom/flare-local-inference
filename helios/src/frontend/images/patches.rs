@@ -98,7 +98,67 @@ impl PatchProcessor {
             cu_seqlens: vec![0],
         };
         result.reserve_outputs(total, FEATURES, false, images.len(), images.len() + 1)?;
-        let normalized: [Vec<f32>; 3] = std::array::from_fn(|channel| {
+        let normalized = self.normalized();
+        for (index, image) in images.iter().enumerate() {
+            let geometry = result.geometry[index];
+            let pixels = (self.resize)(image, geometry.width, geometry.height);
+            push_patches(
+                &mut result,
+                &normalized,
+                [&pixels, &pixels],
+                &geometry,
+                self.patch_size,
+            );
+            result
+                .cu_seqlens
+                .push(result.cu_seqlens.last().unwrap() + geometry.patches as i32);
+        }
+        Ok(result)
+    }
+
+    /// Packs one video temporal patch into the window `geometry`: the first temporal
+    /// slice holds `first` and the second holds `second`, in the patch order of a still
+    /// image.
+    pub fn pack_pair(
+        &self,
+        first: &RgbImage,
+        second: &RgbImage,
+        geometry: &ImageGeometry,
+    ) -> Result<ProcessedImages> {
+        let patches = geometry.height / self.patch_size * (geometry.width / self.patch_size);
+        if geometry.grid_thw[0] != 1
+            || geometry.height % self.patch_size != 0
+            || geometry.width % self.patch_size != 0
+            || geometry.height / self.patch_size % MERGE != 0
+            || geometry.width / self.patch_size % MERGE != 0
+            || geometry.patches != patches
+            || geometry.tokens.checked_mul(MERGE * MERGE) != Some(patches)
+            || patches > self.limits.max_patches_per_image
+        {
+            return Err("video window geometry is not a prepared merged patch grid".into());
+        }
+        let first_pixels = (self.resize)(first, geometry.width, geometry.height);
+        let second_pixels = (self.resize)(second, geometry.width, geometry.height);
+        let normalized = self.normalized();
+        let mut result = ProcessedImages {
+            geometry: vec![*geometry],
+            cu_seqlens: vec![0],
+            ..Default::default()
+        };
+        result.reserve_outputs(patches, FEATURES, false, 1, 2)?;
+        push_patches(
+            &mut result,
+            &normalized,
+            [&first_pixels, &second_pixels],
+            geometry,
+            self.patch_size,
+        );
+        result.cu_seqlens.push(patches as i32);
+        Ok(result)
+    }
+
+    fn normalized(&self) -> [Vec<f32>; 3] {
+        std::array::from_fn(|channel| {
             (0..256)
                 .map(|value| match self.normalization {
                     Normalization::Symmetric => (value as f32 - 127.5) / 127.5,
@@ -110,42 +170,46 @@ impl PatchProcessor {
                     }
                 })
                 .collect()
-        });
-        for (image, geometry) in images.iter().zip(&result.geometry) {
-            let pixels = (self.resize)(image, geometry.width, geometry.height);
-            let grid_h = geometry.height / self.patch_size;
-            let grid_w = geometry.width / self.patch_size;
-            for by in 0..grid_h / MERGE {
-                for bx in 0..grid_w / MERGE {
-                    for dy in 0..MERGE {
-                        for dx in 0..MERGE {
-                            let (row, col) = (by * MERGE + dy, bx * MERGE + dx);
-                            result.position_ids.push([row as i64, col as i64]);
-                            for channel in 0..3 {
-                                for _temporal in 0..2 {
-                                    for y in 0..self.patch_size {
-                                        for x in 0..self.patch_size {
-                                            let byte = pixels[((row * self.patch_size + y)
-                                                * geometry.width
-                                                + col * self.patch_size
-                                                + x)
-                                                * 3
-                                                + channel];
-                                            result
-                                                .pixel_values
-                                                .push(normalized[channel][byte as usize]);
-                                        }
-                                    }
+        })
+    }
+}
+
+/// Appends the patch rows of one vision window in merged-block order. Each patch holds
+/// two temporal slices, filled from `frames` in order.
+fn push_patches(
+    result: &mut ProcessedImages,
+    normalized: &[Vec<f32>; 3],
+    frames: [&[u8]; 2],
+    geometry: &ImageGeometry,
+    patch_size: usize,
+) {
+    let grid_h = geometry.height / patch_size;
+    let grid_w = geometry.width / patch_size;
+    for by in 0..grid_h / MERGE {
+        for bx in 0..grid_w / MERGE {
+            for dy in 0..MERGE {
+                for dx in 0..MERGE {
+                    let (row, col) = (by * MERGE + dy, bx * MERGE + dx);
+                    result.position_ids.push([row as i64, col as i64]);
+                    for channel in 0..3 {
+                        for temporal in 0..2 {
+                            for y in 0..patch_size {
+                                for x in 0..patch_size {
+                                    let byte = frames[temporal][((row * patch_size + y)
+                                        * geometry.width
+                                        + col * patch_size
+                                        + x)
+                                        * 3
+                                        + channel];
+                                    result
+                                        .pixel_values
+                                        .push(normalized[channel][byte as usize]);
                                 }
                             }
                         }
                     }
                 }
             }
-            result
-                .cu_seqlens
-                .push(result.cu_seqlens.last().unwrap() + geometry.patches as i32);
         }
-        Ok(result)
     }
 }

@@ -68,7 +68,7 @@ def image_slot_request(configuration: Configuration, model: ResolvedModel, flag:
 def plan_with_rules(configuration: Configuration, model: ResolvedModel, gpus, *, selected=None,
                     image_concurrency: int | None = None, language_model_only: bool = False,
                     **settings) -> planning.Plan:
-    """Plan with the image-slot rules shared by export, debug-serve, and bench.
+    """Plan with the image-slot and video rules shared by export, debug-serve, and bench.
 
     `image_slot_request` resolves the image slots. For a recipe that declares zero
     default image slots, zero selects the text-only preparation, and a count that is
@@ -94,12 +94,14 @@ def snapshot_rules(configuration: Configuration, model: ResolvedModel, plan: pla
 
     A plan with image slots requires the vision tensors of a recipe that declares
     their prefixes; the usage error names what asked for the slots and the missing
-    weights. Planning applies the rules to a cached snapshot, and
+    weights. A plan with image slots also records why the recipe cannot prepare the
+    snapshot's video processor. Planning applies the rules to a cached snapshot, and
     a command that downloads the snapshot after planning applies them again, so the
     outcome does not depend on whether the snapshot was cached.
     """
     recipe, hub_cache = model.recipe, configuration.directory("hub_cache")
-    if not plan.image_concurrency or not recipe.vision_prefixes or not model.cached(hub_cache):
+    if (not plan.image_concurrency or not (recipe.vision_prefixes or recipe.video_unsupported)
+            or not model.cached(hub_cache)):
         return plan
     snapshot = model.snapshot(hub_cache)
     if recipe.vision_prefixes:
@@ -109,6 +111,8 @@ def snapshot_rules(configuration: Configuration, model: ResolvedModel, plan: pla
             _, source = image_slot_request(configuration, model, image_concurrency)
             raise UsageError(f"{source}: {model.checkpoint.alias}'s checkpoint carries no"
                              f" {', '.join(recipe.vision_prefixes)} weights")
+    if recipe.video_unsupported is not None:
+        plan = replace(plan, video_unsupported=recipe.video_unsupported(snapshot))
     return plan
 
 

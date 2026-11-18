@@ -552,6 +552,7 @@ fn base64_images_follow_the_rendered_placeholder_order() {
             syntax.rejected_tokens.clear();
             syntax.image_tokens = Some(ImageTokenLayout {
                 feature_token: image_start + 1,
+                video_feature_token: None,
                 span: Some(ImageSpan {
                     start_token: image_start,
                     end_token: image_start + 3,

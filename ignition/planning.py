@@ -200,6 +200,8 @@ class Plan:
     tuning_replica: TuningReplica | None = None
     # Image request slots. Zero prepares no vision encoder, image graphs, or image storage.
     image_concurrency: int = 0
+    # Why a cached snapshot's video processor cannot be consumed; its core rejects video.
+    video_unsupported: str | None = None
     # The recipe's eligible BF16 projections load as MXFP8 when the plan asks for it.
     online_mxfp8: bool = False
     online_mxfp8_scope: str | None = None
@@ -373,7 +375,7 @@ class Plan:
                 and self.fixed_bytes + self.page_bytes <= self.supply_bytes)
 
     def to_dict(self) -> dict:
-        return {
+        result = {
             "alias": self.checkpoint.alias, "repository": self.checkpoint.repository,
             "revision": self.checkpoint.revision, "architecture": self.checkpoint.architecture,
             "gpus": [{"index": gpu.index, "name": gpu.name, "uuid": gpu.uuid, "free_bytes": gpu.free_bytes,
@@ -427,6 +429,9 @@ class Plan:
             "free_bytes": self.free_bytes, "headroom_bytes": self.headroom_bytes, "reserve_bytes": self.reserve_bytes,
             "supply_bytes": self.supply_bytes,
         }
+        if self.video_unsupported is not None:
+            result["video_unsupported"] = self.video_unsupported
+        return result
 
 
 def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concurrency: int, reserve_bytes: int,

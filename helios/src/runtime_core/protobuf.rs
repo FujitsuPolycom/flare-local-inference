@@ -150,11 +150,21 @@ pub(super) fn frontend_settings(value: wire::FrontendSettings) -> Result<serde_j
         .map(|image| -> Result<serde_json::Value> {
             use wire::image_settings::Profile;
             Ok(match required(image.profile, "image profile")? {
-                Profile::Qwen(config) => serde_json::json!({"qwen": {
-                    "min_pixels": config.min_pixels, "max_pixels": config.max_pixels,
-                    "position_side": config.position_side, "image_token_id": config.image_token_id,
-                    "video_token_id": config.video_token_id,
-                }}),
+                Profile::Qwen(config) => {
+                    let mut qwen = serde_json::json!({
+                        "min_pixels": config.min_pixels, "max_pixels": config.max_pixels,
+                        "position_side": config.position_side, "image_token_id": config.image_token_id,
+                        "video_token_id": config.video_token_id,
+                    });
+                    if let Some(video) = config.video {
+                        qwen["video"] = serde_json::json!({
+                            "max_frames": video.max_frames,
+                            "min_pixels": video.min_pixels, "max_pixels": video.max_pixels,
+                            "temporal_patch_size": video.temporal_patch_size,
+                        });
+                    }
+                    serde_json::json!({"qwen": qwen})
+                }
                 Profile::Mimo(config) => serde_json::json!({"mimo": {
                     "min_pixels": config.min_pixels, "max_pixels": config.max_pixels,
                     "image_mean": config.image_mean, "image_std": config.image_std,
@@ -651,6 +661,105 @@ mod tests {
                     assert!(processor.geometry(701, 503).unwrap().tokens <= 384);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn server_configuration_omits_an_undeclared_video_feature_token() {
+        let layout = |video_feature_token| {
+            let contract = wire::ServingContract {
+                model_contract: Some(wire::ModelContract {
+                    version: 3,
+                    frontend: Some(wire::FrontendContract {
+                        image_tokens: Some(wire::ImageTokenLayout {
+                            feature_token: 248_056,
+                            span: None,
+                            video_feature_token,
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let config = serving_contract(contract, 8).unwrap();
+            config["model_contract"]["frontend"]["image_tokens"].to_string()
+        };
+        assert_eq!(layout(None), r#"{"feature_token":248056,"span":null}"#);
+        assert_eq!(
+            layout(Some(248_057)),
+            r#"{"feature_token":248056,"span":null,"video_feature_token":248057}"#
+        );
+    }
+
+    #[test]
+    fn qwen_video_settings_are_an_optional_message_of_the_image_profile() {
+        let qwen = |video| {
+            wire::FrontendSettings {
+                tokenizer: Some(wire::TokenizerSettings::default()),
+                eos_token_ids: vec![1],
+                prompt_encoder: wire::PromptEncoder::PromptJinja as i32,
+                image: Some(wire::ImageSettings {
+                    profile: Some(wire::image_settings::Profile::Qwen(wire::QwenImageSettings {
+                        min_pixels: 65_536,
+                        max_pixels: 16_777_216,
+                        position_side: 48,
+                        image_token_id: 248_056,
+                        video_token_id: 248_057,
+                        video,
+                    })),
+                }),
+                ..Default::default()
+            }
+        };
+        // A core without the message loads as an image core without video settings.
+        let decoded = wire::FrontendSettings::decode(qwen(None).encode_to_vec().as_slice()).unwrap();
+        assert!(decoded.image.as_ref().unwrap().profile.as_ref().is_some_and(|profile| {
+            matches!(profile, wire::image_settings::Profile::Qwen(settings) if settings.video.is_none())
+        }));
+        // Inspection of an unverified core serializes the stored settings as they are.
+        assert_eq!(
+            serde_json::to_value(decoded.image.as_ref().unwrap()).unwrap(),
+            serde_json::json!({"profile": {"Qwen": {
+                "min_pixels": 65_536, "max_pixels": 16_777_216, "position_side": 48,
+                "image_token_id": 248_056, "video_token_id": 248_057,
+            }}})
+        );
+        let json = frontend_settings(decoded).unwrap();
+        assert_eq!(json["image"], serde_json::json!({"qwen": {
+            "min_pixels": 65_536, "max_pixels": 16_777_216, "position_side": 48,
+            "image_token_id": 248_056, "video_token_id": 248_057,
+        }}));
+        #[cfg(feature = "server")]
+        {
+            let frontend: crate::frontend::FrontendSettings =
+                serde_json::from_value(json).unwrap();
+            let processor = crate::frontend::images::ImageProcessor::load(
+                frontend.image.unwrap(), Default::default()).unwrap();
+            assert!(!processor.has_video_settings());
+            assert!(processor.video_windows(4, 64, 64).is_err());
+        }
+
+        let settings = wire::QwenVideoSettings {
+            max_frames: 768,
+            min_pixels: 4_096,
+            max_pixels: 25_165_824,
+            temporal_patch_size: 2,
+        };
+        let json = frontend_settings(qwen(Some(settings))).unwrap();
+        assert_eq!(json["image"]["qwen"]["video"], serde_json::json!({
+            "max_frames": 768, "min_pixels": 4_096,
+            "max_pixels": 25_165_824, "temporal_patch_size": 2,
+        }));
+        #[cfg(feature = "server")]
+        {
+            let frontend: crate::frontend::FrontendSettings =
+                serde_json::from_value(json).unwrap();
+            let processor = crate::frontend::images::ImageProcessor::load(
+                frontend.image.unwrap(), Default::default()).unwrap();
+            assert!(processor.has_video_settings());
+            let (windows, window) = processor.video_windows(4, 64, 64).unwrap();
+            assert_eq!((windows, window.tokens), (2, 4));
         }
     }
 

@@ -5534,6 +5534,7 @@ fn worker_restores_conditioned_windows_with_fresh_generation_and_unchanged_sampl
                 position_side: 48,
                 image_token_id: 248056,
                 video_token_id: 248057,
+                video: None,
             }),
             ImageLimits {
                 patches_per_feature: 4,
@@ -6199,4 +6200,57 @@ fn local_copyout_rechecks_headroom_after_each_queued_pin() {
     worker.service_store().unwrap();
     assert_eq!(fake_store(&mut worker).stored.len(), 2);
     assert_eq!(pins(&worker, second), 1);
+}
+
+#[tokio::test]
+async fn http_chat_admits_video_parts_only_with_prepared_video_settings() {
+    use crate::frontend::images::{
+        ImageLimits, ImageProcessor, ImageSettings, QwenImageSettings, QwenVideoSettings,
+    };
+    use axum::{Extension, extract::State};
+    let qwen = |video: bool| {
+        let settings = ImageSettings::Qwen(QwenImageSettings {
+            min_pixels: 4096,
+            max_pixels: 65536,
+            position_side: 48,
+            image_token_id: 248056,
+            video_token_id: 248057,
+            video: video.then_some(QwenVideoSettings {
+                max_frames: 768,
+                min_pixels: 4096,
+                max_pixels: 25_165_824,
+                temporal_patch_size: 2,
+            }),
+        });
+        Arc::new(ImageProcessor::load(settings, ImageLimits::default()).unwrap())
+    };
+    let body = serde_json::json!({"max_tokens": 2, "messages": [{"role": "user", "content": [
+        {"type": "video", "video": ["data:image/png;base64,AA=="], "fps": 2}]}]});
+    // Without video settings request decoding rejects the part; with them the clip
+    // reaches admission, which rejects its single frame.
+    for (images, message) in [
+        (None, "Unexpected item type in content."),
+        (Some(qwen(false)), "Unexpected item type in content."),
+        (
+            Some(qwen(true)),
+            "video 1: clip has 1 frames; prepared video settings admit 2 through 768 frames",
+        ),
+    ] {
+        let (sender, _receiver) = mpsc::sync_channel(4);
+        let mut state = http_state(sender, None);
+        Arc::get_mut(&mut state).unwrap().images = images;
+        let ingress = Arc::new(state.ingress_slots.clone().acquire_owned().await.unwrap());
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let response =
+            super::super::http::generate(State(state), Extension(ingress), request).await;
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST, "{message}");
+        let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["message"], message);
+    }
 }

@@ -23,6 +23,17 @@ fn main() {
                 ".flare.runtime.ExecutionGraph.packed_token_capacity",
                 "#[serde(default)]",
             )
+            // A core without a video feature token or video settings serializes without
+            // those fields, so its inspection output and server configuration carry no
+            // key for them.
+            .field_attribute(
+                ".flare.runtime.ImageTokenLayout.video_feature_token",
+                "#[serde(default, skip_serializing_if = \"Option::is_none\")]",
+            )
+            .field_attribute(
+                ".flare.runtime.QwenImageSettings.video",
+                "#[serde(default, skip_serializing_if = \"Option::is_none\")]",
+            )
             .compile_protos(&["proto/runtime_core.proto"], &["proto"])
             .expect("compile runtime core protobuf schema");
         // The payload schema imports the execution schema and refers to the generated types

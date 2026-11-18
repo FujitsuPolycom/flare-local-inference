@@ -225,7 +225,10 @@ remains request-controlled.
 
 `FrontendSettings` contains EOS token IDs, the special-token strings used by the
 chat template, and optional image settings. Qwen image settings contain resize
-area limits, learned-position geometry, and image/video token IDs. MiMo image
+area limits, learned-position geometry, and image/video token IDs. Their optional
+video settings contain the checkpoint video processor's maximum frame count, clip pixel
+budget, and temporal patch size; a core without the message rejects video parts.
+MiMo image
 settings contain resize limits and channel normalization. DeepSeek's image profile
 has fixed geometry validated by Ignition. Preparation reads and validates structural
 checkpoint config files, then exports only these consumed fields. The only frontend

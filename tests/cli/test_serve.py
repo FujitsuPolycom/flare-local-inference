@@ -647,6 +647,11 @@ def test_reuse_weights_requires_cached_version_before_preparation(host, capsys):
     assert 'prepared' not in host
 
 
+UNSUPPORTED_VIDEO = dict(video_processor_type="Qwen3VLVideoProcessor", patch_size=16,
+    temporal_patch_size=2, merge_size=2, cap_pixels_per_frame=True,
+    size=dict(shortest_edge=4096, longest_edge=25165824))
+
+
 def _dense_export(monkeypatch, name="model.visual.merger.ln_q.weight"):
     """Export Qwen3.8 27B through the host's stand-in preparation; its snapshot stores tensor ``name``."""
     stand_in = serve.resolve_model(None, None).recipe
@@ -660,7 +665,40 @@ def _dense_export(monkeypatch, name="model.visual.merger.ln_q.weight"):
     (snapshot / "model.safetensors").write_bytes(len(header).to_bytes(8, "little") + header + b"\0")
     (snapshot / "model.safetensors.index.json").write_text(json.dumps({
         "metadata": {"total_size": 1}, "weight_map": {name: "model.safetensors"}}))
+    (snapshot / "video_preprocessor_config.json").write_text(json.dumps(UNSUPPORTED_VIDEO))
     return snapshot
+
+
+def test_export_reports_an_unsupported_video_configuration(host, capsys, monkeypatch):
+    _dense_export(monkeypatch)
+    assert export("qwen3.8-27b", "--image-concurrency", "2") == 0
+    error = capsys.readouterr().err
+    assert "video input not prepared" in error
+    assert "unsupported video processor per-frame pixel cap" in error
+    assert host["plan"].video_unsupported == "unsupported video processor per-frame pixel cap"
+    assert host["snapshot"]
+
+
+def test_text_only_export_reports_nothing_about_video(host, capsys, monkeypatch):
+    _dense_export(monkeypatch)
+    assert export("qwen3.8-27b") == 0
+    assert "video input" not in capsys.readouterr().err
+    assert host["plan"].image_concurrency == 0 and host["plan"].video_unsupported is None
+
+
+def test_uncached_export_reports_the_video_configuration_after_download(host, monkeypatch, capsys):
+    _dense_export(monkeypatch)
+    state = {"cached": False}
+    monkeypatch.setattr(ResolvedModel, "cached", lambda self, hub_cache: state["cached"])
+
+    def fetch(model, hub_cache, progress_bars):
+        state["cached"] = True
+
+    monkeypatch.setattr(serve, "fetch", fetch)
+    assert export("qwen3.8-27b", "--image-concurrency", "2") == 0
+    error = capsys.readouterr().err
+    assert "video input not prepared" in error
+    assert "unsupported video processor per-frame pixel cap" in error
 
 
 @pytest.mark.parametrize("cached", [True, False])
@@ -679,6 +717,18 @@ def test_export_rejects_image_slots_without_vision_weights_before_preparation(ho
             in capsys.readouterr().err)
     assert state["fetched"] == (0 if cached else 1) and "prepared" not in host
     assert export("qwen3.8-27b") == 0 and host["plan"].image_concurrency == 0
+
+
+def test_flash_next_export_prepares_and_reports_no_video(host, capsys):
+    """The Qwen3.8 Flash Next recipe prepares no video input, whatever its snapshot ships."""
+    snapshot = resolve("qwen3.8-flash").snapshot(Configuration.load().directory("hub_cache"))
+    (snapshot / "video_preprocessor_config.json").write_text(json.dumps(UNSUPPORTED_VIDEO))
+    recipe = resolve("qwen3.8-flash").recipe
+    assert recipe.video_unsupported is None and recipe.vision_prefixes == ()
+    assert export("qwen3.8-flash") == 0
+    assert "video input" not in capsys.readouterr().err
+    assert host["plan"].image_concurrency == 4 and host["plan"].video_unsupported is None
+    assert "video_unsupported" not in host["plan"].to_dict()
 
 
 def test_reuse_weights_passes_cached_metadata_through_export(host, monkeypatch, tmp_path):

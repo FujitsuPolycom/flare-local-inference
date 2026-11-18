@@ -446,6 +446,23 @@ def test_derive_plans_every_other_vision_recipe_as_planning_plan_does(tmp_path, 
     assert "qwen38" in planned and len(planned) > 4
 
 
+def test_plan_with_image_slots_reports_an_unsupported_video_configuration(tmp_path):
+    model = _dense_model(tmp_path, TEXT_TENSOR, VISION_TENSOR)
+    (model.directory / "video_preprocessor_config.json").write_text(json.dumps(dict(
+        video_processor_type="Qwen3VLVideoProcessor", patch_size=16,
+        temporal_patch_size=2, merge_size=2, cap_pixels_per_frame=True,
+        size=dict(shortest_edge=4096, longest_edge=25165824))))
+    image = _planned(_configuration(tmp_path), model, image_concurrency=2)
+    assert image.to_dict()["video_unsupported"] == "unsupported video processor per-frame pixel cap"
+    # A plan without image slots prepares no image front end and reports nothing about video.
+    assert "video_unsupported" not in _planned(_configuration(tmp_path), model).to_dict()
+    # A supported processor is not reported.
+    (model.directory / "video_preprocessor_config.json").write_text(json.dumps(dict(
+        video_processor_type="Qwen3VLVideoProcessor", patch_size=16,
+        temporal_patch_size=2, merge_size=2, size=dict(shortest_edge=4096, longest_edge=25165824))))
+    assert "video_unsupported" not in _planned(_configuration(tmp_path), model, image_concurrency=2).to_dict()
+
+
 def test_expert_scale_compression_changes_weight_budget_and_preserves_native_default():
     import pickle
 

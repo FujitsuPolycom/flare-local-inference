@@ -76,6 +76,17 @@ def usage(prepared):
     return (RankUsage(prepared.memory_report["pages"], prepared.memory_report["free_device_bytes"]),)
 
 
+def video_unsupported(snapshot):
+    """Why the snapshot's video processor cannot be prepared, or None.
+
+    Preparation with image slots exports the processor's settings when the native
+    frontend can consume them, and an image core that rejects video otherwise.
+    """
+    from ignition.preparation.frontend import video_capability
+
+    return video_capability(snapshot)[1]
+
+
 RECIPE = Recipe(
     name="qwen38_dense", served_model_name="Qwen3.8-27B", prepare=prepare, usage=usage,
     # Thinking defaults; bounds span thinking/instruct presets: https://huggingface.co/Qwen/Qwen3.8-27B#best-practices.
@@ -104,5 +115,5 @@ RECIPE = Recipe(
     plain_ranks=MappingProxyType({1: RankCosts(158_148_864, 4_194_304, 4 << 30,
         vision_bytes=VISION_BYTES, vision_slot_bytes=VISION_SLOT_BYTES,
         image_state_row_bytes=158_149_120)}),
-    vision_prefixes=("model.visual.",),
+    vision_prefixes=("model.visual.",), video_unsupported=video_unsupported,
 )

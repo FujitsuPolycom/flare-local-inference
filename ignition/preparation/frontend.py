@@ -77,7 +77,73 @@ def _expected(config, values, label):
             raise ValueError(f"unsupported {label} {key}")
 
 
-def image_settings(config, model, profile, qwen_model_type="qwen4_exp"):
+def video_capability(snapshot):
+    """Return the checkpoint's video settings and None, or None and the reason they are unsupported.
+
+    An absent processor means the checkpoint prepares an image-only front end, which is not an
+    unsupported configuration. A processor the native frontend cannot consume leaves the
+    checkpoint exportable as an image core that rejects video, and the reason names the field
+    the plan report records.
+    """
+    try:
+        return video_settings(snapshot), None
+    except (ValueError, TypeError, AttributeError) as error:
+        return None, str(error)
+
+
+def video_settings(snapshot):
+    """Resolve the checkpoint's video processor limits; None when it declares no video processor.
+
+    Qwen packs two frames into each temporal patch and resizes a whole clip against one pixel
+    budget, so preparation records the maximum frame count, that budget, and the patch size.
+    The reference processor's minimum frame count bounds only the frames it samples itself,
+    which the client supplies here, so admission does not use it. The reference processor
+    applies its per-frame pixel cap only when a checkpoint enables it, which the native
+    frontend does not implement. An unsupported configuration raises; `video_capability`
+    reports it instead.
+    """
+    config = None
+    processor = snapshot / "processor_config.json"
+    if processor.is_file():
+        config = json.loads(processor.read_text()).get("video_processor")
+    if config is None and (snapshot / "video_preprocessor_config.json").is_file():
+        config = json.loads((snapshot / "video_preprocessor_config.json").read_text())
+    if config is None:
+        return None
+    if not isinstance(config, dict):
+        raise ValueError("video processor configuration must be an object")
+    _expected(config, {"video_processor_type": "Qwen3VLVideoProcessor", "patch_size": 16,
+        "temporal_patch_size": 2, "merge_size": 2}, "video processor")
+    # Unstated flags and normalization take the reference processor's class defaults, which
+    # the native frontend also fixes.
+    for key in ("do_resize", "do_rescale", "do_normalize", "do_convert_rgb"):
+        if config.get(key, True) is not True:
+            raise ValueError(f"unsupported video processor {key}")
+    if config.get("resample", 3) != 3:
+        raise ValueError("unsupported video processor resample")
+    if config.get("rescale_factor", 1 / 255) != 1 / 255:
+        raise ValueError("unsupported video processor rescale_factor")
+    for key in ("image_mean", "image_std"):
+        if config.get(key, [0.5] * 3) != [0.5] * 3:
+            raise ValueError(f"unsupported video processor {key}")
+    if config.get("cap_pixels_per_frame") not in (None, False):
+        raise ValueError("unsupported video processor per-frame pixel cap")
+    size = config.get("size") or {}
+    if not isinstance(size, dict):
+        raise ValueError("video processor size must be an object")
+    values = {"max_frames": config.get("max_frames", 768),
+              "min_pixels": size.get("shortest_edge"), "max_pixels": size.get("longest_edge"),
+              "temporal_patch_size": config["temporal_patch_size"]}
+    for name, value in values.items():
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"invalid video processor {name}")
+    if (values["max_pixels"] < values["min_pixels"]
+            or values["max_frames"] < values["temporal_patch_size"]):
+        raise ValueError("unsupported video processor frame or pixel bounds")
+    return values
+
+
+def image_settings(config, model, profile, video=None, qwen_model_type="qwen4_exp"):
     """Resolve the image settings the native frontend consumes for ``profile``.
 
     The Qwen profile serves two checkpoint families with one processor; ``qwen_model_type``
@@ -171,6 +237,8 @@ def image_settings(config, model, profile, qwen_model_type="qwen4_exp"):
             if type(value) is not int or not 0 <= value < 2**32:
                 raise ValueError(f"invalid model {name}")
             result[name] = value
+        if video is not None:
+            result["video"] = video
     else:
         # MiMo checkpoints publish their own resize area and normalization; the native frontend
         # consumes the packaged values, so preparation validates their form rather than fixing them.
@@ -208,8 +276,12 @@ def _native_image_placeholder(snapshot, model, encoder):
 
 
 def prepare_frontend(snapshot, *, eos_token_ids, image_profile=None, preprocessor=None,
-                     prompt_encoder=PromptEncoder.PROMPT_JINJA, qwen_model_type="qwen4_exp"):
-    """Resolve checkpoint structure during preparation; sampling is recipe-owned."""
+                     prompt_encoder=PromptEncoder.PROMPT_JINJA, qwen_model_type="qwen4_exp", video=None):
+    """Resolve checkpoint structure during preparation; sampling is recipe-owned.
+
+    ``video`` is the result of `video_settings` for a recipe that prepares video input with
+    the Qwen image profile; without it the frontend carries no video settings.
+    """
     if not isinstance(prompt_encoder, PromptEncoder):
         raise ValueError("prompt_encoder must be a PromptEncoder")
     snapshot = Path(snapshot)
@@ -234,5 +306,6 @@ def prepare_frontend(snapshot, *, eos_token_ids, image_profile=None, preprocesso
         path = snapshot / "preprocessor_config.json" if preprocessor is None else Path(preprocessor)
         result["image"] = image_settings({} if image_profile == "deepseek_row_major" else json.loads(path.read_text()),
             json.loads((snapshot / "config.json").read_text()), image_profile,
+            video=video,
             qwen_model_type=qwen_model_type)
     return result

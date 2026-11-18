@@ -319,6 +319,12 @@ pub struct FrontendContract {
 )]
 pub struct ImageTokenLayout {
     pub feature_token: u32,
+    /// Video placeholder carrying vision features; absent when the model serves no video.
+    #[cfg_attr(
+        any(feature = "frontend", feature = "runtime-core"),
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub video_feature_token: Option<u32>,
     pub span: Option<ImageSpan>,
 }
 
@@ -385,6 +391,11 @@ impl PreparedContract {
         if self.vision.enabled() != self.frontend.image_tokens.is_some()
             || self.frontend.image_tokens.as_ref().is_some_and(|layout| {
                 layout.feature_token as usize >= self.input_vocabulary
+                    || layout
+                        .video_feature_token
+                        .is_some_and(|token| {
+                            token as usize >= self.input_vocabulary || token == layout.feature_token
+                        })
                     || layout.span.as_ref().is_some_and(|span| {
                         span.max_tokens == 0
                             || span.start_token == span.end_token

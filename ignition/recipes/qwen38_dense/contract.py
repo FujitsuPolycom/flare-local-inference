@@ -10,16 +10,23 @@ from .config import PAGE_TOKENS
 
 
 FEATURE_TOKEN = 248056
+VIDEO_FEATURE_TOKEN = 248057
 PATCH_CAPACITIES = (256, 1024, 4096, 16384)
 VISION = dict(features_per_request=16384, max_images=4, patches_per_feature=4,
               patch_capacities=list(PATCH_CAPACITIES))
 
 
-def frontend(vision=True):
-    """Qwen chat markers; with ``vision``, Qwen image preparation and feature placement."""
+def frontend(vision=True, video=False):
+    """Qwen chat markers; with ``vision``, Qwen image preparation and feature placement.
+
+    ``video`` declares the video placeholder token, which requires video settings prepared
+    from the checkpoint.
+    """
     images = {}
     if vision:
         image_tokens = dict(feature_token=FEATURE_TOKEN, span=None)
+        if video:
+            image_tokens["video_feature_token"] = VIDEO_FEATURE_TOKEN
         images = dict(image_tokens=image_tokens, image_preparation=p.QWEN_IMAGE_PREPARATION,
                       image_layout=p.QWEN_IMAGE_LAYOUT)
     return c.frontend(tools=p.QWEN_CODER, wrapping_newlines=1, terminal_markers=["<tool_call>"],
@@ -29,7 +36,7 @@ def frontend(vision=True):
         position_dimensions=3 if vision else 0, **images)
 
 
-def prepare(signatures, buffers, pool, *, vocabulary, image_slots=0):
+def prepare(signatures, buffers, pool, *, vocabulary, image_slots=0, video=False):
     """Declare the text contract, or with ``image_slots`` the image front end and vision graphs."""
     vision = image_slots > 0
     kinds = {s.kind for s in signatures.values()}
@@ -62,4 +69,4 @@ def prepare(signatures, buffers, pool, *, vocabulary, image_slots=0):
                  *regions],
         graphs=graphs,
         vision={**VISION, "feature_slots": image_slots} if vision else None,
-        frontend=frontend(vision=vision))
+        frontend=frontend(vision=vision, video=video))

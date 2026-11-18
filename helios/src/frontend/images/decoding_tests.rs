@@ -134,7 +134,12 @@ fn webp_preserves_rgb_alpha_and_profile_orientation() {
             let mut encoder = image_webp::WebPEncoder::new(&mut bytes);
             encoder.set_exif_metadata(metadata);
             encoder.encode(&pixels, 2, 1, image_webp::ColorType::Rgba8).unwrap();
-            let decoded = processor(ImageLimits::default()).decode_webp(&bytes).unwrap();
+            let processor = processor(ImageLimits::default());
+            let decoded = processor.decode_webp(&bytes).unwrap();
+            assert_eq!(
+                processor.probe_encoded(super::ImageEncoding::Webp, &bytes).unwrap(),
+                (decoded.width(), decoded.height())
+            );
             let expected = orientation::orient(RgbImage::new(2, 1, vec![10, 20, 30, 90, 80, 70]).unwrap(), value);
             assert_eq!((decoded.width(), decoded.height()), (expected.width(), expected.height()));
             assert_eq!(decoded.pixels(), expected.pixels());
@@ -261,6 +266,84 @@ fn jpeg_limits_and_malformed_data_fail_before_pixel_decompression() {
         normal.decode_jpeg(&duplicate).err().unwrap(),
         Error::Frontend(FrontendError::ImageDecode(_))
     ));
+}
+
+fn png_with_trailing_exif(width: u32, height: u32, value: u16) -> Vec<u8> {
+    let mut info = png::Info::with_size(width, height);
+    info.color_type = png::ColorType::Rgb;
+    info.bit_depth = png::BitDepth::Eight;
+    info.exif_metadata = Some(std::borrow::Cow::Owned(exif(value, true)));
+    let mut bytes = vec![];
+    {
+        let encoder = png::Encoder::with_info(&mut bytes, info).unwrap();
+        let mut writer = encoder.write_header().unwrap();
+        writer
+            .write_image_data(&vec![7; width as usize * height as usize * 3])
+            .unwrap();
+    }
+    // Move the eXIf chunk behind the last IDAT chunk, where PNG also permits it.
+    let signature = bytes[..8].to_vec();
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
+    let mut offset = 8;
+    while offset < bytes.len() {
+        let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        let end = offset + 12 + length;
+        chunks.push(bytes[offset..end].to_vec());
+        offset = end;
+    }
+    let exif_at = chunks
+        .iter()
+        .position(|chunk| &chunk[4..8] == b"eXIf")
+        .unwrap();
+    let exif = chunks.remove(exif_at);
+    let last_idat = chunks
+        .iter()
+        .rposition(|chunk| &chunk[4..8] == b"IDAT")
+        .unwrap();
+    chunks.insert(last_idat + 1, exif);
+    let mut output = signature;
+    for chunk in chunks {
+        output.extend(chunk);
+    }
+    output
+}
+
+#[test]
+fn png_probe_and_decoder_agree_on_trailing_exif_orientation() {
+    let processor = processor(ImageLimits::default());
+    let bytes = png_with_trailing_exif(64, 32, 6);
+    assert_eq!(
+        processor.probe_encoded(super::ImageEncoding::Png, &bytes).unwrap(),
+        (32, 64)
+    );
+    let image = processor.decode_png(&bytes).unwrap();
+    assert_eq!((image.width(), image.height()), (32, 64));
+}
+
+#[test]
+fn probe_extent_matches_every_orientation_fixture() {
+    let (root, manifest) = fixtures();
+    let processor = processor(ImageLimits::default());
+    for case in manifest["cases"].as_array().unwrap() {
+        let encoded = fs::read(root.join(case["encoded"].as_str().unwrap())).unwrap();
+        let encoding = if case["format"] == "JPEG" {
+            super::ImageEncoding::Jpeg
+        } else {
+            super::ImageEncoding::Png
+        };
+        let decoded = if case["format"] == "JPEG" {
+            processor.decode_jpeg(&encoded)
+        } else {
+            processor.decode_png(&encoded)
+        }
+        .unwrap();
+        assert_eq!(
+            processor.probe_encoded(encoding, &encoded).unwrap(),
+            (decoded.width(), decoded.height()),
+            "{}",
+            case["name"]
+        );
+    }
 }
 
 #[test]

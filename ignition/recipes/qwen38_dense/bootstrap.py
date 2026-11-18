@@ -34,7 +34,7 @@ from ignition.preparation.rebuild_manifest import declare_weights
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.disposable import storage_ranges
 from ignition.preparation.execution import GraphSignature
-from ignition.preparation.frontend import annotated_template_asset, prepare_frontend
+from ignition.preparation.frontend import annotated_template_asset, prepare_frontend, video_capability
 from ignition.preparation.fixtures.recurrent import register_benchmark_state
 from ignition.preparation.host_memory import release_unused
 from ignition.preparation.model import PreparedModel
@@ -470,14 +470,16 @@ def prepare(snapshot, config, *, progress=None, core_storage):
     from tokenizers import Tokenizer
     tokenizer_eos = Tokenizer.from_file(str(snapshot / "tokenizer.json")).token_to_id(eos_text)
     eos_ids = list(dict.fromkeys([*(eos if isinstance(eos, list) else [eos]), tokenizer_eos]))
+    video = video_capability(snapshot)[0] if patches else None
     frontend = prepare_frontend(snapshot, eos_token_ids=eos_ids, image_profile="qwen" if patches else None,
-        qwen_model_type="qwen3_5" if patches else None)
+        qwen_model_type="qwen3_5" if patches else None, video=video)
     server_config = dict(identity=identity, model_id=snapshot.name, max_sequence_tokens=config.context,
         prefill_chunk_size=config.prefill_chunk_size, pages=pages, state_rows=state_rows, snapshots=snapshots,
         page_tokens=PAGE_TOKENS, frontend=frontend,
         sampling_defaults=RECIPE.sampling_defaults.as_dict(), assets=assets,
         model_contract=prepare_contract(signatures, buffers, pool, vocabulary=vocabulary,
-            image_slots=config.image_concurrency))
+            image_slots=config.image_concurrency,
+            video=video is not None))
     if config.mtp and config.speculative_round_shapes:
         server_config.update(speculative_widths=config.speculative_widths,
             speculative_fixed_width=config.speculative_fixed_width,

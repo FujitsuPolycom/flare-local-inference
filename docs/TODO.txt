@@ -531,8 +531,28 @@
 [ ] Measure Qwen3.8 27B image preparation memory and latency on DGX Spark,
     including four populated 16,384-patch vision graphs and all four feature slots.
 
+[ ] Compare the video features that a served Qwen3.8 27B core publishes with the
+    Transformers reference on GB10 and on SM120. tests/frontend/test_qwen38_video.py
+    compares CPU preparation only, and no device has run the comparison. Remove this
+    entry when a served core's published video features match the reference on both
+    device classes.
+
+[ ] Prepare video input for the `qwen38` recipe (Qwen3.8 Flash Next). The recipe
+    passes no video settings to `prepare_frontend` and declares no video token, so
+    its cores reject video requests. Remove this entry when a Flash Next core
+    exported with video settings has served a clip.
+
+[ ] Report video-conditioned tokens separately from image tokens: usage counts
+    every conditioned input under `prompt_tokens_details.multimodal_tokens.image`,
+    so a video request reports its video tokens there.
+
 [ ] Fix Qwen image resize for an axis below half the merge factor: the reference
     rounds such an axis to zero before the pixel-budget branches, while
     `PatchProcessor::geometry` clamps it to the factor first, so
     tests/frontend/qwen38_images.json case 3200x16 reports 32x3200 instead of the
     reference 32x3648.
+
+[ ] Measure admission latency and host memory for clips whose decoded frames
+    exceed the decoded-source budget (eight bytes per pixel of `max_image_pixels`
+    per served model): such a frame is decoded at admission for its identity and
+    again when its window is prepared. See api.md.

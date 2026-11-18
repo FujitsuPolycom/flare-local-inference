@@ -147,6 +147,13 @@ io-uring = "0.7"
 sha2 = { version = "0.10.9", features = ["asm"], optional = true }
 
 [[bin]]
+name = "test_qwen_video"
+path = "tests/tools/test_qwen_video.rs"
+required-features = ["server", "test-tools"]
+test = false
+bench = false
+
+[[bin]]
 name = "test_kimi3_images"
 path = "tests/tools/test_kimi3_images.rs"
 required-features = ["server", "test-tools"]

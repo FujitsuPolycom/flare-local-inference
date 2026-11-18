@@ -19,7 +19,8 @@ mod orientation;
 mod conditioned;
 mod padded_grid;
 mod record;
-pub use conditioned::{ImageDescription, ImageEncoding, ImageInput, ImageSource, PreparedImageInput};
+pub use conditioned::{FrameDescription, ImageDescription, ImageEncoding, ImageInput, ImageSource, PreparedImageInput,
+    VideoFrame, VideoInput, VisionSource};
 pub(crate) mod packing;
 mod patches;
 mod patch_merge;
@@ -27,6 +28,7 @@ mod qwen;
 mod radio;
 mod resize;
 mod step;
+mod video;
 
 use std::fmt::Write as _;
 use std::io::Cursor;
@@ -38,6 +40,7 @@ const PATCH: usize = 16;
 const MERGE: usize = 2;
 const FEATURES: usize = 3 * 2 * PATCH * PATCH;
 const IMAGE_TOKEN: &str = "<|image_pad|>";
+const VIDEO_TOKEN: &str = "<|video_pad|>";
 
 /// Admission limits for one request's images. Patch counts are the encoder's unit;
 /// `patches_per_feature` patches merge into one image token, the unit that the model card
@@ -51,6 +54,8 @@ pub struct ImageLimits {
     pub max_patches_per_image: usize,
     pub max_total_patches: usize,
     pub patches_per_feature: usize,
+    /// Frames a request may carry across all of its video clips.
+    pub max_video_frames: usize,
 }
 
 impl Default for ImageLimits {
@@ -62,6 +67,7 @@ impl Default for ImageLimits {
             max_patches_per_image: 16_384,
             max_total_patches: 16_384,
             patches_per_feature: 1,
+            max_video_frames: 16_384,
         }
     }
 }
@@ -93,6 +99,17 @@ impl ImageLimits {
 
     pub fn max_image_tokens_per_image(&self) -> usize {
         self.max_patches_per_image / self.patches_per_feature.max(1)
+    }
+
+    /// Checks the frames a request carries across all of its video clips.
+    pub(crate) fn check_video_count(&self, frames: usize) -> Result<()> {
+        if frames > self.max_video_frames {
+            return Err(Error::frontend(FrontendError::Input(Failure::new(format!(
+                "request has {frames} video frames; max_video_frames_per_prompt is {}",
+                self.max_video_frames
+            )))));
+        }
+        Ok(())
     }
 
     pub(crate) fn check_batch(&self, images: usize, patches: usize) -> Result<()> {
@@ -221,6 +238,33 @@ pub struct ImagePrompt {
     pub rope_delta: i64,
 }
 
+/// A prompt whose image and video placeholders are expanded.
+pub struct MediaPrompt {
+    pub prompt: ImagePrompt,
+    /// Vision windows in prompt order: one still image or one video temporal patch each.
+    pub windows: Vec<PromptWindow>,
+    /// Tokens that replace each media placeholder, in prompt order: the tokens of an
+    /// image, or the timestamp markers, vision delimiters and tokens of a clip.
+    pub expansions: Vec<usize>,
+}
+
+/// The prepared input that fills one vision window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptWindowSource {
+    /// Index into the request's still images.
+    Image(usize),
+    /// Clip and temporal patch among the request's video clips.
+    Video { clip: usize, patch: usize },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromptWindow {
+    /// Expanded prompt tokens whose features this window produces.
+    pub span: std::ops::Range<usize>,
+    pub geometry: ImageGeometry,
+    pub source: PromptWindowSource,
+}
+
 #[derive(Default)]
 struct PreparationCounters {
     decoded: std::sync::atomic::AtomicU64,
@@ -293,6 +337,21 @@ pub struct QwenImageSettings {
     pub position_side: usize,
     pub image_token_id: u32,
     pub video_token_id: u32,
+    /// The checkpoint's video processor settings. A core without them rejects video
+    /// parts, and its settings serialize without this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<QwenVideoSettings>,
+}
+
+/// The checkpoint video processor's clip limits: the largest frame count, the pixel
+/// budget of a whole clip, and the frames in one temporal patch.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QwenVideoSettings {
+    pub max_frames: usize,
+    pub min_pixels: usize,
+    pub max_pixels: usize,
+    pub temporal_patch_size: usize,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -350,7 +409,18 @@ impl ImageProcessor {
         }
         let decoded_budget = std::sync::Arc::new(conditioned::DecodedBudget::new(limits.source_retention_bytes()?));
         use sha2::{Digest, Sha256};
-        let identity_domain = Sha256::digest(serde_json::to_vec(&settings).map_err(|e| e.to_string())?).into();
+        // Video settings shape clip windows and enter window identities through the
+        // window geometry. Image and frame identities depend on the image settings alone.
+        let identity_settings = match &settings {
+            ImageSettings::Qwen(qwen) if qwen.video.is_some() => {
+                Some(ImageSettings::Qwen(QwenImageSettings { video: None, ..qwen.clone() }))
+            }
+            _ => None,
+        };
+        let identity_domain = Sha256::digest(
+            serde_json::to_vec(identity_settings.as_ref().unwrap_or(&settings)).map_err(|e| e.to_string())?,
+        )
+        .into();
         let profile = match settings {
             ImageSettings::Deepseek4 {} => Profile::DeepSeek4,
             ImageSettings::DeepseekRowMajor(settings) => {
@@ -405,10 +475,99 @@ impl ImageProcessor {
         hash.finalize().into()
     }
 
+    /// Input-store key of a video frame's description. It differs from the key of the
+    /// same encoded source described as a still image, whose record has another form.
+    pub fn frame_source_identity(&self, encoding: ImageEncoding, bytes: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"flare-encoded-frame-v1\0");
+        hash.update(self.source_identity(encoding, bytes));
+        hash.finalize().into()
+    }
+
     pub fn process_one(&self, image: &RgbImage) -> Result<ProcessedImages> {
         let images = self.process(std::slice::from_ref(image))?;
         self.counts.prepared.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(images)
+    }
+
+    /// Whether the prepared settings carry the checkpoint's video processor settings.
+    pub fn has_video_settings(&self) -> bool {
+        self.video().is_ok()
+    }
+
+    /// The Qwen profile and its video processor when video settings are prepared.
+    fn video(&self) -> Result<(&qwen::QwenProcessor, &video::VideoProcessor)> {
+        match &self.profile {
+            Profile::Qwen(profile) => profile.video.as_ref().map(|video| (profile, video)),
+            _ => None,
+        }
+        .ok_or_else(|| {
+            Error::frontend(FrontendError::Input(Failure::new(
+                "prepared model does not support video inputs",
+            )))
+        })
+    }
+
+    /// Checks a clip's frame count and source frame rate against the prepared bounds.
+    pub fn check_video_clip(&self, frames: usize, fps: f64) -> Result<()> {
+        let (_, video) = self.video()?;
+        video.check_frames(frames)?;
+        video.timestamps(frames, fps).map(drop)
+    }
+
+    /// The number of temporal patches of a clip and the vision window each of them fills.
+    pub fn video_windows(
+        &self,
+        frames: usize,
+        width: usize,
+        height: usize,
+    ) -> Result<(usize, ImageGeometry)> {
+        let window = self.video()?.1.window(frames, width, height)?;
+        Ok((frames.div_ceil(video::TEMPORAL_PATCH), window))
+    }
+
+    /// Packs the two frames of one temporal patch into the window's vision inputs.
+    pub fn process_video_window(
+        &self,
+        first: &RgbImage,
+        second: &RgbImage,
+        geometry: &ImageGeometry,
+    ) -> Result<ProcessedImages> {
+        let result = self.video()?.0.process_pair(first, second, geometry)?;
+        self.counts.prepared.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(result)
+    }
+
+    /// Expands the image and video placeholders of a prompt that carries video clips.
+    pub fn expand_media_prompt(
+        &self,
+        frontend: &Frontend,
+        text: &str,
+        images: &ProcessedImages,
+        videos: &[VideoInput],
+    ) -> Result<MediaPrompt> {
+        let (profile, video) = self.video()?;
+        profile.expand_media_prompt(video, frontend, text, images, videos)
+    }
+
+    /// Identity of one temporal patch: both frames' identities and the window geometry.
+    pub fn video_window_identity(
+        &self,
+        first: [u8; 32],
+        second: [u8; 32],
+        geometry: &ImageGeometry,
+    ) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"flare-video-window-v1\0");
+        hash.update(first);
+        hash.update(second);
+        hash.update((geometry.width as u64).to_le_bytes());
+        hash.update((geometry.height as u64).to_le_bytes());
+        hash.update(geometry.grid_thw[1].to_le_bytes());
+        hash.update(geometry.grid_thw[2].to_le_bytes());
+        hash.finalize().into()
     }
 
     pub fn preparation_counts(&self) -> ImagePreparationCounts {
@@ -442,6 +601,10 @@ impl ImageProcessor {
         overrun: Option<ImageOverrun>,
     ) -> Result<()> {
         self.limits.check_budget(images, patches, overrun)
+    }
+
+    pub(crate) fn check_video_count(&self, frames: usize) -> Result<()> {
+        self.limits.check_video_count(frames)
     }
 
     /// Decodes PNG with the prepared profile’s alpha and orientation semantics.
@@ -778,6 +941,7 @@ mod tests {
                 position_side: 48,
                 image_token_id: 248056,
                 video_token_id: 248057,
+                video: None,
             }),
             limits,
         )
@@ -800,6 +964,44 @@ mod tests {
             writer.write_image_data(data).unwrap();
         }
         bytes
+    }
+
+    #[test]
+    fn video_settings_stay_out_of_image_identities() {
+        // The serialized settings are the identity domain of semantic identities, which
+        // enter the prefix hash, and of encoded-source keys in the input store.
+        let settings = |video| {
+            ImageSettings::Qwen(QwenImageSettings {
+                min_pixels: 65_536,
+                max_pixels: 16_777_216,
+                position_side: 48,
+                image_token_id: 248_056,
+                video_token_id: 248_057,
+                video,
+            })
+        };
+        assert_eq!(
+            serde_json::to_string(&settings(None)).unwrap(),
+            r#"{"qwen":{"min_pixels":65536,"max_pixels":16777216,"position_side":48,"image_token_id":248056,"video_token_id":248057}}"#
+        );
+        let image = ImageProcessor::load(settings(None), ImageLimits::default()).unwrap();
+        let video = ImageProcessor::load(
+            settings(Some(QwenVideoSettings {
+                max_frames: 768,
+                min_pixels: 4_096,
+                max_pixels: 25_165_824,
+                temporal_patch_size: 2,
+            })),
+            ImageLimits::default(),
+        )
+        .unwrap();
+        assert!(video.has_video_settings() && !image.has_video_settings());
+        let pixels = RgbImage::new(2, 2, (0..12).collect()).unwrap();
+        assert_eq!(video.semantic_identity(&pixels), image.semantic_identity(&pixels));
+        assert_eq!(
+            video.source_identity(ImageEncoding::Png, b"source"),
+            image.source_identity(ImageEncoding::Png, b"source")
+        );
     }
 
     #[test]
@@ -852,7 +1054,7 @@ mod tests {
     fn image_profiles_accept_five_images_within_the_total_patch_budget() {
         let settings = [
             ImageSettings::Qwen(QwenImageSettings { min_pixels: 65536, max_pixels: 16777216,
-                position_side: 48, image_token_id: 248056, video_token_id: 248057 }),
+                position_side: 48, image_token_id: 248056, video_token_id: 248057, video: None }),
             ImageSettings::Mimo(MimoImageSettings { min_pixels: 65536, max_pixels: 16777216,
                 image_mean: [0.5; 3], image_std: [0.5; 3] }),
             ImageSettings::Deepseek4 {},

@@ -6,8 +6,8 @@
 
 //! Per-image prompt descriptions and reconstructible CPU preparation inputs.
 
-use super::{ImageGeometry, ImageProcessor, ProcessedImages, RgbImage};
-use crate::Result;
+use super::{ImageGeometry, ImageProcessor, ProcessedImages, Profile, RgbImage};
+use crate::{Error, Failure, FrontendError, Result};
 use std::{ops::Range, sync::Arc};
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -25,6 +25,24 @@ impl ImageDescription {
     pub fn height(&self) -> usize {
         self.height
     }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(self).map_err(|e| e.to_string())?)
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        Ok(serde_json::from_slice(bytes).map_err(|e| e.to_string())?)
+    }
+}
+
+/// Extent and semantic identity of one decoded video frame, which the input store keeps
+/// under the frame's key (`ImageProcessor::frame_source_identity`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FrameDescription {
+    pub identity: [u8; 32],
+    pub width: usize,
+    pub height: usize,
+}
+
+impl FrameDescription {
     pub fn encode(&self) -> Result<Vec<u8>> {
         Ok(serde_json::to_vec(self).map_err(|e| e.to_string())?)
     }
@@ -100,6 +118,17 @@ impl ImageSource {
             decoded.lock().unwrap().take();
         }
     }
+
+    /// Whether both sources hold one decoded image or one retention slot.
+    fn shares_decoded(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Decoded(a), Self::Decoded(b)) => Arc::ptr_eq(a, b),
+            (Self::Encoded { decoded: a, .. }, Self::Encoded { decoded: b, .. }) => {
+                Arc::ptr_eq(a, b)
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -108,13 +137,49 @@ pub struct ImageInput {
     pub source: ImageSource,
 }
 
+/// One source frame of a video clip. Its identity is the semantic identity of its pixels,
+/// whichever temporal patch it fills.
+#[derive(Clone, Debug)]
+pub struct VideoFrame {
+    pub identity: [u8; 32],
+    pub source: ImageSource,
+}
+
+/// A video clip: the frames the client supplied, in order, and the window they share.
+#[derive(Clone, Debug)]
+pub struct VideoInput {
+    /// Rate at which the client sampled the frames, in frames per second.
+    pub fps: f64,
+    /// Vision window of each temporal patch.
+    pub window: ImageGeometry,
+    pub frames: Vec<VideoFrame>,
+}
+
+impl VideoInput {
+    /// The two frames of one temporal patch. The final patch of an odd clip repeats the
+    /// last frame.
+    pub fn frames_of(&self, patch: usize) -> (&VideoFrame, &VideoFrame) {
+        let first = patch * super::video::TEMPORAL_PATCH;
+        let second = (first + 1).min(self.frames.len() - 1);
+        (&self.frames[first], &self.frames[second])
+    }
+}
+
+/// The inputs one vision window consumes.
+#[derive(Clone, Debug)]
+pub enum VisionSource {
+    Image(ImageSource),
+    /// The two frames of one video temporal patch.
+    Frames { first: ImageSource, second: ImageSource },
+}
+
 #[derive(Clone)]
 pub struct PreparedImageInput {
     pub identity: [u8; 32],
     pub token_span: Range<usize>,
     pub feature_range: Range<usize>,
     pub geometry: ImageGeometry,
-    pub source: ImageSource,
+    pub source: VisionSource,
     processor: Arc<ImageProcessor>,
 }
 
@@ -141,7 +206,27 @@ impl PreparedImageInput {
             geometry: input.description.geometry,
             token_span,
             feature_range,
-            source: input.source,
+            source: VisionSource::Image(input.source),
+            processor,
+        }
+    }
+
+    /// The vision window of one temporal patch of a video clip.
+    pub fn video(
+        identity: [u8; 32],
+        geometry: ImageGeometry,
+        token_span: Range<usize>,
+        feature_range: Range<usize>,
+        first: ImageSource,
+        second: ImageSource,
+        processor: Arc<ImageProcessor>,
+    ) -> Self {
+        Self {
+            identity,
+            geometry,
+            token_span,
+            feature_range,
+            source: VisionSource::Frames { first, second },
             processor,
         }
     }
@@ -223,38 +308,79 @@ impl PreparedImageInput {
     }
 
     pub fn release_decoded(&self) {
-        self.source.release_decoded();
+        match &self.source {
+            VisionSource::Image(source) => source.release_decoded(),
+            VisionSource::Frames { first, second } => {
+                first.release_decoded();
+                second.release_decoded();
+            }
+        }
     }
 
     pub fn materialize(&self) -> Result<ProcessedImages> {
-        let image = match &self.source {
-            ImageSource::Decoded(image) => RetainedDecoded {
-                image: image.clone(),
-                _lease: None,
-            },
-            ImageSource::Encoded {
-                encoding,
-                bytes,
-                decoded,
-            } => {
-                let retained = decoded.lock().unwrap().take();
-                match retained {
-                    Some(image) => image,
-                    None => RetainedDecoded {
-                        image: Arc::new(self.processor.decode_encoded(*encoding, bytes)?),
-                        _lease: None,
-                    },
+        let result = match &self.source {
+            VisionSource::Image(source) => {
+                let image = take_decoded(&self.processor, source)?;
+                if self.processor.semantic_identity(&image.image) != self.identity {
+                    return Err("image source differs from its prompt description".into());
                 }
+                self.processor.process_one(&image.image)?
+            }
+            VisionSource::Frames { first, second } => {
+                let first_frame = take_decoded(&self.processor, first)?;
+                // The final patch of an odd clip names one source twice; its retained
+                // decode is taken once and fills both temporal slices.
+                let second_frame = if first.shares_decoded(second) {
+                    None
+                } else {
+                    Some(take_decoded(&self.processor, second)?)
+                };
+                let second_frame = second_frame.as_ref().unwrap_or(&first_frame);
+                let identity = self.processor.video_window_identity(
+                    self.processor.semantic_identity(&first_frame.image),
+                    self.processor.semantic_identity(&second_frame.image),
+                    &self.geometry,
+                );
+                if identity != self.identity {
+                    return Err("video frames differ from their prompt description".into());
+                }
+                self.processor.process_video_window(
+                    &first_frame.image,
+                    &second_frame.image,
+                    &self.geometry,
+                )?
             }
         };
-        if self.processor.semantic_identity(&image.image) != self.identity {
-            return Err("image source differs from its prompt description".into());
-        }
-        let result = self.processor.process_one(&image.image)?;
         if !self.valid_processed(&result) {
             return Err("image preprocessing differs from its prompt geometry".into());
         }
         Ok(result)
+    }
+}
+
+/// Takes the decode a source retains, or decodes the source when it retains none. The
+/// source's mutex is released before decoding, and a taken decode releases its lease
+/// when the caller drops it.
+fn take_decoded(processor: &ImageProcessor, source: &ImageSource) -> Result<RetainedDecoded> {
+    match source {
+        ImageSource::Decoded(image) => Ok(RetainedDecoded {
+            image: image.clone(),
+            _lease: None,
+        }),
+        ImageSource::Encoded {
+            encoding,
+            bytes,
+            decoded,
+        } => {
+            let retained = decoded.lock().unwrap().take();
+            match retained {
+                Some(image) => Ok(image),
+                None => Ok(RetainedDecoded {
+                    image: Arc::new(processor.decode_encoded(*encoding, bytes)?),
+                    _lease: None,
+                }),
+            }
+        }
     }
 }
 
@@ -309,6 +435,165 @@ impl ImageProcessor {
         })
     }
 
+    /// The extent an encoded image decodes to, after the orientation the profile
+    /// applies, read without decoding pixels. The checks are those the decoder makes
+    /// before it decodes: the byte and pixel limits and the supported sample formats.
+    pub fn probe_encoded(
+        &self,
+        encoding: ImageEncoding,
+        bytes: &[u8],
+    ) -> Result<(usize, usize)> {
+        match encoding {
+            ImageEncoding::Png => self.probe_png(bytes),
+            ImageEncoding::Jpeg => self.probe_jpeg(bytes),
+            ImageEncoding::Webp => self.probe_webp(bytes),
+        }
+    }
+
+    pub fn describe_frame(&self, image: &RgbImage) -> FrameDescription {
+        FrameDescription {
+            identity: self.semantic_identity(image),
+            width: image.width(),
+            height: image.height(),
+        }
+    }
+
+    fn oriented_extent(
+        &self,
+        width: usize,
+        height: usize,
+        orientation: u16,
+    ) -> (usize, usize) {
+        if orientation >= 5 {
+            (height, width)
+        } else {
+            (width, height)
+        }
+    }
+
+    fn probe_png(&self, bytes: &[u8]) -> Result<(usize, usize)> {
+        if bytes.len() > self.limits.max_encoded_bytes {
+            return Err(Error::frontend(FrontendError::Input(Failure::new(
+                "encoded image exceeds the configured byte limit",
+            ))));
+        }
+        let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+        decoder.set_transformations(png::Transformations::EXPAND);
+        decoder.set_limits(png::Limits {
+            bytes: self.limits.max_input_pixels.saturating_mul(8),
+        });
+        let mut reader = decoder.read_info().map_err(|e| {
+            Error::frontend(FrontendError::ImageDecode(Failure::caused_by(
+                format!("invalid PNG: {e}"),
+                e,
+            )))
+        })?;
+        let (width, height, bit_depth, animated) = {
+            let info = reader.info();
+            (info.width as usize, info.height as usize, info.bit_depth,
+             info.animation_control.is_some())
+        };
+        self.check_input_extent(width, height)?;
+        if bit_depth == png::BitDepth::Sixteen || animated {
+            return Err(Error::frontend(FrontendError::ImageDecode(Failure::new(
+                "PNG requires non-animated, at most 8-bit samples",
+            ))));
+        }
+        // An eXIf chunk may follow the image data. `finish` skips that data without
+        // inflating it and parses the chunks behind it, as the decoder does after it
+        // has read the frame.
+        reader.finish().map_err(|e| {
+            Error::frontend(FrontendError::ImageDecode(Failure::caused_by(
+                format!("invalid PNG: {e}"),
+                e,
+            )))
+        })?;
+        let orientation = if matches!(
+            self.profile,
+            Profile::Moonvit | Profile::DeepseekRowMajor(_) | Profile::PaddedGrid
+        ) {
+            1
+        } else {
+            reader.info().exif_metadata
+                .as_deref()
+                .map(super::orientation::exif_orientation)
+                .transpose()?
+                .unwrap_or(1)
+        };
+        Ok(self.oriented_extent(width, height, orientation))
+    }
+
+    fn probe_jpeg(&self, bytes: &[u8]) -> Result<(usize, usize)> {
+        if bytes.len() > self.limits.max_encoded_bytes {
+            return Err(Error::frontend(FrontendError::Input(Failure::new(
+                "encoded image exceeds the configured byte limit",
+            ))));
+        }
+        let error = |e| {
+            Error::frontend(FrontendError::ImageDecode(Failure::caused_by(
+                format!("invalid JPEG: {e}"),
+                e,
+            )))
+        };
+        let mut decoder = turbojpeg::Decompressor::new().map_err(error)?;
+        decoder.set_scan_limit(100).map_err(error)?;
+        let header = decoder.read_header(bytes).map_err(error)?;
+        self.check_input_extent(header.width as usize, header.height as usize)?;
+        if header.is_lossless || header.is_arithmetic {
+            return Err(Error::frontend(FrontendError::ImageDecode(Failure::new(
+                "JPEG requires baseline or progressive Huffman coding",
+            ))));
+        }
+        let orientation = if matches!(
+            self.profile,
+            Profile::Moonvit | Profile::DeepseekRowMajor(_) | Profile::PaddedGrid
+        ) {
+            1
+        } else {
+            super::orientation::jpeg_orientation(bytes)?
+        };
+        Ok(self.oriented_extent(header.width as usize, header.height as usize, orientation))
+    }
+
+    fn probe_webp(&self, bytes: &[u8]) -> Result<(usize, usize)> {
+        if bytes.len() > self.limits.max_encoded_bytes {
+            return Err(Error::frontend(FrontendError::Input(Failure::new(
+                "encoded image exceeds the configured byte limit",
+            ))));
+        }
+        let error = |e| {
+            Error::frontend(FrontendError::ImageDecode(Failure::caused_by(
+                format!("invalid WebP: {e}"),
+                e,
+            )))
+        };
+        let mut decoder = image_webp::WebPDecoder::new(std::io::Cursor::new(bytes))
+            .map_err(error)?;
+        let (width, height) = decoder.dimensions();
+        self.check_input_extent(width as usize, height as usize)?;
+        if decoder.is_animated() {
+            return Err(Error::frontend(FrontendError::ImageDecode(Failure::new(
+                "animated WebP is unsupported; provide a still image",
+            ))));
+        }
+        let orientation = if matches!(
+            self.profile,
+            Profile::Moonvit | Profile::DeepseekRowMajor(_) | Profile::PaddedGrid
+        ) {
+            1
+        } else {
+            decoder.exif_metadata().map_err(error)?
+                .as_deref()
+                .map(|data| {
+                    super::orientation::exif_orientation(
+                        data.strip_prefix(b"Exif\0\0").unwrap_or(data))
+                })
+                .transpose()?
+                .unwrap_or(1)
+        };
+        Ok(self.oriented_extent(width as usize, height as usize, orientation))
+    }
+
     pub fn decode_encoded(&self, encoding: ImageEncoding, bytes: &[u8]) -> Result<RgbImage> {
         let image = match encoding {
             ImageEncoding::Png => self.decode_png(bytes),
@@ -338,6 +623,7 @@ mod tests {
                 position_side: 48,
                 image_token_id: 248056,
                 video_token_id: 248057,
+                video: None,
             }),
             ImageSettings::Mimo(MimoImageSettings {
                 min_pixels: 65536,

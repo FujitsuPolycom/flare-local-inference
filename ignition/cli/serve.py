@@ -324,6 +324,8 @@ def _prepare(args):
             model.verify(hub_cache)
         plan = snapshot_rules(configuration, model, plan, image_concurrency=args.image_concurrency)
 
+    if plan.video_unsupported is not None:
+        progress.console.print(f"video input not prepared: {plan.video_unsupported}")
     environment.apply(configuration, plan.gpus, plan.recipe.b12x_environment)
     import flare_heliopause
 

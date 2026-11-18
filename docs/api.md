@@ -48,7 +48,8 @@ The additional `flare` object reports prepared and selected serving metadata:
 | `max_image_tokens_per_image` | Image tokens one image may cost after the profile's normalization; the smaller of one prepared vision graph and one feature window; zero for text-only cores |
 | `max_image_pixels` | Largest decoded image extent (width times height) accepted before normalization; zero for text-only cores |
 | `max_image_bytes` | Largest encoded image accepted; zero for text-only cores |
-| `input_modalities` | `text`, plus `image` when vision is prepared |
+| `max_video_frames_per_prompt` | Context-derived upper bound on video frames across a request's clips; present only for a core with prepared video settings |
+| `input_modalities` | `text`, plus `image` when vision is prepared, plus `video` for a core with prepared video settings |
 | `output_modalities` | `text` |
 
 Generation requests always use the loaded model, regardless of the request's
@@ -548,6 +549,59 @@ is reused; the total image tokens across a conversation may exceed
 must fit a prepared vision graph and one feature window. The whole request must
 fit the HTTP body limit and the context shared by images, text, and generated
 output. Animated images are unsupported.
+
+The chat completions API accepts a video part from a core with prepared video
+settings: `{"type": "video", "video": [FRAME, ...], "fps": NUMBER}`. Each frame
+is an image data URL of a kind the server decodes, the frames are in display
+order, and `fps` is the rate, in frames per second, at which the client sampled
+them. The server decodes no video container, does not resample, and accepts no
+audio. A core without prepared video settings rejects the part as it rejects
+any undefined content type, with `Unexpected item type in content.` (HTTP 400),
+before it reads an image; the Responses and Messages APIs define no video part.
+
+The frames of a clip pair in order into temporal patches of two, and the last
+patch of an odd clip repeats the final frame. All frames of a clip have one
+pixel size after orientation. The checkpoint video processor's rule derives one
+resize target for every frame from the clip's frame count and the prepared pixel
+budget of a clip. Each temporal patch fills one vision window with one frame in
+each temporal slice, and the prompt receives the checkpoint processor's text for
+it: the timestamp marker `<S seconds>`, where `S` is the mean source time of the
+patch's two frames printed with one decimal, then vision start, the patch's
+video tokens, and vision end. A message may mix images and clips.
+
+Admission rejects a request with HTTP 400 when it violates one of these limits.
+A message about a clip names it `video N`, and a message about a frame names it
+`video N frame M`, counted from one in request order.
+
+- A clip has at least two frames and at most the prepared maximum frame count,
+  which `flare inspect` shows as `max_frames`. The checkpoint processor's lower
+  frame bound applies to frames it samples from a container and does not apply
+  to supplied frames.
+- `fps` is between 0.001 and 1000. Within this range every frame time is
+  finite, and the longest marker belongs to the last patch of the longest clip
+  at the lowest rate: `<766500.0 seconds>` for 768 frames.
+- A frame is a still PNG, JPEG, or WebP image within `max_image_bytes` and
+  `max_image_pixels`, and its longer side is at most 200 times its shorter side.
+- One temporal patch costs at most `max_image_tokens_per_image` tokens.
+- A request carries at most `max_video_frames_per_prompt` frames across its
+  clips. The video tokens of its clips and the image tokens of its images
+  together stay within `max_image_tokens_per_prompt`; a rejection states their
+  sum. The request also fits the HTTP body limit and the context.
+
+Admission checks frame counts, rates, the extent in each frame's encoded header,
+clip geometry, and the budgets above before it decodes a frame. It then decodes
+each frame once for its identity, unless the input store holds the frame's
+description from an earlier request, and rejects a frame whose decoded extent
+differs from its header. A decoded frame stays in memory for window preparation
+while the decoded-source budget has room; that budget is eight bytes per pixel
+of `max_image_pixels` for one served model and is shared by the images and
+frames of all requests. Window preparation decodes a frame that admission did
+not retain, unless the input store holds the prepared window. A retained frame
+is released when its window is prepared, when a reused checkpoint covers its
+window, and when its request is rejected, cancelled, or completes.
+
+Video tokens count toward `prompt_tokens`, and usage reports them under
+`prompt_tokens_details.multimodal_tokens.image` together with image tokens.
 
 Image costs are the token counts that usage reports in
 `prompt_tokens_details.multimodal_tokens.image`: the profile normalizes each

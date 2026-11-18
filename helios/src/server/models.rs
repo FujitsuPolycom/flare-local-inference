@@ -66,7 +66,11 @@ impl ModelCatalog {
             .flatten();
         // Match vLLM's ModelCard / ModelPermission wire fields while
         // advertising only features supported by this server.
-        let card = json!({
+        let video = matches!(
+            model.contract.frontend.image_tokens.as_ref(),
+            Some(tokens) if tokens.video_feature_token.is_some()
+        );
+        let mut card = json!({
             "id": id,
             "object": "model",
             "created": created,
@@ -103,7 +107,9 @@ impl ModelCatalog {
                 "max_image_tokens_per_image": limits.map_or(0, |l| l.max_image_tokens_per_image()),
                 "max_image_pixels": limits.map_or(0, |l| l.max_input_pixels),
                 "max_image_bytes": limits.map_or(0, |l| l.max_encoded_bytes),
-                "input_modalities": if model.contract.vision.enabled() {
+                "input_modalities": if video {
+                    vec!["text", "image", "video"]
+                } else if model.contract.vision.enabled() {
                     vec!["text", "image"]
                 } else {
                     vec!["text"]
@@ -111,6 +117,10 @@ impl ModelCatalog {
                 "output_modalities": ["text"],
             },
         });
+        if video {
+            card["flare"]["max_video_frames_per_prompt"] =
+                json!(limits.map_or(0, |l| l.max_video_frames));
+        }
         let mut capabilities = vec!["completion"];
         if model.contract.vision.enabled() {
             capabilities.push("vision");
@@ -364,6 +374,23 @@ mod tests {
         assert_eq!(vision["flare"]["max_image_tokens_per_image"], 256);
         assert_eq!(vision["flare"]["max_image_pixels"], 64 * 1024 * 1024);
         assert_eq!(vision["flare"]["max_image_bytes"], 32 * 1024 * 1024);
+        assert!(vision["flare"].get("max_video_frames_per_prompt").is_none());
+        model.contract.frontend.image_tokens = Some(
+            crate::model::contract::ImageTokenLayout {
+                feature_token: 248056,
+                video_feature_token: Some(248057),
+                span: None,
+            },
+        );
+        let video = ModelCatalog::new(&model, &[], None).card;
+        assert_eq!(
+            video["flare"]["input_modalities"],
+            json!(["text", "image", "video"])
+        );
+        assert_eq!(
+            video["flare"]["max_video_frames_per_prompt"],
+            model.limits.max_sequence_tokens
+        );
     }
 
     #[test]

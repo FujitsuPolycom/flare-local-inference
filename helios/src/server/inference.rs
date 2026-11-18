@@ -39,6 +39,8 @@ pub struct Message {
 pub enum Part {
     Text(String),
     Image(String),
+    /// Pre-extracted frames and the rate the client sampled them at.
+    Video(crate::frontend::VideoPart),
     Reasoning(String),
     ToolCall {
         id: Option<String>,
@@ -211,6 +213,9 @@ fn content(parts: &[Part]) -> Result<Value> {
         match part {
             Part::Text(text) => values.push(json!({"type":"text","text":text})),
             Part::Image(url) => values.push(json!({"type":"image_url","image_url":{"url":url}})),
+            Part::Video(video) => values.push(
+                json!({"type":"video","video":video.frames,"fps":video.fps}),
+            ),
             _ => return Err("tool result content must contain text or images".into()),
         }
     }
@@ -302,7 +307,7 @@ pub fn template_messages(
         };
         for (part_index, part) in message.parts.iter().enumerate() {
             match part {
-                Part::Text(_) | Part::Image(_) => {
+                Part::Text(_) | Part::Image(_) | Part::Video(_) => {
                     if current.get("tool_calls").is_some() {
                         flush(&mut current, &mut ordinary, &mut ordinary_hints, &mut out)?;
                     }

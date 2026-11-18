@@ -354,7 +354,7 @@ For concurrency 32 with seven draft tokens per request, use
 ## Qwen3.8 27B
 
 `qwen3.8-27b` prepares `nvidia/Qwen3.8-27B-NVFP4` for text generation and Qwen
-image requests on one GPU.
+image and video requests on one GPU.
 It uses the canonical Qwen3.5 dense decoder with tensor-scaled FP8 attention
 projections and NVFP4 MLP and vocabulary weights. FP8 KV pages and Gated DeltaNet
 continuations reside in device memory. The pinned BF16
@@ -371,10 +371,19 @@ The recipe has no host-mapped tables.
 
 A plan that requests image slots loads the snapshot's `model.visual.*` vision
 tower and captures Qwen image graphs for 256, 1,024, 4,096, and 16,384 patches.
+An image-slot plan also reads the checkpoint video processor, from
+`processor_config.json`'s `video_processor` or `video_preprocessor_config.json`,
+and records its maximum frame count, clip pixel budget, and temporal patch size in the
+core's frontend settings. A snapshot without a video processor exports none, and
+that core rejects video requests. A processor whose type or per-frame pixel cap
+the native frontend does not implement also exports an image core without video
+settings; the plan report's `video_unsupported` field names the unsupported
+setting.
 Each captured vision graph validates and sanitizes its patch window, encodes it,
 and publishes complete image features for one request. Prefill replaces the
-embeddings at image-token positions, token 248056, with the published rows. Each
-feature slot holds 16,384 BF16 vectors of width 5,120, or 160 MiB; four slots
+embeddings at image-token positions, token 248056, with the published rows; a
+video temporal patch runs the same graph as one window and fills token 248057.
+Each feature slot holds 16,384 BF16 vectors of width 5,120, or 160 MiB; four slots
 reserve 640 MiB. A plan with image slots reserves 2,997,599,804 bytes beyond the
 text catalog: the four slots, the captured encoder scratch for patch capacities
 256 through 16,384, the float32 patch upload, per-graph handoff metadata, the

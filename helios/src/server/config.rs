@@ -116,7 +116,7 @@ impl Bootstrap {
                     ))
                 })?;
         }
-        let contract = serde_json::from_value(
+        let contract: crate::model::PreparedContract = serde_json::from_value(
             object
                 .get("model_contract")
                 .ok_or("model_contract metadata is required")?
@@ -128,6 +128,7 @@ impl Bootstrap {
                 error,
             ))
         })?;
+        check_video_declarations(&frontend_settings, &contract)?;
         let prepared_sequence_tokens = usize::try_from(integer("max_sequence_tokens", None)?)
             .map_err(|_| "prepared context extent overflow")?;
         let mut model = ModelConfig {
@@ -436,6 +437,37 @@ impl ServerConfig {
     }
 }
 
+/// Video admission expands clips with the video token of the prepared video settings,
+/// and prompt validation accepts features at the image token layout's video feature
+/// token. A core declares both with one token, or neither.
+fn check_video_declarations(
+    frontend: &FrontendSettings,
+    contract: &crate::model::PreparedContract,
+) -> Result<()> {
+    let settings = match &frontend.image {
+        Some(crate::frontend::images::ImageSettings::Qwen(settings)) if settings.video.is_some() => {
+            Some(settings.video_token_id)
+        }
+        _ => None,
+    };
+    let layout = contract
+        .frontend
+        .image_tokens
+        .as_ref()
+        .and_then(|tokens| tokens.video_feature_token);
+    if settings != layout {
+        let show = |token: Option<u32>| token.map_or("none".to_owned(), |token| token.to_string());
+        return Err(format!(
+            "prepared video settings declare video token {} and the image token layout declares \
+             video feature token {}; a core declares both with one token or neither",
+            show(settings),
+            show(layout)
+        )
+        .into());
+    }
+    Ok(())
+}
+
 pub(crate) fn image_limits(vision: &crate::model::VisionCapabilities, context_tokens: usize) -> Result<ImageLimits> {
     let live_patches = vision
         .features_per_request
@@ -454,6 +486,7 @@ pub(crate) fn image_limits(vision: &crate::model::VisionCapabilities, context_to
     }
     Ok(ImageLimits {
         max_images: context_tokens,
+        max_video_frames: context_tokens,
         max_patches_per_image,
         max_total_patches,
         patches_per_feature: vision.patches_per_feature,
@@ -825,4 +858,46 @@ mod tests {
             "{error}"
         );
     }
+
+    #[test]
+    fn loading_rejects_video_settings_and_layout_tokens_that_disagree() {
+        use crate::model::contract::ImageTokenLayout;
+        use serde_json::json;
+
+        let mut model = crate::frontend::test_support::model_config(crate::model::testing::metadata());
+        let manifest = crate::model::testing::manifest(&model);
+        // The video token of the prepared video settings, and the layout's video feature token.
+        let mut load = |settings: Option<u32>, layout: Option<u32>| {
+            model.contract.frontend.image_tokens = Some(ImageTokenLayout {
+                feature_token: 248056, video_feature_token: layout, span: None,
+            });
+            let mut qwen = json!({"min_pixels": 4096, "max_pixels": 25165824, "position_side": 48,
+                "image_token_id": 248056, "video_token_id": settings.unwrap_or(248057)});
+            if settings.is_some() {
+                qwen["video"] = json!({"max_frames": 768, "min_pixels": 4096,
+                    "max_pixels": 25165824, "temporal_patch_size": 2});
+            }
+            let config = json!({
+                "identity": "11".repeat(32), "model_id": "video-declarations",
+                "model_contract": model.contract, "sampling_defaults": model.sampling_defaults,
+                "frontend": {"tokenizer": {}, "eos_token_ids": [0], "image": {"qwen": qwen}},
+            });
+            Bootstrap::load(&config.to_string(), &manifest).err().unwrap().to_string()
+        };
+        let disagreement = |settings: &str, layout: &str| {
+            format!(
+                "prepared video settings declare video token {settings} and the image token layout \
+                 declares video feature token {layout}; a core declares both with one token or neither"
+            )
+        };
+        assert_eq!(load(Some(248057), None), disagreement("248057", "none"));
+        assert_eq!(load(None, Some(248057)), disagreement("none", "248057"));
+        assert_eq!(load(Some(248057), Some(248058)), disagreement("248057", "248058"));
+        // Declarations that agree pass the check; this configuration omits the next field
+        // that loading reads.
+        for (settings, layout) in [(Some(248057), Some(248057)), (None, None)] {
+            assert_eq!(load(settings, layout), "server configuration requires max_sequence_tokens");
+        }
+    }
+
 }

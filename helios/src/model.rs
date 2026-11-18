@@ -26,7 +26,10 @@ pub use contract::PreparedContract;
 pub use inputs::{InputStep, pack_inputs};
 pub use packing::Inputs;
 #[cfg(feature = "server")]
-pub use prompt::{prepare_image_inputs, prepare_input, prepare_output, reasoning_delimiter_tokens};
+pub use prompt::{
+    prepare_image_inputs, prepare_input, prepare_media_inputs, prepare_output,
+    reasoning_delimiter_tokens,
+};
 #[cfg(feature = "server")]
 pub(crate) use prompt::validate_conditioned_inputs;
 
@@ -423,11 +426,15 @@ pub fn validate_prompt_data(config: &ModelConfig, tokens: &[u32], data: &PromptD
         return Err("prompt arrays violate prepared geometry".into());
     }
     if let Some(layout) = &config.contract.frontend.image_tokens {
+        // A video temporal patch carries its features at the video placeholder.
+        let feature_token = |token: u32| {
+            token == layout.feature_token || layout.video_feature_token == Some(token)
+        };
         if data.vision_token_indices.len() != tokens.len()
             || tokens
                 .iter()
                 .zip(&data.vision_token_indices)
-                .any(|(token, index)| (*token == layout.feature_token) != (*index >= 0))
+                .any(|(token, index)| feature_token(*token) != (*index >= 0))
         {
             return Err("image feature tokens do not match their feature indices".into());
         }
@@ -437,7 +444,7 @@ pub fn validate_prompt_data(config: &ModelConfig, tokens: &[u32], data: &PromptD
                     || tokens[s.start] != span.start_token
                     || tokens[s.end - 1] != span.end_token
             }) || tokens.iter().enumerate().any(|(position, token)| {
-                let scoped = *token == layout.feature_token
+                let scoped = feature_token(*token)
                     || *token == span.start_token
                     || *token == span.end_token
                     || span.interior_tokens.contains(token);

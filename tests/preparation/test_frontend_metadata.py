@@ -10,7 +10,9 @@ import json
 from google.protobuf.json_format import MessageToDict, ParseError
 import pytest
 
-from ignition.preparation.frontend import image_settings, prepare_frontend, tokenizer_settings
+from ignition.preparation.frontend import (
+    image_settings, prepare_frontend, tokenizer_settings, video_settings,
+)
 from ignition.preparation.core_file import combine, read_index, write_sources
 from ignition.preparation.core_proto import serving
 from ignition.preparation.runtime_core_pb2 import BundleIndex, ModelIndex
@@ -86,6 +88,92 @@ def test_image_metadata_is_a_tight_consumed_contract():
             image_settings(changed, model, "qwen")
 
 
+def video_processor(**changes):
+    config = dict(video_processor_type="Qwen3VLVideoProcessor", patch_size=16,
+        temporal_patch_size=2, merge_size=2, min_frames=4, max_frames=768,
+        size=dict(shortest_edge=4096, longest_edge=25165824),
+        image_mean=[.5] * 3, image_std=[.5] * 3, fps=2)
+    config.update(changes)
+    return config
+
+
+def test_video_settings_come_from_the_checkpoint_video_processor(tmp_path):
+    processor = video_processor()
+    (tmp_path / "video_preprocessor_config.json").write_text(json.dumps(processor))
+    expected = dict(max_frames=768, min_pixels=4096, max_pixels=25165824,
+                    temporal_patch_size=2)
+    assert video_settings(tmp_path) == expected
+    # The complete processor takes precedence over the standalone video config, and its
+    # minimum frame count is not prepared because supplied clips are not resampled.
+    (tmp_path / "processor_config.json").write_text(json.dumps(
+        dict(video_processor=video_processor(min_frames=6, max_frames=512))))
+    assert video_settings(tmp_path)["max_frames"] == 512
+    # Absent video processor: the core rejects video.
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    assert video_settings(bare) is None
+    # Class defaults apply to the maximum frame count the checkpoint does not state.
+    (tmp_path / "processor_config.json").write_text(json.dumps(
+        dict(video_processor={k: v for k, v in video_processor().items()
+                             if k != "max_frames"})))
+    assert video_settings(tmp_path)["max_frames"] == 768
+
+
+def test_qwen_preparation_exports_video_settings_when_the_checkpoint_declares_them(tmp_path):
+    processor, model = qwen_source()
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps({"eos_token": "<eos>"}))
+    (tmp_path / "config.json").write_text(json.dumps(model))
+    (tmp_path / "preprocessor_config.json").write_text(json.dumps(processor))
+    def frontend(**options):
+        return prepare_frontend(tmp_path, eos_token_ids=[248057], image_profile="qwen",
+            qwen_model_type=model["model_type"], **options)
+
+    assert video_settings(tmp_path) is None
+    assert "video" not in frontend(video=video_settings(tmp_path))["image"]["qwen"]
+    (tmp_path / "video_preprocessor_config.json").write_text(json.dumps(video_processor()))
+    with_video = frontend(video=video_settings(tmp_path))
+    assert with_video["image"]["qwen"]["video"] == dict(max_frames=768,
+        min_pixels=4096, max_pixels=25165824, temporal_patch_size=2)
+    # A recipe that passes no video settings prepares none, whatever the snapshot ships.
+    assert "video" not in frontend()["image"]["qwen"]
+
+
+@pytest.mark.parametrize("content", [
+    {"video_processor": []},
+    {"video_processor": {**video_processor(), "size": []}},
+])
+def test_malformed_video_configuration_is_unsupported_not_a_crash(tmp_path, content):
+    from ignition.preparation.frontend import video_capability
+
+    (tmp_path / "processor_config.json").write_text(json.dumps(content))
+    values, reason = video_capability(tmp_path)
+    assert values is None and reason
+    with pytest.raises(ValueError):
+        video_settings(tmp_path)
+
+
+@pytest.mark.parametrize("changes", [
+    dict(cap_pixels_per_frame=True), dict(video_processor_type="Qwen2VLVideoProcessor"),
+])
+def test_unsupported_video_configuration_prepares_an_image_core(tmp_path, changes):
+    from ignition.preparation.frontend import video_capability
+
+    processor, model = qwen_source()
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps({"eos_token": "<eos>"}))
+    (tmp_path / "config.json").write_text(json.dumps(model))
+    (tmp_path / "preprocessor_config.json").write_text(json.dumps(processor))
+    (tmp_path / "video_preprocessor_config.json").write_text(
+        json.dumps(video_processor(**changes)))
+    values, reason = video_capability(tmp_path)
+    assert values is None and reason
+    frontend = prepare_frontend(tmp_path, eos_token_ids=[248057], image_profile="qwen",
+        qwen_model_type=model["model_type"], video=values)
+    assert frontend["image"]["qwen"]["image_token_id"] == 248056
+    assert "video" not in frontend["image"]["qwen"]
+    with pytest.raises(ValueError):
+        video_settings(tmp_path)
+
+
 def test_qwen_frontend_checks_the_recipes_model_type(tmp_path):
     processor, model = qwen_source()
     (tmp_path / "tokenizer_config.json").write_text(json.dumps({"eos_token": "<eos>"}))
@@ -104,6 +192,21 @@ def test_qwen_frontend_checks_the_recipes_model_type(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps({**model, "model_type": "qwen3_5"}))
     with pytest.raises(ValueError, match="model_type"):
         prepare_frontend(tmp_path, eos_token_ids=[248057], image_profile="qwen")
+
+
+@pytest.mark.parametrize("changes", [
+    dict(cap_pixels_per_frame=True), dict(video_processor_type="Qwen2VLVideoProcessor"),
+    dict(temporal_patch_size=4), dict(merge_size=4), dict(resample=2),
+    dict(rescale_factor=.5), dict(image_std=[.5, .5, 1.]), dict(do_normalize=False),
+    dict(size=dict(shortest_edge=0, longest_edge=25165824)),
+    dict(size=dict(shortest_edge=8192, longest_edge=4096)),
+    dict(max_frames=1),
+])
+def test_video_settings_reject_configurations_the_frontend_does_not_consume(tmp_path, changes):
+    (tmp_path / "video_preprocessor_config.json").write_text(
+        json.dumps(video_processor(**changes)))
+    with pytest.raises(ValueError):
+        video_settings(tmp_path)
 
 
 def test_qwen_dense_vision_configuration_uses_the_qwen_image_profile():

@@ -75,7 +75,9 @@ fn arguments(v: &Value) -> Result<Value> {
 fn qualified(name: &str, namespace: Option<&str>) -> String {
     namespace.map_or_else(|| name.to_owned(), |ns| format!("{ns}__{name}"))
 }
-fn plain_parts(value: &Value, protocol: Protocol) -> Result<Vec<Part>> {
+/// `video` admits chat video parts; without it they are unexpected items, like any
+/// content type the protocol does not define.
+fn plain_parts(value: &Value, protocol: Protocol, video: bool) -> Result<Vec<Part>> {
     if value.is_null() {
         return Ok(vec![]);
     }
@@ -93,6 +95,9 @@ fn plain_parts(value: &Value, protocol: Protocol) -> Result<Vec<Part>> {
         .map(|part| match field(part, "type")? {
             "text" | "input_text" | "output_text" => Ok(Part::Text(field(part, "text")?.into())),
             "image_url" => Ok(Part::Image(field(&part["image_url"], "url")?.into())),
+            "video" if video && protocol == Protocol::Chat => {
+                Ok(Part::Video(crate::frontend::video_part(part)?))
+            }
             "input_image" => Ok(Part::Image(field(part, "image_url")?.into())),
             "image" if protocol == Protocol::Messages => {
                 let source = &part["source"];
@@ -147,7 +152,7 @@ fn thinking(text: &str, signature: Option<&str>) -> Result<Part> {
     }
     Ok(Part::Reasoning(text.into()))
 }
-fn chat_messages(body: &Value) -> Result<Vec<Message>> {
+fn chat_messages(body: &Value, video: bool) -> Result<Vec<Message>> {
     array(body, "messages")?
         .iter()
         .map(|v| {
@@ -166,11 +171,11 @@ fn chat_messages(body: &Value) -> Result<Vec<Message>> {
                 parts.push(Part::ToolResult {
                     id: optional_id(v, "tool_call_id")?,
                     name: optional_id(v, "name")?,
-                    content: plain_parts(&content, Protocol::Chat)?,
+                    content: plain_parts(&content, Protocol::Chat, video)?,
                     is_error: flag(v, "is_error", false)? || failed,
                 });
             } else {
-                parts.extend(plain_parts(&v["content"], Protocol::Chat)?);
+                parts.extend(plain_parts(&v["content"], Protocol::Chat, video)?);
                 if present(v, "tool_calls") {
                     for call in array(v, "tool_calls")? {
                         parts.push(Part::ToolCall {
@@ -195,7 +200,7 @@ fn anthropic_messages(body: &Value, hints: &mut Vec<(usize, usize)>) -> Result<V
     if present(body, "system") {
         messages.push(Message {
             role: Role::System,
-            parts: plain_parts(&body["system"], Protocol::Messages)?,
+            parts: plain_parts(&body["system"], Protocol::Messages, false)?,
             phase: None,
         });
     }
@@ -223,10 +228,10 @@ fn anthropic_messages(body: &Value, hints: &mut Vec<(usize, usize)>) -> Result<V
                     "tool_result" => vec![Part::ToolResult {
                         id: Some(field(block, "tool_use_id")?.into()),
                         name: None,
-                        content: plain_parts(&block["content"], Protocol::Messages)?,
+                        content: plain_parts(&block["content"], Protocol::Messages, false)?,
                         is_error: flag(block, "is_error", false)?,
                     }],
-                    _ => plain_parts(&json!([block]), Protocol::Messages)?,
+                    _ => plain_parts(&json!([block]), Protocol::Messages, false)?,
                 });
                 if role == Role::User
                     && hints.len() < 4
@@ -240,7 +245,7 @@ fn anthropic_messages(body: &Value, hints: &mut Vec<(usize, usize)>) -> Result<V
                 }
             }
         } else {
-            parts = plain_parts(&v["content"], Protocol::Messages)?;
+            parts = plain_parts(&v["content"], Protocol::Messages, false)?;
         }
         if role == Role::System {
             if parts.iter().any(|part| !matches!(part, Part::Text(_))) {
@@ -281,7 +286,7 @@ fn responses_messages(body: &Value) -> Result<Vec<Message>> {
         let (role, parts) = match kind {
             "message" => (
                 serde_json::from_value(item["role"].clone()).map_err(|_| "invalid input role")?,
-                plain_parts(&item["content"], Protocol::Responses)?,
+                plain_parts(&item["content"], Protocol::Responses, false)?,
             ),
             "function_call" => (
                 Role::Assistant,
@@ -312,7 +317,7 @@ fn responses_messages(body: &Value) -> Result<Vec<Message>> {
                 vec![Part::ToolResult {
                     id: Some(field(&item, "call_id")?.into()),
                     name: None,
-                    content: plain_parts(&item["output"], Protocol::Responses)?,
+                    content: plain_parts(&item["output"], Protocol::Responses, false)?,
                     is_error: false,
                 }],
             ),
@@ -695,6 +700,17 @@ fn generation_logprobs(protocol: Protocol, body: &Value) -> Result<Option<Logpro
 }
 
 pub(crate) fn decode(protocol: Protocol, body: Value, count: bool) -> Result<Decoded> {
+    decode_with(protocol, body, count, false)
+}
+
+/// Decodes a request for a model whose prepared settings admit chat video parts when
+/// `video` is set.
+pub(crate) fn decode_with(
+    protocol: Protocol,
+    body: Value,
+    count: bool,
+    video: bool,
+) -> Result<Decoded> {
     body.as_object().ok_or("request must be a JSON object")?;
     reject(
         &body,
@@ -834,7 +850,7 @@ pub(crate) fn decode(protocol: Protocol, body: Value, count: bool) -> Result<Dec
     }
     let mut checkpoint_hints = Vec::new();
     let input = match protocol {
-        Protocol::Chat => Input::Conversation(chat_messages(&body)?),
+        Protocol::Chat => Input::Conversation(chat_messages(&body, video)?),
         Protocol::Messages => {
             let messages = anthropic_messages(&body, &mut checkpoint_hints)?;
             if messages.last().is_some_and(|m| m.role == Role::Assistant) {
@@ -898,7 +914,7 @@ mod tests {
         Ok(decoded.request.options.stops)
     }
     fn normalize_tool_arguments(message: &mut Value) -> Result<()> {
-        let decoded = chat_messages(&json!({"messages":[message]}))?;
+        let decoded = chat_messages(&json!({"messages":[message]}), false)?;
         *message = template_messages(&decoded, ToolChoice::Auto, &[], true)?.remove(0);
         Ok(())
     }
@@ -1162,6 +1178,7 @@ mod native_prompt_tests {
                     position_side: 48,
                     image_token_id: token(placeholder),
                     video_token_id: token("<|video_pad|>"),
+                    video: None,
                 })
             } else {
                 ImageSettings::Moonvit {}
@@ -1183,6 +1200,7 @@ mod native_prompt_tests {
             };
             config.contract.frontend.image_tokens = Some(ImageTokenLayout {
                 feature_token: token(placeholder),
+                video_feature_token: None,
                 span: None,
             });
             config.contract.frontend.rejected_tokens.clear();

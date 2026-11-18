@@ -46,7 +46,9 @@ fn prepare_inner(
     if body.get("model").and_then(Value::as_str) != Some(config.model_id.as_str()) {
         return Err("requested model is not loaded".into());
     }
-    let decoded = super::protocol::decode(super::protocol::Protocol::Chat, body, false)?;
+    let video = processor.is_some_and(|processor| processor.has_video_settings());
+    let decoded =
+        super::protocol::decode_with(super::protocol::Protocol::Chat, body, false, video)?;
     let prepared = prepare_inference(
         frontend,
         processor,
@@ -159,6 +161,7 @@ pub(super) fn prepare_inference_cached(
                 text: frontend.decode(&token_ids, false)?,
                 token_ids,
                 image_sources: Vec::new(),
+                video_sources: Vec::new(),
                 image_checkpoint_hints: Vec::new(),
             },
             echo,
@@ -167,6 +170,11 @@ pub(super) fn prepare_inference_cached(
         (frontend.render_chat(&normalized, &options)?, String::new())
     };
     let images = describe_images(&rendered.image_sources, processor, input_store)?;
+    let image_tokens = images
+        .iter()
+        .map(|image| image.description.geometry.tokens)
+        .sum();
+    let videos = describe_videos(&rendered.video_sources, processor, input_store, image_tokens)?;
     let output = if raw.is_some() {
         None
     } else {
@@ -203,7 +211,7 @@ pub(super) fn prepare_inference_cached(
         data,
         conditioning,
         conditioned_inputs,
-    } = crate::model::prepare_image_inputs(config, frontend, processor, &rendered, images)?;
+    } = crate::model::prepare_media_inputs(config, frontend, processor, &rendered, images, videos)?;
     let mut expansions = token_expansions.iter().peekable();
     let mut additional = 0;
     for boundary in &mut message_boundaries {
@@ -216,8 +224,14 @@ pub(super) fn prepare_inference_cached(
         *boundary += additional;
     }
     if !rendered.image_checkpoint_hints.is_empty() {
+        // A hint is an ordinal among the still images; conditioned inputs also hold the
+        // windows of video clips.
+        let images: Vec<_> = conditioned_inputs
+            .iter()
+            .filter(|input| matches!(input.source, crate::frontend::images::VisionSource::Image(_)))
+            .collect();
         for &index in &rendered.image_checkpoint_hints {
-            let image = conditioned_inputs
+            let image = images
                 .get(index)
                 .ok_or("image checkpoint hint has no prepared image")?;
             if image.token_span.end < tokens.len() {
@@ -888,7 +902,7 @@ fn describe_images(
     processor: Option<&ImageProcessor>,
     input_store: Option<&flare_selene::input::InputStore>,
 ) -> Result<Vec<crate::frontend::images::ImageInput>> {
-    use crate::frontend::images::{ImageDescription, ImageEncoding, ImageInput};
+    use crate::frontend::images::{ImageDescription, ImageInput};
     use std::sync::Arc;
 
     // Every image is described and costed before the budget verdict, so a rejection reports
@@ -907,39 +921,7 @@ fn describe_images(
         processor
             .check_batch(index + 1, 0)
             .map_err(|error| error.admission_context(AdmissionError::Image))?;
-        let (data, encoding) =
-            if let Some(data) = url.strip_prefix("data:image/png;base64,") {
-                (data, ImageEncoding::Png)
-            } else if let Some(data) = url.strip_prefix("data:image/jpeg;base64,") {
-                (data, ImageEncoding::Jpeg)
-            } else if let Some(data) = url.strip_prefix("data:image/webp;base64,") {
-                (data, ImageEncoding::Webp)
-            } else {
-                return Err(Error::admission(
-                    AdmissionError::Image,
-                    "image input requires a base64 PNG, JPEG, or WebP data URL",
-                ));
-            };
-        if data.len() > processor.max_encoded_bytes().div_ceil(3).saturating_mul(4) {
-            return Err(Error::admission(
-                AdmissionError::Image,
-                "encoded image exceeds the configured byte limit",
-            ));
-        }
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(data)
-            .map_err(|error| {
-                Error::Admission(AdmissionError::Image(Failure::caused_by(
-                    format!("invalid image base64: {error}"),
-                    error,
-                )))
-            })?;
-        if bytes.len() > processor.max_encoded_bytes() {
-            return Err(Error::admission(
-                AdmissionError::Image,
-                "encoded image exceeds the configured byte limit",
-            ));
-        }
+        let (encoding, bytes) = image_data_url(url, processor)?;
         let source_key = processor.source_identity(encoding, &bytes);
         let _source_guard = input_store.map(|store| store.source_guard(source_key));
         let description = input_store.and_then(|store| {
@@ -998,9 +980,207 @@ fn describe_images(
     Ok(images)
 }
 
+/// Reads the encoding and bytes of one image data URL, bounded by the prepared
+/// encoded-byte limit.
+fn image_data_url(
+    url: &str,
+    processor: &ImageProcessor,
+) -> Result<(crate::frontend::images::ImageEncoding, Vec<u8>)> {
+    use crate::frontend::images::ImageEncoding;
+    let (data, encoding) =
+        if let Some(data) = url.strip_prefix("data:image/png;base64,") {
+            (data, ImageEncoding::Png)
+        } else if let Some(data) = url.strip_prefix("data:image/jpeg;base64,") {
+            (data, ImageEncoding::Jpeg)
+        } else if let Some(data) = url.strip_prefix("data:image/webp;base64,") {
+            (data, ImageEncoding::Webp)
+        } else {
+            return Err(Error::admission(
+                AdmissionError::Image,
+                "image input requires a base64 PNG, JPEG, or WebP data URL",
+            ));
+        };
+    if data.len() > processor.max_encoded_bytes().div_ceil(3).saturating_mul(4) {
+        return Err(Error::admission(
+            AdmissionError::Image,
+            "encoded image exceeds the configured byte limit",
+        ));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|error| {
+            Error::Admission(AdmissionError::Image(Failure::caused_by(
+                format!("invalid image base64: {error}"),
+                error,
+            )))
+        })?;
+    if bytes.len() > processor.max_encoded_bytes() {
+        return Err(Error::admission(
+            AdmissionError::Image,
+            "encoded image exceeds the configured byte limit",
+        ));
+    }
+    Ok((encoding, bytes))
+}
+
+/// Describes the video clips of a request, after its still images, whose tokens share
+/// the request's multimodal budget.
+///
+/// Admission runs in two passes. The first decodes no pixel: it validates each clip's
+/// frame count and rate, reads every frame's extent from its encoded header, requires
+/// the frames of a clip to share one extent, derives the clip's vision window, and
+/// checks the request's frame count and the tokens of all of its images and clips. The
+/// second takes each frame's identity from the frame description the input store keeps
+/// by encoded source, or decodes the frame when the store has none. A decoded frame stays
+/// with its source for window preparation while the decoded-source budget shared with
+/// images has room; the source releases it when its window is prepared or its request
+/// ends.
+fn describe_videos(
+    sources: &[crate::frontend::VideoPart],
+    processor: Option<&ImageProcessor>,
+    input_store: Option<&flare_selene::input::InputStore>,
+    image_tokens: usize,
+) -> Result<Vec<crate::frontend::images::VideoInput>> {
+    use crate::frontend::images::{FrameDescription, VideoFrame, VideoInput};
+    use std::sync::Arc;
+
+    if sources.is_empty() {
+        return Ok(Vec::new());
+    }
+    let processor = processor
+        .filter(|processor| processor.has_video_settings())
+        .ok_or_else(|| {
+            Error::admission(
+                AdmissionError::Feature,
+                "prepared model does not support video inputs",
+            )
+        })?;
+    // Clip and frame ordinals are one-based, like image ordinals.
+    let rejected = |subject: String, error: Error| {
+        Error::Admission(AdmissionError::Image(Failure::caused_by(
+            format!("{subject}: {error}"),
+            error,
+        )))
+    };
+    let mut clips = Vec::with_capacity(sources.len());
+    let mut frame_total = 0usize;
+    let mut tokens = image_tokens;
+    for (clip, source) in sources.iter().enumerate() {
+        let clip = clip + 1;
+        processor
+            .check_video_clip(source.frames.len(), source.fps)
+            .map_err(|error| rejected(format!("video {clip}"), error))?;
+        frame_total += source.frames.len();
+        processor
+            .check_video_count(frame_total)
+            .map_err(|error| error.admission_context(AdmissionError::Image))?;
+        let mut frames = Vec::with_capacity(source.frames.len());
+        let mut extent = None;
+        for (frame, url) in source.frames.iter().enumerate() {
+            let frame = frame + 1;
+            let (encoding, bytes) = image_data_url(url, processor)
+                .map_err(|error| rejected(format!("video {clip} frame {frame}"), error))?;
+            let probed = processor
+                .probe_encoded(encoding, &bytes)
+                .map_err(|error| rejected(format!("video {clip} frame {frame}"), error))?;
+            let (width, height) = *extent.get_or_insert(probed);
+            if probed != (width, height) {
+                return Err(Error::admission(
+                    AdmissionError::Image,
+                    format!(
+                        "video {clip} frame {frame} is {}x{} px; the frames of a clip share one \
+                         size and its first frame is {width}x{height} px",
+                        probed.0, probed.1
+                    ),
+                ));
+            }
+            frames.push((encoding, bytes));
+        }
+        let (width, height) = extent.ok_or("video clip has no frames")?;
+        let (windows, window) = processor
+            .video_windows(source.frames.len(), width, height)
+            .map_err(|error| rejected(format!("video {clip}"), error))?;
+        tokens = windows
+            .checked_mul(window.tokens)
+            .and_then(|clip_tokens| tokens.checked_add(clip_tokens))
+            .ok_or_else(|| Error::admission(AdmissionError::Image, "video token count overflow"))?;
+        clips.push((source.fps, window, (width, height), frames));
+    }
+    let limit = processor.limits().max_image_tokens_per_prompt();
+    if tokens > limit {
+        return Err(Error::admission(
+            AdmissionError::Image,
+            format!(
+                "request needs {tokens} image and video tokens; max_image_tokens_per_prompt is {limit}"
+            ),
+        ));
+    }
+    let mut videos = Vec::with_capacity(clips.len());
+    for (clip, (fps, window, extent, frames)) in clips.into_iter().enumerate() {
+        let clip = clip + 1;
+        let mut described = Vec::with_capacity(frames.len());
+        for (frame, (encoding, bytes)) in frames.into_iter().enumerate() {
+            let frame = frame + 1;
+            let source_key = processor.frame_source_identity(encoding, &bytes);
+            let _source_guard = input_store.map(|store| store.source_guard(source_key));
+            let cached = input_store.and_then(|store| {
+                let record = store.get_blocking(source_key, false)?;
+                let description = FrameDescription::decode(&record.metadata)
+                    .ok()
+                    .filter(|description| (description.width, description.height) == extent);
+                if description.is_none() {
+                    store.invalidate(source_key);
+                }
+                description
+            });
+            let (identity, decoded) = match cached {
+                Some(description) => (description.identity, None),
+                None => {
+                    let image = processor
+                        .decode_encoded(encoding, &bytes)
+                        .map_err(|error| rejected(format!("video {clip} frame {frame}"), error))?;
+                    if (image.width(), image.height()) != extent {
+                        return Err(Error::admission(
+                            AdmissionError::Image,
+                            format!(
+                                "video {clip} frame {frame} decodes to {}x{} px; its header declares {}x{} px",
+                                image.width(),
+                                image.height(),
+                                extent.0,
+                                extent.1
+                            ),
+                        ));
+                    }
+                    let description = processor.describe_frame(&image);
+                    if let Some(store) = input_store {
+                        store.insert(
+                            source_key,
+                            Arc::new(flare_selene::input::PreparedInputRecord {
+                                metadata: description.encode()?.into(),
+                                payload: None,
+                            }),
+                        );
+                    }
+                    (description.identity, Some(image))
+                }
+            };
+            described.push(VideoFrame {
+                identity,
+                source: processor.encoded_source(encoding, bytes.into(), decoded),
+            });
+        }
+        videos.push(VideoInput { fps, window, frames: described });
+    }
+    Ok(videos)
+}
+
 #[cfg(test)]
 #[path = "request/recipient_tests.rs"]
 mod recipient_tests;
+
+#[cfg(test)]
+#[path = "request/video_tests.rs"]
+mod video_tests;
 
 #[cfg(test)]
 #[path = "request/tml_tests.rs"]

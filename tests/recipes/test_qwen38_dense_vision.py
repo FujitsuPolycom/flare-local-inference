@@ -44,11 +44,13 @@ def test_dense_contract_declares_the_qwen_image_frontend():
     assert contract.PATCH_CAPACITIES == (256, 1024, 4096, 16384)
     assert contract.VISION == dict(features_per_request=16384, max_images=4,
         patches_per_feature=4, patch_capacities=[256, 1024, 4096, 16384])
-    frontend = contract.frontend()
-    assert frontend["image_tokens"] == dict(feature_token=248056, span=None)
+    frontend = contract.frontend(video=True)
+    assert frontend["image_tokens"] == dict(feature_token=248056,
+        video_feature_token=248057, span=None)
     assert frontend["image_preparation"] == p.QWEN_IMAGE_PREPARATION
     assert frontend["image_layout"] == p.QWEN_IMAGE_LAYOUT
     assert frontend["position_dimensions"] == 3
+    assert contract.frontend()["image_tokens"] == dict(feature_token=248056, span=None)
     assert contract.frontend(vision=False)["image_tokens"] is None
     assert contract.frontend(vision=False)["position_dimensions"] == 0
 
@@ -185,7 +187,7 @@ def _image_catalog():
     for tokens in contract.PATCH_CAPACITIES:
         add("vision", 1, tokens)
     document = contract.prepare(signatures, buffers, pool, vocabulary=vocabulary,
-        image_slots=config.image_concurrency)
+        image_slots=config.image_concurrency, video=True)
     bundle = PreparedExecution(buffers=buffers, signatures=signatures,
         graphs=dict.fromkeys(signatures), max_active=capacity, device=0,
         estimated_durations_ns=dict.fromkeys(signatures, 1))
@@ -202,7 +204,8 @@ def test_dense_image_catalog_declares_qwen_layout_and_passes_native_contract_val
     assert contract["vision"] == dict(feature_slots=4, features_per_request=16384,
         max_images=4, patches_per_feature=4, patch_capacities=[256, 1024, 4096, 16384])
     frontend = contract["frontend"]
-    assert frontend["image_tokens"] == dict(feature_token=248056, span=None)
+    assert frontend["image_tokens"] == dict(feature_token=248056,
+        video_feature_token=248057, span=None)
     assert frontend["image_preparation"] == p.QWEN_IMAGE_PREPARATION
     assert frontend["image_layout"] == p.QWEN_IMAGE_LAYOUT
     assert frontend["position_dimensions"] == 3
@@ -245,10 +248,13 @@ def test_dense_feature_slot_geometry():
 def test_dense_frontend_declares_the_qwen_image_profile():
     from ignition.preparation.frontend import prepare_frontend
 
+    from ignition.preparation.frontend import video_settings
+
     frontend = prepare_frontend(_snapshot(), eos_token_ids=[248046, 248044], image_profile="qwen",
-        qwen_model_type="qwen3_5")
+        qwen_model_type="qwen3_5", video=video_settings(_snapshot()))
     assert frontend["image"]["qwen"] == dict(min_pixels=65536, max_pixels=16777216,
-        position_side=48, image_token_id=248056, video_token_id=248057)
+        position_side=48, image_token_id=248056, video_token_id=248057,
+        video=dict(max_frames=768, min_pixels=4096, max_pixels=25165824, temporal_patch_size=2))
 
 
 def _dense_weights(path, device):

@@ -112,7 +112,7 @@ fn checkpoint_template_tokenization_requests_and_message_boundaries_match_transf
     image_config.contract.frontend.rejected_tokens = (154832..=154835).chain([154855]).collect();
     image_config.contract.frontend.image_layout = Some(ImageLayoutKind::Glm);
     image_config.contract.frontend.image_preparation = Some(ImagePreparationKind::Glm);
-    image_config.contract.frontend.image_tokens = Some(ImageTokenLayout { feature_token: 154854, span: None });
+    image_config.contract.frontend.image_tokens = Some(ImageTokenLayout { feature_token: 154854, video_feature_token: None, span: None });
     let processor = ImageProcessor::load(ImageSettings::Glm {}, ImageLimits {
         max_patches_per_image: 32768, max_total_patches: 128000, patches_per_feature: 4,
         ..ImageLimits::default()

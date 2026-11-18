@@ -274,6 +274,9 @@ class Recipe:
     b12x_environment: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
     # Tensor-name prefixes whose presence means the checkpoint carries the recipe's vision encoder.
     vision_prefixes: tuple[str, ...] = ()
+    # For a recipe that prepares video input: given a snapshot directory, why its video
+    # processor cannot be prepared, or None. The core of such a snapshot rejects video.
+    video_unsupported: Callable | None = None
     mla_compute_modes: tuple[str, ...] = ("auto",)
     mla_compute_mode: str = "auto"
     expert_scale_compression: str | None = None

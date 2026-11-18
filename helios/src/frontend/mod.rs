@@ -284,8 +284,41 @@ fn token_segments(text: &str, hints: &mut Vec<usize>) -> serde_json::Result<Vec<
     Ok(segments)
 }
 
+/// A chat video part: frames the client extracted, in order, as image data URLs, and
+/// the rate in frames per second at which it sampled them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VideoPart {
+    pub frames: Vec<String>,
+    pub fps: f64,
+}
+
+/// Reads the shape of a video content part. Admission validates the frame count, the
+/// rate, and each frame against the prepared video settings.
+pub fn video_part(value: &Json) -> Result<VideoPart> {
+    let invalid = |message: &str| Error::frontend(FrontendError::Input(Failure::new(message)));
+    let frames = value
+        .get("video")
+        .and_then(Json::as_array)
+        .ok_or_else(|| invalid("video must be an array of image data URLs"))?
+        .iter()
+        .map(|frame| {
+            frame
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| invalid("video frames must be image data URL strings"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let fps = value
+        .get("fps")
+        .and_then(Json::as_f64)
+        .ok_or_else(|| invalid("video fps must be a number of frames per second"))?;
+    Ok(VideoPart { frames, fps })
+}
+
 pub struct RenderedPrompt {
     pub image_sources: Vec<String>,
+    /// Video parts in message order, each with the frames the client supplied.
+    pub video_sources: Vec<VideoPart>,
     /// Indices in image_sources whose expanded spans end at requested checkpoints.
     pub image_checkpoint_hints: Vec<usize>,
     pub text: String,
@@ -667,6 +700,7 @@ impl Frontend {
         }
         let mut messages = messages.to_vec();
         let mut image_sources = Vec::new();
+        let mut video_sources = Vec::new();
         let mut image_checkpoint_hints = Vec::new();
         let mut checkpoint_hints = Vec::new();
         for (index, message) in messages.iter_mut().enumerate() {
@@ -701,6 +735,10 @@ impl Frontend {
                         let image_index = image_sources.len();
                         image_sources.push(url.to_owned());
                         *part = serde_json::json!({"type":"image", "image_index":image_index});
+                    } else if kind == "video" {
+                        let index = video_sources.len();
+                        video_sources.push(video_part(part)?);
+                        *part = serde_json::json!({"type":"video", "video_index":index});
                     }
                 }
             }
@@ -818,6 +856,7 @@ impl Frontend {
             text,
             token_ids,
             image_sources,
+            video_sources,
             image_checkpoint_hints,
         })
     }
@@ -978,6 +1017,35 @@ mod tests {
             inline_system_messages: Default::default(),
             defaults: Map::new(),
         }
+    }
+
+    fn part_frontend(source: &str) -> Frontend {
+        Frontend {
+            prompt_encoder: PromptEncoder::Jinja,
+            image_placeholder_token_id: None,
+            ordinary_tokenizer: None,
+            tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
+            template: Some(jinja::CompiledTemplate::compile(source).unwrap()),
+            template_source: source.to_owned(),
+            bos_token_id: None,
+            vocabulary_bytes: Default::default(),
+            effort_levels: Default::default(),
+            inline_system_messages: Default::default(),
+            defaults: Map::new(),
+        }
+    }
+
+    #[test]
+    fn video_parts_reach_the_template_without_their_frames() {
+        let frontend = part_frontend(
+            "{% for m in messages %}{% for part in m.content %}{% if part.type == 'video' %}{% if part.video is defined %}{{ raise_exception('video frames reached the template') }}{% endif %}<|vision_start|><|video_pad|><|vision_end|>{% endif %}{% endfor %}{% endfor %}",
+        );
+        let messages = vec![serde_json::json!({"role":"user","content":[{"type":"video",
+            "video":["data:image/png;base64,AA==","data:image/png;base64,AQ=="],"fps":2.0}]})];
+        let rendered = frontend.render_chat(&messages, &Map::new()).unwrap();
+        assert_eq!(rendered.text, "<|vision_start|><|video_pad|><|vision_end|>");
+        assert_eq!(rendered.video_sources.len(), 1);
+        assert_eq!(rendered.video_sources[0].frames.len(), 2);
     }
 
     #[test]

@@ -417,6 +417,8 @@ message ImageSpan {
 message ImageTokenLayout {
   uint32 feature_token = 1;
   ImageSpan span = 2;
+  // Video placeholder carrying vision features, when the checkpoint serves video.
+  optional uint32 video_feature_token = 3;
 }
 message FrontendContract {
   ToolParser tools = 1;
@@ -530,6 +532,15 @@ message QwenImageSettings {
   uint32 position_side = 3;
   uint32 image_token_id = 4;
   uint32 video_token_id = 5;
+  // Maximum frame count, pixel budget, and temporal patch size of the checkpoint's video
+  // processor. Absent when the checkpoint declares none; such cores reject video requests.
+  optional QwenVideoSettings video = 6;
+}
+message QwenVideoSettings {
+  uint64 max_frames = 1;
+  uint64 min_pixels = 2;
+  uint64 max_pixels = 3;
+  uint32 temporal_patch_size = 4;
 }
 message MimoImageSettings {
   uint64 min_pixels = 1;

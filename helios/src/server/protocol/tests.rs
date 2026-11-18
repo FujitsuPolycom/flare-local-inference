@@ -1727,3 +1727,59 @@ fn requested_logprob_ids_require_enablement_and_validate_before_deduplication() 
             json!({"messages":[{"role":"user","content":"x"}],"max_tokens":1,"logprob_token_ids":ids}), false).is_err());
     }
 }
+
+#[test]
+fn chat_video_parts_keep_frames_and_sampling_rate() {
+    let frames = json!(["data:image/png;base64,AA==", "data:image/png;base64,AA=="]);
+    let body = json!({"max_tokens":4,"messages":[
+        {"role":"user","content":[{"type":"video","video":frames,"fps":2}]},
+        {"role":"tool","tool_call_id":"call","content":[{"type":"video","video":frames,"fps":0.5}]}]});
+    let req = decode_with(Protocol::Chat, body.clone(), false, true).unwrap().request;
+    let Input::Conversation(messages) = req.input else {
+        panic!()
+    };
+    let native = template_messages(&messages, ToolChoice::Auto, &[], true).unwrap();
+    assert_eq!(native[0]["content"][0], json!({"type":"video","video":frames,"fps":2.0}));
+    assert_eq!(native[1]["content"][0], json!({"type":"video","video":frames,"fps":0.5}));
+    // A request decoded for a model without prepared video settings has no video part.
+    let error = decode(Protocol::Chat, body, false).err().unwrap();
+    assert_eq!(error.to_string(), "Unexpected item type in content.");
+}
+
+#[test]
+fn video_parts_require_a_frame_array_and_a_numeric_rate() {
+    let video = |content: Value, protocol| {
+        decode_with(protocol, json!({"max_tokens":4,"messages":[
+            {"role":"user","content":[content]}]}), false, true)
+    };
+    for (content, message) in [
+        (json!({"type":"video","fps":2}), "video must be an array of image data URLs"),
+        (json!({"type":"video","video":"frame","fps":2}), "video must be an array of image data URLs"),
+        (json!({"type":"video","video":[7],"fps":2}), "video frames must be image data URL strings"),
+        (json!({"type":"video","video":["data:image/png;base64,AA==", null],"fps":2}),
+            "video frames must be image data URL strings"),
+        (json!({"type":"video","video":["data:image/png;base64,AA=="]}),
+            "video fps must be a number of frames per second"),
+        (json!({"type":"video","video":["data:image/png;base64,AA=="],"fps":"2"}),
+            "video fps must be a number of frames per second"),
+    ] {
+        assert_eq!(video(content, Protocol::Chat).err().unwrap().to_string(), message);
+    }
+    // Admission, which knows the prepared bounds, validates the frame count and the rate.
+    for content in [
+        json!({"type":"video","video":[],"fps":2}),
+        json!({"type":"video","video":["data:image/png;base64,AA=="],"fps":0}),
+        json!({"type":"video","video":["data:image/png;base64,AA=="],"fps":-2.5}),
+    ] {
+        assert!(video(content, Protocol::Chat).is_ok());
+    }
+    // Only the chat completions API defines the part.
+    let content = json!({"type":"video","video":["data:image/png;base64,AA=="],"fps":2});
+    assert_eq!(
+        video(content.clone(), Protocol::Messages).err().unwrap().to_string(),
+        "unsupported content type video"
+    );
+    let responses = decode_with(Protocol::Responses, json!({"input":[
+        {"role":"user","content":[content]}]}), false, true);
+    assert_eq!(responses.err().unwrap().to_string(), "unsupported content type video");
+}

@@ -272,8 +272,16 @@ pub(super) fn vision_json(
     let profile = settings.image.as_ref().and_then(|image| image.profile.as_ref()).map(|profile| {
         use wire::image_settings::Profile;
         match profile {
-            Profile::Qwen(c) => json!({"profile": "qwen", "min_pixels": c.min_pixels, "max_pixels": c.max_pixels,
-                "position_side": c.position_side, "image_token_id": c.image_token_id, "video_token_id": c.video_token_id}),
+            Profile::Qwen(c) => {
+                let mut value = json!({"profile": "qwen", "min_pixels": c.min_pixels, "max_pixels": c.max_pixels,
+                    "position_side": c.position_side, "image_token_id": c.image_token_id, "video_token_id": c.video_token_id});
+                // An absent message means the core rejects video parts.
+                if let Some(video) = c.video.as_ref() {
+                    value["video"] = json!({"max_frames": video.max_frames, "min_pixels": video.min_pixels,
+                        "max_pixels": video.max_pixels, "temporal_patch_size": video.temporal_patch_size});
+                }
+                value
+            }
             Profile::Mimo(c) => json!({"profile": "mimo", "min_pixels": c.min_pixels, "max_pixels": c.max_pixels}),
             Profile::DeepseekRowMajor(c) => json!({"profile": "deepseek_row_major", "min_pixels": c.min_pixels,
                 "max_tokens": c.max_tokens, "max_width_height_ratio": c.max_width_height_ratio}),
@@ -287,7 +295,7 @@ pub(super) fn vision_json(
             Profile::PaddedGrid(_) => json!({"profile": "padded_grid"}),
         }
     });
-    json!({
+    let mut value = json!({
         "feature_slots": vision.feature_slots,
         "max_image_tokens_per_prompt": context_tokens,
         "max_images": context_tokens,
@@ -295,7 +303,11 @@ pub(super) fn vision_json(
         "patches_per_feature": vision.patches_per_feature,
         "patch_capacities": vision.patch_capacities,
         "image": profile,
-    })
+    });
+    if value.pointer("/image/video").is_some() {
+        value["max_video_frames_per_prompt"] = json!(context_tokens);
+    }
+    value
 }
 
 fn engram_json(engram: &wire::Engram) -> Value {
@@ -736,5 +748,105 @@ mod tests {
         assert_eq!(frontend["prompt_encoder"], "DEEPSEEK_V41");
         assert_eq!(frontend["image_placeholder_token_id"], 7);
         assert!(frontend["tools"].is_null());
+    }
+
+    #[test]
+    fn inspection_reports_video_settings_only_for_cores_that_prepare_them() {
+        let index = |video| wire::ModelIndex {
+            contract: Some(wire::ServingContract {
+                model_contract: Some(wire::ModelContract {
+                    vision: Some(wire::VisionCapacity {
+                        feature_slots: 4,
+                        features_per_request: 4096,
+                        max_images: 4096,
+                        patches_per_feature: 4,
+                        patch_capacities: vec![16384],
+                    }),
+                    ..Default::default()
+                }),
+                max_sequence_tokens: 131072,
+                ..Default::default()
+            }),
+            frontend: Some(wire::FrontendSettings {
+                tokenizer: Some(wire::TokenizerSettings::default()),
+                eos_token_ids: vec![1],
+                prompt_encoder: wire::PromptEncoder::PromptJinja as i32,
+                image: Some(wire::ImageSettings {
+                    profile: Some(wire::image_settings::Profile::Qwen(wire::QwenImageSettings {
+                        min_pixels: 65_536,
+                        max_pixels: 16_777_216,
+                        position_side: 48,
+                        image_token_id: 248_056,
+                        video_token_id: 248_057,
+                        video,
+                    })),
+                }),
+                ..Default::default()
+            }),
+            sampling_defaults: Some(Default::default()),
+            ..Default::default()
+        };
+        let inspect = |video| {
+            let options = InspectionOptions { frontend: true, ..Default::default() };
+            describe_index(&index(video), options, None).unwrap()["vision"].clone()
+        };
+        let image = json!({"profile": "qwen", "min_pixels": 65_536, "max_pixels": 16_777_216,
+            "position_side": 48, "image_token_id": 248_056, "video_token_id": 248_057});
+        let mut expected = json!({
+            "feature_slots": 4,
+            "max_image_tokens_per_prompt": 131072,
+            "max_images": 131072,
+            "image_feature_window_tokens": 4096,
+            "patches_per_feature": 4,
+            "patch_capacities": [16384],
+            "image": image,
+        });
+        assert_eq!(inspect(None), expected);
+        expected["image"]["video"] = json!({"max_frames": 768, "min_pixels": 4096,
+            "max_pixels": 25_165_824, "temporal_patch_size": 2});
+        expected["max_video_frames_per_prompt"] = json!(131072);
+        assert_eq!(
+            inspect(Some(wire::QwenVideoSettings {
+                max_frames: 768,
+                min_pixels: 4096,
+                max_pixels: 25_165_824,
+                temporal_patch_size: 2,
+            })),
+            expected
+        );
+    }
+
+    #[test]
+    fn complete_inspection_omits_an_undeclared_video_feature_token() {
+        let inspect = |video_feature_token| {
+            let index = wire::ModelIndex {
+                contract: Some(wire::ServingContract {
+                    model_contract: Some(wire::ModelContract {
+                        frontend: Some(wire::FrontendContract {
+                            image_tokens: Some(wire::ImageTokenLayout {
+                                feature_token: 248_056,
+                                span: None,
+                                video_feature_token,
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    max_sequence_tokens: 131072,
+                    ..Default::default()
+                }),
+                frontend: Some(wire::FrontendSettings::default()),
+                sampling_defaults: Some(Default::default()),
+                ..Default::default()
+            };
+            let options = InspectionOptions { all: true, ..Default::default() };
+            let inspected = describe_index(&index, options, None).unwrap();
+            inspected["contract"]["model_contract"]["frontend"]["image_tokens"].to_string()
+        };
+        assert_eq!(inspect(None), r#"{"feature_token":248056,"span":null}"#);
+        assert_eq!(
+            inspect(Some(248_057)),
+            r#"{"feature_token":248056,"span":null,"video_feature_token":248057}"#
+        );
     }
 }
