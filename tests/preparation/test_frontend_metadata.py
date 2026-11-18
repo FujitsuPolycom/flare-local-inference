@@ -86,6 +86,41 @@ def test_image_metadata_is_a_tight_consumed_contract():
             image_settings(changed, model, "qwen")
 
 
+def test_qwen_frontend_checks_the_recipes_model_type(tmp_path):
+    processor, model = qwen_source()
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps({"eos_token": "<eos>"}))
+    (tmp_path / "config.json").write_text(json.dumps(model))
+    (tmp_path / "preprocessor_config.json").write_text(json.dumps(processor))
+    accepted = prepare_frontend(tmp_path, eos_token_ids=[248057], image_profile="qwen",
+        qwen_model_type=model["model_type"])
+    assert accepted["image"]["qwen"]["min_pixels"] == 65536
+    # Each Qwen recipe names its own model type, so one recipe's checkpoint cannot
+    # prepare the other recipe's image frontend.
+    with pytest.raises(ValueError, match="model_type"):
+        prepare_frontend(tmp_path, eos_token_ids=[248057], image_profile="qwen",
+            qwen_model_type="qwen3_5")
+    # Without a stated type the profile requires the Flash Next family.
+    assert prepare_frontend(tmp_path, eos_token_ids=[248057], image_profile="qwen") == accepted
+    (tmp_path / "config.json").write_text(json.dumps({**model, "model_type": "qwen3_5"}))
+    with pytest.raises(ValueError, match="model_type"):
+        prepare_frontend(tmp_path, eos_token_ids=[248057], image_profile="qwen")
+
+
+def test_qwen_dense_vision_configuration_uses_the_qwen_image_profile():
+    processor, model = qwen_source()
+    expected = image_settings(processor, model, "qwen", qwen_model_type="qwen4_exp")
+    assert image_settings(processor, {**model, "model_type": "qwen3_5"}, "qwen",
+        qwen_model_type="qwen3_5") == expected
+    assert image_settings(processor, model, "qwen", qwen_model_type="qwen4_exp") == expected
+    # Each recipe names its own model type; neither accepts a checkpoint for the other.
+    with pytest.raises(ValueError, match="model_type"):
+        image_settings(processor, model, "qwen", qwen_model_type="qwen3_5")
+    for family in ("qwen3_5_vision", "mimo_v2"):
+        with pytest.raises(ValueError, match="unsupported model configuration"):
+            image_settings(processor, {**model, "model_type": family}, "qwen",
+                qwen_model_type="qwen3_5")
+
+
 def mimo_source(min_pixels, max_pixels, mean, std):
     processor = dict(processor_class="Qwen2_5_VLProcessor", image_processor_type="Qwen2VLImageProcessor",
         patch_size=16, temporal_patch_size=2, merge_size=2, min_pixels=min_pixels, max_pixels=max_pixels,

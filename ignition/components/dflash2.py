@@ -16,6 +16,7 @@ from ignition.components.grouped_convolution import PreparedGroupedConvolution
 from ignition.components.linear import prepare_projection
 from ignition.components.mlp import MLPScratch, PreparedMLP
 from ignition.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
+from ignition.components.paged_batch import rotary_positions
 from ignition.preparation.persistent import persistent_copy
 from ignition.preparation.examples import declaration_tensor
 from ignition.components.vocabulary import PreparedVocabularyProjection
@@ -38,6 +39,13 @@ def _inverse(geometry, device):
 
 
 def _rotary(values, positions, inverse):
+    """Rotate with one position per token, or the temporal axis of per-axis positions.
+
+    The draft has one rotary axis. Per-axis positions carry the temporal position
+    in their first column, which is the position the draft rotates at.
+    """
+    if positions.ndim == 2:
+        positions = positions[:, 0]
     frequencies = positions.clamp_min(0).float()[:, None] * inverse[None]
     angles = torch.cat((frequencies, frequencies), -1)
     cos, sin = angles.cos().to(values.dtype), angles.sin().to(values.dtype)
@@ -156,6 +164,10 @@ class PreparedContext:
             positions = m.positions[indices]
             valid = (offsets < kept) & (positions >= 0)
             states = m.state_rows[0]
+        rope, axes = positions, rotary_positions(m)
+        if axes is not m.positions:
+            # Metadata of a pool with a rotary offset region carries per-axis positions.
+            rope = axes[indices] if self.compact else axes
         slots = torch.where(valid, states * self.window + positions.remainder(self.window), -1)
         projected = self.norm(self.gather(self.project(auxiliary)))
         kv = self.project_kv(projected)
@@ -165,7 +177,7 @@ class PreparedContext:
         width = kv_heads * a.key_dim
         chunks = kv.view(auxiliary.shape[0], len(self.layers), width + kv_heads * a.value_dim)
         for index, (norm, writer) in enumerate(self.layers):
-            key = _rotary(norm(chunks[:, index, :width].view(key_shape)), positions, self.inverse)
+            key = _rotary(norm(chunks[:, index, :width].view(key_shape)), rope, self.inverse)
             value = chunks[:, index, width:].view(auxiliary.shape[0], kv_heads, a.value_dim).contiguous()
             writer(key, value, slots)
 
@@ -294,8 +306,8 @@ class DraftAttention:
         kv_width = self.key_shape[1] * self.key_shape[2]
         projected = self.qkv(source)
         q, k, v = projected.split((q_width, kv_width, self.value_shape[1] * self.value_shape[2]), -1)
-        query = _rotary(self.q_norm(q.view(self.query_shape)), m.positions, self.inverse)
-        key = _rotary(self.k_norm(k.view(self.key_shape)), m.positions, self.inverse)
+        query = _rotary(self.q_norm(q.view(self.query_shape)), rotary_positions(m), self.inverse)
+        key = _rotary(self.k_norm(k.view(self.key_shape)), rotary_positions(m), self.inverse)
         value = v.view(self.value_shape).contiguous()
         return projected, query, key, value
 

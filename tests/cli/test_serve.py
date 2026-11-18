@@ -612,6 +612,48 @@ def test_local_tuning_gpus_cannot_change_multihost_sharding(tmp_path, capsys, co
     assert 'multi-host ranks retain their sharding' in capsys.readouterr().err
 
 
+@pytest.mark.skipif(sys.platform != 'linux', reason='host rendezvous requires Linux')
+@pytest.mark.parametrize('command, ranks', [('export', 4), ('debug-serve', 1), ('debug-serve', 4)])
+def test_language_model_only_overrides_configured_image_capacity(monkeypatch, tmp_path, capsys, command, ranks):
+    from ignition.preparation import host_ranks
+
+    model = resolve('glm-5.3-flash')
+    monkeypatch.setattr(serve, 'resolve_model', lambda configuration, name: model)
+    monkeypatch.setattr(ResolvedModel, 'cached', lambda self, hub_cache: True)
+    monkeypatch.delenv('CUDA_VISIBLE_DEVICES', raising=False)
+    gpu = planning.Gpu(0, 'NVIDIA GB300', 'GPU-0000', 288 * GIB, 288 * GIB, (10, 3))
+    monkeypatch.setattr(planning, 'discover_gpus', lambda: (gpu,))
+    monkeypatch.setattr(host_ranks, 'source_identity', lambda: None)
+    monkeypatch.setattr(host_ranks, 'local_topology', lambda gpu: gpu)
+    monkeypatch.setattr(host_ranks, 'topology_gpu', lambda gpu, index: replace(gpu, index=index, uuid=f'GPU-{index:04d}'))
+    monkeypatch.setattr(host_ranks, 'HostRendezvous', lambda *args, **kwargs:
+        types.SimpleNamespace(accept=lambda report: (gpu,) * ranks))
+
+    class PlanReady(Exception):
+        pass
+
+    plan_model = planning.plan
+
+    def inspect_plan(*args, **kwargs):
+        plan = plan_model(*args, **kwargs)
+        assert (plan.world_size, plan.language_model_only, plan.image_concurrency, plan.max_images) == (ranks, True, 0, 0)
+        raise PlanReady
+
+    monkeypatch.setattr(planning, 'plan', inspect_plan)
+    config = tmp_path / 'config.toml'
+    config.write_text('[defaults]\nimage_concurrency = 2\n[models."glm-5.3-flash"]\nimage_concurrency = 3\n')
+    args = [command, 'glm-5.3-flash', '--config', str(config), '--gpus', '0',
+            '--max-concurrency', '4', '--language-model-only', '--no-mtp']
+    if ranks > 1:
+        args += ['--ranks', str(ranks), '--rendezvous', '127.0.0.1:29630']
+    if command == 'debug-serve':
+        args += ['--direct', '--port', '0']
+    with pytest.raises(PlanReady):
+        main(args)
+    assert main([*args, '--image-concurrency', '2']) == 2
+    assert '--image-concurrency requires the vision encoder' in capsys.readouterr().err
+
+
 def test_export_rejects_size_sharding(host):
     assert export("qwen3.8-flash") == 0
     with pytest.raises(SystemExit) as error:

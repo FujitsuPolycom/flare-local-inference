@@ -10,7 +10,7 @@ import torch
 
 from .collectives import PreparedAllReduce
 from .draft_sampling import DRAFT_CANDIDATES, PreparedDraftDistribution, PreparedDraftBlockBroadcast
-from .paged_batch import Metadata, PreparedBatch
+from .paged_batch import Metadata, prepare_batch, row_rotary_offsets
 from .speculation import (
     DRAFT_RNG_DOMAIN,
     PreparedSpeculativeCommit,
@@ -41,6 +41,8 @@ class DraftProposalState:
     base_offset: torch.Tensor
     metadata: Metadata | None
     features: dict[str, torch.Tensor] | None = None
+    # Each row's rotary offset from its token index, for a pool that declares the region.
+    rotary_offsets: torch.Tensor | None = None
 
 
 class PreparedParallelDraftRound:
@@ -69,7 +71,7 @@ class PreparedParallelDraftRound:
         self.rows = torch.arange(b, device=device)
         self.draft_positions = torch.arange(w - 1, device=device) if self.vocabulary_parallel else None
         self.metadata = Metadata.allocate(tokens, b, blocks, device, samples=b * w, max_query_tokens=w)
-        self.validator = PreparedBatch(
+        self.validator = prepare_batch(
             o.inputs,
             o.requests,
             Metadata.allocate(b, b, blocks, device),
@@ -405,6 +407,7 @@ class PreparedParallelDraftRound:
         validated = self.validator.begin(self.validation(validation_input), present=present)
         device = o.requests.histogram.device
         active = validated.lengths > 0
+        offsets = row_rotary_offsets(validated)
         if allowed is not None:
             active = active & allowed
         slots = o.inputs.row_slot_ids[:b].long()
@@ -426,7 +429,7 @@ class PreparedParallelDraftRound:
             draft_inputs[:, 0].copy_(candidates[:, 0])
             draft_metadata = Metadata.pack(before, active.int() * block, states,
                 o.inputs.page_tables[safe], draft_inputs, o.inputs.live_rows,
-                token_capacity=b * block, sample_count=b * block)
+                token_capacity=b * block, sample_count=b * block, rotary_offset=offsets)
             result = self.draft(draft_metadata)
             draft_logits, selector_features = result[:2]
             features = result[2] if len(result) == 3 else None
@@ -502,7 +505,8 @@ class PreparedParallelDraftRound:
                 else:
                     self.proposal_block.finish(block_state, drafts, probabilities, valid, sampled, active, limits)
         candidates[:, 1:].copy_(drafts)
-        proposal = DraftProposalState(before, active, candidates, drafts, valid, base_offset, draft_metadata, features)
+        proposal = DraftProposalState(before, active, candidates, drafts, valid, base_offset, draft_metadata, features,
+            offsets)
         if advance_rng and self.draft is not None:
             self.commit_draft_rng(proposal=proposal)
         return proposal
@@ -527,7 +531,7 @@ class PreparedParallelDraftRound:
         states = o.inputs.request_state_rows[safe, 0]
         metadata = Metadata.pack(proposal.before, limits, states, o.inputs.page_tables[safe],
             proposal.candidates, o.inputs.live_rows, token_capacity=self.target_token_capacity,
-            sample_count=b * w, max_query_tokens=w)
+            sample_count=b * w, max_query_tokens=w, rotary_offset=proposal.rotary_offsets)
         hidden, logits, auxiliary, records = self.decoder(metadata)
         if self.vocabulary_parallel:
             target_probabilities, target_valid, _ = target.run(logits.view(b, w, -1), proposal.drafts)

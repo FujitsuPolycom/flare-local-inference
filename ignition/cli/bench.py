@@ -147,6 +147,8 @@ def run(args):
         raise UsageError("ignition bench supports Qwen3.8-27B DFlash2, Kimi K3.1 Pro DSpark, and Nemotron Bolt LiLiCorr")
     if settings.speculation_study and model.recipe.name != "qwen38_dense":
         raise UsageError("--speculation-study requires Qwen3.8-27B DFlash2")
+    if model.recipe.name == "qwen38_dense" and args.image_concurrency is not None:
+        raise UsageError("Qwen3.8-27B benchmark graphs prepare no vision encoder; --image-concurrency does not apply")
     from ignition.preparation.selection import BenchmarkSelection
 
     concurrency = configuration.max_concurrency(model.checkpoint.alias, max(settings.batches), args.max_concurrency)
@@ -169,7 +171,8 @@ def run(args):
         image_concurrency=args.image_concurrency, mixed_prefill=args.mixed_prefill,
         prompt_logprobs=args.prompt_logprobs, expert_scale_compression=args.expert_scale_compression,
         online_mxfp8=args.online_mxfp8, online_mxfp8_scope=args.online_mxfp8_scope,
-        language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode)
+        language_model_only=args.language_model_only or model.recipe.name == "qwen38_dense",
+        mla_compute_mode=args.mla_compute_mode)
     plan = replace(plan, benchmark_selection=BenchmarkSelection(
         batches=settings.batches, contexts=settings.contexts, width=settings.width,
         prefill_chunk=plan.prefill_chunk if settings.prefill else 0, speculation_study=settings.speculation_study,
