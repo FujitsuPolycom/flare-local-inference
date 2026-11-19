@@ -8,6 +8,11 @@
 
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static STORAGE_SIMULATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct SnapshotQuote {
     pub(super) snapshots: Vec<SnapshotId>,
@@ -18,22 +23,14 @@ pub(super) struct SnapshotQuote {
     rank: crate::cache::RetentionRank,
 }
 
-/// Prefix offsets into `postings` from the per-page posting counts: `starts[page]` is
-/// the first slot for `page` and `starts[page + 1]` the slot after its last. The
-/// offsets index the postings allocation, whose length is the aggregate candidate
-/// cost. Accepted alias geometries can need more postings than `u32::MAX` (65,537
-/// aliases over 65,536 free pages reach 2^32), so the offsets are pointer-sized.
-fn posting_starts(counts: &[usize]) -> Vec<usize> {
-    let mut starts = vec![0usize; counts.len() + 1];
-    for (page, &count) in counts.iter().enumerate() {
-        starts[page + 1] += count;
-    }
-    for page in 1..starts.len() {
-        starts[page] += starts[page - 1];
-    }
-    starts
+// Counts pages visited by select_snapshots; read only by the work-bound test.
+#[cfg(test)]
+thread_local! {
+    static SNAPSHOT_PAGE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Minimizes free-page backing for one or two aliases, with lowest-id ties.
+/// Larger selections retain the greedy feasible witness used for future captures.
 fn select_snapshots(
     backing: &[bool],
     protected_refs: &[u32],
@@ -49,110 +46,105 @@ fn select_snapshots(
     if count == 0 {
         return Some(Vec::new());
     }
-    let candidates: Vec<_> = candidates
+    if candidates.len() < count {
+        return None;
+    }
+    let budget = available - keep_pages;
+    let mut free = vec![0u32; backing.len() + 1];
+    let mut blocked = vec![0u32; backing.len() + 1];
+    // Aliases are contiguous ranges. Prefix sums count free pages and detect pages
+    // occupied by KV rather than protected snapshot backing in constant time per range.
+    for page in 0..backing.len() {
+        #[cfg(test)]
+        SNAPSHOT_PAGE_VISITS.set(SNAPSHOT_PAGE_VISITS.get() + 1);
+        free[page + 1] = free[page] + u32::from(backing[page]);
+        blocked[page + 1] = blocked[page] + u32::from(!backing[page] && protected_refs[page] == 0);
+    }
+    let span = |sum: &[u32], r: &std::ops::Range<u32>| {
+        (sum[r.end as usize] - sum[r.start as usize]) as usize
+    };
+    let candidates: Vec<(SnapshotId, std::ops::Range<u32>, usize)> = candidates
         .iter()
-        .copied()
-        .filter_map(|id| {
-            let mut cost = Vec::new();
-            if let Some(range) = ranges.get(id.0 as usize) {
-                for page in range.clone() {
-                    if backing[page as usize] {
-                        cost.push(page as usize);
-                    } else if protected_refs[page as usize] == 0 {
-                        return None;
-                    }
-                }
-            }
-            Some((id, cost))
+        .filter_map(|&id| {
+            let range = ranges.get(id.0 as usize).cloned().unwrap_or(0..0);
+            (span(&blocked, &range) == 0).then(|| {
+                let cost = span(&free, &range);
+                (id, range, cost)
+            })
         })
         .collect();
+    if candidates.len() < count {
+        return None;
+    }
     if count == 1 {
-        // The lowest cost, ties to the lowest id, skipping candidates whose cost exceeds the
-        // spare pages. One row is the shape of a quote for an anchor-only capture, so this
-        // path avoids building the two-row index below.
-        let budget = available - keep_pages;
         let mut best: Option<(usize, SnapshotId)> = None;
-        for (id, pages) in &candidates {
-            if best.is_some_and(|(cost, _)| pages.len() >= cost) || pages.len() > budget {
+        for &(id, _, cost) in &candidates {
+            if best.is_some_and(|(best_cost, _)| cost >= best_cost) || cost > budget {
                 continue;
             }
-            best = Some((pages.len(), *id));
-            if pages.is_empty() {
+            best = Some((cost, id));
+            if cost == 0 {
                 break;
             }
         }
         return best.map(|(_, id)| vec![id]);
     }
     if count > 2 {
-        // Future capture capacity uses a conservative witness without enumerating subsets.
         let mut selected = BTreeSet::<SnapshotId>::new();
-        let mut excluded = BTreeSet::<usize>::new();
+        let mut excluded = vec![false; backing.len()];
+        let mut excluded_pages = 0usize;
+        let mut open = free.clone();
         for _ in 0..count {
-            let (id, pages) = candidates
+            let (id, range, _) = candidates
                 .iter()
-                .filter(|(id, _)| !selected.contains(id))
-                .min_by_key(|(id, pages)| {
-                    (
-                        pages
-                            .iter()
-                            .filter(|page| !excluded.contains(*page))
-                            .count(),
-                        *id,
-                    )
-                })?;
-            excluded.extend(pages);
-            if excluded.len() > available - keep_pages {
+                .filter(|(id, _, _)| !selected.contains(id))
+                .min_by_key(|(id, range, _)| (span(&open, range), *id))?;
+            for page in range.clone() {
+                #[cfg(test)]
+                SNAPSHOT_PAGE_VISITS.set(SNAPSHOT_PAGE_VISITS.get() + 1);
+                if backing[page as usize] && !excluded[page as usize] {
+                    excluded[page as usize] = true;
+                    excluded_pages += 1;
+                }
+            }
+            if excluded_pages > budget {
                 return None;
             }
             selected.insert(*id);
+            for page in 0..backing.len() {
+                #[cfg(test)]
+                SNAPSHOT_PAGE_VISITS.set(SNAPSHOT_PAGE_VISITS.get() + 1);
+                open[page + 1] = open[page] + u32::from(backing[page] && !excluded[page]);
+            }
         }
         return Some(selected.into_iter().collect());
     }
-    // Two rows: the lowest union of the two candidates' costs, ties to the lexicographically
-    // lowest ids, among pairs whose union fits the spare pages. The union is
-    // |a| + |b| - |a ∩ b|; the inverted index counts the shared pages for every pair, so
-    // the pair loop never builds or merges a set.
-    let budget = available - keep_pages;
-    let mut counts = vec![0usize; backing.len()];
-    for (_, pages) in &candidates {
-        for &page in pages {
-            counts[page] += 1;
-        }
-    }
-    let starts = posting_starts(&counts);
-    let mut next = starts.clone();
-    let mut postings = vec![0u32; starts[backing.len()]];
-    for (candidate, (_, pages)) in candidates.iter().enumerate() {
-        for &page in pages {
-            postings[next[page] as usize] = candidate as u32;
-            next[page] += 1;
-        }
-    }
-    let mut overlap = vec![0u32; candidates.len()];
+    // The union costs |A| + |B| - |A ∩ B|; the intersection is another range.
     let mut best: Option<(usize, usize, usize)> = None;
     for a in 0..candidates.len() {
-        let pages = &candidates[a].1;
-        if pages.len() > budget {
+        let (_, range_a, cost_a) = &candidates[a];
+        // A pair costs at least its larger member, so a member at or above the best
+        // cost cannot improve on it (first-found ties are already the lowest ids).
+        if *cost_a > budget || best.is_some_and(|(cost, _, _)| *cost_a >= cost) {
             continue;
         }
-        for &page in pages {
-            for &b in &postings[starts[page] as usize..starts[page + 1] as usize] {
-                if b as usize > a {
-                    overlap[b as usize] += 1;
-                }
-            }
-        }
         for b in a + 1..candidates.len() {
-            let union = pages.len() + candidates[b].1.len() - overlap[b] as usize;
+            let (_, range_b, cost_b) = &candidates[b];
+            if best.is_some_and(|(cost, _, _)| *cost_b >= cost) {
+                continue;
+            }
+            let (lo, hi) = (
+                range_a.start.max(range_b.start),
+                range_a.end.min(range_b.end),
+            );
+            let shared = if lo < hi {
+                (free[hi as usize] - free[lo as usize]) as usize
+            } else {
+                0
+            };
+            let union = cost_a + cost_b - shared;
             if union <= budget && best.is_none_or(|(cost, _, _)| union < cost) {
                 best = Some((union, a, b));
-            }
-        }
-        for &page in pages {
-            for &b in &postings[starts[page] as usize..starts[page + 1] as usize] {
-                if b as usize > a {
-                    overlap[b as usize] -= 1;
-                }
             }
         }
         if best.is_some_and(|(cost, _, _)| cost == 0) {
@@ -250,6 +242,8 @@ impl RequestScheduler {
         rank: crate::cache::RetentionRank,
         allowed: Option<&BTreeSet<SnapshotId>>,
     ) -> Option<SnapshotQuote> {
+        #[cfg(test)]
+        STORAGE_SIMULATIONS.set(STORAGE_SIMULATIONS.get() + 1);
         let keep_pages = keep_pages.max(self.decode_growth_pages());
         let mut cache = self.cache.clone();
         let mut backing = self.free_backing();
@@ -1215,8 +1209,7 @@ mod tests {
         assert!(picked > compared / 20);
     }
 
-    /// Two rows on pools where candidates' alias windows overlap heavily, the case the
-    /// shared-page counts exist for.
+    /// Two rows on pools where candidates' alias windows overlap heavily.
     #[test]
     fn two_row_selection_matches_reference() {
         let rng = &mut 0x00d2_c0de_1234_5678u64;
@@ -1252,19 +1245,83 @@ mod tests {
         );
     }
 
-    /// Offsets into the two-row index are pointer-sized. `share_snapshot_pages` accepts
-    /// 65,537 aliases over 65,536 pages, and with every page free each candidate costs
-    /// the whole pool: 4,295,032,832 postings, which a 32-bit prefix sum wraps.
     #[test]
-    fn pair_index_offsets_span_the_posting_count() {
-        const ALIASES: usize = 65_537;
-        const PAGES: usize = 65_536;
-        let counts = vec![ALIASES; PAGES];
-        let starts = posting_starts(&counts);
-        assert_eq!(starts.len(), PAGES + 1);
-        assert_eq!(starts[PAGES], ALIASES * PAGES);
-        assert!(starts[PAGES] > u32::MAX as usize);
-        assert!(starts.windows(2).all(|pair| pair[0] <= pair[1]));
+    fn overlapping_snapshot_selection_matches_reference() {
+        let rng = &mut 0x51ec_7100_abc0_1234u64;
+        let mut compared = 0;
+        for case in 0..500 {
+            let pages = (lcg(rng) % 25) as usize;
+            let snapshots = (lcg(rng) % 10) as usize;
+            let backing: Vec<bool> = (0..pages)
+                .map(|_| lcg(rng) % 3 != 0 || case % 3 == 0)
+                .collect();
+            let refs: Vec<u32> = (0..pages).map(|_| (lcg(rng) % 3) as u32).collect();
+            let ranges: Vec<_> = (0..snapshots)
+                .map(|_| {
+                    let start = (lcg(rng) % (pages + 1) as u64) as u32;
+                    let end = (lcg(rng) % (pages + 1) as u64) as u32;
+                    start.min(end)..start.max(end)
+                })
+                .collect();
+            // Missing ranges represent rows with no shared page backing.
+            let candidates: BTreeSet<_> = (0..snapshots + case % 3)
+                .filter(|_| lcg(rng) % 4 != 0)
+                .map(|id| SnapshotId(id as u32))
+                .collect();
+            for count in 0..=5 {
+                for keep in 0..=pages + 1 {
+                    assert_eq!(
+                        select_snapshots(&backing, &refs, &ranges, &candidates, keep, count),
+                        reference_select(&backing, &refs, &ranges, &candidates, keep, count),
+                        "case {case} count {count} keep {keep}"
+                    );
+                    compared += 1;
+                }
+            }
+        }
+        println!("OVERLAPPING_SNAPSHOT_PARITY compared={compared}");
+    }
+
+    #[test]
+    fn nested_snapshot_selection_bounds_page_visits() {
+        const PAGES: usize = 256;
+        const ALIASES: usize = 128;
+        let backing = vec![true; PAGES];
+        let refs = vec![0; PAGES];
+        let ranges: Vec<_> = (0..ALIASES).map(|id| id as u32..PAGES as u32).collect();
+        let candidates = (0..ALIASES).map(|id| SnapshotId(id as u32)).collect();
+        for count in [2, 4] {
+            SNAPSHOT_PAGE_VISITS.set(0);
+            let selected = select_snapshots(&backing, &refs, &ranges, &candidates, 0, count);
+            let visits = SNAPSHOT_PAGE_VISITS.get();
+            let expected = (ALIASES - count..ALIASES)
+                .map(|id| SnapshotId(id as u32))
+                .collect();
+            assert_eq!(selected, Some(expected));
+            // One prefix scan, then at most one selected range and one pool scan per
+            // greedy row. Page work must not grow with the sum of pairwise overlaps.
+            let bound = PAGES * (1 + 2 * count);
+            println!("NESTED_SNAPSHOT_WORK count={count} visits={visits} bound={bound}");
+            assert!(
+                visits <= bound,
+                "count {count}: {visits} page visits exceed {bound}"
+            );
+        }
+    }
+
+    #[test]
+    fn large_overlapping_alias_pool_selects_lowest_ids() {
+        const ALIASES: u32 = 65_537;
+        const PAGES: u32 = 65_536;
+        let backing = vec![true; PAGES as usize];
+        let refs = vec![0; PAGES as usize];
+        let ranges = vec![0..PAGES; ALIASES as usize];
+        let candidates = (0..ALIASES).map(SnapshotId).collect();
+        assert!(u64::from(ALIASES) * u64::from(PAGES) > u64::from(u32::MAX));
+        assert_eq!(
+            select_snapshots(&backing, &refs, &ranges, &candidates, 0, 2),
+            Some(vec![SnapshotId(0), SnapshotId(1)])
+        );
     }
 
     /// Cache benchmark fixture: 202,183 pages of 128 KV tokens and 2,457 snapshot rows.

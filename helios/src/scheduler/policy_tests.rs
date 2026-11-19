@@ -61,6 +61,33 @@ fn equal_counts_from_different_cohorts_and_different_logical_prefixes_are_not_pr
     assert!(!s.dominates_padding(candidate, Candidate { batch: 4, packed_token_capacity: 4, mask: 1 << handles[1].slot, ..candidate }));
 }
 
+#[test]
+fn prefill_keeps_candidate_without_resized_duration() {
+    let mut s = engine(1, false);
+    s.prefill_graphs(&[128, 256, 512]).unwrap();
+    let mut graphs = super::tests::duration_graphs(1);
+    graphs.retain(|graph| graph.kind != GraphKind::Prefill || graph.token_capacity != 256);
+    s.measured_graph_durations(&graphs).unwrap();
+    let handle = add(&mut s, 1, 200, 1);
+    s.request_mut(handle).unwrap().phase = RequestPhase::Prefill;
+    let (values, age_price, scale) = s.lane_values(s.window_remaining().unwrap());
+    let mut candidates = Vec::new();
+    s.candidates(&mut candidates, &values, age_price);
+    let mut candidate = *candidates.iter()
+        .find(|c| c.kind == GraphKind::Prefill && c.capacity == 128)
+        .unwrap();
+    // The retained estimate stopped at a cut that the quoted selection omits.
+    candidate.work = 100;
+    assert_eq!(s.costs.duration(GraphKind::Prefill, 1, 256), None);
+    let plan = s.available_plan(candidate, &values, age_price, scale, PlanOrigin::Ordinary)
+        .unwrap();
+    assert_eq!((plan.token_capacity, plan.lanes[0].tokens), (128, 128));
+    assert_eq!(plan.estimated_duration_ns(), candidate.duration_ns);
+    assert_eq!(plan.selected_cost.retained_ns, candidate.duration_ns);
+    assert_eq!(plan.selection_value_rate(), candidate.rate.score);
+    assert_eq!(plan.origin, PlanOrigin::Ordinary);
+}
+
 fn engine(active: usize, speculative: bool) -> RequestScheduler {
     engine_with_geometry(active, speculative, 64, None)
 }

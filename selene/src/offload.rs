@@ -684,14 +684,18 @@ impl Startup {
         registrar: std::sync::Arc<dyn crate::HostRegistrar + Send + Sync>,
         approve: impl FnOnce(bool) -> Result<bool>,
     ) -> Result<(String, Vec<u64>)> {
-        let (mut pool, mut charges) = builder.start(registrar)?;
-        let summary = if !approve(pool.approved())? {
-            pool.close()?;
-            charges.fill(0);
-            "local tiers only".into()
-        } else {
-            pool.summary()?
-        };
+        let prepared = builder.start(registrar);
+        let approved = approve(prepared.as_ref().is_ok_and(|(pool, _)| pool.approved()));
+        let (mut pool, charges) = prepared?;
+        if !approved? {
+            if let Err(error) = pool.close() {
+                eprintln!("warning: cannot close the failed pool: {error}");
+            }
+            return Err(pool::startup::attachment_error(
+                "a rank could not attach; check that rank's startup error",
+            ));
+        }
+        let summary = pool.summary()?;
         self.pool = Some(pool);
         Ok((summary, charges))
     }

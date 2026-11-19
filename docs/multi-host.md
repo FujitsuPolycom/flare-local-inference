@@ -60,7 +60,7 @@ A multi-host instance can use a Selene prefix cache pool (see
 
 - Pass the same `--prefix-cache-pool` setting to every rank, or to none.
 - Local retention is disk only; `--prefix-cache-memory` is rejected.
-- If any rank's registration is refused, every rank uses its local tiers.
+- If any rank's registration or attachment fails, every rank fails startup.
 - The pool and record links connect to rank zero's ephemeral TCP port and carry
   session secrets in plaintext, so secure the cluster fabric.
 - Build with `rdma` only if the manager offers RDMA.

@@ -753,7 +753,7 @@ impl NativeModel {
                         .ok_or_else(|| invalid("minimum cache footprint overflow"))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            // Establish that local serving fits even if the pool is refused.
+            // Reserve the minimum serving footprint before approving pool registration.
             capacities(
                 cores,
                 &available,

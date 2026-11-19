@@ -10,9 +10,11 @@ content in its index.
 Flare copies each published GPU checkpoint into its first configured host tier,
 in both local and pool modes. Pooled instances announce the GPU holding at
 publication and cascade retained records under host pressure: DRAM to local
-NVMe, then the manager. A handover drops the source only after the destination
-commits. Refusals, unavailable destinations and repeated failures keep records
-local and retry after progress; see [host retention](../docs/prefix-cache-offload.md#215-sharing-through-a-pool). GPU eviction does not initiate a late copy.
+NVMe, then the manager. A handover drops the source after the destination
+commits. Invalid or oversized puts discard the source immediately; budget or
+in-flight refusals get one retry before discarding it. Other failures and
+unavailable destinations keep records local and retry after progress; see
+[host retention](../docs/prefix-cache-offload.md#215-sharing-through-a-pool). GPU eviction does not initiate a late copy.
 The [shutdown drain](../docs/prefix-cache-offload.md#25-transfers-slabs-and-record-files)
 is opt-in and off by default; shutdown without it drains accesses before releasing memory.
 A GPU cache hit refreshes a local host record's recency, but cannot
@@ -69,7 +71,10 @@ Size options accept bytes with binary K/M/G/T suffixes.
 | `--metrics` | disabled; when set, HTTP `GET /metrics` |
 
 See [address forms and startup warnings](docs/network-operations.md#addresses-and-startup-warnings)
-for network connection settings and diagnostics.
+for network connection settings and diagnostics. A configured pool must attach
+at instance startup; timeouts, registration failures and memory-budget rejection
+stop startup with corrective actions. Start the manager before its instances, or
+remove `--prefix-cache-pool` to run local-only.
 
 The arena and staging are preallocated files under `/dev/shm/selene/<name>-<hash>`, where the hash
 is 32 hex digits derived from the absolute socket path, so the shared-memory mount must hold at

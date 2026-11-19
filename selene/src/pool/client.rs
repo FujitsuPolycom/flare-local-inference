@@ -34,10 +34,9 @@ use super::{
     startup::{Approve, RegisteredRegion, Startup},
 };
 
-/// The normal wait for [`PoolClient::start`] to reach the manager at startup. A manager that has not
-/// answered by then is not used by this process at all: it runs on its local tiers, with one
-/// warning, and never attaches later (see [`PoolClient::start`]).
-pub const STARTUP_WAIT: Duration = Duration::from_secs(10);
+/// The manager readiness window: 30 one-second probes in the manager's operating guide.
+/// If recovery takes longer, start the manager before the instance.
+pub const STARTUP_WAIT: Duration = Duration::from_secs(30);
 
 /// Where the manager listens.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,8 +69,7 @@ pub struct PoolConfig {
     pub registration_context: usize,
     /// Called once at startup with everything the client is about to register (see
     /// [`PlannedRegion`]), after the manager's first Hello and before the first registration.
-    /// `Err(reason)` registers nothing: the pool is off for this process, with one warning naming
-    /// the sizes and the reason. `None` approves.
+    /// `Err(reason)` registers nothing and fails startup with the sizes and reason. `None` approves.
     pub approve: Option<Approve>,
 }
 
@@ -91,18 +89,19 @@ impl PoolClient {
     ///
     /// Registering host memory with the GPU consumes device memory, so a serving instance does
     /// it only before it admits requests. This call is that time. It spawns the I/O thread and
-    /// waits up to `wait` for the manager's first Hello; on that Hello the thread maps
+    /// waits up to `wait` for the manager's first Hello; on that Hello a blocking worker maps
     /// the manager's shared regions and registers each through `registrar` (for a manager on
-    /// another host, this process's own data-channel staging), and `start` returns with the
-    /// ranges in [`PoolClient::registered_regions`]. From then on the client never calls the
-    /// registrar again: a reconnect after a manager restart continues with the same
-    /// registrations when the manager reports the same regions, and a manager that reports
-    /// different ones (it recreated them, so running instances must restart) turns the pool off
-    /// for this process, with one warning. A manager not reached in time, or a pool refused at
-    /// startup (version, encryption, scope or an untrusted certificate), leaves the process on
-    /// its local tiers, with one warning, for good: the client does not attach later. Start the
-    /// manager before the instance. The returned client is in [`PoolStatus::Connecting`] while
-    /// its session opens, or [`PoolStatus::Disabled`] when it will not attach.
+    /// another host, this process's own data-channel staging). Registration has no deadline;
+    /// session opening gets another 40 seconds before `start` returns the ranges in
+    /// [`PoolClient::registered_regions`]. A manager not reached in time, or a pool refused
+    /// at startup (version, encryption, scope or an untrusted certificate), fails startup.
+    /// Start the manager before the instance. Initial index and rank readiness may still be
+    /// pending when this call returns.
+    ///
+    /// After startup the client never calls the registrar again. A reconnect after a manager
+    /// restart continues with the same registrations when the manager reports the same regions.
+    /// Different regions turn the pool off for this process with one warning; restart the
+    /// instance to register the manager's recreated regions.
     pub fn start(
         config: PoolConfig,
         ranks: Option<RankSet>,
@@ -194,30 +193,25 @@ impl PoolClient {
             .name("selene-pool".into())
             .spawn(move || conn::run(engine, link))
             .map_err(|e| Error::caused_by("cannot start the pool thread", e))?;
-        let registered = match startup.wait(wait) {
-            Ok(registered) => registered,
-            Err(timed_out) => {
-                if timed_out {
-                    let reason = format!(
-                        "the pool manager did not answer within {wait:?} of startup; this instance \
-                         uses its local tiers only and will not attach to the pool later \
-                         (start the manager before the instance)",
-                    );
-                    eprintln!("warning: {reason}");
-                    shared.set_status(PoolStatus::Disabled(reason));
-                }
-                Vec::new()
-            }
-        };
-        Ok(PoolClient {
+        let mut client = PoolClient {
             shared,
             announce,
             stop,
             thread: Some(thread),
             next_fetch: 0,
             next_put: 0,
-            registered,
-        })
+            registered: Vec::new(),
+        };
+        client.registered = match startup.wait(wait) {
+            Ok(registered) => registered,
+            Err(error) => {
+                if let Err(close_error) = client.close() {
+                    eprintln!("warning: cannot close the failed pool client: {close_error}");
+                }
+                return Err(error);
+            }
+        };
+        Ok(client)
     }
 
     /// The ranges registered at startup, in registration order.

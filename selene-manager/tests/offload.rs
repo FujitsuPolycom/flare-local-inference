@@ -10,44 +10,64 @@ fn pool(address: &str) -> PoolOptions {
 }
 
 #[test]
-fn startup_releases_registration_and_charges_when_a_peer_rejects_the_pool() {
+fn startup_fails_and_releases_registration_when_a_rank_rejects_the_pool() {
     use flare_selene::pool::{Budget, PoolBuilder};
     use flare_selene::testing::{TrackingRegistrar, geometry};
     use std::sync::Arc;
 
     let mut manager = selene_manager::testing::Manager::new();
     manager.run();
-    let options = pool(&manager.address());
-    let geometry = vec![geometry(64, &[("kv", 4096)], 4096)];
-    let registrar = Arc::new(TrackingRegistrar::default());
-    let mut startup = Startup::default();
-    let (summary, charges) = startup
-        .start_pool(
-            PoolBuilder {
-                options: &options,
-                identity: [3; 32],
-                geometry: &geometry,
-                gpu_uuids: vec![[1; 16]],
-                registration_context: 0,
-                budget: Budget {
-                    host: Ok(u64::MAX),
-                    devices: vec![(u64::MAX, false), (u64::MAX, true)],
+    for local_approved in [true, false] {
+        let options = pool(&manager.address());
+        let geometry = vec![geometry(64, &[("kv", 4096)], 4096)];
+        let registrar = Arc::new(TrackingRegistrar::default());
+        let mut startup = Startup::default();
+        let mut agreed = false;
+        let reason = startup
+            .start_pool(
+                PoolBuilder {
+                    options: &options,
+                    identity: [3; 32],
+                    geometry: &geometry,
+                    gpu_uuids: vec![[1; 16]],
+                    registration_context: 0,
+                    budget: Budget {
+                        host: Ok(if local_approved { u64::MAX } else { 0 }),
+                        devices: vec![(u64::MAX, false), (u64::MAX, true)],
+                    },
+                    peers: None,
+                    disk: false,
                 },
-                peers: None,
-                disk: false,
-            },
-            registrar.clone(),
-            |approved| {
-                assert!(approved);
-                assert_eq!(registrar.calls.lock().unwrap().len(), 2);
-                assert_eq!(*registrar.drops.lock().unwrap(), 0);
-                Ok(false)
-            },
-        )
-        .unwrap();
-    assert_eq!(summary, "local tiers only");
-    assert_eq!(charges, [0, 0]);
-    assert_eq!(*registrar.drops.lock().unwrap(), 2);
+                registrar.clone(),
+                |approved| {
+                    agreed = true;
+                    assert_eq!(approved, local_approved);
+                    assert_eq!(
+                        registrar.calls.lock().unwrap().len(),
+                        if local_approved { 2 } else { 0 }
+                    );
+                    assert_eq!(*registrar.drops.lock().unwrap(), 0);
+                    Ok(false)
+                },
+            )
+            .err()
+            .expect("a peer rejection must fail startup")
+            .to_string();
+        assert!(agreed);
+        assert!(
+            reason.contains(if local_approved {
+                "a rank could not attach"
+            } else {
+                "host budget has 0 bytes left"
+            }),
+            "{reason}"
+        );
+        assert!(reason.contains("remove --prefix-cache-pool"), "{reason}");
+        assert_eq!(
+            *registrar.drops.lock().unwrap(),
+            if local_approved { 2 } else { 0 }
+        );
+    }
 }
 
 #[test]

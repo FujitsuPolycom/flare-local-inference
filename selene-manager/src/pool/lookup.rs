@@ -194,12 +194,11 @@ impl Core {
                 {
                     continue;
                 }
-                let Some((level, source_ref)) =
+                let Some((mut level, source_ref)) =
                     self.reach(session.shm, session.instance, source, tier)
                 else {
                     continue;
                 };
-                let closer = rank(&order, level);
                 let begin = request.resident_tokens;
                 if begin >= entry.key.consumed_tokens {
                     continue;
@@ -215,8 +214,17 @@ impl Core {
                 ) else {
                     continue;
                 };
+                if source == SourceId::Manager
+                    && level == v2::Level::HostDram
+                    && walk
+                        .nodes
+                        .iter()
+                        .any(|node| state.index.get(source, node.key, Tier::Dram).is_none())
+                {
+                    level = v2::Level::HostNvme;
+                }
                 found.push((
-                    closer,
+                    rank(&order, level),
                     std::cmp::Reverse(entry.key.consumed_tokens),
                     source,
                     tier,
@@ -320,3 +328,98 @@ fn candidate(
 type Ranked = (i32, std::cmp::Reverse<u64>, SourceId, Tier, v2::Candidate);
 
 pub(super) type LookupQueue = VecDeque<Queued>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        arena::Arena,
+        pool::core::{OpenPeer, PoolConfig},
+    };
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn a_manager_chain_with_disk_pages_is_priced_as_nvme() {
+        let (mut core, _handle, _events) = Core::new(
+            PoolConfig::default(),
+            v2::SharedMemory::default(),
+            Arena::new(1 << 20).unwrap(),
+            None,
+        );
+        let (tx, _rx) = mpsc::channel(64);
+        let sid = core
+            .open(
+                OpenPeer {
+                    unix: true,
+                    pid: std::process::id(),
+                    uid: core.euid,
+                    gid: core.egid,
+                },
+                v2::OpenSession {
+                    manager_incarnation: core.incarnation,
+                    instance_id: vec![1; 16],
+                    process_nonce: vec![2; 16],
+                    scope: Some(v2::Scope {
+                        model_identity: vec![1; 32],
+                        layout_fingerprint: vec![2; 16],
+                        geometry: Some(v2::Geometry {
+                            page_tokens: 64,
+                            ranks: vec![v2::RankPlanes {
+                                plane_bytes: vec![4096],
+                                row_bytes: 4096,
+                            }],
+                            page_record_bytes: 4096,
+                            row_record_bytes: 4096,
+                        }),
+                    }),
+                    ..Default::default()
+                },
+                tx,
+            )
+            .unwrap();
+        let parent = Key {
+            consumed_tokens: 128,
+            digest: [3; 16],
+        };
+        let child = Key {
+            consumed_tokens: 256,
+            digest: [4; 16],
+        };
+        let scope = core.sessions[&sid].scope;
+        let index = &mut core.scopes.get_mut(&scope).unwrap().index;
+        for (key, parent, tier) in [
+            (parent, None, Tier::Nvme),
+            (child, Some(parent), Tier::Dram),
+        ] {
+            index.upsert(
+                SourceId::Manager,
+                Entry {
+                    key,
+                    parent,
+                    bucket: [9; 16],
+                    tail_pages: 2,
+                    row: true,
+                    tier,
+                    bytes: 3 * 4096,
+                },
+            );
+        }
+        let (status, candidates) = core.answer_lookup(
+            sid,
+            v2::LookupRequest {
+                boundaries: vec![v2::PrefixKey {
+                    consumed_tokens: 0,
+                    digest: vec![9; 16],
+                }],
+                before_tokens: 257,
+                ..Default::default()
+            },
+        );
+        assert_eq!(status, v2::LookupStatus::LookupOk);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.key, Some(key_to(child)));
+        assert_eq!(candidate.nodes.len(), 2);
+        assert_eq!(candidate.level, v2::Level::HostNvme as i32);
+        assert_eq!(candidate.tier, v2::Tier::Dram as i32);
+    }
+}

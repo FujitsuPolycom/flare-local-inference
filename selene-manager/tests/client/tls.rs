@@ -16,7 +16,7 @@ fn other_roots() -> Roots {
     Roots::Fixed(vec![cert.cert.der().clone()])
 }
 
-fn connect(config: PoolConfig, roots: Roots) -> PoolClient {
+fn connect(config: PoolConfig, roots: Roots) -> Result<PoolClient> {
     let (copier, _) = SimulatedGpu::shared(&geo()).unwrap();
     PoolClient::start(
         config,
@@ -26,7 +26,6 @@ fn connect(config: PoolConfig, roots: Roots) -> PoolClient {
         roots,
         Duration::from_secs(2),
     )
-    .unwrap()
 }
 
 fn ready(client: &PoolClient) {
@@ -38,7 +37,7 @@ fn ready(client: &PoolClient) {
 #[test]
 fn a_client_with_a_ca_connects_to_a_tls_manager() {
     let manager = network_manager(true);
-    let mut client = connect(config(&manager, 1), Roots::System);
+    let mut client = connect(config(&manager, 1), Roots::System).unwrap();
     ready(&client);
     assert!(!client.registered_regions().is_empty());
     client.close().unwrap();
@@ -49,32 +48,31 @@ fn a_client_without_a_ca_file_trusts_the_hosts_store() {
     let manager = network_manager(true);
     let mut config = config(&manager, 1);
     config.ca = None;
-    let mut client = connect(config, roots(&manager));
+    let mut client = connect(config, roots(&manager)).unwrap();
     ready(&client);
     client.close().unwrap();
 }
 
 #[test]
-fn an_untrusted_manager_disables_the_pool_without_registration() {
+fn an_untrusted_manager_fails_startup_without_registration() {
     let manager = network_manager(true);
     let mut config = config(&manager, 1);
     config.ca = None;
-    let mut client = connect(config, other_roots());
-    let PoolStatus::Disabled(reason) = client.status() else {
-        panic!("{:?}", client.status());
-    };
+    let reason = connect(config, other_roots())
+        .err()
+        .expect("untrusted manager")
+        .to_string();
     assert!(
         reason.contains("cannot verify the pool manager over TLS"),
         "{reason}"
     );
-    assert!(client.registered_regions().is_empty());
-    client.close().unwrap();
+    assert!(reason.contains("--prefix-cache-pool-ca"), "{reason}");
 }
 
 #[test]
 fn a_ca_file_overrides_the_hosts_store() {
     let manager = network_manager(true);
-    let mut client = connect(config(&manager, 1), other_roots());
+    let mut client = connect(config(&manager, 1), other_roots()).unwrap();
     ready(&client);
     client.close().unwrap();
 }
@@ -88,7 +86,7 @@ fn a_bare_address_uses_plaintext() {
     };
     config.address = flare_selene::testing::pool_address(address).unwrap();
     assert!(matches!(config.address, PoolAddress::TcpPlaintext(_)));
-    let mut client = connect(config, Roots::System);
+    let mut client = connect(config, Roots::System).unwrap();
     ready(&client);
     client.close().unwrap();
 }
@@ -105,10 +103,11 @@ fn a_client_with_a_ca_never_downgrades_to_plaintext() {
     let ca = manager.base.join("client-ca.pem");
     std::fs::write(&ca, cert.cert.pem()).unwrap();
     config.ca = Some(ca);
-    let mut client = connect(config, Roots::System);
-    assert!(matches!(client.status(), PoolStatus::Disabled(_)));
-    assert!(client.registered_regions().is_empty());
-    client.close().unwrap();
+    let reason = connect(config, Roots::System)
+        .err()
+        .expect("encryption mismatch")
+        .to_string();
+    assert!(reason.contains("remove --prefix-cache-pool"), "{reason}");
 }
 
 #[test]
@@ -120,10 +119,11 @@ fn a_plaintext_client_refuses_a_tls_manager() {
     };
     config.address = flare_selene::testing::pool_address(address).unwrap();
     config.ca = None;
-    let mut client = connect(config, Roots::System);
-    assert!(matches!(client.status(), PoolStatus::Disabled(_)));
-    assert!(client.registered_regions().is_empty());
-    client.close().unwrap();
+    let reason = connect(config, Roots::System)
+        .err()
+        .expect("encryption mismatch")
+        .to_string();
+    assert!(reason.contains("remove --prefix-cache-pool"), "{reason}");
 }
 
 #[test]

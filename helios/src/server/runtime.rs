@@ -149,6 +149,10 @@ pub(super) async fn await_admission(generations: &mut [Generation]) -> Result<()
 }
 
 impl Generation {
+    pub(super) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
     pub(super) async fn wait_for_first_token(&mut self) -> Result<()> {
         (&mut self.first_token)
             .await
@@ -170,7 +174,7 @@ impl Generation {
 }
 impl Drop for Generation {
     fn drop(&mut self) {
-        self.cancelled.store(true, Ordering::Release);
+        self.cancel();
     }
 }
 
@@ -194,9 +198,12 @@ struct Incoming {
     prompt_scored: usize,
     /// Retry capacity admission only after the scheduler's resources change.
     blocked: Option<(crate::cache::Fence, usize, usize, usize)>,
-    /// Pool lookup started on arrival, retained until its answer or the first
-    /// prefill submission. Cancellation drops it with the `Incoming`.
+    /// Pool lookup started on arrival. A ticket that will never be answered is
+    /// replaced when next selected for admission; pending tickets survive until
+    /// prefill submission.
+    /// Cancellation drops the ticket with the `Incoming`.
     pool_lookup: Option<flare_selene::pool::LookupTicket>,
+    /// Start of the pending ticket's admission grace period; reset on replacement.
     pool_lookup_started: Option<std::time::Instant>,
     /// Replaced on readmission and counted once when this request ends.
     host_lookup_outcome: Option<crate::offload::LookupOutcome>,
@@ -279,6 +286,17 @@ impl Incoming {
     fn prompt_score_range(&self, start: usize, tokens: usize) -> std::ops::Range<usize> {
         let first = (if start == 0 { 0 } else { start + 1 }).max(self.prompt_scored);
         first..(start + tokens + 1).min(self.prompt_score_end)
+    }
+
+    fn finish_cancelled(&self, carried: Carried) {
+        self.emit(GenerationEvent::Finished {
+            prompt_tokens: carried.prompt_tokens.unwrap_or(self.prompt.tokens.len()),
+            generated_tokens: carried.generated_tokens,
+            reused_prompt_tokens: carried.reused_prompt_tokens.unwrap_or(0),
+            reason: "stop",
+            termination: crate::output::Termination::Cancelled,
+            stop_sequence: None,
+        });
     }
 
     fn notify_admission(&self, result: Result<()>) {
@@ -1290,9 +1308,10 @@ impl<'a> Worker<'a> {
                 }
             }
         }
-        self.parked.retain(|(incoming, _)| {
+        self.parked.retain(|(incoming, parked)| {
             let cancelled = incoming.cancelled.load(Ordering::Acquire);
             if cancelled {
+                incoming.finish_cancelled(parked.carried);
                 self.metrics.cancelled.fetch_add(1, Ordering::Relaxed);
                 progress = true;
             }
@@ -1307,6 +1326,13 @@ impl<'a> Worker<'a> {
                 if active.prepared_image.is_some() {
                     self.preparing_image = None;
                 }
+                let live = self.scheduler.request(active.request)?;
+                active.incoming.finish_cancelled(Carried {
+                    prompt_tokens: Some(active.carried.prompt_tokens.unwrap_or(live.prompt_tokens)),
+                    generated_tokens: active.carried.generated_tokens + live.generated_tokens,
+                    reused_prompt_tokens: Some(active.carried.reused_prompt_tokens.unwrap_or(live.reused_prompt_tokens())),
+                    ..active.carried
+                });
                 self.scheduler.cancel(active.request)?;
                 self.metrics.cancelled.fetch_add(1, Ordering::Relaxed);
                 self.admissions[slot] = None;
@@ -1316,7 +1342,9 @@ impl<'a> Worker<'a> {
         while self.scheduler.has_available_slot() {
             let now = std::time::Instant::now();
             for incoming in self.pending.iter_mut().chain(self.parked.iter_mut().map(|(incoming, _)| incoming)) {
-                if let Some(store) = self.store.as_mut().filter(|store| store.pooled()) {
+                if incoming.pool_plan.is_none()
+                    && let Some(store) = self.store.as_mut().filter(|store| store.pooled())
+                {
                     begin_pool_lookup(&mut self.scheduler, store.as_mut(), incoming);
                 }
                 incoming.poll_pool_lookup();
@@ -1350,11 +1378,24 @@ impl<'a> Worker<'a> {
                 }
             };
             if incoming.cancelled.load(Ordering::Acquire) {
+                if let Some(parked) = &parked {
+                    incoming.finish_cancelled(parked.carried);
+                }
                 self.metrics.cancelled.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             if incoming.prompt.logprobs && self.config.max_top_logprobs == 0 {
                 incoming.reject_admission("logprobs are not available in this model core".into());
+                continue;
+            }
+            if let Some(store) = self.store.as_mut().filter(|store| store.pooled()) {
+                begin_pool_lookup(&mut self.scheduler, store.as_mut(), &mut incoming);
+            }
+            if incoming.awaits_pool(std::time::Instant::now()) {
+                match parked {
+                    Some(parked) => self.parked.insert(position, (incoming, parked)),
+                    None => self.pending.insert(position, incoming),
+                }
                 continue;
             }
             let pending_pool_answer = incoming.pool_lookup.as_ref().is_some_and(|ticket| {
@@ -1874,7 +1915,10 @@ impl<'a> Worker<'a> {
                                     .fetch_add(1, Ordering::Relaxed);
                                 self.metrics.progress(0, 1, 0, 0, 0, 0);
                             }
-                            if abandon || request.incoming.cancelled.load(Ordering::Acquire) {
+                            if !abandon && request.incoming.cancelled.load(Ordering::Acquire) {
+                                continue;
+                            }
+                            if abandon {
                                 self.scheduler.cancel(request.request)?;
                                 self.active[slot] = None;
                                 self.admissions[slot] = None;
@@ -2630,15 +2674,28 @@ fn begin_pool_lookup(
     store: &mut dyn flare_selene::HostStore,
     incoming: &mut Incoming,
 ) {
-    if !incoming.host_lookup || incoming.prompt_scored < incoming.prompt_score_end || incoming.pool_plan.is_some() {
+    if !incoming.host_lookup || incoming.prompt_scored < incoming.prompt_score_end {
         return;
     }
-    let Ok(plan) = scheduler.plan_admission(&incoming.spec()) else {
+    let retry = incoming.pool_lookup.as_ref().is_some_and(|ticket| {
+        matches!(ticket.state(), flare_selene::pool::LookupState::None)
+    });
+    if incoming.pool_plan.is_some() && !retry {
+        return;
+    }
+    let plan = match incoming.pool_plan.as_ref() {
+        Some(plan) => scheduler.refresh_admission_plan(plan),
+        None => scheduler.plan_admission(&incoming.spec()),
+    };
+    let Ok(plan) = plan else {
         return;
     };
     if plan.resident_tokens() < incoming.prompt.tokens.len() as u64 {
-        incoming.pool_lookup_started = Some(std::time::Instant::now());
         incoming.pool_lookup = store.begin_lookup(plan.history());
+        incoming.pool_lookup_started = incoming.pool_lookup.as_ref().and_then(|ticket| {
+            matches!(ticket.state(), flare_selene::pool::LookupState::Pending)
+                .then(std::time::Instant::now)
+        });
     }
     incoming.pool_plan = Some(plan);
 }

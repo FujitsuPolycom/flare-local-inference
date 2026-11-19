@@ -1432,9 +1432,9 @@ The manager's `--name` supplies the pool salt for scope and instance identities.
 `--prefix-cache-pool-ca FILE` supplies the CA for a TLS manager;
 without it, TLS verifies the manager against the host's trust store. A CA
 cannot be used with a Unix socket or plaintext address. A manager declaring
-a different encryption setting disables the pool for TCP clients. Unix-socket
-clients trust filesystem permissions and can use the same TLS manager. The CA
-requires the pool flag. These command-line options are forwarded to
+a different encryption setting at startup fails attachment for TCP clients.
+Unix-socket clients trust filesystem permissions and can use the same TLS manager.
+The CA requires the pool flag. These command-line options are forwarded to
 every rank and have no configuration-file key. See
 [the pool section](prefix-cache-offload.md#215-sharing-through-a-pool).
 

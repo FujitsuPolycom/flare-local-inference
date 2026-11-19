@@ -362,6 +362,7 @@ impl CompositeStore {
 
     /// Remove a record's memory copy, or schedule the removal when a job still pins it.
     fn remove_copy(&mut self, key: PrefixKey) {
+        self.thinning.remove(&key);
         if self.memory.remove_record(&key).is_err()
             && self.memory.index().contains(&key)
             && !self.stale.contains(&key)
@@ -470,7 +471,13 @@ impl CompositeStore {
             return;
         }
         self.stats.held[0] += u64::from(!reserved_file);
-        if let Some(parent) = parent {
+        if let Some(parent) = parent
+            && self
+                .memory
+                .index()
+                .node(&parent)
+                .is_some_and(|node| node.row)
+        {
             self.thinning.insert(parent);
         }
         self.thin_rows();
@@ -514,14 +521,26 @@ impl CompositeStore {
     }
 
     fn thin_rows(&mut self) {
-        for key in std::mem::take(&mut self.thinning) {
+        self.thin_rows_for(self.memory.layout().row_slots().saturating_mul(2));
+    }
+
+    fn thin_rows_for(&mut self, headroom: usize) {
+        if self.memory.free_retention_slots() > headroom {
+            return;
+        }
+        let mut queued = self.disk.index().thinning_order(&mut self.thinning);
+        for key in queued.by_ref() {
             if !self.disk.index().row_redundant(&key, false) {
                 continue;
             }
             if self.parked.get(&key).is_some_and(|p| p.writing) || !self.memory.drop_row(&key) {
                 self.thinning.insert(key);
             }
+            if self.memory.free_retention_slots() > headroom {
+                break;
+            }
         }
+        self.thinning.extend(queued);
     }
 
     /// The disk write of a record whose memory copy is resident has finished.
@@ -763,6 +782,10 @@ impl CompositeStore {
         bucket: [u8; 16],
         row: bool,
     ) -> Result<()> {
+        let needed = self.memory.layout().record_slots(tail_pages, row);
+        if self.memory.fits(needed) && self.memory.free_retention_slots() < needed {
+            self.thin_rows_for(needed);
+        }
         let source = self
             .disk
             .record(&key)
@@ -820,6 +843,7 @@ impl CompositeStore {
                     inbound.error.get_or_insert(error);
                     continue;
                 }
+                self.thinning.remove(&key);
             }
             if tail_pages == 0 && !row {
                 // An ancestor whose endpoint shares its parent's last page
@@ -959,7 +983,12 @@ impl CompositeStore {
                     .complete_record(&node, true)
                     .and_then(|()| self.memory.pin_record(&node));
                 match pinned {
-                    Ok(()) => inbound.nodes[index].state = NodeState::Resident,
+                    Ok(()) => {
+                        inbound.nodes[index].state = NodeState::Resident;
+                        if inbound.nodes[index].row {
+                            self.thinning.insert(node);
+                        }
+                    }
                     Err(error) => {
                         inbound.nodes[index].state = NodeState::Waiting;
                         inbound.error.get_or_insert(error);
@@ -1089,6 +1118,9 @@ impl HostStore for CompositeStore {
         }
         let (parent, tail) = self.disk.plan_record(checkpoint);
         let needed = self.memory.layout().record_slots(tail.len(), true);
+        if self.memory.fits(needed) && self.memory.free_retention_slots() < needed {
+            self.thin_rows_for(needed);
+        }
         let short = self.memory.shortfall(needed);
         if short > 0 && short > self.spillable_slots() {
             let result = self.disk.store(checkpoint);
@@ -1338,6 +1370,8 @@ impl HostStore for CompositeStore {
                 self.retry_after = None;
             }
             self.maintenance_progress = progress;
+            // A spill moves records to disk with their rows; rows are reclaimed
+            // only where an allocation needs room.
             self.spill_parked(self.memory.reserve(2 * self.memory.pool().intake_slots()));
             self.disk.maintain();
         }
@@ -1813,7 +1847,7 @@ mod tests {
     }
 
     #[test]
-    fn conversation_rows_thin_before_spill_and_restore_after_recovery() {
+    fn conversation_rows_survive_spill_and_restore_after_recovery() {
         let Some(directory) = test_directory("composite", "conversation-rows") else {
             return;
         };
@@ -1847,20 +1881,17 @@ mod tests {
             store.memory_stored(checkpoint.id, checkpoint.key, Ok(bytes), &mut Vec::new());
             checkpoints.push(checkpoint);
         }
-        assert_eq!(store.memory.index().nodes().filter(|n| n.row).count(), 2);
-        assert_eq!(store.stats().rows_thinned, [6, 0]);
-        assert_eq!(
-            store.store(&checkpoints[5]).unwrap(),
-            StoreOutcome::Retry(StoreReason::Slabs)
-        );
+        assert_eq!(store.memory.index().nodes().filter(|n| n.row).count(), 8);
+        assert_eq!(store.stats().rows_thinned, [0, 0]);
+        assert_eq!(store.store(&checkpoints[5]).unwrap(), StoreOutcome::Present);
         assert_eq!(
             store.memory.stats().slots_used,
-            8 + 2 * store.memory.layout().row_slots()
+            8 + 8 * store.memory.layout().row_slots()
         );
         let rewind = store
             .lookup(&history(7 * PAGE_TOKENS), 0, u64::MAX)
             .unwrap();
-        assert_eq!(rewind.consumed_tokens, PAGE_TOKENS);
+        assert_eq!(rewind.consumed_tokens, 7 * PAGE_TOKENS);
         let tip = store.lookup(&full, 0, u64::MAX).unwrap();
         assert_eq!(tip.chain.nodes.len(), 8);
         assert_eq!(tip.tier, Tier::Dram);
@@ -1883,14 +1914,11 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        for (index, checkpoint) in checkpoints.iter().enumerate() {
-            assert_eq!(announced[&checkpoint.key], index == 0 || index == 7);
+        for checkpoint in &checkpoints {
+            assert!(announced[&checkpoint.key]);
         }
         let keys: Vec<_> = checkpoints[..6].iter().map(|c| c.key).collect();
-        assert!(matches!(
-            store.memory.pin_export_chain(&keys, 0, true),
-            Err(ExportRefusal::ChainGap)
-        ));
+        drop(store.memory.pin_export_chain(&keys, 0, true).unwrap());
 
         for checkpoint in &checkpoints {
             assert_eq!(store.spill(checkpoint.key), Some(checkpoint.key));
@@ -1901,7 +1929,7 @@ mod tests {
         let mut total = 0;
         for (index, checkpoint) in checkpoints.iter().enumerate() {
             let record = store.disk.record(&checkpoint.key).unwrap();
-            let row = index == 0 || index == 7;
+            let row = true;
             assert_eq!(record.bytes, record.header.length(row));
             let bytes = fs::read(&record.path).unwrap();
             assert_eq!(bytes.len() as u64, record.header.length(row));
@@ -1913,7 +1941,7 @@ mod tests {
         }
         assert_eq!(store.disk.used(), total);
 
-        // A late fork keeps using its already thinned parent's pages.
+        // A late fork retains its parent's endpoint as well as its pages.
         let mut fork_history = history(6 * PAGE_TOKENS);
         fork_history
             .append(&vec![42; PAGE_TOKENS as usize], &[])
@@ -1928,7 +1956,7 @@ mod tests {
             StateSlotId(9),
         );
         written(&mut store, &fork, fork.parent, 9);
-        assert!(!store.disk.index()[&checkpoints[5].key].row);
+        assert!(store.disk.index()[&checkpoints[5].key].row);
         assert_eq!(store.disk.index()[&checkpoints[5].key].children(), 2);
         total += store.disk.record(&fork.key).unwrap().bytes;
         store.close().unwrap();
@@ -1945,12 +1973,12 @@ mod tests {
             0,
             Some(copier),
         );
-        assert_eq!(recovered.disk.index().nodes().filter(|n| n.row).count(), 3);
+        assert_eq!(recovered.disk.index().nodes().filter(|n| n.row).count(), 9);
         assert_eq!(recovered.disk.used(), total);
         let rewind = recovered
             .lookup(&history(6 * PAGE_TOKENS), 0, u64::MAX)
             .unwrap();
-        assert_eq!(rewind.consumed_tokens, PAGE_TOKENS);
+        assert_eq!(rewind.consumed_tokens, 6 * PAGE_TOKENS);
         let hit = recovered.lookup(&full, 0, u64::MAX).unwrap();
         assert_eq!(hit.tier, Tier::Nvme);
         recovered
@@ -1976,11 +2004,172 @@ mod tests {
     }
 
     #[test]
+    fn composite_keeps_a_parents_row_while_headroom_remains() {
+        let Some(directory) = test_directory("composite", "keep-parent-row") else {
+            return;
+        };
+        let mut store = composite(&directory, 128, 16, 1 << 30);
+        let full = history(3 * PAGE_TOKENS);
+        let mut ids = Ids::new();
+        let mut checkpoints = Vec::new();
+        for turn in 1..=3u32 {
+            let checkpoint = checkpoint(
+                &mut ids,
+                &full,
+                u64::from(turn) * PAGE_TOKENS,
+                (turn > 1).then(|| u64::from(turn - 1) * PAGE_TOKENS),
+                pages(0..turn),
+                1,
+                StateSlotId(turn),
+            );
+            if let Some(parent) = checkpoint.parent {
+                store.disk.index_mut().pin(&parent).unwrap();
+            }
+            let (_, bytes) =
+                copy_landed(&mut store, &checkpoint, checkpoint.parent, u64::from(turn));
+            store.memory_stored(checkpoint.id, checkpoint.key, Ok(bytes), &mut Vec::new());
+            checkpoints.push(checkpoint);
+        }
+        assert!(
+            store
+                .memory
+                .record(&checkpoints[1].key)
+                .unwrap()
+                .row
+                .is_some(),
+            "the DRAM row of a recently stored parent was dropped with no memory pressure"
+        );
+        let mut branch = history(2 * PAGE_TOKENS);
+        branch
+            .append(&vec![7; PAGE_TOKENS as usize + 5], &[])
+            .unwrap();
+        let hit = store.lookup(&branch, 0, u64::MAX).unwrap();
+        assert_eq!(hit.consumed_tokens, 2 * PAGE_TOKENS);
+        store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn pressure_reclaims_the_oldest_parent_row_and_stops_with_headroom() {
+        let Some(directory) = test_directory("composite", "parent-row-pressure") else {
+            return;
+        };
+        let mut store = composite(&directory, 22, 0, 1 << 30);
+        let full = history(4 * PAGE_TOKENS);
+        let mut ids = Ids::new();
+        let mut checkpoints = Vec::new();
+        for turn in 1..=4u32 {
+            let checkpoint = checkpoint(
+                &mut ids,
+                &full,
+                u64::from(turn) * PAGE_TOKENS,
+                (turn > 1).then(|| u64::from(turn - 1) * PAGE_TOKENS),
+                pages(0..turn),
+                1,
+                StateSlotId(turn),
+            );
+            if turn == 4 {
+                store.reused(checkpoints[1]);
+            }
+            if let Some(parent) = checkpoint.parent {
+                store.disk.index_mut().pin(&parent).unwrap();
+            }
+            let (_, bytes) =
+                copy_landed(&mut store, &checkpoint, checkpoint.parent, u64::from(turn));
+            store.memory_stored(checkpoint.id, checkpoint.key, Ok(bytes), &mut Vec::new());
+            checkpoints.push(checkpoint.key);
+        }
+        assert!(store.memory.record(&checkpoints[1]).unwrap().row.is_some());
+        assert!(store.memory.record(&checkpoints[2]).unwrap().row.is_none());
+        assert_eq!(store.stats().rows_thinned, [1, 0]);
+        assert_eq!(
+            store.memory.pool().free_slots() - store.memory.pool().intake_slots(),
+            9
+        );
+        store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn thinning_queue_keeps_only_resident_records_after_removal_and_eviction() {
+        for remove_explicitly in [false, true] {
+            let Some(directory) = test_directory("composite", "thinning-queue-bound") else {
+                return;
+            };
+            let mut store = composite(&directory, 1024, 0, 1 << 30);
+            let mut ids = Ids::new();
+            for salt in 1..=64 {
+                let mut full = PrefixHistory::new(IDENTITY);
+                full.append(&vec![salt; 192], &[]).unwrap();
+                let mut checkpoints = Vec::new();
+                for turn in 1..=3u32 {
+                    let checkpoint = checkpoint(
+                        &mut ids,
+                        &full,
+                        u64::from(turn) * PAGE_TOKENS,
+                        (turn > 1).then(|| u64::from(turn - 1) * PAGE_TOKENS),
+                        pages(0..turn),
+                        1,
+                        StateSlotId(turn),
+                    );
+                    if let Some(parent) = checkpoint.parent {
+                        store.disk.index_mut().pin(&parent).unwrap();
+                    }
+                    written(&mut store, &checkpoint, checkpoint.parent, u64::from(salt));
+                    checkpoints.push(checkpoint);
+                }
+                assert!(store.thinning.contains(&checkpoints[1].key));
+                if remove_explicitly {
+                    for checkpoint in checkpoints.iter().rev() {
+                        store.disk.expire(checkpoint.key).unwrap();
+                        store.drop_evicted_copies();
+                    }
+                } else {
+                    let bytes = store.disk.used();
+                    store.disk.set_limit(bytes);
+                    let key = PrefixKey {
+                        consumed_tokens: 8 * PAGE_TOKENS,
+                        digest: [salt as u8; 16],
+                    };
+                    store
+                        .disk
+                        .reserve_record(key, None, [0; 16], 8, true, true)
+                        .unwrap();
+                    store.drop_evicted_copies();
+                    assert!(
+                        checkpoints
+                            .iter()
+                            .all(|checkpoint| !store.disk.index().contains(&checkpoint.key))
+                    );
+                    store
+                        .disk
+                        .commit_record(key, Err(invalid("unused reservation")), None)
+                        .unwrap();
+                    store.disk.set_limit(1 << 30);
+                }
+                assert!(
+                    store
+                        .thinning
+                        .iter()
+                        .all(|key| store.memory.index().contains(key)),
+                    "stale thinning keys after chain {salt}, explicit removal={remove_explicitly}"
+                );
+                assert!(store.thinning.len() <= store.memory.index().len());
+            }
+            store.close().unwrap();
+            drop(store);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
     fn thinning_waits_for_a_spill_then_for_the_disk_child_commit() {
         let Some(directory) = test_directory("composite", "thinning-during-spill") else {
             return;
         };
-        let mut store = composite(&directory, 128, 16, 1 << 30);
+        let mut store = composite(&directory, 18, 0, 1 << 30);
         let full = history(3 * PAGE_TOKENS);
         let mut ids = Ids::new();
         let checkpoints: Vec<_> = (1..=3u32)
@@ -2000,6 +2189,13 @@ mod tests {
             unreachable!()
         };
         written(&mut store, root, None, 1);
+        let file_bytes = store
+            .disk
+            .record(&root.key)
+            .unwrap()
+            .header
+            .length_with_row();
+        store.disk.set_limit(3 * file_bytes + 2 * ROW_RECORD);
         // Match `store`'s parent pin for each synthetic copy-out.
         store.disk.index_mut().pin(&root.key).unwrap();
         let (record, bytes) = copy_landed(&mut store, parent, parent.parent, 2);
@@ -3555,7 +3751,7 @@ mod tests {
             assert!(!store.memory.record(&root.key).unwrap().durable);
             assert_eq!(store.parked[&root.key].failures, 0);
             assert_eq!(store.stats().store_failed, 0);
-            assert_eq!(store.stats().dropped, [0; 6]);
+            assert_eq!(store.stats().dropped, [0; 8]);
             assert!(store.stats().held[0] > 0);
             fs::remove_file(flag).unwrap();
             poll_until(&mut store, &mut Vec::new(), |s| s.outbound.is_empty());
@@ -3730,7 +3926,7 @@ mod tests {
         assert_eq!(store.stats().stored, 3 + persisted as u64);
         assert!(store.jobs.is_empty());
         assert_eq!(store.stats().store_failed, 0);
-        assert_eq!(store.stats().dropped, [0; 6]);
+        assert_eq!(store.stats().dropped, [0; 8]);
         assert!(store.stats().held[0] > 0);
         store.close().unwrap();
         drop(store);
@@ -4585,7 +4781,7 @@ mod tests {
                 .all(|root| store.memory.record(&root.key).is_some())
         );
         assert_eq!(store.parked.len(), roots.len());
-        assert_eq!(store.stats().dropped, [0; 6]);
+        assert_eq!(store.stats().dropped, [0; 8]);
         assert!(store.stats().held[0] > 0);
         let mut events = Vec::new();
         poll_until(&mut store, &mut events, |store| store.jobs.is_empty());

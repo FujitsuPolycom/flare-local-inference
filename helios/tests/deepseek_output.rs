@@ -308,25 +308,42 @@ async fn json_literals_keep_markup_as_content_and_tool_blocks_end_output() {
 }
 
 #[test]
-fn complete_calls_validate_nonempty_names_and_json_arguments() {
+fn complete_calls_reject_empty_names_and_retain_values_that_are_not_json() {
     for spaced in [false, true] {
         let (open, body, close) = block(spaced);
-        for invalid in [
-            body.replace("name=\"lookup\"", "name=\"\""),
-            body.replace(">3</", ">not-json</"),
-        ] {
-            let text = format!("{open}{invalid}{close}");
-            assert!(
-                actual(
-                    &[&text],
-                    spaced,
-                    OutputStart::Content,
-                    false,
-                    Termination::Eos
-                )
-                .is_err(),
-                "{text}"
-            );
+        // Fed whole when `whole` is set, and one character at a time otherwise.
+        let feed = |body: String, whole: bool| {
+            let text = format!("{open}{body}{close}");
+            let chunks: Vec<_> = if whole {
+                vec![text.as_str()]
+            } else {
+                text.char_indices()
+                    .map(|(i, c)| &text[i..i + c.len_utf8()])
+                    .collect()
+            };
+            actual(
+                &chunks,
+                spaced,
+                OutputStart::Content,
+                false,
+                Termination::Eos,
+            )
+        };
+        let run = |body: String| feed(body, true);
+        assert!(run(body.replace("name=\"lookup\"", "name=\"\"")).is_err());
+        // A `string="false"` value is JSON the model wrote. Text that does not
+        // parse stays in the call as a string.
+        for (raw, whole) in ["not-json", r#"["grep '\.' a"]"#, r#""open"#, "", "1, 2"]
+            .into_iter()
+            .flat_map(|raw| [(raw, true), (raw, false)])
+        {
+            let parsed = feed(body.replace(">3</", &format!(">{raw}</")), whole).unwrap();
+            assert_eq!(parsed.calls.len(), 2);
+            let arguments: Value = serde_json::from_str(&parsed.calls[0].1).unwrap();
+            assert_eq!(arguments["city"], "東京🙂\\\nquoted \"value\"");
+            assert_eq!(arguments["limit"], json!(raw));
+            let arguments: Value = serde_json::from_str(&parsed.calls[1].1).unwrap();
+            assert_eq!(arguments, json!({"items": [true, null, {"x": 2}]}));
         }
     }
 }
@@ -509,6 +526,75 @@ fn tool_call_buffers_are_bounded_without_limiting_plain_content() {
             .err()
             .unwrap();
             assert!(error.to_string().contains("1 MiB"), "{error}");
+        }
+    }
+}
+
+fn parse_literal_parameters(
+    spaced: bool,
+    parameters: &[(&str, &str)],
+) -> flare_helios::Result<Parsed> {
+    let (open, _, close) = block(spaced);
+    let s = if spaced { " " } else { "" };
+    let mut output = pipeline(spaced, OutputStart::Content, false);
+    let header = format!("{open}<｜DSML｜{s}invoke name=\"lookup\">");
+    assert!(output.push(Input::Text(&header))?.is_empty());
+    for (name, value) in parameters {
+        let parameter = format!(
+            "<｜DSML｜{s}parameter name=\"{name}\" string=\"false\">{value}</｜DSML｜{s}parameter>"
+        );
+        assert!(output.push(Input::Text(&parameter))?.is_empty());
+    }
+    let end = format!("</｜DSML｜{s}invoke>{close}");
+    let mut parsed = Parsed::default();
+    for event in output.push(Input::Text(&end))? {
+        parsed.event(event);
+    }
+    for event in output.finish(Termination::Eos)? {
+        parsed.event(event);
+    }
+    assert_eq!(parsed.ended, 1);
+    Ok(parsed)
+}
+
+#[test]
+fn tool_call_size_includes_retained_strings_and_closing_brace_in_either_order() {
+    const LIMIT: usize = 1024 * 1024;
+    let overhead = "lookup".len() + r#"{"note": "\t", "n": 1}"#.len();
+    for spaced in [false, true] {
+        for size in [LIMIT, LIMIT + 1, LIMIT + 2] {
+            let note = format!("{}\t", "x".repeat(size - overhead));
+            for parameters in [
+                [("note", note.as_str()), ("n", "1")],
+                [("n", "1"), ("note", note.as_str())],
+            ] {
+                let result = parse_literal_parameters(spaced, &parameters);
+                if size == LIMIT {
+                    let parsed = result.unwrap();
+                    let (name, arguments) = &parsed.calls[0];
+                    assert_eq!(name.len() + arguments.len(), LIMIT);
+                    assert_eq!(parsed.arguments(), [json!({"note": note, "n": 1})]);
+                } else {
+                    let error = result.err().expect("oversized tool call was published");
+                    assert!(error.to_string().contains("1 MiB"), "{error}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn literal_nesting_includes_the_enclosing_argument_object() {
+    for spaced in [false, true] {
+        for depth in [126, 127, 128] {
+            let value = format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
+            let parsed = parse_literal_parameters(spaced, &[("x", &value)]).unwrap();
+            let expected = if depth == 126 {
+                serde_json::from_str(&value).unwrap()
+            } else {
+                Value::String(value)
+            };
+            assert_eq!(parsed.arguments(), [json!({"x": expected})]);
         }
     }
 }

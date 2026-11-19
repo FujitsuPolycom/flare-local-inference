@@ -29,7 +29,7 @@ cite them by number.
 3. **Encryption is declared, not negotiated.** The client selects its connection
    mode before connecting; see [address forms and trust](docs/network-operations.md#addresses-and-startup-warnings).
    For TCP clients, `Hello.encryption` must equal what the client connected with,
-   else the pool is disabled for the process (one warning, local tiers only).
+   else instance startup fails with an encryption-mode error.
    Unix-socket clients trust filesystem permissions and accept either network mode.
    RDMA is not listed in `data_transports` when the manager is TLS.
 4. **Same host is proven by the socket; levels.** `shared_memory` is
@@ -40,9 +40,10 @@ cite them by number.
    (neighbour GPU = level 2, neighbour DRAM = 3, neighbour NVMe = 4) are offered
    to every session, whether the copy goes through shared windows or through the
    manager's relay. Manager-store candidates are offered
-   to every session: a same-host manager's DRAM is level 3 and its NVMe level 4; a
-   remote manager's records (DRAM or NVMe) are level 5. The manager computes the
-   level from the requester's perspective.
+   to every session: a same-host manager chain is level 3 when every record the
+   claim reads is in DRAM, and level 4 when any requires NVMe. A remote manager's
+   records (DRAM or NVMe) are level 5. The candidate's `tier` is the endpoint's
+   tier; its level reflects the slowest tier read from the requester's perspective.
 5. **Content keys.** A source pins ready content by its scoped prefix key and
    validates the chain shape. Index entries are hints: late evictions can remove
    a fresh hint and cause a miss, but cannot grant ownership or change bytes.
@@ -98,9 +99,10 @@ cite them by number.
     export pinned, subtracts the resources the pin protects once, and uses the
     reservation arithmetic that admission uses, never a copy of it.
 17. **Put is part of the protocol.** The eviction cascade ends in a write into the
-    manager's store. Refusals keep the source local and release its selection.
-    Retrying requires manager progress, reconnect or a short backoff; the model
-    worker never waits for room.
+    manager's store. Refusals follow the pressure policy in section 11: invalid
+    or oversized puts discard the source; budget or in-flight refusals retry once
+    after a backoff, then discard it. Other failures keep the source local and
+    release selection. The model worker never waits for room.
 18. **Entries die with their session; its successor announces its own.** When a
     session ends, with or without a successor, the manager removes every entry it
     announced. When a new session opens for the same `instance_id`, the old
@@ -215,10 +217,13 @@ Manager algorithm for each candidate source entry (endpoint `E` with a row):
 
 1. Skip the requester's own instance and sources the requester cannot reach
    (decision 4), including sources with no export slots. Busy sources are eligible.
-2. Compute the level from the tier and the relation to the requester.
+2. Compute the initial level from the endpoint's tier and the relation to the requester.
 3. `begin` = `resident_tokens` (exact, not page-aligned); the physical start
    is `floor(begin / page_tokens)`. Walk parents from `E` to the node containing
-   that page and require a contiguous chain. A hole gives no candidate.
+   that page and require a contiguous chain. A hole gives no candidate. Manager
+   chains may mix DRAM and NVMe; instance chains must stay in one tier. For a
+   same-host manager, use level 4 if any record the claim reads requires NVMe;
+   otherwise use level 3. The candidate's `tier` remains the endpoint's tier.
 4. Drop it if it supplies no page and no row beyond `begin` (zero pages with the
    row is kept: a row-only tail).
 5. Order by longest match, then fixed copy level and stable source identity; return at most
@@ -228,8 +233,9 @@ Answers: `LOOKUP_OK`, `LOOKUP_NOT_READY` (with `retry_after_ms`),
 `LOOKUP_OVERLOADED` (the session already has `max_concurrent_lookups` lookups
 waiting; answered at once, never queued), `LOOKUP_INVALID`.
 The requester treats every non-OK answer, a timeout, and a lost session as "no
-pool candidates for this request" and admits with its local match. Each request
-owns its lookup ticket.
+pool candidates for this attempt" and can admit with its local match. A queued
+request whose ticket has no answer retries the lookup when selected for
+admission. Each request owns its lookup ticket.
 
 A candidate is a hint. After the reply the client verifies each node against its
 history; any mismatch drops the candidate. Lookup reserves no export slot: another
@@ -690,8 +696,10 @@ Other files are left alone. Shutdown retains the regions for reconnecting client
   back the pool. It disables the pool for the process (local tiers only, one
   warning) and never registers late. Restarting the instance picks up the new
   regions;
-- manager unreachable at the first connect: it waits a bounded time, then runs
-  local-only for the life of the process and never attaches later.
+- manager unreachable at the first connect: it waits up to 30 seconds, then
+  fails startup. Registration failure, session-opening timeout and rejected memory
+  approval also fail startup; the operator must correct the cause or remove
+  `--prefix-cache-pool` to run local-only.
 
 **Why reuse is safe.** Reusing the files gives up what files created per
 incarnation would guarantee: that no access under the dead manager can alias a
@@ -774,17 +782,24 @@ writer                          manager
  ...
  PutCommit{metadata} ---------->|
  <------ Stored{bytes}          |  committed, indexed: the writer may drop its copy
- or  <-- PutRefused{reason}     |  PRESENT is success; refusals keep the source local
+ or  <-- PutRefused{reason}     |  PRESENT is success; other reasons follow pressure policy
 ```
 
 - `PutCancel` is legal only before `PutCommit`. Unfilled windows stay leased to
   the writer until `FenceAck{put_id}` or process exit.
-- "Already held means committed": `Stored` and `PRESENT` are the only answers
-  that let the writer remove its local copy after a handover. All refusals,
-  synchronous submission errors and repeated failures retain the source.
+- For a record not already indexed, if the published parent is absent or has no
+  stored row, `PutAccept` selects no parent and `first_page = 0`. The writer sends
+  the complete page chain and endpoint row as a root, over shared memory or the data channel.
+- "Already held means committed": only `Stored` and `PRESENT` confirm a
+  committed destination copy. Discarding a refused source under the pressure
+  policy does not establish a destination copy.
 - **Pressure policy.** `BUDGET` may mean temporary staging or arena pressure,
-  not a full manager. Every refusal releases selection and retries only after
-  a manager or put event, a reconnect or a short backoff. Queue bounds stop
+  not a full manager. `INVALID` and `OVERSIZE` discard the source; `BUDGET` and
+  `INFLIGHT` retain selection for one retry after a 50 ms backoff, then discard
+  it if refused again with either reason. Pool events do not shorten this
+  backoff. Other refusals, synchronous submission errors and repeated failures
+  retain the source and release selection; their retries wait for a manager or
+  put event, a reconnect or a short backoff. Queue bounds stop
   selection before pinning. Unavailable or busy managers leave local LRU eviction
   as the end of the chain; only the manager's own LRU drops its committed data.
   Manager loss releases waiting selections through the failed-move path. Moves
@@ -820,6 +835,8 @@ wire service; the store has none of its own.
   burst on one session beyond `max_concurrent_lookups` is refused `LOOKUP_OVERLOADED` at once.
 - **Manager-store entries.** The manager's own store appears in each scope's index as the
   manager's entries (tier DRAM or NVMe; records recovered after a restart start on NVMe).
+  Manager chains may mix both tiers; instance chains may not. A candidate's `tier`
+  names its endpoint's tier, while its level reflects the slowest tier the claim reads.
 - **Windows.** An instance-to-instance claim reserves one staging block for the whole export
   (its size rounds up to the allocator's size class), cut into windows by the pinned records.
   A host-tier source whose export does not fit streams with `window_credits`. Windows for the

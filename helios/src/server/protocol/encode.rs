@@ -86,6 +86,7 @@ pub(crate) struct Encoder {
     tools: Vec<Tool>,
     tool_choice: ToolChoice,
     parallel_tool_calls: bool,
+    pub tool_limit_reached: bool,
     tool_grammars: std::collections::HashMap<String, crate::grammar::TextGrammar>,
     prompts: Vec<PromptUsage>,
     choices_per_prompt: usize,
@@ -136,6 +137,7 @@ impl Encoder {
             tools,
             tool_choice,
             parallel_tool_calls,
+            tool_limit_reached: false,
             tool_grammars: Default::default(),
             prompts,
             choices_per_prompt,
@@ -443,6 +445,9 @@ impl Encoder {
         let mut frames = vec![];
         let mut content_logprobs = Vec::new();
         for event in events {
+            if self.tool_limit_reached {
+                break;
+            }
             if matches!(self.tool_choice, ToolChoice::Named(_))
                 && matches!(&event, Event::Content(_) | Event::ContentLogprobs(_))
             {
@@ -479,13 +484,14 @@ impl Encoder {
                 _ => {}
             }
             if let Event::ToolBegin { name, .. } = &event {
+                if !self.parallel_tool_calls && self.outputs[index].has_tools() {
+                    self.tool_limit_reached = true;
+                    break;
+                }
                 if let ToolChoice::Named(selected) = &self.tool_choice {
                     if name != selected {
                         return Err(format!("model emitted tool {name:?}, but tool_choice selects {selected:?}").into());
                     }
-                }
-                if !self.parallel_tool_calls && self.outputs[index].has_tools() {
-                    return Err("parallel tool calls are disabled, but the model produced more than one tool call".into());
                 }
                 if self.tool_choice != ToolChoice::Auto && self.tool(name).is_none() {
                     return Err(format!("model emitted undeclared tool {name}").into());
@@ -530,6 +536,8 @@ impl Encoder {
         cached: u64,
         stop: Option<String>,
     ) -> Result<Vec<Frame>> {
+        let cause = if self.tool_limit_reached { Termination::Cancelled } else { cause };
+        let stop = if self.tool_limit_reached { None } else { stop };
         let mut frames = vec![];
         if self.protocol == Protocol::Chat {
             self.chats[index].finish()?;
