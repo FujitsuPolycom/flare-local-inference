@@ -768,11 +768,11 @@ impl Core {
             core.refused_claim(sid, key, m, reason);
             Ok(())
         };
-        let (scope, pid) = {
+        let (scope, pid, shm) = {
             let session = &self.sessions[&sid];
-            (session.scope, session.pid)
+            (session.scope, session.pid, session.shm)
         };
-        if self.link_for((key.0, key.1), scope, pid).is_none() {
+        if self.link_for((key.0, key.1), scope, pid, shm).is_none() {
             return refuse(self, v2::ClaimReason::SourceBusy);
         }
         let slices = self.requester_slices(sid);
@@ -968,12 +968,7 @@ impl Core {
             }
             Ok(GetAnswer::Done) => {
                 attest(&mut claim.parties, Owner::Store, Party::Drained, false);
-                // Every window is queued: the handler ends the transfer after them.
-                if let Some(hub) = self.cfg.channel.as_ref() {
-                    for leg in claim.legs.iter().filter(|leg| !leg.source) {
-                        hub.finish(leg.ch.transfer);
-                    }
-                }
+                self.finish_req_legs_if_delivered(key);
                 self.complete_if_latched(key);
             }
             Ok(GetAnswer::Refused(refused)) => {
@@ -2209,6 +2204,140 @@ mod tests {
         });
         core.claims.insert(key, claim);
         key
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pid_zero_exit_reclaims_windows_and_cancels_puts() {
+        use crate::pool::{
+            core::OpenPeer,
+            mp::PutMp,
+            store_bridge::{Link, PutPhase, PutRec, StoreHandle},
+        };
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pidfd = std::sync::Arc::new(crate::local::watch_pid(child.id()).0.unwrap());
+        let (mut core, _old_out) = core();
+        core.sessions.clear();
+        let (tx, _out) = mpsc::channel(64);
+        let sid = core
+            .open(
+                OpenPeer {
+                    unix: true,
+                    pid: 0,
+                    uid: core.euid,
+                    gid: core.egid,
+                    pidfd: Some(pidfd.clone()),
+                },
+                v2::OpenSession {
+                    manager_incarnation: core.incarnation,
+                    instance_id: INSTANCE.to_vec(),
+                    process_nonce: NONCE.to_vec(),
+                    scope: Some(v2::Scope {
+                        model_identity: vec![1; 32],
+                        layout_fingerprint: vec![2; 16],
+                        geometry: Some(v2::Geometry {
+                            page_tokens: 64,
+                            ranks: vec![v2::RankPlanes {
+                                plane_bytes: vec![4096],
+                                row_bytes: 4096,
+                            }],
+                            page_record_bytes: 4096,
+                            row_record_bytes: 4096,
+                        }),
+                    }),
+                    export_slots: 2,
+                    claim_slots: 2,
+                    ..Default::default()
+                },
+                tx,
+            )
+            .unwrap();
+        assert!(core.sessions[&sid].shm);
+        let process = (INSTANCE, NONCE);
+        assert!(core.procs[&process].pid.is_none());
+        assert!(std::sync::Arc::ptr_eq(
+            core.procs[&process].pidfd.as_ref().unwrap(),
+            &pidfd
+        ));
+        let key = delivered(&mut core);
+        let window = &mut core.claims.get_mut(&key).unwrap().windows[0];
+        window.phase = Phase::RequesterRead;
+        window.extent = Some(std::sync::Arc::new(
+            core.staging.allocate(6 * 4096).unwrap(),
+        ));
+        core.get_answer(key, Ok(GetAnswer::Done));
+        core.finish(key, v2::ClaimState::Failed, v2::ClaimReason::Cancelled);
+        let link = Link {
+            connection: 7,
+            namespace: [0; 32],
+        };
+        let put = (INSTANCE, NONCE, 2);
+        core.puts.insert(
+            put,
+            PutRec {
+                phase: PutPhase::Open,
+                link,
+                pending_windows: 0,
+                remaining: 0,
+                windows: [(0, std::sync::Arc::new(core.staging.allocate(4096).unwrap()))].into(),
+                parties: vec![Participant {
+                    owner: Owner::Proc(process),
+                    source: true,
+                    memory: true,
+                    state: Party::Quarantined,
+                }],
+                refused: false,
+                key: crate::Key::default(),
+                chain_pages: 1,
+                row: true,
+                accepted: None,
+                legs: Vec::new(),
+                deferred_commit: None,
+                mp: PutMp {
+                    layout: rank_layout(1),
+                    peers: Vec::new(),
+                    windows: Default::default(),
+                    passes: 0,
+                    whole: Vec::new(),
+                    row: None,
+                },
+            },
+        );
+        let (commands, mut received) = mpsc::channel(64);
+        core.store = Some(StoreHandle {
+            commands,
+            next_connection: 7,
+        });
+        core.tick();
+        assert!(!core.procs[&process].exited);
+        assert_eq!(core.staging.used(), 9 * 4096);
+        assert!(core.puts.contains_key(&put));
+        assert!(received.try_recv().is_err());
+        drop(child.stdin.take());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !core.procs[&process].exited {
+            core.tick();
+            assert!(Instant::now() < deadline, "the child exit was not observed");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(core.staging.used(), 0);
+        assert!(!core.puts.contains_key(&put));
+        assert!(matches!(
+            received.try_recv(),
+            Ok(crate::store::StoreCommand::Cancel {
+                connection: 7,
+                transfer: 2
+            })
+        ));
+        core.session_lost(sid);
+        core.tick();
+        assert!(!core.procs.contains_key(&process));
+        assert!(child.wait().unwrap().success());
     }
 
     fn copy_ok() -> v2::CopyResult {

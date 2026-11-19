@@ -333,6 +333,7 @@ Embedded native code may have additional terms in the linked license files.
 | getrandom 0.2.17 | Runtime | [source](https://crates.io/api/v1/crates/getrandom/0.2.17/download) | [LICENSE-APACHE](getrandom-0.2.17/LICENSE-APACHE), [LICENSE-MIT](getrandom-0.2.17/LICENSE-MIT) |
 | getrandom 0.3.4 | Runtime | [source](https://crates.io/api/v1/crates/getrandom/0.3.4/download) | [LICENSE-APACHE](getrandom-0.3.4/LICENSE-APACHE), [LICENSE-MIT](getrandom-0.3.4/LICENSE-MIT) |
 | getrandom 0.4.3 | Runtime | [source](https://crates.io/api/v1/crates/getrandom/0.4.3/download) | [LICENSE-APACHE](getrandom-0.4.3/LICENSE-APACHE), [LICENSE-MIT](getrandom-0.4.3/LICENSE-MIT) |
+| gif 0.14.2 | Runtime | [source](https://crates.io/api/v1/crates/gif/0.14.2/download) | [LICENSE-APACHE](gif-0.14.2/LICENSE-APACHE), [LICENSE-MIT](gif-0.14.2/LICENSE-MIT) |
 | hashbrown 0.15.5 | Runtime | [source](https://crates.io/api/v1/crates/hashbrown/0.15.5/download) | [LICENSE-APACHE](hashbrown-0.15.5/LICENSE-APACHE), [LICENSE-MIT](hashbrown-0.15.5/LICENSE-MIT) |
 | hashbrown 0.17.1 | Runtime | [source](https://crates.io/api/v1/crates/hashbrown/0.17.1/download) | [LICENSE-APACHE](hashbrown-0.17.1/LICENSE-APACHE), [LICENSE-MIT](hashbrown-0.17.1/LICENSE-MIT) |
 | heck 0.5.0 | Build/proc-macro only | [source](https://crates.io/api/v1/crates/heck/0.5.0/download) | [LICENSE-APACHE](heck-0.5.0/LICENSE-APACHE), [LICENSE-MIT](heck-0.5.0/LICENSE-MIT) |
@@ -436,6 +437,7 @@ Embedded native code may have additional terms in the linked license files.
 | ureq-proto 0.6.4 | Runtime | [source](https://crates.io/api/v1/crates/ureq-proto/0.6.4/download) | [LICENSE-APACHE.txt](ureq-proto-0.6.4/LICENSE-APACHE.txt), [LICENSE-MIT.txt](ureq-proto-0.6.4/LICENSE-MIT.txt) |
 | url 2.5.8 | Runtime | [source](https://crates.io/api/v1/crates/url/2.5.8/download) | [LICENSE-APACHE](url-2.5.8/LICENSE-APACHE), [LICENSE-MIT](url-2.5.8/LICENSE-MIT) |
 | utf8-zero 0.8.1 | Runtime | [source](https://crates.io/api/v1/crates/utf8-zero/0.8.1/download) | [LICENSE-APACHE](utf8-zero-0.8.1/LICENSE-APACHE), [LICENSE-MIT](utf8-zero-0.8.1/LICENSE-MIT) |
+| weezl 0.1.12 | Runtime | [source](https://crates.io/api/v1/crates/weezl/0.1.12/download) | [LICENSE-APACHE](weezl-0.1.12/LICENSE-APACHE), [LICENSE-MIT](weezl-0.1.12/LICENSE-MIT) |
 | windows-link 0.2.1 | Runtime | [source](https://crates.io/api/v1/crates/windows-link/0.2.1/download) | [license-apache-2.0](windows-link-0.2.1/license-apache-2.0), [license-mit](windows-link-0.2.1/license-mit) |
 | windows-sys 0.59.0 | Runtime | [source](https://crates.io/api/v1/crates/windows-sys/0.59.0/download) | [license-apache-2.0](windows-sys-0.59.0/license-apache-2.0), [license-mit](windows-sys-0.59.0/license-mit) |
 | windows-sys 0.60.2 | Runtime | [source](https://crates.io/api/v1/crates/windows-sys/0.60.2/download) | [license-apache-2.0](windows-sys-0.60.2/license-apache-2.0), [license-mit](windows-sys-0.60.2/license-mit) |

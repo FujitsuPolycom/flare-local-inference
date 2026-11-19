@@ -1137,8 +1137,9 @@ templates across quantization publishers as specified in
 The [native image processor](../helios/src/frontend/images/mod.rs) is checked
 against the checkpoint's Transformers processor. Compare resized and normalized
 pixels, patch order, image grids, placeholder expansion, and positions before
-admitting image requests. PNG, JPEG, and static WebP decoding preserve the
-prepared profile's alpha and EXIF orientation semantics. JPEG and lossy WebP
+admitting image requests. PNG, JPEG, static WebP, and non-animated GIF decoding
+preserve the prepared profile's alpha semantics. PNG, JPEG, and static WebP also
+preserve EXIF orientation; GIF carries none. JPEG and lossy WebP
 RGB values use a per-channel tolerance of two against Pillow fixtures;
 resize, normalization, and patch formation must
 match exactly when given the same decoded pixels.

@@ -56,6 +56,7 @@ pub enum ImageEncoding {
     Png,
     Jpeg,
     Webp,
+    Gif,
 }
 
 #[derive(Debug)]
@@ -435,10 +436,10 @@ impl ImageProcessor {
         })
     }
 
-    /// The extent an encoded image decodes to, after the orientation the profile
+    /// The extent an encoded video frame decodes to, after the orientation the profile
     /// applies, read without decoding pixels. The checks are those the decoder makes
     /// before it decodes: the byte and pixel limits and the supported sample formats.
-    pub fn probe_encoded(
+    pub fn probe_video_frame(
         &self,
         encoding: ImageEncoding,
         bytes: &[u8],
@@ -447,6 +448,9 @@ impl ImageProcessor {
             ImageEncoding::Png => self.probe_png(bytes),
             ImageEncoding::Jpeg => self.probe_jpeg(bytes),
             ImageEncoding::Webp => self.probe_webp(bytes),
+            ImageEncoding::Gif => Err(Error::frontend(FrontendError::Input(Failure::new(
+                "video frames must be PNG, JPEG, or WebP images",
+            )))),
         }
     }
 
@@ -488,15 +492,12 @@ impl ImageProcessor {
                 e,
             )))
         })?;
-        let (width, height, bit_depth, animated) = {
-            let info = reader.info();
-            (info.width as usize, info.height as usize, info.bit_depth,
-             info.animation_control.is_some())
-        };
+        let info = reader.info();
+        let (width, height) = (info.width as usize, info.height as usize);
         self.check_input_extent(width, height)?;
-        if bit_depth == png::BitDepth::Sixteen || animated {
+        if info.animation_control.is_some() {
             return Err(Error::frontend(FrontendError::ImageDecode(Failure::new(
-                "PNG requires non-animated, at most 8-bit samples",
+                "animated PNG is not supported",
             ))));
         }
         // An eXIf chunk may follow the image data. `finish` skips that data without
@@ -599,6 +600,7 @@ impl ImageProcessor {
             ImageEncoding::Png => self.decode_png(bytes),
             ImageEncoding::Jpeg => self.decode_jpeg(bytes),
             ImageEncoding::Webp => self.decode_webp(bytes),
+            ImageEncoding::Gif => self.decode_gif(bytes),
         }?;
         self.counts
             .decoded

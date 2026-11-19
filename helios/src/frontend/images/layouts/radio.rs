@@ -8,7 +8,7 @@ use crate::{
     cache::ConditioningEvent,
     frontend::{
         Frontend, RenderedPrompt,
-        images::{ImageProcessor, ImageDescription},
+        images::{ImageProcessor, ImageDescription, RADIO_PLACEHOLDER},
     },
     model::{PreparedInput, PromptData},
 };
@@ -19,7 +19,7 @@ pub(crate) fn prepare_input(
     rendered: &RenderedPrompt,
     images: &[ImageDescription],
 ) -> Result<PreparedInput> {
-    let placeholder = frontend.encode("<image>", false)?;
+    let placeholder = frontend.encode(RADIO_PLACEHOLDER, false)?;
     let [placeholder] = placeholder.as_slice() else {
         return Err("RADIO image placeholder must encode one token".into());
     };

@@ -165,10 +165,17 @@ class HeldFile:
     path: Path
     descriptor: int
     identity: tuple
+    name: str
 
     def validate(self):
-        if file_identity(self.descriptor) != self.identity or file_identity_path(self.path) != self.identity:
-            raise RuntimeError("checkpoint source changed after admission")
+        try:
+            if file_identity(self.descriptor) == self.identity and file_identity_path(self.path) == self.identity:
+                return
+            cause = None
+        except OSError as error:
+            # The error text carries the absolute path and is sent to the peer.
+            cause = error
+        raise RuntimeError(f"checkpoint source changed after admission: {self.name}") from cause
 
 
 def file_identity_path(path):
@@ -199,7 +206,7 @@ class RootSource:
                     continue
                 name = relative_name(path.relative_to(self.snapshot).as_posix())
                 descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
-                held = HeldFile(path, descriptor, file_identity(descriptor))
+                held = HeldFile(path, descriptor, file_identity(descriptor), name)
                 self.files[name] = held
                 # Selective reads release their completed ranges; read-ahead outside those ranges
                 # would remain cached in the same DRAM needed by the integrated GPU.
@@ -297,6 +304,12 @@ class SourceServer:
                     raise ValueError(f"unknown checkpoint source operation {kind}")
         except BaseException as error:
             self.error = error
+            # The peer exits on this error and closes its control socket, and _watch_until_closed in
+            # host_ranks.py then ends this process; print the reason first.
+            try:
+                print(f"flare: checkpoint source for rank {self.rank} failed: {error}", flush=True)
+            except (OSError, ValueError):
+                pass
             if channel is not None:
                 try:
                     channel.send("error", error=str(error)[:4096])

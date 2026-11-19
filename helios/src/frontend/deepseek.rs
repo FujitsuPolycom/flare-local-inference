@@ -437,27 +437,10 @@ pub(super) fn render(
         .collect::<Result<Vec<_>>>()?;
     let mut token_ids = Vec::new();
     let mut offsets = Vec::new();
-    let plain = frontend
-        .ordinary_tokenizer
-        .as_ref()
-        .expect("DeepSeek plain tokenizer is initialized");
     let mut start = 0;
     let mut image_count = 0;
     for range in &rendered.special_ranges {
-        let span = &rendered.prompt[start..range.start];
-        let encoding = plain.encode(span, false).map_err(|error| {
-            Error::frontend(FrontendError::Tokenizer(Failure::boxed(
-                error.to_string(),
-                error,
-            )))
-        })?;
-        token_ids.extend_from_slice(encoding.get_ids());
-        offsets.extend(
-            encoding
-                .get_offsets()
-                .iter()
-                .map(|&(a, b)| (start + a, start + b)),
-        );
+        frontend.push_ordinary(&rendered.prompt, start..range.start, &mut token_ids, &mut offsets)?;
         let special = &rendered.prompt[range.clone()];
         let id = if special == IMAGE_SPECIAL_TOKEN {
             image_count += 1;
@@ -472,21 +455,12 @@ pub(super) fn render(
         offsets.push((range.start, range.end));
         start = range.end;
     }
-    let encoding = plain
-        .encode(&rendered.prompt[start..], false)
-        .map_err(|error| {
-            Error::frontend(FrontendError::Tokenizer(Failure::boxed(
-                error.to_string(),
-                error,
-            )))
-        })?;
-    token_ids.extend_from_slice(encoding.get_ids());
-    offsets.extend(
-        encoding
-            .get_offsets()
-            .iter()
-            .map(|&(a, b)| (start + a, start + b)),
-    );
+    frontend.push_ordinary(
+        &rendered.prompt,
+        start..rendered.prompt.len(),
+        &mut token_ids,
+        &mut offsets,
+    )?;
     if image_count != image_sources.len() {
         return Err(invalid(
             "image placeholder count does not match image sources",
@@ -542,6 +516,7 @@ pub(super) fn render(
         image_sources,
         video_sources: Vec::new(),
         image_checkpoint_hints: Vec::new(),
+        ordinary: Vec::new(),
         message_boundaries,
     })
 }

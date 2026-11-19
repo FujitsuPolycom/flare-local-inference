@@ -163,6 +163,7 @@ pub(super) fn prepare_inference_cached(
                 image_sources: Vec::new(),
                 video_sources: Vec::new(),
                 image_checkpoint_hints: Vec::new(),
+                ordinary: Vec::new(),
             },
             echo,
         )
@@ -736,6 +737,24 @@ mod tests {
         assert!(pixels.contains("image is 40x40 px; max_image_pixels is 1000"), "{pixels}");
     }
     #[test]
+    fn gif_data_url_is_decoded_and_described() {
+        use crate::frontend::images::{ImageLimits, ImageSettings};
+        let encoded = include_bytes!("../../../tests/frontend/gif-inputs/frame-offset.gif");
+        let url = format!(
+            "data:image/gif;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(encoded)
+        );
+        let processor = ImageProcessor::load(ImageSettings::Moonvit {}, ImageLimits::default()).unwrap();
+        let images = describe_images(&[url], Some(&processor), None).unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!((images[0].description.width, images[0].description.height), (20, 12));
+        let error = describe_images(&["data:image/gif;base64,AA==".into()], Some(&processor), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid GIF"), "{error}");
+    }
+
+    #[test]
     fn source_cache_coalesces_decoding_and_preserves_media_validation() {
         use crate::frontend::images::{ImageLimits, ImageSettings};
         use flare_selene::input::{DiskBudget, InputStore};
@@ -921,7 +940,7 @@ fn describe_images(
         processor
             .check_batch(index + 1, 0)
             .map_err(|error| error.admission_context(AdmissionError::Image))?;
-        let (encoding, bytes) = image_data_url(url, processor)?;
+        let (encoding, bytes) = image_data_url(url, processor, true)?;
         let source_key = processor.source_identity(encoding, &bytes);
         let _source_guard = input_store.map(|store| store.source_guard(source_key));
         let description = input_store.and_then(|store| {
@@ -985,21 +1004,24 @@ fn describe_images(
 fn image_data_url(
     url: &str,
     processor: &ImageProcessor,
+    allow_gif: bool,
 ) -> Result<(crate::frontend::images::ImageEncoding, Vec<u8>)> {
     use crate::frontend::images::ImageEncoding;
-    let (data, encoding) =
-        if let Some(data) = url.strip_prefix("data:image/png;base64,") {
-            (data, ImageEncoding::Png)
-        } else if let Some(data) = url.strip_prefix("data:image/jpeg;base64,") {
-            (data, ImageEncoding::Jpeg)
-        } else if let Some(data) = url.strip_prefix("data:image/webp;base64,") {
-            (data, ImageEncoding::Webp)
-        } else {
-            return Err(Error::admission(
-                AdmissionError::Image,
-                "image input requires a base64 PNG, JPEG, or WebP data URL",
-            ));
-        };
+    let (media, data) = url.split_once(";base64,").unwrap_or_default();
+    let encoding = match media {
+        "data:image/png" => ImageEncoding::Png,
+        "data:image/jpeg" => ImageEncoding::Jpeg,
+        "data:image/webp" => ImageEncoding::Webp,
+        "data:image/gif" if allow_gif => ImageEncoding::Gif,
+        _ => return Err(Error::admission(
+            AdmissionError::Image,
+            if allow_gif {
+                "image input requires a base64 PNG, JPEG, WebP, or GIF data URL"
+            } else {
+                "video frame requires a base64 PNG, JPEG, or WebP data URL"
+            },
+        )),
+    };
     if data.len() > processor.max_encoded_bytes().div_ceil(3).saturating_mul(4) {
         return Err(Error::admission(
             AdmissionError::Image,
@@ -1078,10 +1100,10 @@ fn describe_videos(
         let mut extent = None;
         for (frame, url) in source.frames.iter().enumerate() {
             let frame = frame + 1;
-            let (encoding, bytes) = image_data_url(url, processor)
+            let (encoding, bytes) = image_data_url(url, processor, false)
                 .map_err(|error| rejected(format!("video {clip} frame {frame}"), error))?;
             let probed = processor
-                .probe_encoded(encoding, &bytes)
+                .probe_video_frame(encoding, &bytes)
                 .map_err(|error| rejected(format!("video {clip} frame {frame}"), error))?;
             let (width, height) = *extent.get_or_insert(probed);
             if probed != (width, height) {

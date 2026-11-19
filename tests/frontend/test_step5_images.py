@@ -40,6 +40,11 @@ def test_native_chat_template(reference, tmp_path):
 
     _, tokenizer, assets = reference
     original = _compile_jinja_template((CHECKPOINT / "chat_template.jinja").read_text())
+    from tokenizers import Tokenizer
+
+    ordinary_config = json.loads((CHECKPOINT / "tokenizer.json").read_text())
+    ordinary_config["added_tokens"] = []
+    ordinary = Tokenizer.from_str(json.dumps(ordinary_config))
     config = json.loads((CHECKPOINT / "tokenizer_config.json").read_text())
     special = {key: config[key] for key in ("bos_token", "eos_token")}
     for name in ("tokenizer.json", "tokenizer_config.json"):
@@ -61,8 +66,15 @@ def test_native_chat_template(reference, tmp_path):
         for preserve in (False, True):
             options = dict(options, add_generation_prompt=True, preserve_thinking=preserve)
             rendered = original.render(messages=messages, **special, **options)
+            ids = tokenizer.encode(rendered, add_special_tokens=False).ids
+            if name == "image":
+                literal = messages[0]["content"]
+                before, after = rendered.split(literal)
+                ids = (tokenizer.encode(before, add_special_tokens=False).ids
+                    + ordinary.encode(literal, add_special_tokens=False).ids
+                    + tokenizer.encode(after, add_special_tokens=False).ids)
             fixtures["cases"].append({"name": f"{name}-{preserve}", "messages": messages, "options": options,
-                "rendered": rendered, "token_ids": tokenizer.encode(rendered, add_special_tokens=False).ids})
+                "rendered": rendered, "token_ids": ids})
     for name, options in (("thinking_disabled", {"enable_thinking": False, "add_generation_prompt": True}),
                           ("thinking_enabled", {"enable_thinking": True, "add_generation_prompt": True}),
                           ("default", {"enable_thinking": True, "add_generation_prompt": False})):

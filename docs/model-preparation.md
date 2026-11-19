@@ -420,10 +420,27 @@ each continuation row stores the offset between a request's rotary position and
 its token index; decode, the DFlash2 draft, and snapshot/restore reuse that
 offset, while KV page addressing keeps the token index.
 
-Prepare on the same GPU architecture as the serving device:
+Prepare on the same GPU architecture as the serving device. Set the image
+slot count to zero for an explicitly text-only core.
 
 ```sh
-.venv/bin/ignition export qwen3.8-27b --gpus 0
+.venv/bin/ignition export qwen3.8-27b --gpus 0 --image-concurrency 0
+```
+
+For four image slots and up to 16 concurrent requests, set both limits.
+
+```sh
+.venv/bin/ignition export qwen3.8-27b --gpus 0 --max-concurrency 16 --image-concurrency 4
+```
+
+The GB10 image and video serving checks used the paged-attention warmup fix proposed in
+[#268](https://github.com/NVIDIA/hyperflare-inference/issues/268). The 32 GiB
+RTX 5090 serving checks used reduced graph and vision storage reservations.
+The image and video branches integrated with main `ba42481a` have CPU validation only.
+
+To convert either core, use the cache entry printed by its export.
+
+```sh
 .venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/qwen38-27b-tp1.safetensors
 ```
 
@@ -569,7 +586,7 @@ Images replay one at a time into bounded windows in the request's feature buffer
 Chunked prefill consumes each window before the buffer is reused. Combined image
 tokens may exceed the buffer's capacity; each image must fit one window and a
 captured patch capacity. HTTP body and total context limits also apply.
-PNG, JPEG, and static WebP data URLs are accepted.
+PNG, JPEG, static WebP, and non-animated GIF data URLs are accepted.
 
 For Qwen, each feature slot holds 16,384 BF16 vectors of width 2,560: 80 MiB per
 rank. Four image slots therefore reserve 320 MiB even with 32 active request slots.

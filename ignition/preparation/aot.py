@@ -1040,11 +1040,13 @@ class ForwardCache:
             dist.all_gather_object(outcomes, outcome, group=group)
             for _, job in sent:
                 Path(job).unlink(missing_ok=True)
+            # Raise inside the phase so it ends as failed rather than complete. Every rank holds the same
+            # outcomes, so every rank raises here and none skips a collective.
+            failures = [(index, failure) for index, (_, failure) in zip(ranks, outcomes) if failure is not None]
+            if failures:
+                raise RuntimeError(f"forward compilation failed: {failures}")
             # Forwards lent to other ranks are complete once every rank reports.
             stage.update(advance=len(lent))
-        failures = [(index, failure) for index, (_, failure) in zip(ranks, outcomes) if failure is not None]
-        if failures:
-            raise RuntimeError(f"forward compilation failed: {failures}")
         restored.clear()
         bound = None
         paths = {key: value for compiled, _ in outcomes for key, value in compiled.items()}

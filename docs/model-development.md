@@ -129,9 +129,11 @@ and [native frontend interfaces](../helios/README.md#native-frontend).
 ### Complete-message endpoints
 
 - Render the conversation once and record endpoints while producing its output.
-  Tokenize each required text or ordinary/special-token segment once. Do not
-  recover boundaries by rendering or tokenizing every conversation prefix,
-  searching for message text, or inserting marker text into the prompt.
+  Tokenize each required text or ordinary/special-token segment once, except that
+  a Jinja prompt region whose request text spells a control token is encoded a
+  second time. Do not recover boundaries by rendering or tokenizing every
+  conversation prefix, searching for message text, or inserting marker text into
+  the prompt.
 - Record the completed preamble and every completed normalized message in output
   order, including system, assistant, and tool messages where supported. A merged
   user run has the endpoint of the merged message; reordered results have
@@ -168,6 +170,11 @@ and [native frontend interfaces](../helios/README.md#native-frontend).
   Marks inside macros, captured assignments, or filter blocks are forbidden;
   mark the root call site after the helper returns. Handle each output branch,
   including tool-only messages and empty content with nonempty framing.
+- Name in the template text or in a recipe default every control token the
+  template writes. An added token that is neither special nor named there is
+  lexical: request text that spells it tokenizes to that token. A control
+  assembled from request fields (for example `'<|' + role + '|>'`) counts as
+  request text.
 - Verify the recipe exports the annotated asset and Helios loads it through the
   shared compiler. Do not bypass the missing-annotation error or add a broad
   template fallback. Compatibility substitutions must match the exact template

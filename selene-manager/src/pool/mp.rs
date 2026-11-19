@@ -13,7 +13,7 @@
 //! and answers for itself under its own process identity.
 
 use super::{
-    claims::{Channel, ClaimKey, Owner, Participant, Party, Phase, attest},
+    claims::{Channel, ClaimKey, Owner, Participant, Party, Phase, attest, party_state},
     core::{ChanOwner, Core, Event, ProcKey},
     pass::{PassError, PassJob, PassOut},
 };
@@ -463,8 +463,10 @@ impl Core {
             .windows
             .iter()
             .all(|w| !matches!(w.phase, Phase::Unissued | Phase::SourceWrite));
-        // A claim on the store's records ends its transfers when the store is done.
-        if !all || claim.windows.is_empty() || claim.manager.is_some() {
+        // The store may drain before its windows' assembly passes finish.
+        let store_pending = claim.manager.is_some()
+            && party_state(&claim.parties, Owner::Store) != Party::Drained;
+        if !all || claim.windows.is_empty() || store_pending {
             return;
         }
         if let Some(hub) = &self.cfg.channel {

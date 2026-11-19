@@ -243,7 +243,7 @@ def test_source_mutation_aborts_the_same_reader(tmp_path):
         with path.open("r+b") as stream:
             stream.seek(start)
             stream.write(b"!")
-        with pytest.raises(RuntimeError, match="checkpoint source changed after admission"):
+        with pytest.raises(RuntimeError, match="checkpoint source changed after admission: weights.safetensors"):
             client.read("weights.safetensors", start, 1)
         server.thread.join(5)
         assert isinstance(server.error, RuntimeError)
@@ -289,7 +289,7 @@ def test_end_marker_byte_accounting_is_authenticated(tmp_path):
         assert "accounting" in str(server.error)
 
 
-def test_finish_reports_checkpoint_identity_change(tmp_path):
+def test_finish_reports_checkpoint_identity_change(tmp_path, capsys):
     with connected(tmp_path) as (client, server, _):
         source = server.source.snapshot / "weights.safetensors"
         link = server.source.snapshot / "temporary-link"
@@ -299,6 +299,8 @@ def test_finish_reports_checkpoint_identity_change(tmp_path):
             client.finish()
         server.thread.join(5)
         assert isinstance(server.error, RuntimeError)
+        assert capsys.readouterr().out == ("flare: checkpoint source for rank 1 failed: "
+                                           "checkpoint source changed after admission: weights.safetensors\n")
 
 
 def test_channel_delivers_authenticated_error_when_expecting_data():
@@ -464,6 +466,7 @@ def test_peer_export_keeps_the_remote_owner_for_cleanup(tmp_path, monkeypatch, f
     import torch.distributed as dist
     from ignition.preparation import host_ranks, runtime_core
     from ignition.preparation.core_file import read_sources
+    from ignition.preparation.core_snapshot import ExportOptions
 
     events = []
     control_root, control_peer = socket.socketpair()
@@ -526,7 +529,8 @@ def test_peer_export_keeps_the_remote_owner_for_cleanup(tmp_path, monkeypatch, f
                   "store": ("127.0.0.1", 1234), "exporting": False}
     source = tmp_path / "weights.bin"
     source.write_bytes(b"synthetic weights")
-    commands = iter((("checkpoint-source", None), assignment, ("export", {}), "close"))
+    commands = iter((("checkpoint-source", None), assignment,
+                     ("export", {}, ExportOptions(tmp_path)), "close"))
     def export(*args, **kwargs):
         from ignition.preparation.core_file import write_sources
         from ignition.preparation.runtime_core_pb2 import ModelIndex, BundleIndex, Span

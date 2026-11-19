@@ -180,10 +180,12 @@ non-anchor cut. Submission quotes storage for the winning prompt row. When no
 quote fails, estimated and submitted work agree. Storage shortage can change
 which cuts fit the work budget, so the estimate and quoted selection can differ
 in either direction. If the quoted work differs from the winning estimate, an
-ordinary prefill plan advances toward the quoted cut up to the catalog maximum and
-uses the smallest catalog capacity covering that work, with its cost and duration
-recomputed. If a required lookup is unavailable, it retains the winning candidate
-and clips work to that candidate's capacity. Mixed, refresh, and discovery plans
+ordinary prefill or mixed plan advances toward the quoted cut up to the catalog
+maximum and uses the smallest catalog capacity covering that work, with duration
+and value recomputed. Mixed plans resize only the prompt capacity among shapes
+with the same batch capacity and decode width; decode lanes retain their token
+counts. If a required lookup is unavailable, it retains the winning candidate
+and clips work to that candidate's capacity. Refresh and discovery plans
 retain their capacities and clip work to fit. Atomic image spans, feature windows,
 and prompt length also restrict logical work. A graph with 64 useful prompt tokens
 earns 64 prompt units and at most one output token, regardless of physical capacity.

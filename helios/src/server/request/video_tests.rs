@@ -124,6 +124,31 @@ fn clips_are_planned_from_frame_headers_and_each_frame_is_decoded_once() {
 }
 
 #[test]
+fn sixteen_bit_png_frames_use_the_still_image_rgb_conversion() {
+    use crate::frontend::images::RgbImage;
+
+    let processor = video_processor(limits());
+    let frames = vec![
+        data_url(include_bytes!("../../../../tests/frontend/png-16bit-inputs/gray16.png")),
+        data_url(include_bytes!("../../../../tests/frontend/png-16bit-inputs/rgb16.png")),
+    ];
+    let videos = describe_videos(
+        &[VideoPart { frames, fps: 2.0 }], Some(&processor), None, 0,
+    ).unwrap();
+    assert_eq!(videos.len(), 1);
+    assert_eq!(videos[0].frames.len(), 2);
+    let (first, second) = videos[0].frames_of(0);
+    // The fixture RGB bytes are the checkpoint processor's Pillow conversion.
+    for (frame, rgb) in [
+        (first, include_bytes!("../../../../tests/frontend/png-16bit-inputs/gray16.rgb")),
+        (second, include_bytes!("../../../../tests/frontend/png-16bit-inputs/rgb16.rgb")),
+    ] {
+        let expected = RgbImage::new(2, 2, rgb.to_vec()).unwrap();
+        assert_eq!(frame.identity, processor.semantic_identity(&expected));
+    }
+}
+
+#[test]
 fn clip_rejections_name_the_clip_and_decode_no_frame() {
     let processor = video_processor(limits());
     let one = |clip: VideoPart| rejection(&processor, &[clip], 0);
@@ -187,7 +212,17 @@ fn frame_rejections_name_the_clip_and_frame() {
     assert!(message.starts_with("video 1 frame 2: invalid image base64"), "{message}");
     assert_eq!(
         rejection(&processor, &[with("https://example.invalid/frame.png".into())], 0),
-        "video 1 frame 2: image input requires a base64 PNG, JPEG, or WebP data URL"
+        "video 1 frame 2: video frame requires a base64 PNG, JPEG, or WebP data URL"
+    );
+    let gif = format!(
+        "data:image/gif;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(
+            include_bytes!("../../../../tests/frontend/gif-inputs/frame-offset.gif")
+        )
+    );
+    assert_eq!(
+        rejection(&processor, &[with(gif)], 0),
+        "video 1 frame 2: video frame requires a base64 PNG, JPEG, or WebP data URL"
     );
     // A frame cut off inside its image data fails the header pass of the second clip.
     let bytes = png(64, 64, 7);
@@ -239,7 +274,7 @@ fn a_frame_whose_image_data_is_shorter_than_its_header_is_rejected_by_frame() {
     let processor = video_processor(limits());
     assert_eq!(
         processor
-            .probe_encoded(crate::frontend::images::ImageEncoding::Png, &bytes)
+            .probe_video_frame(crate::frontend::images::ImageEncoding::Png, &bytes)
             .unwrap(),
         (64, 64)
     );

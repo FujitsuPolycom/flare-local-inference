@@ -100,12 +100,12 @@ impl QwenProcessor {
         }
     }
 
-    /// Expands the image placeholders in already rendered chat text, in image order.
+    /// Expands the image placeholders in already rendered chat tokens, in image order.
     /// Inputs contain no padding; the scheduler adds padding outside logical lengths.
     pub fn expand_prompt(
         &self,
         frontend: &Frontend,
-        text: &str,
+        prompt_token_ids: &[u32],
         images: &ProcessedImages,
     ) -> Result<ImagePrompt> {
         if frontend.encode(IMAGE_TOKEN, false)? != [self.image_token_id] {
@@ -113,25 +113,29 @@ impl QwenProcessor {
                 "image token ID does not match tokenizer",
             ))));
         }
-        if text.matches(IMAGE_TOKEN).count() != images.geometry.len() {
+        let placeholder_count = prompt_token_ids
+            .iter()
+            .filter(|id| **id == self.image_token_id)
+            .count();
+        if placeholder_count != images.geometry.len() {
             return Err(Error::frontend(FrontendError::Input(Failure::new(
                 "image placeholder count does not match prepared images",
             ))));
         }
-        let mut expanded = String::with_capacity(text.len());
-        let mut parts = text.split(IMAGE_TOKEN);
-        expanded.push_str(parts.next().unwrap_or_default());
-        for (part, geometry) in parts.zip(&images.geometry) {
-            for _ in 0..geometry.tokens {
-                expanded.push_str(IMAGE_TOKEN);
-            }
-            expanded.push_str(part);
-        }
-        let token_ids = frontend.encode(&expanded, false)?;
-        if token_ids.contains(&self.video_token_id) {
+        if prompt_token_ids.contains(&self.video_token_id) {
             return Err(Error::frontend(FrontendError::Input(Failure::new(
                 "video inputs are not supported by the image processor",
             ))));
+        }
+        let mut token_ids = Vec::new();
+        let mut geometry = images.geometry.iter();
+        for &id in prompt_token_ids {
+            if id == self.image_token_id {
+                let tokens = geometry.next().expect("placeholder count was checked").tokens;
+                token_ids.extend(std::iter::repeat_n(self.image_token_id, tokens));
+            } else {
+                token_ids.push(id);
+            }
         }
         let mm_token_type_ids: Vec<i32> = token_ids
             .iter()
@@ -186,7 +190,6 @@ impl QwenProcessor {
             ))));
         }
         Ok(ImagePrompt {
-            text: expanded,
             rope_delta: current - token_ids.len() as i64,
             token_ids,
             mm_token_type_ids,
@@ -194,7 +197,7 @@ impl QwenProcessor {
         })
     }
 
-    /// Expands the image and video placeholders of rendered chat text, in prompt order.
+    /// Expands the image and video placeholders in rendered token IDs, in prompt order.
     /// A still image fills one vision window. A clip replaces its placeholder with one
     /// window per temporal patch, each preceded by its timestamp marker and enclosed in
     /// vision delimiters, which is the text the checkpoint processor writes.
@@ -202,7 +205,7 @@ impl QwenProcessor {
         &self,
         video: &video::VideoProcessor,
         frontend: &Frontend,
-        text: &str,
+        prompt_token_ids: &[u32],
         images: &ProcessedImages,
         videos: &[VideoInput],
     ) -> Result<MediaPrompt> {
@@ -212,30 +215,29 @@ impl QwenProcessor {
         {
             return Err(invalid("image or video token ID does not match tokenizer"));
         }
-        let (placeholders, _) = video::media_placeholders(text);
+        let placeholders: Vec<_> = video::media_placeholders(
+            prompt_token_ids, self.image_token_id, self.video_token_id,
+        ).collect();
         let stills = placeholders.iter().filter(|(_, still)| *still).count();
         if stills != images.geometry.len() || placeholders.len() - stills != videos.len() {
             return Err(invalid(
                 "image and video placeholder counts do not match prepared inputs",
             ));
         }
-        // Each planned window with its input and grid, and the bytes of `expanded` that
-        // replace each placeholder.
-        let mut expanded = String::with_capacity(text.len());
+        let vision_start = frontend.encode(VISION_START_TOKEN, false)?;
+        let vision_end = frontend.encode(VISION_END_TOKEN, false)?;
+        let mut token_ids = Vec::with_capacity(prompt_token_ids.len());
         let mut plan = Vec::new();
-        let mut replacements = Vec::with_capacity(images.geometry.len() + videos.len());
+        let mut expansions = Vec::with_capacity(placeholders.len());
         let (mut copied, mut image, mut clip) = (0, 0, 0);
         for (at, still) in placeholders {
-            expanded.push_str(&text[copied..at]);
-            let start = expanded.len();
+            token_ids.extend_from_slice(&prompt_token_ids[copied..at]);
+            let start = token_ids.len();
             if still {
                 let geometry = images.geometry[image];
-                for _ in 0..geometry.tokens {
-                    expanded.push_str(IMAGE_TOKEN);
-                }
+                token_ids.extend(std::iter::repeat_n(self.image_token_id, geometry.tokens));
                 plan.push((PromptWindowSource::Image(image), geometry));
                 image += 1;
-                copied = at + IMAGE_TOKEN.len();
             } else {
                 let input = &videos[clip];
                 for (patch, seconds) in video
@@ -243,30 +245,18 @@ impl QwenProcessor {
                     .into_iter()
                     .enumerate()
                 {
-                    expanded.push_str(&video::timestamp_marker(seconds));
-                    expanded.push_str(VISION_START_TOKEN);
-                    for _ in 0..input.window.tokens {
-                        expanded.push_str(VIDEO_TOKEN);
-                    }
-                    expanded.push_str(VISION_END_TOKEN);
+                    token_ids.extend(frontend.encode(&video::timestamp_marker(seconds), false)?);
+                    token_ids.extend_from_slice(&vision_start);
+                    token_ids.extend(std::iter::repeat_n(self.video_token_id, input.window.tokens));
+                    token_ids.extend_from_slice(&vision_end);
                     plan.push((PromptWindowSource::Video { clip, patch }, input.window));
                 }
                 clip += 1;
-                copied = at + VIDEO_TOKEN.len();
             }
-            replacements.push(start..expanded.len());
+            expansions.push(token_ids.len() - start);
+            copied = at + 1;
         }
-        expanded.push_str(&text[copied..]);
-        let encoding = frontend
-            .tokenizer()
-            .encode(expanded.as_str(), false)
-            .map_err(|error| {
-                Error::frontend(FrontendError::Tokenizer(Failure::boxed(
-                    error.to_string(),
-                    error,
-                )))
-            })?;
-        let token_ids = encoding.get_ids().to_vec();
+        token_ids.extend_from_slice(&prompt_token_ids[copied..]);
         let mm_token_type_ids: Vec<i32> = token_ids
             .iter()
             .map(|id| {
@@ -331,18 +321,8 @@ impl QwenProcessor {
         if planned.next().is_some() {
             return Err(invalid("prepared vision input was not consumed by prompt"));
         }
-        // Tokens of each replacement, from the tokenizer's byte offsets into `expanded`.
-        let offsets = encoding.get_offsets();
-        let expansions = replacements
-            .iter()
-            .map(|bytes| {
-                offsets.partition_point(|(start, _)| *start < bytes.end)
-                    - offsets.partition_point(|(_, end)| *end <= bytes.start)
-            })
-            .collect();
         Ok(MediaPrompt {
             prompt: ImagePrompt {
-                text: expanded,
                 rope_delta: current - token_ids.len() as i64,
                 token_ids,
                 mm_token_type_ids,

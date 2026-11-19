@@ -132,34 +132,13 @@ impl VideoProcessor {
     }
 }
 
-/// The image and video placeholders of rendered text in prompt order: the byte offset
-/// of each and whether it is a still image. Each placeholder kind is searched once
-/// across the text. The second value counts the search steps: one for each placeholder
-/// found and one for each kind when its search ends.
-pub(super) fn media_placeholders(text: &str) -> (Vec<(usize, bool)>, usize) {
-    let mut images = text.match_indices(IMAGE_TOKEN);
-    let mut videos = text.match_indices(VIDEO_TOKEN);
-    let mut searches = 0;
-    let mut step = |matches: &mut std::str::MatchIndices<'_, &str>| {
-        searches += 1;
-        matches.next().map(|(at, _)| at)
-    };
-    let (mut image, mut video) = (step(&mut images), step(&mut videos));
-    let mut placeholders = Vec::new();
-    loop {
-        match (image, video) {
-            (Some(at), other) if other.is_none_or(|video| at < video) => {
-                placeholders.push((at, true));
-                image = step(&mut images);
-            }
-            (_, Some(at)) => {
-                placeholders.push((at, false));
-                video = step(&mut videos);
-            }
-            _ => break,
-        }
-    }
-    (placeholders, searches)
+/// Identifies media placeholders by their rendered token IDs in prompt order.
+pub(super) fn media_placeholders(
+    tokens: &[u32], image_id: u32, video_id: u32,
+) -> impl Iterator<Item = (usize, bool)> + '_ {
+    tokens.iter().enumerate().filter_map(move |(index, &id)| {
+        (id == image_id || id == video_id).then_some((index, id == image_id))
+    })
 }
 
 /// The timestamp text that precedes one temporal patch's vision span.
@@ -273,22 +252,16 @@ mod tests {
     }
 
     #[test]
-    fn placeholders_are_found_with_one_search_step_each() {
-        // A search that restarts at every placeholder scans the rest of the text for the
-        // kind that is absent there, and takes two steps for each placeholder.
-        let text = format!("{}tail", "a<|video_pad|>b<|image_pad|><|video_pad|>".repeat(1000));
-        let (placeholders, searches) = media_placeholders(&text);
+    fn media_placeholders_keep_token_order_across_mixed_and_repeated_inputs() {
+        let tokens = [9, 20, 10, 20].repeat(1000);
+        let placeholders: Vec<_> = media_placeholders(&tokens, 10, 20).collect();
         assert_eq!(placeholders.len(), 3000);
-        assert_eq!(searches, placeholders.len() + 2);
-        assert!(placeholders.windows(2).all(|pair| pair[0].0 < pair[1].0));
-        for (index, (at, still)) in placeholders.iter().enumerate() {
-            assert_eq!(*still, index % 3 == 1);
-            assert!(text[*at..].starts_with(if *still { IMAGE_TOKEN } else { VIDEO_TOKEN }));
+        for (group, chunk) in placeholders.chunks_exact(3).enumerate() {
+            let start = 4 * group;
+            assert_eq!(chunk, [(start + 1, false), (start + 2, true), (start + 3, false)]);
         }
-        let (placeholders, searches) = media_placeholders(&IMAGE_TOKEN.repeat(500));
-        assert_eq!((placeholders.len(), searches), (500, 502));
-        assert!(placeholders.iter().all(|(_, still)| *still));
-        assert_eq!(media_placeholders("no placeholder"), (vec![], 2));
+        assert_eq!(media_placeholders(&[10; 500], 10, 20).count(), 500);
+        assert_eq!(media_placeholders(&[9], 10, 20).count(), 0);
     }
 
     #[test]

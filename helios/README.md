@@ -179,13 +179,19 @@ statically. It performs no `pkg-config` discovery and uses no system
 `libturbojpeg` at build time or run time. Without NASM on `PATH`, libjpeg-turbo
 builds without SIMD extensions.
 
-Image admission accepts base64 `image/png`, `image/jpeg`, and `image/webp` data
-URLs. JPEG uses
+Image admission accepts base64 `image/png`, `image/jpeg`, `image/webp`, and
+`image/gif` data URLs. JPEG uses
 accurate IDCT, smooth chroma upsampling, and at most 100 progressive scans.
 Baseline/progressive Huffman JPEG is supported; lossless and arithmetic JPEG
 are rejected. Encoded byte and decoded pixel limits apply before pixel allocation.
+16-bit PNG samples follow Pillow's RGB conversion: RGB, RGBA, and grayscale-alpha
+keep the high byte, and grayscale clamps to 8 bits. Animated PNG is rejected.
+A GIF with a readable second image is rejected as animated. A single-frame GIF decodes as Pillow's
+RGB and RGBA conversions do, on a canvas that covers the logical screen and the
+frame. MoonViT and padded-grid preparation keep the transparent index as alpha.
 PNG and JPEG EXIF orientation is applied before resize; orientations 1–8 include
 mirrored and axis-swapped images. Invalid orientation metadata is rejected.
+GIF carries no EXIF orientation.
 RGB conversion discards alpha and does not apply embedded color profiles.
 Pillow is used only to generate test fixtures, never by native image admission.
 
@@ -560,6 +566,35 @@ mapping. Image hints retain indices into the rendered image-source list and
 resolve to the ends of prepared image spans after expansion. Hints do not change
 prompt bytes, token IDs, image conditioning, or ordinary/special-token selection.
 
+The Jinja renderer records which output bytes come from the request. Every
+string and object key supplied by the request is ordinary text, and the record
+follows it through captures, namespace values and exact string operations;
+other builtins that receive request text mark their whole result ordinary. Text
+written in the template and every string in a template default, including
+strings nested in default arrays or objects, are controls unless the request
+overrides that default.
+
+The frontend encodes the whole prompt first. A control is an added token that is
+special, or that the chat template or one of its defaults names, or the
+placeholder text that an image layout lets request text spell. The RADIO layout
+(the C-RADIO image encoder) is the one that does: its template lets message text
+place `<image>` placeholders, and cores prepared for it declare no placeholder
+token ID, so the layout supplies the text. Spelled RADIO placeholders stay
+controls when they and the placeholders the template wrote together account for
+every attached image; otherwise they are ordinary text. Other added tokens, such
+as GLM's `/nothink`, are lexical text, and request text that spells one
+tokenizes to that token. Only when a control overlaps ordinary text does the
+frontend re-encode the text between the other added tokens that contains the
+spelling, with a tokenizer built at load without added vocabulary, so a spelling
+of a control in request text never becomes that control's token. An added token
+that strips adjacent whitespace (`lstrip` or `rstrip`) counts as spelled only
+when the request wrote the token's own bytes, not the whitespace beside it.
+
+The output parser finds its markers in the rendered text and skips a match that
+lies entirely inside one ordinary range (`RenderedPrompt::ordinary`). A marker
+the template builds from request fields, such as `'<|im_start|>' + message.role`,
+has template-written bytes, so the parser finds it whether or not ranges exist.
+
 `Frontend::encode`, `decode`, and `incremental_decoder` use Hugging Face's Rust
 tokenizers library pinned to the fixture environment's version. Incremental
 decoding preserves incomplete UTF-8 between chunks and flushes remaining bytes
@@ -653,7 +688,7 @@ the prepared graph contract maps them to backing storage and padding sentinels.
 ## Native image preparation
 
 The `images` feature adds `frontend::images::ImageProcessor` and PNG, JPEG,
-and static WebP decoding; it also enables `frontend`. Typed core metadata
+static WebP, and non-animated GIF decoding; it also enables `frontend`. Typed core metadata
 selects the preparation profile and token layout independently. Profiles cover
 Qwen, MiMo, patch-merge, DeepSeek, DeepSeek row-major, Moonvit, Step, RADIO,
 and GLM inputs.
@@ -666,7 +701,7 @@ vision positions `[N,2]` int64, interpolation indices `[N,4]` int64 and weights
 `[N,4]` float32, and per-image cumulative patch offsets int32. Patch features
 are ordered by channel, temporal copy, pixel row, and pixel column; patches
 are ordered by 2×2 spatial merge blocks. `expand_prompt` consumes the rendered
-chat text, expands each image placeholder, tokenizes the result, and returns
+chat token IDs, expands only control-token image placeholders, and returns
 modality IDs and four unpadded position rows `[text,T,H,W]` plus the mRoPE delta.
 The model scheduler can transpose the last three rows into `[tokens,3]`.
 

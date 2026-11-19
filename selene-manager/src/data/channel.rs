@@ -1725,7 +1725,10 @@ mod tests {
                 let staging = Arena::new(1 << 20).unwrap();
                 let (base, len) = staging.mapping();
                 // SAFETY: the arena stays mapped and in place for the life of the instance.
-                let device = unsafe { rdma::Device::open(base, len) }.unwrap();
+                let device = unsafe {
+                    rdma::Device::open(base, len, crate::testing::rdma_address().unwrap())
+                }
+                .unwrap();
                 Self { staging, device }
             }
 
@@ -1761,8 +1764,9 @@ mod tests {
         }
 
         fn start_rdma(regions: Arc<LocalRegions>) -> (Hub, mpsc::UnboundedReceiver<Event>, String) {
-            let device = crate::data::ibv::Device::open(regions.clone()).unwrap();
-            let listener = StdListener::bind("127.0.0.1:0").unwrap();
+            let local_address = crate::testing::rdma_address().unwrap();
+            let device = crate::data::ibv::Device::open(regions.clone(), local_address).unwrap();
+            let listener = StdListener::bind(std::net::SocketAddr::new(local_address, 0)).unwrap();
             let (hub, events) = Hub::start(
                 &Handle::current(),
                 listener,
@@ -1937,7 +1941,11 @@ mod tests {
                     generated.signing_key.serialize_pem().as_bytes(),
                 )
                 .unwrap();
-                let device = crate::data::ibv::Device::open(regions.clone()).unwrap();
+                let device = crate::data::ibv::Device::open(
+                    regions.clone(),
+                    crate::testing::rdma_address().unwrap(),
+                )
+                .unwrap();
                 let listener = StdListener::bind("127.0.0.1:0").unwrap();
                 assert!(
                     Hub::start(

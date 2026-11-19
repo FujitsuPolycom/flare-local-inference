@@ -49,7 +49,7 @@ pub(crate) fn prepare_input(
     } else {
         let processor = processor.ok_or("image processing is unavailable")?;
         let processed = processor.describe_inputs(images)?;
-        let expanded = processor.expand_prompt(frontend, &rendered.text, &processed)?;
+        let expanded = processor.expand_prompt(frontend, &rendered.token_ids, &processed)?;
         let positions = (0..expanded.token_ids.len())
             .map(|position| {
                 [
@@ -130,7 +130,7 @@ pub(crate) fn prepare_media_input(
     } else {
         processor.describe_inputs(images)?
     };
-    let expanded = processor.expand_media_prompt(frontend, &rendered.text, &processed, videos)?;
+    let expanded = processor.expand_media_prompt(frontend, &rendered.token_ids, &processed, videos)?;
     let prompt = expanded.prompt;
     let positions = (0..prompt.token_ids.len())
         .map(|position| {

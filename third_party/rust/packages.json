@@ -2518,6 +2518,28 @@
     ]
   },
   {
+    "name": "gif",
+    "version": "0.14.2",
+    "license": "MIT OR Apache-2.0",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "source_url": "https://crates.io/api/v1/crates/gif/0.14.2/download",
+    "targets": {
+      "x86_64-unknown-linux-gnu": [
+        "runtime"
+      ],
+      "aarch64-unknown-linux-gnu": [
+        "runtime"
+      ],
+      "x86_64-pc-windows-msvc": [
+        "runtime"
+      ]
+    },
+    "license_files": [
+      "gif-0.14.2/LICENSE-APACHE",
+      "gif-0.14.2/LICENSE-MIT"
+    ]
+  },
+  {
     "name": "h2",
     "version": "0.4.20",
     "license": "MIT",
@@ -7398,6 +7420,28 @@
     },
     "license_files": [
       "webpki-roots-1.0.9/LICENSE"
+    ]
+  },
+  {
+    "name": "weezl",
+    "version": "0.1.12",
+    "license": "MIT OR Apache-2.0",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "source_url": "https://crates.io/api/v1/crates/weezl/0.1.12/download",
+    "targets": {
+      "x86_64-unknown-linux-gnu": [
+        "runtime"
+      ],
+      "aarch64-unknown-linux-gnu": [
+        "runtime"
+      ],
+      "x86_64-pc-windows-msvc": [
+        "runtime"
+      ]
+    },
+    "license_files": [
+      "weezl-0.1.12/LICENSE-APACHE",
+      "weezl-0.1.12/LICENSE-MIT"
     ]
   },
   {

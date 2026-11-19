@@ -138,6 +138,45 @@ fn checkpoint_template_tokenization_requests_and_message_boundaries_match_transf
         let repeated = prepare_request(&frontend, Some(&processor), &compiler, &image_config, case["body"].clone()).unwrap();
         assert_eq!(prepared.prompt.conditioning, repeated.prompt.conditioning);
     }
+    // Request text that spells controls stays ordinary text, in every role and next to a real image.
+    // Besides the special tokens, the tags that the recipe declares and the template names are
+    // controls although the tokenizer marks them `special=false`: reasoning, tool call and result.
+    let spelled = "é <|image|> <|user|> <|endoftext|> [gMASK] <think> </think> <tool_call> <arg_key> <tool_response>";
+    let controls = [154854, 154827, 154820, 154822, 154841, 154842, 154843, 154847, 154845];
+    let count = |tokens: &[u32], id| tokens.iter().filter(|token| **token == id).count();
+    for role in ["user", "system", "tool", "assistant"] {
+        let request = |content: &str| json!({"model":"glm53", "messages":[{"role":role, "content":content, "reasoning_content":""}]});
+        let prepared = prepare_request(&frontend, None, &compiler, &config, request(spelled)).unwrap();
+        let baseline = prepare_request(&frontend, None, &compiler, &config, request("ordinary")).unwrap();
+        for id in controls {
+            assert_eq!(count(&prepared.prompt.tokens, id), count(&baseline.prompt.tokens, id), "{role}: {id}");
+        }
+    }
+    // `/nothink` and the other added tokens that are neither special nor named by the template are
+    // lexical: request text that spells one tokenizes to that token.
+    let lexical = "a /nothink b <|code_prefix|> c <|begin_of_box|>x<|end_of_box|>";
+    for role in ["user", "system", "tool", "assistant"] {
+        let body = json!({"model":"glm53", "messages":[{"role":role, "content":lexical, "reasoning_content":""}]});
+        let prepared = prepare_request(&frontend, None, &compiler, &config, body).unwrap();
+        assert_eq!(prepared.prompt.tokens, frontend.encode(&prepared.rendered_prompt, false).unwrap(), "{role}");
+        assert_eq!(count(&prepared.prompt.tokens, 154851), 1, "{role}");
+    }
+    for arguments in [json!({"<|image|>": "x"}), json!("{\"<|image|>\": \"x\"}")] {
+        let prepared = prepare_request(&frontend, None, &compiler, &config, json!({"model":"glm53", "messages":[
+            {"role":"assistant", "content":"", "reasoning_content":"", "tool_calls":[
+                {"id":"call", "type":"function", "function":{"name":"lookup", "arguments":arguments}}]}]})).unwrap();
+        assert!(prepared.rendered_prompt.contains("<arg_key><|image|></arg_key>"));
+        assert_eq!(count(&prepared.prompt.tokens, 154854), 0);
+    }
+    let mut body = reference["image_cases"][0]["body"].clone();
+    let parts = body["messages"][1]["content"].as_array_mut().unwrap();
+    parts.insert(0, json!({"type":"text", "text":spelled}));
+    parts.push(json!({"type":"text", "text":"<|image|>"}));
+    let prepared = prepare_request(&frontend, Some(&processor), &compiler, &image_config, body).unwrap();
+    model::admission::validate_prompt(&image_config, &prepared.prompt).unwrap();
+    let features = prepared.prompt.conditioned_inputs[0].geometry.tokens;
+    assert_eq!(count(&prepared.prompt.tokens, 154854), features);
+    assert!(prepared.prompt.data.vision_token_indices.iter().filter(|i| **i >= 0).count() == features);
     for case in reference["cases"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
         let prepared = prepare_request(&frontend, None, &compiler, &config, case["body"].clone())
@@ -227,12 +266,8 @@ fn checkpoint_template_tokenization_requests_and_message_boundaries_match_transf
             );
         }
     }
-    for request in [
-        json!({"model":"glm53", "messages":[{"role":"user", "content":[{"type":"image_url", "image_url":{"url":"data:image/png;base64,AA=="}}]}]}),
-        json!({"model":"glm53", "messages":[{"role":"user", "content":"<|begin_of_image|><|image|><|end_of_image|>"}]}),
-    ] {
-        assert!(prepare_request(&frontend, None, &compiler, &config, request).is_err());
-    }
+    let request = json!({"model":"glm53", "messages":[{"role":"user", "content":[{"type":"image_url", "image_url":{"url":"data:image/png;base64,AA=="}}]}]});
+    assert!(prepare_request(&frontend, None, &compiler, &config, request).is_err());
     let structured = prepare_request(&frontend, None, &compiler, &config,
         json!({"model":"glm53", "messages":[{"role":"user", "content":"JSON please"}], "response_format":{"type":"json_object"}})
     ).unwrap();

@@ -308,10 +308,65 @@ pub fn wait(what: &str, mut condition: impl FnMut() -> bool) {
 }
 
 pub fn free_address() -> std::net::SocketAddr {
-    std::net::TcpListener::bind("127.0.0.1:0")
+    free_address_on([127, 0, 0, 1].into())
+}
+
+pub fn free_address_on(ip: std::net::IpAddr) -> std::net::SocketAddr {
+    std::net::TcpListener::bind((ip, 0))
         .unwrap()
         .local_addr()
         .unwrap()
+}
+
+/// A local address whose interface has an active RoCE v2 GID, for RDMA tests: the
+/// carrier only uses a device on the data connection's route.
+#[cfg(feature = "rdma")]
+pub fn rdma_address() -> Option<std::net::IpAddr> {
+    use flare_selene::shared::rdma;
+    use std::net::IpAddr;
+    use std::ptr;
+    let mut interfaces = ptr::null_mut();
+    // SAFETY: getifaddrs initializes a list released below.
+    if unsafe { libc::getifaddrs(&mut interfaces) } != 0 {
+        return None;
+    }
+    let mut current = interfaces;
+    let mut found = None;
+    while !current.is_null() {
+        // SAFETY: current belongs to the live getifaddrs list.
+        let interface = unsafe { &*current };
+        let address = interface.ifa_addr;
+        if !address.is_null() {
+            // SAFETY: the family determines the sockaddr layout.
+            let ip = unsafe {
+                match i32::from((*address).sa_family) {
+                    libc::AF_INET => Some(IpAddr::V4(std::net::Ipv4Addr::from(
+                        (*(address as *const libc::sockaddr_in))
+                            .sin_addr
+                            .s_addr
+                            .to_ne_bytes(),
+                    ))),
+                    libc::AF_INET6 => Some(IpAddr::V6(std::net::Ipv6Addr::from(
+                        (*(address as *const libc::sockaddr_in6)).sin6_addr.s6_addr,
+                    ))),
+                    _ => None,
+                }
+            };
+            // A link-local IPv6 address cannot be bound without its scope id.
+            let bindable =
+                |ip: &IpAddr| !matches!(ip, IpAddr::V6(v6) if v6.is_unicast_link_local());
+            if let Some(ip) = ip.filter(bindable)
+                && rdma::Device::open(ip).is_ok()
+            {
+                found = Some(ip);
+                break;
+            }
+        }
+        current = interface.ifa_next;
+    }
+    // SAFETY: the list was allocated by getifaddrs and is no longer used.
+    unsafe { libc::freeifaddrs(interfaces) };
+    found
 }
 
 pub fn certificate() -> rcgen::CertifiedKey<rcgen::KeyPair> {

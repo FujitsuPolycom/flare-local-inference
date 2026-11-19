@@ -116,13 +116,20 @@ pub struct Shared {
 }
 
 /// What the connection said about its peer.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct OpenPeer {
     /// A Unix-domain connection (the only kind whose credentials are meaningful).
     pub unix: bool,
     pub pid: u32,
     pub uid: u32,
     pub gid: u32,
+    pub pidfd: Option<Arc<OwnedFd>>,
+}
+
+impl OpenPeer {
+    pub(super) fn shared_memory(&self, uid: u32, gid: u32) -> bool {
+        self.unix && self.uid == uid && self.gid == gid && (self.pid != 0 || self.pidfd.is_some())
+    }
 }
 
 pub enum Event {
@@ -219,7 +226,7 @@ pub(super) struct Instance {
 
 pub(super) struct Proc {
     pub pid: Option<u32>,
-    pub pidfd: Option<OwnedFd>,
+    pub pidfd: Option<Arc<OwnedFd>>,
     pub exited: bool,
     pub claim_hw: u64,
     pub put_hw: u64,
@@ -231,14 +238,17 @@ pub(super) struct Proc {
 }
 
 impl Proc {
-    pub(super) fn watch(&mut self, pid: Option<u32>) {
+    pub(super) fn watch(&mut self, peer: &OpenPeer) {
+        let started_pid = peer.unix.then_some(peer.pid).filter(|pid| *pid != 0);
         if self.pid.is_none()
-            && let Some(pid) = pid
+            && let Some(pid) = started_pid
         {
             self.pid = Some(pid);
             let (pidfd, exited) = watch_pid(pid);
-            self.pidfd = pidfd;
+            self.pidfd = pidfd.map(Arc::new);
             self.exited |= exited;
+        } else if self.pid.is_none() && self.pidfd.is_none() {
+            self.pidfd = peer.pidfd.clone();
         }
     }
 }
@@ -550,7 +560,7 @@ impl Core {
             }
         };
         let limits = &self.cfg.limits;
-        let shm = peer.unix && peer.uid == self.euid && peer.gid == self.egid;
+        let shm = peer.shared_memory(self.euid, self.egid);
         // A session without shared memory serves exports over the data channel.
         let export_slots = if shm || self.cfg.channel.is_some() {
             open.export_slots.min(limits.max_export_slots)
@@ -573,7 +583,6 @@ impl Core {
         self.next_session += 1;
         let sid = self.next_session;
         let proc_key = (instance, nonce);
-        let started_pid = peer.unix.then_some(peer.pid).filter(|pid| *pid != 0);
         let entry = self.procs.entry(proc_key).or_insert_with(|| Proc {
             pid: None,
             pidfd: None,
@@ -584,7 +593,7 @@ impl Core {
             link: None,
         });
         entry.idle_since = None;
-        entry.watch(started_pid);
+        entry.watch(&peer);
         let fresh = !self.scopes.contains_key(&scope.id);
         self.scopes.entry(scope.id).or_insert_with(|| ScopeState {
             valid: scope.clone(),
@@ -596,10 +605,10 @@ impl Core {
         }
         // Opening the session is the process telling the manager it is back: the store's
         // connection for it is made now, not at its first window, because a restarted manager
-        // holds its shared regions until every process of the previous run has made one (and a
-        // process that is refused claims for the hold would never get to its first window).
-        if let Some(pid) = started_pid {
-            self.link_for(proc_key, scope.id, pid);
+        // holds its shared regions for previous-run processes (PROTOCOL.md 8.6), and a
+        // process refused claims for the hold would never get to its first window.
+        if peer.unix && (peer.pid != 0 || shm) {
+            self.link_for(proc_key, scope.id, peer.pid, shm);
         }
         self.instances.insert(
             instance,

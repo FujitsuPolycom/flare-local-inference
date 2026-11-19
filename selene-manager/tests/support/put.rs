@@ -191,13 +191,13 @@ pub async fn put(
             return cancel(session, id, options.keep_windows).await;
         }
         let start = if window.page_count > 0 {
-            header.page_segment as usize + (window.first_page - first) as usize * page_bytes
+            header.page_segment as usize + window.first_page as usize * page_bytes
         } else {
             header.row_segment as usize
         };
         let mut hashes = Vec::new();
         for position in 0..window.page_count as usize {
-            let relative = (window.first_page - first) as usize + position;
+            let relative = window.first_page as usize + position;
             let page = header.page_segment as usize + relative * page_bytes;
             if options.corrupt_page == Some(relative) {
                 bytes[page] ^= 1;

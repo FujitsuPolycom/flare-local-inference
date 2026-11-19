@@ -1863,6 +1863,69 @@ fn mixed_prefill_exploration_requires_additional_useful_tokens() {
 }
 
 #[test]
+fn mixed_prefill_capacity_matches_quoted_work_without_snapshot_storage() {
+    for speculative in [false, true] {
+        for (prompt_tokens, capacity, missing_duration) in [
+            (200, 256, false), (300, 512, false), (1024, 512, false), (200, 128, true),
+        ] {
+            let width = if speculative { 8 } else { 1 };
+            let shapes = [
+                (2, width, 128, 128_000),
+                (2, width, 256, 256_000),
+                (2, width, 512, 512_000),
+            ];
+            let measured: Vec<_> = shapes.iter().copied()
+                .filter(|&(_, _, prefill, _)| !missing_duration || prefill != 256).collect();
+            let mut s = mixed_engine(2, speculative, &measured);
+            s.mixed_graphs(&shapes.map(|(batch, width, prefill, _)| (batch, width, prefill))).unwrap();
+            throughput_only(&mut s);
+            s.policy.checkpoint_extra_work_fraction = 0.5;
+            let decoder = add(&mut s, 1, 64, 1024);
+            ready(&mut s, &[decoder]);
+            let mut spec = super::tests::spec(prompt_tokens, 1);
+            spec.message_boundaries = vec![100, prompt_tokens];
+            let prompt = s.admit(spec).unwrap();
+            initialize(&mut s, prompt);
+            let before = s.plan().unwrap();
+            assert_eq!(before.kind, GraphKind::Mixed);
+            assert_eq!((before.prefill_capacity(), before.lanes[1].tokens), (128, 100));
+            let mut held = Vec::new();
+            while let Some(snapshot) = s.reserve_snapshot(0) {
+                held.push(snapshot);
+            }
+            assert!(!held.is_empty());
+            assert!(s.free_snapshots.is_empty());
+            let request = s.request(prompt).unwrap();
+            assert_eq!(s.estimated_checkpoint_cut(request), Some(100));
+            assert_eq!(s.checkpoint_cut(request), Some(prompt_tokens));
+            let plan = s.plan().unwrap();
+            assert_eq!(plan.kind, GraphKind::Mixed);
+            assert_eq!((plan.prefill_capacity(), plan.lanes[1].tokens),
+                (capacity, prompt_tokens.min(capacity)));
+            assert_eq!((plan.batch_capacity, plan.token_capacity), (2, width));
+            assert_eq!(plan.mixed.as_ref().unwrap().prefill_row, Some(1));
+            assert_eq!(plan.mixed.as_ref().unwrap().speculative, speculative);
+            assert_eq!(plan.lanes[0].request, decoder);
+            assert_eq!(plan.lanes[0].tokens, before.lanes[0].tokens);
+            assert_eq!(plan.lanes[0].start_position, before.lanes[0].start_position);
+            assert_eq!(plan.lanes[1].request, prompt);
+            assert_eq!(plan.estimated_duration_ns(), capacity as u64 * 1000);
+            assert_eq!(plan.selected_cost.retained_ns, capacity as u64 * 1000);
+            assert_eq!(plan.origin, PlanOrigin::Ordinary);
+            if missing_duration {
+                assert_eq!(plan.selection_value_rate(), before.selection_value_rate());
+                continue;
+            }
+            let output = s.expected_speculative_tokens(s.request(decoder).unwrap(), plan.lanes[0].tokens);
+            let expected = (plan.lanes[1].tokens as f64 + 64.0 * output
+                + if prompt_tokens <= 512 { 64.0 } else { 0.0 })
+                / (plan.estimated_duration_ns() as f64 / 1e6);
+            assert!((plan.selection_value_rate() * plan.selection_log_scale().exp() - expected).abs() < 1e-10);
+        }
+    }
+}
+
+#[test]
 fn mixed_value_selects_an_efficiency_knee_and_a_fitting_prompt_tail() {
     for prompt_tokens in [64, 8192] {
         let mut s = mixed_engine(

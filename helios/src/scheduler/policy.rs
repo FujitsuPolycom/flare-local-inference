@@ -1172,13 +1172,20 @@ impl RequestScheduler {
         log_scale: f64,
         origin: PlanOrigin,
     ) -> Option<ScheduledPlan> {
-        if candidate.kind.is_prefill() && matches!(origin, PlanOrigin::Ordinary) {
-            let slot = bits(candidate.mask).next().unwrap();
+        if (candidate.kind.is_prefill() || candidate.prefill_slot.is_some())
+            && matches!(origin, PlanOrigin::Ordinary)
+        {
+            let slot = candidate.prefill_slot.unwrap_or_else(|| bits(candidate.mask).next().unwrap());
             let request = self.slots[slot].request.as_ref().unwrap();
+            let (capacity, work) = if candidate.kind == GraphKind::Mixed {
+                (candidate.prefill_capacity, self.prefill_work(request, candidate.prefill_capacity))
+            } else {
+                (candidate.capacity, candidate.work)
+            };
             let cut = self.checkpoint_cut(request);
-            if self.prefill_work_through(request, candidate.capacity, cut) != candidate.work {
+            if self.prefill_work_through(request, capacity, cut) != work {
                 if let Some(resized) =
-                    self.resize_prefill(candidate, request, cut, values[slot], age_price)
+                    self.resize_prefill(candidate, request, cut, values, age_price)
                 {
                     candidate = resized;
                 }
@@ -1199,19 +1206,41 @@ impl RequestScheduler {
         mut candidate: Candidate,
         request: &LiveRequest,
         cut: Option<usize>,
-        value: LaneValue,
+        values: &[LaneValue; REQUEST_LANES],
         age_price: f64,
     ) -> Option<Candidate> {
-        let catalog = self.prefill_catalog(candidate.kind);
-        let work = self.prefill_work_through(request, *catalog.last()?, cut);
-        let capacity = *catalog.iter().find(|&&capacity| capacity >= work)?;
-        let duration_ns = self.costs.duration(candidate.kind, candidate.batch, capacity)?;
+        let mixed = candidate.kind == GraphKind::Mixed;
+        let (capacity, prefill, work) = if mixed {
+            let catalog = self.mixed_catalog.iter()
+                .filter(|&&(batch, width, _)| batch == candidate.batch && width == candidate.capacity)
+                .map(|&(_, _, prefill)| prefill);
+            let work = self.prefill_work_through(request, catalog.clone().max()?, cut);
+            let prefill = catalog.filter(|&capacity| capacity >= work).min()?;
+            (candidate.capacity, prefill, work)
+        } else {
+            let catalog = self.prefill_catalog(candidate.kind);
+            let work = self.prefill_work_through(request, *catalog.last()?, cut);
+            let capacity = *catalog.iter().find(|&&capacity| capacity >= work)?;
+            (capacity, 0, work)
+        };
+        let duration_ns = self.costs.shape_duration(candidate.kind, candidate.batch, capacity, prefill)?;
         candidate.capacity = capacity;
+        candidate.prefill_capacity = prefill;
         candidate.work = work;
         candidate.duration_ns = duration_ns;
+        let slot = request.handle.slot as usize;
+        let kind = if mixed { GraphKind::Prefill } else { candidate.kind };
+        let mut expected = self.lane_value_for_tokens(request, kind, work, duration_ns, values[slot]);
+        if mixed {
+            let decode = if self.speculative_widths.is_empty() { GraphKind::Decode } else { GraphKind::Speculative };
+            expected += bits(candidate.mask & !(1 << slot)).map(|slot| {
+                self.lane_value(self.slots[slot].request.as_ref().unwrap(), decode,
+                    candidate.capacity, duration_ns, values[slot])
+            }).sum::<f64>();
+        }
         candidate.rate = ValueRate::new(
             duration_ns,
-            self.lane_value_for_tokens(request, candidate.kind, work, duration_ns, value),
+            expected,
             age_price,
         );
         Some(candidate)

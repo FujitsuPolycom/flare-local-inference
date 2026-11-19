@@ -15,7 +15,7 @@
 //! is gone.
 //!
 pub use crate::shared::rdma::Handshake;
-use std::{io, sync::Arc};
+use std::{io, net::IpAddr, sync::Arc};
 
 #[cfg(not(feature = "rdma"))]
 fn invalid(message: &str) -> io::Error {
@@ -39,12 +39,16 @@ mod verbs {
     unsafe impl Sync for Device {}
 
     impl Device {
-        /// Register private staging on the first active device.
+        /// Register private staging on the device matching the data socket address.
         ///
         /// # Safety
         /// The range must remain mapped at this address until the device is dropped.
-        pub unsafe fn open(base: *mut u8, len: usize) -> io::Result<Arc<Self>> {
-            let device = rdma::Device::open()?;
+        pub unsafe fn open(
+            base: *mut u8,
+            len: usize,
+            local_address: IpAddr,
+        ) -> io::Result<Arc<Self>> {
+            let device = rdma::Device::open(local_address)?;
             let access = ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0
                 | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE.0;
             // SAFETY: the caller keeps the range mapped for this registration's lifetime.
@@ -121,7 +125,7 @@ mod absent {
         /// # Safety
         ///
         /// Never registers anything.
-        pub unsafe fn open(_: *mut u8, _: usize) -> io::Result<Arc<Self>> {
+        pub unsafe fn open(_: *mut u8, _: usize, _: IpAddr) -> io::Result<Arc<Self>> {
             Err(invalid("this build has no RDMA support"))
         }
     }

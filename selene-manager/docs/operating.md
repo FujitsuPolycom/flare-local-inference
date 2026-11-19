@@ -26,8 +26,10 @@ upgrades for `selene`. The wire contract is [PROTOCOL.md](../PROTOCOL.md) and
   address.
 - **Same host, same identity.** The manager and every instance that uses shared memory must
   run with the same effective uid and gid, share the socket directory and `/dev/shm/selene` at
-  identical paths, and (in containers) share a PID namespace so peer credentials are real.
-  Instances that cannot meet this work over `--listen`, without shared memory.
+  identical paths. On Linux 6.5+, the manager uses `SO_PEERPIDFD` to watch clients
+  in separate PID namespaces. On older kernels, a client whose pid is invisible
+  gets no shared memory: share a PID namespace, or configure `--listen` and connect
+  over TCP to use the data channel. Without shared memory or a data channel, instance startup fails.
 
 Record expiry is off by default. `--max-age DURATION|off`
 accepts positive durations in ms, s, m, h, or bare seconds; `off` disables expiry.
@@ -97,9 +99,18 @@ recreates them under a new generation and logs that running instances must resta
 pool: until they do, they run on local tiers only. A file owned by another user stops the
 start, as does an unexpected I/O error while checking them
 (an interrupted call is retried); either stops the manager's start with an error and deletes nothing. After
-a crash the manager keeps the regions out of service until each process that had a session has
-reconnected or exited ([PROTOCOL.md 8.6](../PROTOCOL.md#86-persistent-shared-regions)). The files outlive a stopped manager and keep their
-memory: remove the `/dev/shm/selene/<name>-<hash>` directory to give it back.
+a crash the manager keeps the regions out of service for recorded previous-run
+processes ([PROTOCOL.md 8.6](../PROTOCOL.md#86-persistent-shared-regions)).
+Visible-pid holders release on reconnect or observed exit, with no time limit.
+A pid-zero holder from a separate PID namespace cannot be watched again after a
+manager restart. It releases when its nonce reconnects or 60 seconds after
+manager startup, whichever comes first; expiry logs the released nonce prefixes.
+A live client drains its copies when its session ends before reconnecting
+(PROTOCOL.md 8.1). The bound allows that drain and prevents a dead client from
+holding the regions indefinitely, assuming session-loss detection and drainage
+finish within those 60 seconds. The files outlive a stopped manager and keep
+their memory: stop the manager and instances before removing the
+`/dev/shm/selene/<name>-<hash>` directory to give it back.
 
 Protect these files from systemd-logind `RemoveIPC`, which can unlink a normal
 user's shared memory when their last login session ends, including files used
@@ -223,8 +234,9 @@ unchanged; changing either means restarting the instances too.
 Disk recovery completes before the manager binds any listener, so a manager that
 accepts connections is `READY`. It serves lookups, claims and puts without waiting
 for previous instances to reconnect, with one exception: after a crash, claims are
-refused `REGIONS_HELD` until each process that held a session has reconnected or
-exited (see [Sizing](#sizing)).
+refused `REGIONS_HELD` while recorded previous-run processes hold the regions.
+Visible-pid holders release on reconnect or observed exit; pid-zero holders
+release on nonce reconnect or 60 seconds after startup (see [Sizing](#sizing)).
 While the manager drains for shutdown, requests answer `NOT_READY`.
 Sources reconnect and resnapshot independently, so their hints may temporarily miss.
 
@@ -242,7 +254,7 @@ refusal as a normal outcome and move to another candidate, another tier, or reco
 | Reason | Meaning | Operator action |
 |---|---|---|
 | `NOT_READY` | The manager is draining for shutdown. | None; check `selene_pool_state`. |
-| `REGIONS_HELD` | After a crash, the shared regions are held for processes of the previous run. | None while those instances reconnect; a live process that never reconnects keeps the hold. Check `selene_pool_regions_held`. |
+| `REGIONS_HELD` | After a crash, the shared regions are held for processes of the previous run. | Visible-pid holders wait for reconnect or observed exit; pid-zero holders release within 60 s of startup. Check `selene_pool_regions_held`. |
 | `CLAIM_LIMIT` | The requester already has its claim slots in flight (default 2). | None; limits do not scale with concurrency. |
 | `SOURCE_LIMIT` / `SOURCE_BUSY` | The source already serves its export slots (default 2). | None. |
 | `UNKNOWN_SOURCE` / `STALE_SOURCE` | The named source or entry is gone, or the source reconnected. | None; the index catches up. |

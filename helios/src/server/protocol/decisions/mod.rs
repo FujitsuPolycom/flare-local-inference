@@ -623,26 +623,29 @@ fn candidates() -> Vec<String> {
     candidates
 }
 
+/// The token `label` becomes when it follows the rendered prompt, or `None` when it would not be a
+/// single ordinary token there. No tokenizer merge crosses an added token, so only the text after
+/// the prompt's last one can change how the label tokenizes: the prompt's tokens from there on must
+/// stay as they are when the label is appended. That text is encoded as ordinary text, because
+/// request text that spells a control holds ordinary token IDs in `tokens`.
 fn label_id(
     frontend: &crate::frontend::Frontend,
-    prompt: &str,
     tokens: &[u32],
-    decoded: &str,
     added_vocabulary: &tokenizers::tokenizer::AddedVocabulary,
     label: &str,
     vocabulary: usize,
 ) -> Result<Option<u32>> {
-    let extended = frontend.encode(&format!("{prompt}{label}"), false)?;
+    let added = added_vocabulary.get_added_tokens_decoder();
+    let tail = &tokens[tokens.iter().rposition(|id| added.contains_key(id)).map_or(0, |at| at + 1)..];
+    let decoded = frontend.decode(tail, false)?;
+    let extended = frontend.encode_ordinary(&format!("{decoded}{label}"))?;
     let Some(&id) = extended.last() else {
         return Ok(None);
     };
-    if extended.len() != tokens.len() + 1
-        || !extended.starts_with(tokens)
+    if extended.len() != tail.len() + 1
+        || !extended.starts_with(tail)
         || id as usize >= vocabulary
-        || added_vocabulary
-            .get_added_tokens_decoder()
-            .get(&id)
-            .is_some_and(|token| token.special)
+        || added.get(&id).is_some_and(|token| token.special)
         || frontend.decode(&extended, false)? != format!("{decoded}{label}")
     {
         return Ok(None);
@@ -708,22 +711,13 @@ fn prepare_questions(
             let rendered = state
                 .frontend
                 .render_chat(&normalized, &decoded.request.options.template)?;
-            let tokens = state.frontend.encode(&rendered.text, false)?;
-            if tokens != rendered.token_ids {
-                return Err(
-                    "chat template encoding cannot verify contextual decision labels".into(),
-                );
-            }
-            let decoded_tokens = state.frontend.decode(&tokens, false)?;
             let mut ids = Vec::new();
             let mut selected = Vec::new();
             let choices = if pass == 0 { &candidates } else { &labels };
             for label in choices {
                 if let Some(id) = label_id(
                     &state.frontend,
-                    &rendered.text,
-                    &tokens,
-                    &decoded_tokens,
+                    &rendered.token_ids,
                     added_vocabulary,
                     label,
                     config.contract.vocabulary,

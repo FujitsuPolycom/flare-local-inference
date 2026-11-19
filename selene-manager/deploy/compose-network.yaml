@@ -9,7 +9,6 @@ services:
   manager:
     image: ${MANAGER_IMAGE:-selene:local}
     user: "${CACHE_UID:-1000}:${CACHE_GID:-1000}"
-    pid: host
     command:
       - --name
       - pool

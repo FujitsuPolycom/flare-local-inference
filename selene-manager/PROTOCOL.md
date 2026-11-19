@@ -34,13 +34,16 @@ cite them by number.
    RDMA is not listed in `data_transports` when the manager is TLS.
 4. **Same host is proven by the socket; levels.** `shared_memory` is
    returned only on a Unix-domain socket whose peer uid and gid match the
-   manager's. A session without it uses `DATA_CHANNEL` only. It may be an
-   export source when the manager serves a data channel: its windows are relayed
-   through the manager (section 7.5). Instance-sourced candidates
-   (neighbour GPU = level 2, neighbour DRAM = 3, neighbour NVMe = 4) are offered
-   to every session, whether the copy goes through shared windows or through the
-   manager's relay. Manager-store candidates are offered
-   to every session: a same-host manager chain is level 3 when every record the
+   manager's and whose exit can be watched: a nonzero peer pid, or a pidfd from
+   `SO_PEERPIDFD` (Linux 6.5+). A pid-zero peer without that descriptor receives
+   no shared memory; on older kernels, share a PID namespace or configure
+   `--listen` and connect over TCP for the data channel. A session without shared
+   memory uses `DATA_CHANNEL` only. It may be an export source when the manager
+   serves a data channel: its windows are relayed through the manager (section 7.5).
+   Instance-sourced candidates (neighbour GPU = level 2, neighbour DRAM = 3,
+   neighbour NVMe = 4) are offered to every session, whether the copy goes through
+   shared windows or through the manager's relay. Manager-store candidates are
+   offered to every session: a same-host manager chain is level 3 when every record the
    claim reads is in DRAM, and level 4 when any requires NVMe. A remote manager's
    records (DRAM or NVMe) are level 5. The candidate's `tier` is the endpoint's
    tier; its level reflects the slowest tier read from the requester's perspective.
@@ -492,7 +495,11 @@ is not reused until the owning process is confirmed exited, or for the lifetime
 of the manager process if exit cannot be observed (remote sessions). A
 disconnected local process that is still alive keeps its windows quarantined
 (`Core::holders` in `selene-manager/src/pool/claims.rs`; exit is observed through
-the pidfd helpers in `selene-manager/src/local.rs`).
+the pidfd helpers in `selene-manager/src/local.rs`). Visible peer pids from
+`SO_PEERCRED` are watched with `pidfd_open`. When the peer pid is zero because it
+is outside the manager's PID namespace, the accepted Unix socket supplies the
+pidfd through `SO_PEERPIDFD`. Socket closure alone is never exit proof; the pidfd
+becomes readable after the process has fully exited.
 
 - The manager counts quarantined bytes in `selene_pool_quarantined_bytes` and
   logs each quarantine event once (designed, not implemented: it logs only a
@@ -604,8 +611,8 @@ records.
 - A `ClaimRelease`, `FenceAck` or `ExportEnd` that mentions a vanished claim or
   export is answered (`UNKNOWN_CLAIM`) or ignored. The restarted manager grants
   none of the previous run's windows: it reuses the same region files and holds
-  them until each process that had a session has reconnected or exited
-  (section 8.6).
+  them for recorded previous-run processes, with a 60-second bound for pid-zero
+  holders (section 8.6).
 - Records the dead manager held only in DRAM are lost; NVMe records are
   recovered. A writer drops its source copy at `Stored`, so a lost record cannot
   be resent; it is recomputed on demand.
@@ -659,7 +666,7 @@ dying: a hold protects against eviction only (`ClaimGranted` in selene.proto).
 | stream ends, process alive | `REQUESTER_LOST` | `SOURCE_LOST` | removed | quarantined until fence acks arrive on a new session or the process exits |
 | superseded by a reconnect (same process) | `REQUESTER_LOST` | `SOURCE_LOST` | removed; the new session's snapshot announces its own | as above; the old stream's fence acks are accepted on the new session |
 | superseded by another process (same `instance_id`) | `REQUESTER_LOST` | `SOURCE_LOST` | removed; the new session's snapshot announces its own | quarantined until the old process's exit is confirmed; the new process attests nothing for it |
-| manager restart | all dead | all dead | gone | the same region files, held until the previous run's processes have reconnected (drained) or exited (8.6) |
+| manager restart | all dead | all dead | gone | the same region files, held for previous-run processes under 8.6, with a 60 s bound for pid-zero holders |
 
 ### 8.6 Persistent shared regions
 
@@ -684,8 +691,9 @@ running instances must restart to use the pool. Only these definite mismatches
 recreate the files; an unexpected I/O error during the check (an interrupted
 `fallocate` is retried) fails the start and deletes nothing. The lock decides
 ownership, so a live manager's files are never reclaimed and another instance's
-directory is never read. Startup refuses region files owned by another user or symbolic links, and
-removes only its unfinished `generation.tmp` and `holders.tmp` metadata writes.
+directory is never read. Startup refuses region files owned by another user or
+symbolic links, and removes only its unfinished `generation.tmp` and `holders.tmp`
+metadata writes.
 Other files are left alone. Shutdown retains the regions for reconnecting clients.
 
 **Client.** A client uses the pool only with the regions it registered:
@@ -704,28 +712,42 @@ Other files are left alone. Shutdown retains the regions for reconnecting client
 **Why reuse is safe.** Reusing the files gives up what files created per
 incarnation would guarantee: that no access under the dead manager can alias a
 window of the new one. Physical fencing (7.1) is kept by the following rule. The
-manager records the pid and start time of every process with a local session, in
-a file that survives a crash. When it starts on reused regions, each recorded
-process that is still the same live process is a previous-run holder, and the
-manager takes the whole of both regions out of service (no window, put extent or
-record can be allocated in them) until every such holder has either
+manager records the pids and start times of visible-pid sessions and
+shared-memory ranks, and the process nonces of pid-zero shared-memory sessions
+and ranks, in a file that survives a crash.
+When it starts on reused regions, each recorded visible process that is still
+the same live process, and every recorded pid-zero process, is a previous-run
+holder. The manager takes the whole of both regions out of service (no window,
+put extent or record can be allocated in them) until every holder is released:
 
-1. exited, as its pidfd reports (the 7.4 quarantine rule: memory returns when
-   the owning process is confirmed gone), or
-2. opened a new session. A client opens one only after step 3 of 8.1: it has
-   failed its claims and every copy it submitted under the old incarnation has
-   completed on every rank. Old-epoch windows are not referred to by the new
-   incarnation (stale messages are rejected by `manager_incarnation`), so after
-   that nothing of the old epoch can write.
+1. A visible-pid holder is released when its pidfd reports exit, or when it opens
+   a new session. A visible process that cannot be watched keeps its hold until
+   it reconnects; there is no time limit for visible-pid holders.
+2. A pid-zero holder is released when its nonce opens a new session or rank
+   attachment, or 60 seconds after manager startup (`PID_ZERO_HOLD`), whichever
+   comes first. Its pidfd does not survive a restart, so the manager cannot
+   observe its exit. At expiry the manager logs the released nonce prefixes in
+   one line.
 
-While the hold lasts a claim is refused at once with `REGIONS_HELD`, not `NO_WINDOWS`. It ends as soon as the last recorded holder has reconnected or exited, not on a timer. A requester that gets it claims again after a short wait (250 ms), within the restore's own deadline, and recomputes only when that passes.
+A reconnect follows step 3 of 8.1: the client has failed its claims and every copy
+it submitted under the dead incarnation has completed on every rank. Stale
+messages are rejected by `manager_incarnation`, so no further copy is submitted
+under that incarnation. A live client drains its copies when its session ends,
+even if it never reconnects; this bounds its writes from the previous run. The
+60-second pid-zero hold allows that drain and prevents a dead client, whose
+replacement has a different nonce, from holding the regions indefinitely. This
+bound assumes the live client's session-loss detection and copy drain finish
+within 60 seconds of manager startup; it is not proof of process exit.
 
-A holder that is alive but never reconnects, or whose exit cannot be observed,
-keeps the regions held: the same outcome as a quarantined window in 7.4, at region
-size, and visible as `REGIONS_HELD`. A process that was not recorded cannot have a
-window of the old epoch, so it needs no wait. Recreated files need no hold: they
-are different files that no old mapping can reach. When the hold ends the
-allocators are fresh, so every window of the old epoch is free by construction.
+While the hold lasts a claim is refused at once with `REGIONS_HELD`, not
+`NO_WINDOWS`. It ends as soon as the last holder is released. A requester that
+gets it claims again after a short wait (250 ms), within the restore's own
+deadline, and recomputes only when that passes.
+
+A process that was not recorded cannot have a window of the dead incarnation,
+so it needs no wait. Recreated files need no hold: they are different files that
+no existing mapping can reach. When the hold ends the allocators are fresh, so
+every window of the previous run is free by construction.
 
 ## 9. Single-source restores
 
@@ -790,6 +812,8 @@ writer                          manager
 - For a record not already indexed, if the published parent is absent or has no
   stored row, `PutAccept` selects no parent and `first_page = 0`. The writer sends
   the complete page chain and endpoint row as a root, over shared memory or the data channel.
+- `PutGrant` window page numbers count from the accepted record's first page
+  (`PutAccept.first_page` is chain-relative), for every writer and rank agent.
 - "Already held means committed": only `Stored` and `PRESENT` confirm a
   committed destination copy. Discarding a refused source under the pressure
   policy does not establish a destination copy.
@@ -910,7 +934,7 @@ be granted nothing, but their open streams can attest and say goodbye. A new att
 requires a live rank-0 session. Stream loss retains shared-window obligations until the
 process exits. A restarted manager has no record of these obligations: it keeps them in
 memory only. Section 8.6 states how region files it reuses are held for the previous run's
-session processes.
+session processes and pid-zero shared-memory ranks.
 
 **13.4 Windows and checksums.** A multi-process source states, per rank, slice transfer
 checksums (`RankSums`): rank 0's `WindowFilled.rank_sums`/`PutFilled.rank_sums` for itself and

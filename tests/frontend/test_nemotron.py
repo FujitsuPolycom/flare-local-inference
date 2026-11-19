@@ -70,6 +70,18 @@ def test_native_nemotron_chat_matches_checkpoint(tmp_path):
         add(f"images_{count}", [dict(role="user", content=content)], add_generation_prompt=True)
     add("explicit_image_placeholder", [dict(role="user", content=[dict(type="image"),
         dict(type="text", text="Describe <image>.")])], add_generation_prompt=True)
+    # No image is attached to this request, so the spelled placeholder is ordinary text; with an
+    # attached image it positions the image (helios/tests/image_admission.rs).
+    from tokenizers import Tokenizer
+
+    ordinary_config = json.loads((snapshot / "tokenizer.json").read_text())
+    ordinary_config["added_tokens"] = []
+    ordinary = Tokenizer.from_str(json.dumps(ordinary_config))
+    literal = "Describe <image>."
+    before, after = cases[-1]["rendered"].split(literal)
+    cases[-1]["token_ids"] = (tokenizer.encode(before, add_special_tokens=False)
+        + ordinary.encode(literal, add_special_tokens=False).ids
+        + tokenizer.encode(after, add_special_tokens=False))
 
     samples = ["Hello, world!", "中文 é a\u0301 👨‍👩‍👧‍👦\r\n  next line", "<think>\nwork</think>answer",
                "<tool_call>\n<function=lookup>\n<parameter=query>\nParis\n</parameter>\n</function>\n</tool_call>"]
