@@ -64,6 +64,12 @@ fn network_manager_with(tls: bool, rdma: bool) -> Manager {
     net.listen_data = Some(free());
     net.metrics = Some(free());
     net.rdma = rdma;
+    #[cfg(feature = "rdma")]
+    if rdma {
+        // The carrier uses the device on the data connection's route.
+        let ip = selene_manager::testing::rdma_address().expect("no local RoCE v2 address");
+        net.listen_data = Some(selene_manager::testing::free_address_on(ip));
+    }
     if tls {
         let generated = selene_manager::testing::certificate();
         let (cert, key) = (

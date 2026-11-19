@@ -291,13 +291,59 @@ pub struct RenderedPrompt {
     pub text: String,
     pub token_ids: Vec<u32>,
     pub message_boundaries: Vec<usize>,
+    /// Sorted, disjoint byte ranges of `text` that came from the request. A token whose bytes
+    /// overlap one is request text; an output marker is skipped only when one range holds all of
+    /// it. Empty for prompts that are not rendered from a Jinja text template.
+    pub ordinary: Vec<std::ops::Range<usize>>,
+}
+
+/// Whether `ordinary`, sorted and disjoint, overlaps the byte range `start..end`.
+pub(crate) fn overlaps_ordinary(ordinary: &[std::ops::Range<usize>], start: usize, end: usize) -> bool {
+    let first = ordinary.partition_point(|range| range.end <= start);
+    ordinary.get(first).is_some_and(|range| range.start < end)
+}
+
+/// Whether one range of `ordinary` holds all of the byte range `start..end`. Ranges are sorted,
+/// disjoint and merged where they touch, so a match that the request spelled completely lies in
+/// one range, and a match with any template-written byte does not.
+#[cfg(feature = "server")]
+pub(crate) fn within_ordinary(ordinary: &[std::ops::Range<usize>], start: usize, end: usize) -> bool {
+    let first = ordinary.partition_point(|range| range.end < end);
+    ordinary.get(first).is_some_and(|range| range.start <= start)
+}
+
+/// Whether `token` occurs in a string of `value`, nested arrays and objects included.
+fn json_names(value: &Json, token: &str) -> bool {
+    match value {
+        Json::String(text) => text.contains(token),
+        Json::Array(items) => items.iter().any(|item| json_names(item, token)),
+        Json::Object(map) => map.values().any(|item| json_names(item, token)),
+        _ => false,
+    }
+}
+
+fn encode_text(tokenizer: &Tokenizer, text: &str, add_special_tokens: bool) -> Result<tokenizers::Encoding> {
+    tokenizer.encode(text, add_special_tokens).map_err(|error| {
+        Error::frontend(FrontendError::Tokenizer(Failure::boxed(
+            error.to_string(),
+            error,
+        )))
+    })
 }
 
 pub struct Frontend {
     prompt_encoder: PromptEncoder,
     image_placeholder_token_id: Option<u32>,
     tokenizer: Tokenizer,
-    ordinary_tokenizer: Option<Tokenizer>,
+    /// The tokenizer without its added vocabulary, for text that must not spell controls.
+    ordinary_tokenizer: Tokenizer,
+    /// The added tokens that request text may not spell: the special tokens and the ones the
+    /// chat template or the image settings name. Other added tokens, such as `/nothink`, are
+    /// lexical: request text that spells one tokenizes to that token.
+    controls: std::collections::HashSet<u32>,
+    /// The control that request text positions images with, when the image layout allows it.
+    spelled_image_placeholder: Option<u32>,
+    template_encoding: TemplateEncoding,
     template: Option<jinja::CompiledTemplate>,
     template_source: String,
     bos_token_id: Option<u32>,
@@ -312,13 +358,7 @@ impl Frontend {
         self.prompt_encoder
     }
     pub fn with_template_encoding(mut self, encoding: TemplateEncoding) -> Self {
-        if self.prompt_encoder == PromptEncoder::Jinja {
-            self.ordinary_tokenizer = matches!(encoding, TemplateEncoding::TokenSegments).then(|| {
-                let mut tokenizer = self.tokenizer.clone();
-                tokenizer.with_added_vocabulary(tokenizers::AddedVocabulary::new());
-                tokenizer
-            });
-        }
+        self.template_encoding = encoding;
         self
     }
     pub fn bos_token_id(&self) -> Option<u32> {
@@ -469,7 +509,28 @@ impl Frontend {
             settings.prompt_encoder,
             settings.image_placeholder_token_id,
         )
-        .map(|frontend| frontend.with_template_encoding(settings.template_encoding))
+        .map(|frontend| {
+            frontend
+                .with_template_encoding(settings.template_encoding)
+                .with_image_placeholder_text(settings)
+        })
+    }
+
+    /// Records the token that request text may spell to position images.
+    fn with_image_placeholder_text(mut self, settings: &FrontendSettings) -> Self {
+        #[cfg(feature = "images")]
+        let text = settings
+            .image
+            .as_ref()
+            .and_then(images::ImageSettings::spelled_placeholder);
+        #[cfg(not(feature = "images"))]
+        let text = {
+            let _ = settings;
+            None::<&str>
+        };
+        self.spelled_image_placeholder = text.and_then(|text| self.tokenizer.token_to_id(text));
+        self.controls.extend(self.spelled_image_placeholder);
+        self
     }
 
     fn load_encoder(
@@ -551,12 +612,24 @@ impl Frontend {
         defaults.insert("tools".into(), Json::Null);
         defaults.insert("documents".into(), Json::Null);
         defaults.extend(template_defaults);
-        // Programmatic encoders tokenize message text without the added vocabulary.
-        let ordinary_tokenizer = (prompt_encoder != PromptEncoder::Jinja).then(|| {
-            let mut ordinary = tokenizer.clone();
-            ordinary.with_added_vocabulary(tokenizers::AddedVocabulary::new());
-            ordinary
-        });
+        let mut ordinary_tokenizer = tokenizer.clone();
+        ordinary_tokenizer.with_added_vocabulary(tokenizers::AddedVocabulary::new());
+        // A token the template names in its text or writes through a default (a special-token
+        // string of the tokenizer config, a recipe default, nested ones included) is a control.
+        // Whitespace alone is never a marker, however often a template writes it.
+        let controls = tokenizer
+            .get_added_vocabulary()
+            .get_added_tokens_decoder()
+            .iter()
+            .filter(|(_, token)| {
+                token.special
+                    || (!token.content.trim().is_empty()
+                        && (template_source.contains(&token.content)
+                            || defaults.values().any(|value| json_names(value, &token.content))))
+            })
+            .map(|(&id, _)| id)
+            .chain(image_placeholder_token_id)
+            .collect();
         let frontend = Self {
             prompt_encoder,
             image_placeholder_token_id,
@@ -566,6 +639,9 @@ impl Frontend {
             inline_system_messages: Default::default(),
             tokenizer,
             ordinary_tokenizer,
+            controls,
+            spelled_image_placeholder: None,
+            template_encoding: TemplateEncoding::Text,
             template,
             template_source,
             defaults,
@@ -579,15 +655,12 @@ impl Frontend {
     }
 
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
-        self.tokenizer
-            .encode(text, add_special_tokens)
-            .map(|encoding| encoding.get_ids().to_vec())
-            .map_err(|error| {
-                Error::frontend(FrontendError::Tokenizer(Failure::boxed(
-                    error.to_string(),
-                    error,
-                )))
-            })
+        encode_text(&self.tokenizer, text, add_special_tokens).map(|encoding| encoding.get_ids().to_vec())
+    }
+
+    /// Encodes `text` without the added vocabulary, so a spelled control stays ordinary text.
+    pub fn encode_ordinary(&self, text: &str) -> Result<Vec<u32>> {
+        encode_text(&self.ordinary_tokenizer, text, false).map(|encoding| encoding.get_ids().to_vec())
     }
 
     pub fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> Result<String> {
@@ -709,17 +782,24 @@ impl Frontend {
             .map(|field| self.mark_continuation(&mut messages, &field))
             .transpose()?;
         context.insert("messages".into(), Json::Array(messages));
+        let default_names: Vec<_> = self
+            .defaults
+            .keys()
+            .filter(|name| !options.contains_key(*name) && name.as_str() != "messages")
+            .map(String::as_str)
+            .collect();
         let rendered = self
             .template
             .as_ref()
             .unwrap()
-            .render(&context, &checkpoint_hints)
+            .render_with_defaults(&context, &checkpoint_hints, &default_names)
             .map_err(|error| {
                 Error::frontend(FrontendError::Template(Failure::caused_by(
                     error.message.clone(),
                     error,
                 )))
             })?;
+        let ordinary = rendered.ordinary;
         let marks = rendered.marks;
         let rendered = rendered.text;
         let mut hint_bytes = marks
@@ -729,7 +809,8 @@ impl Frontend {
                 _ => None,
             })
             .collect();
-        let mut segments: Vec<TokenSegment> = if self.ordinary_tokenizer.is_some() {
+        let segmented = matches!(self.template_encoding, TemplateEncoding::TokenSegments);
+        let mut segments: Vec<TokenSegment> = if segmented {
             token_segments(&rendered, &mut hint_bytes).map_err(|error| {
                 Error::frontend(FrontendError::Template(Failure::caused_by(
                     "chat template must render an array of text and allow_special segments",
@@ -753,13 +834,10 @@ impl Frontend {
         for mark in marks {
             match mark {
                 jinja::Mark::Hint(_) => {}
-                jinja::Mark::Byte(byte)
-                    if self.ordinary_tokenizer.is_none()
-                        && byte <= *segment_ends.last().unwrap() =>
-                {
+                jinja::Mark::Byte(byte) if !segmented && byte <= *segment_ends.last().unwrap() => {
                     byte_boundaries.push(byte);
                 }
-                jinja::Mark::Position(count) if self.ordinary_tokenizer.is_some() => {
+                jinja::Mark::Position(count) if segmented => {
                     byte_boundaries.push(*segment_ends.get(count).ok_or_else(|| {
                         deepseek::invalid("mark position exceeds the rendered segment count")
                     })?);
@@ -794,18 +872,26 @@ impl Frontend {
             let tokenizer = if segment.allow_special {
                 &self.tokenizer
             } else {
-                self.ordinary_tokenizer.as_ref().unwrap_or(&self.tokenizer)
+                &self.ordinary_tokenizer
             };
-            let encoding = tokenizer
-                .encode(segment.text.as_str(), false)
-                .map_err(|error| {
-                    Error::frontend(FrontendError::Tokenizer(Failure::boxed(
-                        error.to_string(),
-                        error,
-                    )))
-                })?;
-            token_ids.extend_from_slice(encoding.get_ids());
-            offsets.extend(encoding.get_offsets().iter().map(|&(start,end)| (byte_start+start,byte_start+end)));
+            let encoding = encode_text(tokenizer, &segment.text, false)?;
+            let first = token_ids.len();
+            if segmented {
+                token_ids.extend_from_slice(encoding.get_ids());
+                offsets.extend_from_slice(encoding.get_offsets());
+            } else {
+                self.push_segment(
+                    &segment.text,
+                    &ordinary,
+                    &encoding,
+                    image_sources.len(),
+                    &mut token_ids,
+                    &mut offsets,
+                )?;
+            }
+            for span in &mut offsets[first..] {
+                *span = (byte_start + span.0, byte_start + span.1);
+            }
             byte_start += segment.text.len();
             if remaining == 0 {
                 break;
@@ -819,7 +905,97 @@ impl Frontend {
             token_ids,
             image_sources,
             image_checkpoint_hints,
+            // Segmented text is not the template output the ranges index.
+            ordinary: if segmented { Vec::new() } else { ordinary },
         })
+    }
+
+    /// Appends the tokens of a prompt segment to `ids_out` and `offsets_out`, with byte spans
+    /// relative to `text`, so that request text spelling a control stays ordinary. `encoding` is
+    /// the segment encoded with the added vocabulary. Added tokens other than spelled controls
+    /// (template controls and lexical tokens such as `/nothink`) delimit regions; only a region
+    /// that holds a spelled control is encoded again, without the added vocabulary.
+    fn push_segment(
+        &self,
+        text: &str,
+        ordinary: &[std::ops::Range<usize>],
+        encoding: &tokenizers::Encoding,
+        images: usize,
+        ids_out: &mut Vec<u32>,
+        offsets_out: &mut Vec<(usize, usize)>,
+    ) -> Result<()> {
+        let added = self
+            .tokenizer
+            .get_added_vocabulary()
+            .get_added_tokens_decoder();
+        let (ids, offsets) = (encoding.get_ids(), encoding.get_offsets());
+        // An added token with lstrip or rstrip also covers adjacent whitespace, which may be
+        // request text. Only the token's own bytes decide whether the request spelled it.
+        let spelled = |at: usize| {
+            let (start, end) = offsets[at];
+            let own = added.get(&ids[at]).and_then(|token| {
+                let found = text.get(start..end)?.find(token.content.as_str())?;
+                Some(start + found..start + found + token.content.len())
+            });
+            let own = own.unwrap_or(start..end);
+            overlaps_ordinary(ordinary, own.start, own.end)
+        };
+        // The request positions images by spelling their placeholder when the spelled and
+        // template-written placeholders together account for every attached image.
+        let positional = self.spelled_image_placeholder.filter(|id| {
+            let requested = (0..ids.len()).filter(|&at| ids[at] == *id && spelled(at)).count();
+            let written = ids.iter().filter(|token| *token == id).count() - requested;
+            requested > 0 && written + requested == images
+        });
+        // A token ends a region when it is a template control or a lexical added token, or the
+        // image placeholder that positions an attached image.
+        let closes = |at: usize| {
+            let id = ids[at];
+            (added.contains_key(&id) && !(self.controls.contains(&id) && spelled(at)))
+                || positional == Some(id)
+        };
+        let (mut from, mut from_byte, mut dirty) = (0, 0, false);
+        for at in 0..=ids.len() {
+            if at < ids.len() && !closes(at) {
+                dirty |= self.controls.contains(&ids[at]) && added.contains_key(&ids[at]);
+                continue;
+            }
+            if dirty {
+                let end = offsets.get(at).map_or(text.len(), |span| span.0);
+                self.push_ordinary(text, from_byte..end, ids_out, offsets_out)?;
+            } else {
+                ids_out.extend_from_slice(&ids[from..at]);
+                offsets_out.extend_from_slice(&offsets[from..at]);
+            }
+            if at < ids.len() {
+                ids_out.push(ids[at]);
+                offsets_out.push(offsets[at]);
+                from_byte = offsets[at].1;
+            }
+            from = at + 1;
+            dirty = false;
+        }
+        Ok(())
+    }
+
+    /// Appends the encoding of `text[range]` without the added vocabulary, with byte spans
+    /// relative to `text`.
+    fn push_ordinary(
+        &self,
+        text: &str,
+        range: std::ops::Range<usize>,
+        ids: &mut Vec<u32>,
+        offsets: &mut Vec<(usize, usize)>,
+    ) -> Result<()> {
+        let encoding = encode_text(&self.ordinary_tokenizer, &text[range.clone()], false)?;
+        ids.extend_from_slice(encoding.get_ids());
+        offsets.extend(
+            encoding
+                .get_offsets()
+                .iter()
+                .map(|&(a, b)| (range.start + a, range.start + b)),
+        );
+        Ok(())
     }
 
     fn mark_continuation(&self, messages: &mut [Json], field: &str) -> Result<String> {
@@ -968,7 +1144,10 @@ mod tests {
         Frontend {
             prompt_encoder: PromptEncoder::Jinja,
             image_placeholder_token_id: None,
-            ordinary_tokenizer: None,
+            ordinary_tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
+            controls: Default::default(),
+            spelled_image_placeholder: None,
+            template_encoding: TemplateEncoding::Text,
             tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
             template,
             template_source: source,
@@ -1067,7 +1246,10 @@ mod tests {
             let frontend = Frontend {
                 prompt_encoder: PromptEncoder::Jinja,
                 image_placeholder_token_id: None,
-                ordinary_tokenizer: None,
+                ordinary_tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
+                controls: Default::default(),
+                spelled_image_placeholder: None,
+                template_encoding: TemplateEncoding::Text,
                 tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
                 template,
                 template_source: source,
@@ -1128,7 +1310,10 @@ mod tests {
             vocabulary_bytes: Default::default(),
             effort_levels: Default::default(),
             inline_system_messages: Default::default(),
-            ordinary_tokenizer: None,
+            ordinary_tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
+            controls: Default::default(),
+            spelled_image_placeholder: None,
+            template_encoding: TemplateEncoding::Text,
             tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
             template,
             template_source: source.to_owned(),

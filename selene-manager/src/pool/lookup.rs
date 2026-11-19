@@ -354,6 +354,7 @@ mod tests {
                     pid: std::process::id(),
                     uid: core.euid,
                     gid: core.egid,
+                    pidfd: None,
                 },
                 v2::OpenSession {
                     manager_incarnation: core.incarnation,

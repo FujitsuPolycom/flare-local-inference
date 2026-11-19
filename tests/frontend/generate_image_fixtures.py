@@ -109,16 +109,11 @@ def generate(snapshot: Path, output: Path, binary_dir: Path | None):
         rendered = processor.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         result = processor(text=rendered, images=images, return_tensors="pt", return_mm_token_type_ids=True)
         grids = result["image_grid_thw"]
-        expanded = rendered
-        for index in range(len(images)):
-            expanded = expanded.replace("<|image_pad|>", f"<sg-image-{index}>", 1)
-        for index in range(len(images)):
-            expanded = expanded.replace(f"<sg-image-{index}>", processor.replace_image_token(result, index))
         indices, weights = get_vision_interpolation_indices_and_weights(grids, 48, mode="bilinear", align_corners=True, spatial_merge_size=2)
         positions = get_vision_position_ids(grids, 2)
         mrope, delta = Qwen4ExpModel.get_rope_index(positional_model, result["input_ids"], result["mm_token_type_ids"], image_grid_thw=grids)
         case = {"name": name, "inputs": descriptors, "messages": messages, "rendered": rendered,
-            "expanded": expanded, "token_ids": result["input_ids"][0].tolist(),
+            "token_ids": result["input_ids"][0].tolist(),
             "mm_token_type_ids": result["mm_token_type_ids"][0].tolist(),
             "grid_thw": grids.tolist(), "cu_seqlens": get_vision_cu_seqlens(grids).tolist(),
             "rope_delta": delta[0, 0].item(), "resized_rgb_sha256": [], "input_rgb_sha256": []}

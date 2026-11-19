@@ -136,12 +136,13 @@ mod tests {
     #[test]
     fn persisted_header_matches_the_descriptor_layout() {
         let fixture = include_bytes!("../tests/fixtures/flare-header-v1.bin");
-        let decoded = Header::decode(fixture).unwrap();
+        let current = include_bytes!("../tests/fixtures/flare-header-v3.bin");
         let mut planned = new_header(&descriptor(), key(130), Some(key(65)), [4; 16], 1).unwrap();
         planned.created = 1_700_000_000;
         planned.row_checksum = 0x0123456789abcdef;
-        assert_eq!(decoded, planned);
-        assert_eq!(&planned.encode().unwrap(), fixture);
+        assert_eq!(Header::decode(fixture).unwrap(), planned);
+        assert_eq!(Header::decode(current).unwrap(), planned);
+        assert_eq!(&planned.encode().unwrap(), current);
         for (offset, value) in [(129, 0u64), (173, 0), (181, u64::MAX)] {
             let mut invalid = *fixture;
             invalid[offset..offset + 8].copy_from_slice(&value.to_le_bytes());

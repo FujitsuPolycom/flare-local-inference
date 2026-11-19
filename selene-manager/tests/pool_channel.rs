@@ -524,7 +524,11 @@ mod over_rdma {
 
     fn rdma_net() -> Net {
         Net::start_with(
-            |config| config.rdma = true,
+            |config| {
+                config.rdma = true;
+                let ip = selene_manager::testing::rdma_address().expect("no local RoCE v2 address");
+                config.listen_data = Some(selene_manager::testing::free_address_on(ip));
+            },
             |store| store.limits.progress_timeout_ms = 600,
         )
     }

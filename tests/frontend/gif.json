@@ -1,0 +1,160 @@
+{
+  "pillow": "12.3.0",
+  "cases": [
+    {
+      "name": "global-palette",
+      "encoded": "gif-inputs/global-palette.gif",
+      "animated": false,
+      "mode": "P",
+      "rgb": "gif-inputs/global-palette.rgb",
+      "rgba": "gif-inputs/global-palette.rgba",
+      "width": 11,
+      "height": 7
+    },
+    {
+      "name": "local-palette",
+      "encoded": "gif-inputs/local-palette.gif",
+      "animated": false,
+      "mode": "P",
+      "rgb": "gif-inputs/local-palette.rgb",
+      "rgba": "gif-inputs/local-palette.rgba",
+      "width": 9,
+      "height": 6
+    },
+    {
+      "name": "transparency-index",
+      "encoded": "gif-inputs/transparency-index.gif",
+      "animated": false,
+      "mode": "P",
+      "rgb": "gif-inputs/transparency-index.rgb",
+      "rgba": "gif-inputs/transparency-index.rgba",
+      "width": 13,
+      "height": 9
+    },
+    {
+      "name": "frame-offset",
+      "encoded": "gif-inputs/frame-offset.gif",
+      "animated": false,
+      "mode": "P",
+      "rgb": "gif-inputs/frame-offset.rgb",
+      "rgba": "gif-inputs/frame-offset.rgba",
+      "width": 20,
+      "height": 12
+    },
+    {
+      "name": "frame-offset-transparency",
+      "encoded": "gif-inputs/frame-offset-transparency.gif",
+      "animated": false,
+      "mode": "P",
+      "rgb": "gif-inputs/frame-offset-transparency.rgb",
+      "rgba": "gif-inputs/frame-offset-transparency.rgba",
+      "width": 20,
+      "height": 12
+    },
+    {
+      "name": "frame-past-screen",
+      "encoded": "gif-inputs/frame-past-screen.gif",
+      "animated": false,
+      "mode": "P",
+      "rgb": "gif-inputs/frame-past-screen.rgb",
+      "rgba": "gif-inputs/frame-past-screen.rgba",
+      "width": 12,
+      "height": 8
+    },
+    {
+      "name": "empty-screen",
+      "encoded": "gif-inputs/empty-screen.gif",
+      "animated": false,
+      "mode": "P",
+      "rgb": "gif-inputs/empty-screen.rgb",
+      "rgba": "gif-inputs/empty-screen.rgba",
+      "width": 11,
+      "height": 7
+    },
+    {
+      "name": "interlaced",
+      "encoded": "gif-inputs/interlaced.gif",
+      "animated": false,
+      "mode": "P",
+      "rgb": "gif-inputs/interlaced.rgb",
+      "rgba": "gif-inputs/interlaced.rgba",
+      "width": 21,
+      "height": 19
+    },
+    {
+      "name": "interlaced-flat",
+      "encoded": "gif-inputs/interlaced-flat.gif",
+      "animated": false,
+      "mode": "P",
+      "rgb": "gif-inputs/interlaced-flat.rgb",
+      "rgba": "gif-inputs/interlaced-flat.rgba",
+      "width": 31,
+      "height": 19
+    },
+    {
+      "name": "gray-identity-table",
+      "encoded": "gif-inputs/gray-identity-table.gif",
+      "animated": false,
+      "mode": "L",
+      "rgb": "gif-inputs/gray-identity-table.rgb",
+      "rgba": "gif-inputs/gray-identity-table.rgba",
+      "width": 17,
+      "height": 18
+    },
+    {
+      "name": "gray-no-table",
+      "encoded": "gif-inputs/gray-no-table.gif",
+      "animated": false,
+      "mode": "L",
+      "rgb": "gif-inputs/gray-no-table.rgb",
+      "rgba": "gif-inputs/gray-no-table.rgba",
+      "width": 9,
+      "height": 5
+    },
+    {
+      "name": "gray-index-past-table",
+      "encoded": "gif-inputs/gray-index-past-table.gif",
+      "animated": false,
+      "mode": "L",
+      "rgb": "gif-inputs/gray-index-past-table.rgb",
+      "rgba": "gif-inputs/gray-index-past-table.rgba",
+      "width": 9,
+      "height": 5
+    },
+    {
+      "name": "palette-index-past-table",
+      "encoded": "gif-inputs/palette-index-past-table.gif",
+      "animated": false,
+      "mode": "P",
+      "rgb": "gif-inputs/palette-index-past-table.rgb",
+      "rgba": "gif-inputs/palette-index-past-table.rgba",
+      "width": 9,
+      "height": 5
+    },
+    {
+      "name": "local-identity-over-global",
+      "encoded": "gif-inputs/local-identity-over-global.gif",
+      "animated": false,
+      "mode": "L",
+      "rgb": "gif-inputs/local-identity-over-global.rgb",
+      "rgba": "gif-inputs/local-identity-over-global.rgba",
+      "width": 9,
+      "height": 6
+    },
+    {
+      "name": "missing-trailer",
+      "encoded": "gif-inputs/missing-trailer.gif",
+      "animated": false,
+      "mode": "P",
+      "rgb": "gif-inputs/missing-trailer.rgb",
+      "rgba": "gif-inputs/missing-trailer.rgba",
+      "width": 11,
+      "height": 7
+    },
+    {
+      "name": "two-frames",
+      "encoded": "gif-inputs/two-frames.gif",
+      "animated": true
+    }
+  ]
+}

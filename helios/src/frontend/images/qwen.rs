@@ -73,12 +73,12 @@ impl QwenProcessor {
         Ok(result)
     }
 
-    /// Expands the image placeholders in already rendered chat text, in image order.
+    /// Expands the image placeholders in already rendered chat tokens, in image order.
     /// Inputs contain no padding; the scheduler adds padding outside logical lengths.
     pub fn expand_prompt(
         &self,
         frontend: &Frontend,
-        text: &str,
+        prompt_token_ids: &[u32],
         images: &ProcessedImages,
     ) -> Result<ImagePrompt> {
         if frontend.encode(IMAGE_TOKEN, false)? != [self.image_token_id] {
@@ -86,25 +86,29 @@ impl QwenProcessor {
                 "image token ID does not match tokenizer",
             ))));
         }
-        if text.matches(IMAGE_TOKEN).count() != images.geometry.len() {
+        let placeholder_count = prompt_token_ids
+            .iter()
+            .filter(|id| **id == self.image_token_id)
+            .count();
+        if placeholder_count != images.geometry.len() {
             return Err(Error::frontend(FrontendError::Input(Failure::new(
                 "image placeholder count does not match prepared images",
             ))));
         }
-        let mut expanded = String::with_capacity(text.len());
-        let mut parts = text.split(IMAGE_TOKEN);
-        expanded.push_str(parts.next().unwrap_or_default());
-        for (part, geometry) in parts.zip(&images.geometry) {
-            for _ in 0..geometry.tokens {
-                expanded.push_str(IMAGE_TOKEN);
-            }
-            expanded.push_str(part);
-        }
-        let token_ids = frontend.encode(&expanded, false)?;
-        if token_ids.contains(&self.video_token_id) {
+        if prompt_token_ids.contains(&self.video_token_id) {
             return Err(Error::frontend(FrontendError::Input(Failure::new(
                 "video inputs are not supported by the image processor",
             ))));
+        }
+        let mut token_ids = Vec::new();
+        let mut geometry = images.geometry.iter();
+        for &id in prompt_token_ids {
+            if id == self.image_token_id {
+                let tokens = geometry.next().expect("placeholder count was checked").tokens;
+                token_ids.extend(std::iter::repeat_n(self.image_token_id, tokens));
+            } else {
+                token_ids.push(id);
+            }
         }
         let mm_token_type_ids: Vec<i32> = token_ids
             .iter()
@@ -159,7 +163,6 @@ impl QwenProcessor {
             ))));
         }
         Ok(ImagePrompt {
-            text: expanded,
             rope_delta: current - token_ids.len() as i64,
             token_ids,
             mm_token_type_ids,

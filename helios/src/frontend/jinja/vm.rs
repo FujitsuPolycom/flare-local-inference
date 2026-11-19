@@ -10,7 +10,7 @@ use std::rc::Rc;
 use serde_json::{Map, Value as Json};
 
 use super::compiler::{Binary, Instruction as I, Unary};
-use super::value::{LoopValue, Value};
+use super::value::{LoopValue, Notes, Value};
 use super::{CompiledTemplate, Error, Mark, RenderedTemplate, Result};
 
 struct Scope {
@@ -35,8 +35,8 @@ struct Vm<'a> {
     stack: Vec<Value<'a>>,
     loops: Vec<Rc<LoopValue<'a>>>,
     output: String,
-    captures: Vec<(String, Vec<usize>)>,
-    hint_positions: Vec<usize>,
+    captures: Vec<(String, Notes)>,
+    notes: Notes,
     marks: Vec<Mark>,
     depth: usize,
     hint_texts: Vec<&'a str>,
@@ -46,6 +46,7 @@ pub(super) fn render(
     template: &CompiledTemplate,
     context: &Map<String, Json>,
     hints: &[(usize, usize)],
+    defaults: &[&str],
 ) -> Result<RenderedTemplate> {
     let mut hint_texts = Vec::new();
     for &(message, count) in hints {
@@ -76,7 +77,12 @@ pub(super) fn render(
         slots: template
             .names
             .iter()
-            .map(|s| context.get(s).map(Value::json).unwrap_or_else(|| if s == "strftime_now" { Value::Builtin } else { Value::Undefined }))
+            .map(|s| match context.get(s) {
+                Some(value) if defaults.contains(&s.as_str()) => Value::constant(value),
+                Some(value) => Value::json(value),
+                None if s == "strftime_now" => Value::Builtin,
+                None => Value::Undefined,
+            })
             .collect(),
         stamps: vec![0; template.names.len()],
         scope: 0,
@@ -88,16 +94,17 @@ pub(super) fn render(
         loops: Vec::new(),
         output: String::new(),
         captures: Vec::new(),
-        hint_positions: Vec::new(),
+        notes: Notes::default(),
         marks: Vec::new(),
         depth: 0,
         hint_texts,
     };
     vm.run(0)?;
-    vm.marks.extend(vm.hint_positions.into_iter().map(Mark::Hint));
+    vm.marks.extend(vm.notes.hints.into_iter().map(Mark::Hint));
     Ok(RenderedTemplate {
         text: vm.output,
         marks: vm.marks,
+        ordinary: vm.notes.ordinary,
     })
 }
 
@@ -186,31 +193,30 @@ impl<'a> Vm<'a> {
         Ok(())
     }
     fn hinted(&self, value: Value<'a>) -> Value<'a> {
-        if let Value::Str(text) = value
+        if let Value::Str(text) | Value::Text(text) = value
             && self
                 .hint_texts
                 .iter()
                 .any(|hint| !text.is_empty() && std::ptr::eq(*hint, text))
         {
-            return Value::marked(text.to_owned(), vec![text.len()]);
+            let notes = Notes { hints: vec![text.len()], ordinary: value.ordinary() };
+            return Value::annotated(text.to_owned(), notes);
         }
         value
     }
     fn emit(&mut self, value: Value<'a>) {
-        self.hinted(value)
-            .append(&mut self.output, &mut self.hint_positions);
+        self.hinted(value).append(&mut self.output, &mut self.notes);
     }
     fn capture(&mut self) {
         self.captures.push((
             std::mem::take(&mut self.output),
-            std::mem::take(&mut self.hint_positions),
+            std::mem::take(&mut self.notes),
         ));
     }
     fn end_capture(&mut self) -> Value<'a> {
-        let (output, hints) = self.captures.pop().unwrap();
+        let (output, notes) = self.captures.pop().unwrap();
         let text = std::mem::replace(&mut self.output, output);
-        let positions = std::mem::replace(&mut self.hint_positions, hints);
-        Value::marked(text, positions)
+        Value::annotated(text, std::mem::replace(&mut self.notes, notes))
     }
     fn run(&mut self, start: u32) -> Result<()> {
         self.depth += 1;
@@ -228,7 +234,7 @@ impl<'a> Vm<'a> {
                         .push_str(self.template.constants[id as usize].as_str().unwrap()),
                     I::Constant(id) => self
                         .stack
-                        .push(Value::json(&self.template.constants[id as usize])),
+                        .push(Value::constant(&self.template.constants[id as usize])),
                     I::Load(id) => self.stack.push(self.slots[id as usize].clone()),
                     I::Store(id) => {
                         let v = self.pop();
@@ -243,7 +249,9 @@ impl<'a> Vm<'a> {
                         };
                         let mut ns = ns.borrow_mut();
                         let name = &self.template.names[name as usize];
-                        if let Some((_, old)) = ns.iter_mut().find(|(key, _)| key == name) {
+                        if let Some((_, old)) =
+                            ns.iter_mut().find(|(key, _)| key.as_str() == Some(name))
+                        {
                             if matches!(op, I::AppendAttr(..)) {
                                 match (old, value) {
                                     (Value::List(items), value)
@@ -261,7 +269,7 @@ impl<'a> Vm<'a> {
                         } else if matches!(op, I::AppendAttr(..)) {
                             return Err(Error::new("undefined namespace attribute"));
                         } else {
-                            ns.push((name.clone(), value));
+                            ns.push((Value::string(name.clone()), value));
                         }
                     }
                     I::Attr(name) => {
@@ -297,7 +305,12 @@ impl<'a> Vm<'a> {
                         let mut pairs = Vec::with_capacity(n as usize);
                         let mut values = values.into_iter();
                         while let Some(key) = values.next() {
-                            pairs.push((key.text(), values.next().unwrap()));
+                            let key = if key.as_str().is_some() {
+                                key
+                            } else {
+                                ordinary_result(Value::string(key.text()), || key.has_ordinary())
+                            };
+                            pairs.push((key, values.next().unwrap()));
                         }
                         self.stack.push(Value::Map(Rc::new(pairs)));
                     }
@@ -386,11 +399,11 @@ impl<'a> Vm<'a> {
                             self.stack.truncate(start);
                         } else {
                             let mut text = String::with_capacity(size);
-                            let mut hints = Vec::new();
+                            let mut notes = Notes::default();
                             for v in self.stack.drain(start..) {
-                                v.append(&mut text, &mut hints);
+                                v.append(&mut text, &mut notes);
                             }
-                            self.stack.push(Value::marked(text, hints));
+                            self.stack.push(Value::annotated(text, notes));
                         }
                     }
                     I::Drop => {
@@ -578,17 +591,17 @@ fn binary<'a>(op: Binary, a: Value<'a>, b: Value<'a>) -> Result<Value<'a>> {
         }
         B::Concat => {
             let mut text = String::new();
-            let mut hints = Vec::new();
-            a.append(&mut text, &mut hints);
-            b.append(&mut text, &mut hints);
-            return Ok(Value::marked(text, hints));
+            let mut notes = Notes::default();
+            a.append(&mut text, &mut notes);
+            b.append(&mut text, &mut notes);
+            return Ok(Value::annotated(text, notes));
         }
         B::Add if a.as_str().is_some() && b.as_str().is_some() => {
             let mut text = String::new();
-            let mut hints = Vec::new();
-            a.append(&mut text, &mut hints);
-            b.append(&mut text, &mut hints);
-            return Ok(Value::marked(text, hints));
+            let mut notes = Notes::default();
+            a.append(&mut text, &mut notes);
+            b.append(&mut text, &mut notes);
+            return Ok(Value::annotated(text, notes));
         }
         B::Add if a.sequence() && b.sequence() && a.as_str().is_none() && b.as_str().is_none() => {
             let mut items = a.iter()?;
@@ -596,10 +609,13 @@ fn binary<'a>(op: Binary, a: Value<'a>, b: Value<'a>) -> Result<Value<'a>> {
             return Ok(Value::list(items));
         }
         B::Mul if a.as_str().is_some() && b.integer().is_some() => {
-            return Ok(Value::string(
-                a.as_str()
-                    .unwrap()
-                    .repeat(b.integer().unwrap().max(0) as usize),
+            return Ok(ordinary_result(
+                Value::string(
+                    a.as_str()
+                        .unwrap()
+                        .repeat(b.integer().unwrap().max(0) as usize),
+                ),
+                || a.has_ordinary(),
             ));
         }
         B::Lt | B::Le | B::Gt | B::Ge => {
@@ -696,10 +712,11 @@ fn slice<'a>(
     }
     if value.as_str().is_some() {
         let mut s = String::new();
+        let mut notes = Notes::default();
         for v in items {
-            v.write(&mut s);
+            v.append(&mut s, &mut notes);
         }
-        Ok(Value::string(s))
+        Ok(Value::annotated(s, notes))
     } else {
         Ok(Value::list(items))
     }
@@ -741,7 +758,47 @@ fn json_object_members(source: &str) -> Result<Vec<(String, serde_json::Value, S
     Ok(members)
 }
 
+/// Whether any operand of a builtin carries request-derived text.
+fn any_ordinary<'a>(
+    first: Option<&Value<'a>>,
+    args: &[Value<'a>],
+    kw: &[(&str, Value<'a>)],
+) -> bool {
+    first
+        .into_iter()
+        .chain(args)
+        .chain(kw.iter().map(|(_, v)| v))
+        .any(Value::has_ordinary)
+}
+
+/// Marks the result of a builtin ordinary as a whole when its operands carried request-derived
+/// text. A result that holds no text is left alone, so `ordinary` is not evaluated for it.
+fn ordinary_result<'a>(result: Value<'a>, ordinary: impl FnOnce() -> bool) -> Value<'a> {
+    let text = matches!(
+        result,
+        Value::Str(_) | Value::String(_) | Value::List(_) | Value::Map(_)
+    );
+    if text && ordinary() {
+        result.into_ordinary()
+    } else {
+        result
+    }
+}
+
+/// Builtins that are `exact` produce characters that come unchanged from their operands, and keep
+/// the operands' ordinary ranges, so they need no marking. Add a builtin to an `exact` list only
+/// when that holds for every call; any other builtin marks its whole result ordinary.
 fn function<'a>(name: &str, args: &[Value<'a>], kw: &[(&str, Value<'a>)]) -> Result<Value<'a>> {
+    let exact = matches!(name, "namespace" | "dict");
+    let result = function_value(name, args, kw)?;
+    Ok(ordinary_result(result, || !exact && any_ordinary(None, args, kw)))
+}
+
+fn function_value<'a>(
+    name: &str,
+    args: &[Value<'a>],
+    kw: &[(&str, Value<'a>)],
+) -> Result<Value<'a>> {
     match name {
         "json_object_members" => {
             if args.len() != 1 || !kw.is_empty() {
@@ -775,7 +832,10 @@ fn function<'a>(name: &str, args: &[Value<'a>], kw: &[(&str, Value<'a>)]) -> Res
             } else {
                 Vec::new()
             };
-            pairs.extend(kw.iter().map(|(k, v)| ((*k).into(), v.clone())));
+            pairs.extend(
+                kw.iter()
+                    .map(|(k, v)| (Value::string((*k).into()), v.clone())),
+            );
             Ok(Value::Namespace(Rc::new(RefCell::new(pairs))))
         }
         "range" => {
@@ -811,7 +871,9 @@ fn function<'a>(name: &str, args: &[Value<'a>], kw: &[(&str, Value<'a>)]) -> Res
             args.first().map(Value::text).unwrap_or_default(),
         )),
         "dict" => Ok(Value::Map(Rc::new(
-            kw.iter().map(|(k, v)| ((*k).into(), v.clone())).collect(),
+            kw.iter()
+                .map(|(k, v)| (Value::string((*k).into()), v.clone()))
+                .collect(),
         ))),
         _ => Err(Error::new(format!("unknown function {name}"))),
     }
@@ -858,6 +920,32 @@ fn filter<'a>(
     kw: &[(&str, Value<'a>)],
     track_hints: bool,
 ) -> Result<Value<'a>> {
+    let exact = matches!(
+        name,
+        "safe"
+            | "default"
+            | "d"
+            | "sort"
+            | "unique"
+            | "list"
+            | "first"
+            | "last"
+            | "join"
+            | "items"
+            | "dictsort"
+    ) || matches!(name, "trim" | "string") && v.as_str().is_some();
+    let operand = v.clone();
+    let result = filter_value(name, v, args, kw, track_hints)?;
+    Ok(ordinary_result(result, || !exact && any_ordinary(Some(&operand), args, kw)))
+}
+
+fn filter_value<'a>(
+    name: &str,
+    v: Value<'a>,
+    args: &[Value<'a>],
+    kw: &[(&str, Value<'a>)],
+    track_hints: bool,
+) -> Result<Value<'a>> {
     match name {
         "safe" => Ok(v),
         "default" | "d" => Ok(
@@ -878,9 +966,6 @@ fn filter<'a>(
         "trim" => {
             let chars = args.first().and_then(Value::as_str);
             let pred = |c: char| chars.map_or_else(|| c.is_whitespace(), |s| s.contains(c));
-            if let Value::Str(s) = v {
-                return Ok(Value::Str(s.trim_matches(pred)));
-            }
             let text = if let Some(s) = v.as_str() {
                 s
             } else {
@@ -890,14 +975,7 @@ fn filter<'a>(
             if trimmed.len() == text.len() {
                 Ok(v)
             } else {
-                let start = trimmed.as_ptr() as usize - text.as_ptr() as usize;
-                let hints = v
-                    .hints()
-                    .iter()
-                    .filter(|end| **end > start && !trimmed.is_empty())
-                    .map(|end| (end - start).min(trimmed.len()))
-                    .collect();
-                Ok(Value::marked(trimmed.into(), hints))
+                Ok(v.piece(trimmed, true))
             }
         }
         "capitalize" => {
@@ -941,12 +1019,12 @@ fn filter<'a>(
                 }
                 Some(position)
             }).collect();
-            Ok(Value::marked(output, hints))
+            Ok(Value::annotated(output, Notes::hints(hints)))
         }
         "items" => Ok(Value::list(
             v.pairs()?
                 .into_iter()
-                .map(|(k, v)| Value::list(vec![Value::string(k), v]))
+                .map(|(k, v)| Value::list(vec![k, v]))
                 .collect(),
         )),
         "tojson" => {
@@ -964,7 +1042,7 @@ fn filter<'a>(
             v.json_hints(&json, &mut hints);
             let (text, positions) = super::super::json::format_json_hinted(&json, &kwargs, &hints)
                 .map_err(Error::new)?;
-            Ok(Value::marked(text, positions))
+            Ok(Value::annotated(text, Notes::hints(positions)))
         }
         "fromjson" => Ok(Value::owned(
             serde_json::from_str(
@@ -1047,27 +1125,30 @@ fn filter<'a>(
                         folded(&av.text(), case_sensitive).cmp(&folded(&bv.text(), case_sensitive))
                     }
                 } else {
-                    folded(ak, case_sensitive).cmp(&folded(bk, case_sensitive))
+                    folded(&ak.text(), case_sensitive).cmp(&folded(&bk.text(), case_sensitive))
                 };
                 if reverse { order.reverse() } else { order }
             });
             Ok(Value::list(
                 pairs
                     .into_iter()
-                    .map(|(k, v)| Value::list(vec![Value::string(k), v]))
+                    .map(|(k, v)| Value::list(vec![k, v]))
                     .collect(),
             ))
         }
         "join" => {
-            let sep = args.first().map(Value::text).unwrap_or_default();
+            let sep = args.first().cloned().unwrap_or(Value::Str(""));
             let mut text = String::new();
+            let mut notes = Notes::default();
             for (i, v) in v.iter()?.iter().enumerate() {
                 if i != 0 {
-                    text.push_str(&sep);
+                    sep.append(&mut text, &mut notes);
                 }
-                v.write(&mut text);
+                v.append(&mut text, &mut notes);
             }
-            Ok(Value::string(text))
+            // Checkpoint hints follow only text that is emitted or trimmed whole.
+            notes.hints.clear();
+            Ok(Value::annotated(text, notes))
         }
         "list" => Ok(Value::list(v.iter()?)),
         "first" => Ok(v.index(&Value::Int(0))),
@@ -1082,6 +1163,21 @@ fn filter<'a>(
 }
 
 fn method<'a>(
+    name: &str,
+    v: Value<'a>,
+    args: &[Value<'a>],
+    kw: &[(&str, Value<'a>)],
+) -> Result<Value<'a>> {
+    let exact = matches!(
+        name,
+        "get" | "items" | "keys" | "values" | "strip" | "lstrip" | "rstrip" | "split" | "rsplit"
+    );
+    let operand = v.clone();
+    let result = method_value(name, v, args, kw)?;
+    Ok(ordinary_result(result, || !exact && any_ordinary(Some(&operand), args, kw)))
+}
+
+fn method_value<'a>(
     name: &str,
     v: Value<'a>,
     args: &[Value<'a>],
@@ -1122,14 +1218,12 @@ fn method<'a>(
         "strip" | "lstrip" | "rstrip" => {
             let chars = args.first().and_then(Value::as_str);
             let pred = |c: char| chars.map_or_else(|| c.is_whitespace(), |s| s.contains(c));
-            Ok(Value::string(
-                match name {
-                    "lstrip" => text.trim_start_matches(pred),
-                    "rstrip" => text.trim_end_matches(pred),
-                    _ => text.trim_matches(pred),
-                }
-                .into(),
-            ))
+            let trimmed = match name {
+                "lstrip" => text.trim_start_matches(pred),
+                "rstrip" => text.trim_end_matches(pred),
+                _ => text.trim_matches(pred),
+            };
+            Ok(v.piece(trimmed, false))
         }
         "split" | "rsplit" => {
             let limit = args
@@ -1140,7 +1234,7 @@ fn method<'a>(
                 .unwrap_or(usize::MAX);
             let parts: Vec<_> = if args.is_empty() || matches!(args[0], Value::None) {
                 text.split_whitespace()
-                    .map(|s| Value::string(s.into()))
+                    .map(|s| v.piece(s, false))
                     .collect()
             } else {
                 let sep = argument(0)?;
@@ -1150,13 +1244,13 @@ fn method<'a>(
                 if name == "rsplit" {
                     let mut items: Vec<_> = text
                         .rsplitn(limit, sep)
-                        .map(|s| Value::string(s.into()))
+                        .map(|s| v.piece(s, false))
                         .collect();
                     items.reverse();
                     items
                 } else {
                     text.splitn(limit, sep)
-                        .map(|s| Value::string(s.into()))
+                        .map(|s| v.piece(s, false))
                         .collect()
                 }
             };

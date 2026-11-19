@@ -13,7 +13,7 @@
 //! tests/frontend/inkling2_tml.json.
 
 use super::{Frontend, Json, Map, RenderedPrompt, deepseek::invalid};
-use crate::{Error, Failure, FrontendError, Result};
+use crate::Result;
 
 /// Named efforts accepted by the checkpoint chat template; TMLv0 encodes the number.
 const EFFORTS: [(&str, f64); 7] = [
@@ -231,15 +231,7 @@ impl Prompt<'_> {
     }
 
     fn ordinary(&mut self, text: &str) -> Result<()> {
-        let tokenizer = self
-            .frontend
-            .ordinary_tokenizer
-            .as_ref()
-            .expect("TMLv0 ordinary tokenizer is initialized");
-        let encoding = tokenizer.encode(text, false).map_err(|error| {
-            Error::frontend(FrontendError::Tokenizer(Failure::boxed(error.to_string(), error)))
-        })?;
-        self.token_ids.extend_from_slice(encoding.get_ids());
+        self.token_ids.extend(self.frontend.encode_ordinary(text)?);
         self.text.push_str(text);
         Ok(())
     }
@@ -530,6 +522,7 @@ pub(super) fn render(
         token_ids: prompt.token_ids,
         image_sources: prompt.image_sources,
         image_checkpoint_hints: Vec::new(),
+        ordinary: Vec::new(),
         message_boundaries: boundaries,
     })
 }

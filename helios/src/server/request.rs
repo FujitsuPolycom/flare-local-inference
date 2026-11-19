@@ -160,6 +160,7 @@ pub(super) fn prepare_inference_cached(
                 token_ids,
                 image_sources: Vec::new(),
                 image_checkpoint_hints: Vec::new(),
+                ordinary: Vec::new(),
             },
             echo,
         )
@@ -722,6 +723,24 @@ mod tests {
         assert!(pixels.contains("image is 40x40 px; max_image_pixels is 1000"), "{pixels}");
     }
     #[test]
+    fn gif_data_url_is_decoded_and_described() {
+        use crate::frontend::images::{ImageLimits, ImageSettings};
+        let encoded = include_bytes!("../../../tests/frontend/gif-inputs/frame-offset.gif");
+        let url = format!(
+            "data:image/gif;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(encoded)
+        );
+        let processor = ImageProcessor::load(ImageSettings::Moonvit {}, ImageLimits::default()).unwrap();
+        let images = describe_images(&[url], Some(&processor), None).unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!((images[0].description.width, images[0].description.height), (20, 12));
+        let error = describe_images(&["data:image/gif;base64,AA==".into()], Some(&processor), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid GIF"), "{error}");
+    }
+
+    #[test]
     fn source_cache_coalesces_decoding_and_preserves_media_validation() {
         use crate::frontend::images::{ImageLimits, ImageSettings};
         use flare_selene::input::{DiskBudget, InputStore};
@@ -914,10 +933,12 @@ fn describe_images(
                 (data, ImageEncoding::Jpeg)
             } else if let Some(data) = url.strip_prefix("data:image/webp;base64,") {
                 (data, ImageEncoding::Webp)
+            } else if let Some(data) = url.strip_prefix("data:image/gif;base64,") {
+                (data, ImageEncoding::Gif)
             } else {
                 return Err(Error::admission(
                     AdmissionError::Image,
-                    "image input requires a base64 PNG, JPEG, or WebP data URL",
+                    "image input requires a base64 PNG, JPEG, WebP, or GIF data URL",
                 ));
             };
         if data.len() > processor.max_encoded_bytes().div_ceil(3).saturating_mul(4) {

@@ -38,6 +38,7 @@ pub enum ImageEncoding {
     Png,
     Jpeg,
     Webp,
+    Gif,
 }
 
 #[derive(Debug)]
@@ -314,6 +315,7 @@ impl ImageProcessor {
             ImageEncoding::Png => self.decode_png(bytes),
             ImageEncoding::Jpeg => self.decode_jpeg(bytes),
             ImageEncoding::Webp => self.decode_webp(bytes),
+            ImageEncoding::Gif => self.decode_gif(bytes),
         }?;
         self.counts
             .decoded

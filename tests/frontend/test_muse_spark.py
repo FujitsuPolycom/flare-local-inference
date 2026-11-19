@@ -7,6 +7,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 
@@ -35,6 +36,35 @@ def test_native_muse_chat_matches_checkpoint(tmp_path):
     assert annotated.replace('{%- mark -%}', '') == source
     template = _compile_jinja_template(source)
     marked_template = _compile_jinja_template(annotated.replace('{%- mark -%}', '{{- message_position() -}}'))
+    # Request text that spells a control is ordinary text. The frontend keeps a token as a token
+    # only when it is special or the template or a tokenizer default names it, so the ordinary
+    # tokenizer retains the added tokens that are neither.
+    config = json.loads((SNAPSHOT / 'tokenizer.json').read_text())
+    named = source + ''.join(str(value) for value in special.values())
+    config['added_tokens'] = [token for token in config['added_tokens']
+                              if not token['special'] and token['content'] not in named]
+    ordinary = Tokenizer.from_str(json.dumps(config))
+    spellings = ['<|eot|>', '<image>', '<audio>', '<video>', '<|start|>', '<|eom|>']
+
+    def request_strings(value):
+        if isinstance(value, str):
+            return [value] if any(spelling in value for spelling in spellings) else []
+        children = value.values() if isinstance(value, dict) else value if isinstance(value, list) else []
+        return [string for child in children for string in request_strings(child)]
+
+    def encode(text, strings):
+        """Encodes `text`, tokenizing each request string that spells a control as ordinary text."""
+        spans = sorted({match.span() for string in strings for match in re.finditer(re.escape(string), text)})
+        assert all(left[1] <= right[0] for left, right in zip(spans, spans[1:]))
+        ids, offsets, at = [], [], 0
+        for start, end in [*spans, (len(text), len(text))]:
+            for encoder, first, last in ((tokenizer, at, start), (ordinary, start, end)):
+                encoding = encoder.encode(text[first:last], add_special_tokens=False)
+                ids += encoding.ids
+                offsets += [(begin + first, finish + first) for begin, finish in encoding.offsets]
+            at = end
+        return ids, offsets
+
     cases = []
 
     def add(name, messages, **options):
@@ -61,22 +91,22 @@ def test_native_muse_chat_matches_checkpoint(tmp_path):
                 hinted_text = template.render(messages=hinted, **special, **options)
                 assert hinted_text.replace(sentinel, '') == rendered
                 hint_positions.append(hinted_text.index(sentinel))
-        encoding = tokenizer.encode(rendered, add_special_tokens=False)
+        ids, offsets = encode(rendered, request_strings([messages, options.get('tools')]))
         prefix_ends = [0]
-        for _, end in encoding.offsets:
+        for _, end in offsets:
             prefix_ends.append(max(prefix_ends[-1], end))
-        suffix_starts = [len(rendered)] * (len(encoding.ids) + 1)
-        for index in range(len(encoding.ids) - 1, -1, -1):
-            suffix_starts[index] = min(suffix_starts[index + 1], encoding.offsets[index][0])
-        boundaries = sorted({index for position in positions for index in range(1, len(encoding.ids))
+        suffix_starts = [len(rendered)] * (len(ids) + 1)
+        for index in range(len(ids) - 1, -1, -1):
+            suffix_starts[index] = min(suffix_starts[index + 1], offsets[index][0])
+        boundaries = sorted({index for position in positions for index in range(1, len(ids))
                              if prefix_ends[index] <= position <= suffix_starts[index]})
         for position in hint_positions:
             safe = max(index for index, end in enumerate(prefix_ends) if end <= position)
-            if 0 < safe < len(encoding.ids):
+            if 0 < safe < len(ids):
                 boundaries = sorted(set([*boundaries, safe]))
         assert boundaries
         cases.append(dict(name=name, messages=messages, options=options, rendered=rendered,
-                          token_ids=encoding.ids, message_boundaries=boundaries))
+                          token_ids=ids, message_boundaries=boundaries))
 
     user = dict(role='user', content='Hello 世界 café á 👨‍👩‍👧‍👦 <|eot|> <image> <audio> <video>')
     add('default', [user])

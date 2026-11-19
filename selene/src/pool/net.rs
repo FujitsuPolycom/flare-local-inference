@@ -18,11 +18,12 @@
 //! reports `Closed`: the engine frees nothing a task could still touch.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     io,
+    net::IpAddr,
     path::Path,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -57,9 +58,9 @@ const ALIGN: u64 = 4096;
 
 /// Fixed-size slots in one registered region, for windows in transit.
 pub(crate) struct Staging {
-    /// The region registered for RDMA, once it was asked for. Declared first so it is
+    /// Registrations by local data socket address. Declared first so staging is
     /// unregistered before the region is unmapped.
-    rdma: OnceLock<Option<Arc<rdma::Device>>>,
+    rdma: Mutex<HashMap<IpAddr, Option<Arc<rdma::Device>>>>,
     region: Region,
     slot_bytes: u64,
     free: Mutex<Vec<u32>>,
@@ -87,7 +88,7 @@ impl Staging {
         let mut region = Region::anonymous(total)?;
         region.register(registrar, context)?;
         Ok(Self {
-            rdma: OnceLock::new(),
+            rdma: Mutex::new(HashMap::new()),
             region,
             slot_bytes,
             free: Mutex::new((0..slots).rev().collect()),
@@ -100,15 +101,20 @@ impl Staging {
         &self.region
     }
 
-    /// The staging registered for RDMA: opened on first use, `None` (with one warning)
-    /// when this host has no usable device or the build has no RDMA.
-    fn rdma(&self) -> Option<Arc<rdma::Device>> {
+    /// Staging registered on first use of each local address; warn once per address
+    /// when no matching device is available or the build has no RDMA. The route to a
+    /// manager normally keeps one local address; each further address pins the staging
+    /// again (memlock), so this is not keyed by device.
+    fn rdma(&self, local_address: IpAddr) -> Option<Arc<rdma::Device>> {
         self.rdma
-            .get_or_init(|| {
+            .lock()
+            .unwrap()
+            .entry(local_address)
+            .or_insert_with(|| {
                 // SAFETY: the region stays mapped at this address for as long as `self`
                 // lives, and the device is dropped first (field order).
                 match unsafe {
-                    rdma::Device::open(self.region.base() as *mut u8, self.region.len())
+                    rdma::Device::open(self.region.base() as *mut u8, self.region.len(), local_address)
                 } {
                     Ok(device) => Some(device),
                     Err(error) => {
@@ -582,6 +588,7 @@ async fn connect(target: &Target, claim: bool) -> io::Result<Link> {
         TcpStream::connect((host, port)),
     )
     .await?;
+    let local_address = stream.local_addr()?.ip();
     stream.set_nodelay(true)?;
     let mut conn: Box<dyn Conn> = match &target.tls {
         Some((connector, name)) => Box::new(
@@ -600,7 +607,7 @@ async fn connect(target: &Target, claim: bool) -> io::Result<Link> {
     let pair = if claim && target.rdma && target.tls.is_none() {
         target
             .staging
-            .rdma()
+            .rdma(local_address)
             .and_then(|device| match rdma::Pair::new(&device) {
                 Ok(pair) => Some(pair),
                 Err(error) => {

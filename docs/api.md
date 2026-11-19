@@ -335,8 +335,8 @@ without the `flare_` prefix, such as `input_decoded_images_total`.
 | `free_pages` | KV pages reusable after completed GPU fences | `flare_free_kv_pages` |
 | `total_pages` | Pages in the per-rank KV pool | `flare_total_kv_pages` |
 | `page_tokens` | Logical history tokens per KV page | `flare_kv_page_tokens` |
-| `host_hits` | Host prefix-store lookups whose chain admission fetched | `flare_host_cache_hits_total` |
-| `host_reused_tokens` | Tokens covered by host prefix-store chains beyond the GPU checkpoint | `flare_host_cache_reused_tokens_total` |
+| `host_hits` | Requests attached to a successfully restored host prefix | `flare_host_cache_hits_total` |
+| `host_reused_tokens` | Successfully restored tokens beyond each request's admission GPU prefix | `flare_host_cache_reused_tokens_total` |
 | `host_memory_records` | Checkpoint records in the host store's registered memory | `flare_host_cache_memory_records` |
 | `host_disk_records` | Checkpoint records in the host store's record directory | `flare_host_cache_disk_records` |
 | `host_bytes_out` | Bytes copied from GPU checkpoints to the host store | `flare_host_cache_bytes_out_total` |
@@ -390,6 +390,24 @@ with their text wrapped in `<system>...</system>`. Text blocks are joined with
 blank lines. The leading system message and preceding conversation remain
 unchanged. This conversion supplies a textual role cue; it does not provide a
 native system role to models whose templates cannot represent one inline.
+
+Text that a request supplies is ordinary text. A message, instruction, tool
+schema, tool argument or object key that spells a control token of the model
+(`<think>`, a role marker, an image placeholder) is tokenized as the characters it
+spells; only controls the chat template writes keep their token IDs. A control is
+an added token that is special, or that the chat template or one of its defaults
+names (a role, reasoning, tool or image marker), or the placeholder an image
+layout lets request text spell. Every other added token is lexical text, for
+example GLM's `/nothink` or a fill-in-the-middle marker, and request text that
+spells one tokenizes to that token. Text that spells a control counts more
+tokens in `usage.prompt_tokens` than the single control token would, and its
+prefix-cache keys differ from those of a prompt that holds the token. On models
+with a Jinja chat template, prefilling an assistant message with `<think>` or a
+DSML opener through `continue_final_message` or Anthropic continuation therefore
+does not start the reply in reasoning or in a tool call. Generated control text
+that a client echoes back as plain text in a later turn re-enters as ordinary
+tokens, so the prefix cache does not cover that turn. DeepSeek and Inkling
+prompts use native encoders that tokenize request text as ordinary text.
 
 Model output parsers emit neutral semantic events. The ordered accumulator in
 `server/output.rs` retains text, reasoning, and tool blocks. Protocol encoders use
@@ -540,7 +558,7 @@ assistant message.
 
 Strict function schemas (`strict: true`) are rejected. Hosted search,
 computer execution, file stores, audio, and remote image downloads are unsupported. Images must be
-base64 PNG, JPEG, or static WebP data. Images are encoded sequentially into
+base64 PNG, JPEG, static WebP, or non-animated GIF data. Images are encoded sequentially into
 bounded feature windows. Chunked prefill consumes each window before its storage
 is reused; the total image tokens across a conversation may exceed
 `image_feature_window_tokens`. Image count is bounded only by
@@ -944,3 +962,9 @@ and `total_tokens`. Cache writes are not measured and are reported as zero.
 The route shares System One's prompt compilation, exact-ID reads, sequential
 child lifetime, template constraints and rejection of cores without explicit-ID
 logprob inputs; it adds no second scoring path.
+
+Input and instruction text that spells a control token is scored as ordinary
+text, as in chat requests. Each label is checked against the token IDs of the
+rendered prompt: the text after the prompt's last added token, encoded as
+ordinary text, must take the label as exactly one new non-special token, and a
+label that fails the check is unavailable.

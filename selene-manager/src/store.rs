@@ -770,9 +770,15 @@ impl Store {
     pub fn session(&self, connection: u64) -> Option<&Session> {
         self.sessions.get(&connection)
     }
-    pub fn hello(&mut self, connection: u64, pid: u32, descriptor: Descriptor) -> Result<()> {
+    pub fn hello(
+        &mut self,
+        connection: u64,
+        pid: u32,
+        process_nonce: Option<[u8; 16]>,
+        descriptor: Descriptor,
+    ) -> Result<()> {
         let id = self.register_namespace(descriptor)?;
-        self.local.accept(connection, pid)?;
+        self.local.accept(connection, pid, process_nonce)?;
         self.sessions.insert(
             connection,
             Session {
@@ -3779,6 +3785,7 @@ pub enum StoreCommand {
     Hello {
         connection: u64,
         pid: u32,
+        process_nonce: Option<[u8; 16]>,
         descriptor: Descriptor,
         reply: Reply<Result<()>>,
     },
@@ -3900,10 +3907,11 @@ impl Store {
             StoreCommand::Hello {
                 connection,
                 pid,
+                process_nonce,
                 descriptor,
                 reply,
             } => {
-                let result = self.hello(connection, pid, descriptor);
+                let result = self.hello(connection, pid, process_nonce, descriptor);
                 let _ = reply.send(result);
             }
             StoreCommand::Catalog {
@@ -4254,7 +4262,7 @@ mod tests {
             let mut value = descriptor();
             value.ranks[0].planes = planes;
             value.ranks[0].row_bytes = row;
-            store.hello(1, std::process::id(), value.clone()).unwrap();
+            store.hello(1, std::process::id(), None, value.clone()).unwrap();
             let id = value.namespace_id();
             let key = |pages: u32| Key {
                 consumed_tokens: u64::from(pages) * 64 + 3,
@@ -4483,7 +4491,7 @@ mod tests {
         let value = descriptor();
         let id = store.register_namespace(value.clone()).unwrap();
         store
-            .hello(1, std::process::id(), value)
+            .hello(1, std::process::id(), None, value)
             .unwrap();
         let (events, _receiver) = tokio::sync::mpsc::channel(4);
         let get = Get {
@@ -4717,7 +4725,7 @@ mod tests {
         let (mut store, directory) = store("parent");
         let value = descriptor();
         let id = store.register_namespace(value.clone()).unwrap();
-        store.hello(1, 0, value.clone()).unwrap();
+        store.hello(1, 0, None, value.clone()).unwrap();
         let parent = Key {
             consumed_tokens: 64,
             digest: [1; 16],
@@ -4763,7 +4771,7 @@ mod tests {
         let value = descriptor();
         let id = store.register_namespace(value.clone()).unwrap();
         store
-            .hello(1, std::process::id(), value.clone())
+            .hello(1, std::process::id(), None, value.clone())
             .unwrap();
         let parent = Key {
             consumed_tokens: 64,
@@ -4864,7 +4872,7 @@ mod tests {
     fn replacing_a_durable_record_makes_its_children_wait_for_the_rewrite() {
         let (mut store, base, _root) = store_with_root("replace-durable", 1 << 20);
         let value = descriptor();
-        store.hello(1, std::process::id(), value.clone()).unwrap();
+        store.hello(1, std::process::id(), None, value.clone()).unwrap();
         let id = value.namespace_id();
         let parent = Key {
             consumed_tokens: 64,
@@ -5044,7 +5052,7 @@ mod tests {
         let (mut store, directory) = store("fence");
         let value = descriptor();
         let id = store.register_namespace(value.clone()).unwrap();
-        store.hello(1, 0, value.clone()).unwrap();
+        store.hello(1, 0, None, value.clone()).unwrap();
         let key = Key {
             consumed_tokens: 64,
             digest: [6; 16],
@@ -5143,7 +5151,7 @@ mod tests {
         let (mut store, directory) = store("dup");
         let value = descriptor();
         let id = store.register_namespace(value.clone()).unwrap();
-        store.hello(1, 0, value.clone()).unwrap();
+        store.hello(1, 0, None, value.clone()).unwrap();
         let key = Key {
             consumed_tokens: 64,
             digest: [4; 16],
@@ -5233,7 +5241,7 @@ mod tests {
         // needs the arena only after three successive leaf evictions.
         let (mut store, directory) = dram_store("chain", 64 * 1024);
         let value = descriptor();
-        store.hello(1, std::process::id(), value.clone()).unwrap();
+        store.hello(1, std::process::id(), None, value.clone()).unwrap();
         let id = store.sessions[&1].namespace;
         let root = store.memory.allocate(32 * 1024).unwrap();
         let child = store.memory.allocate(16 * 1024).unwrap();
@@ -5295,7 +5303,7 @@ mod tests {
         let (mut store, directory) = store("queued-put");
         let value = descriptor();
         store.register_namespace(value.clone()).unwrap();
-        store.hello(1, std::process::id(), value).unwrap();
+        store.hello(1, std::process::id(), None, value).unwrap();
         let (events, _receiver) = tokio::sync::mpsc::channel(8);
         store.submit_put(
             1,
@@ -5347,7 +5355,7 @@ mod tests {
         let (mut store, directory) = store(label);
         let value = descriptor();
         store.register_namespace(value.clone()).unwrap();
-        store.hello(1, std::process::id(), value).unwrap();
+        store.hello(1, std::process::id(), None, value).unwrap();
         let (events, _receiver) = tokio::sync::mpsc::channel(8);
         let namespace = store.namespace_id().unwrap();
         let key = Key {
@@ -5432,7 +5440,7 @@ mod tests {
         let value = descriptor();
         store.register_namespace(value.clone()).unwrap();
         store
-            .hello(1, std::process::id(), value)
+            .hello(1, std::process::id(), None, value)
             .unwrap();
         let (put_events, _put_receiver) = tokio::sync::mpsc::channel(4);
         store.submit_put(
@@ -5496,7 +5504,7 @@ mod tests {
         let (mut store, directory) = store("cancel-count");
         let value = descriptor();
         store.register_namespace(value.clone()).unwrap();
-        store.hello(1, std::process::id(), value).unwrap();
+        store.hello(1, std::process::id(), None, value).unwrap();
         // Cleanup of an operation that is not there: not a cancellation.
         store.cancel(1, 99);
         assert_eq!(store.metrics.cancels, 0);
@@ -5531,7 +5539,7 @@ mod tests {
     fn committed_streamed_put_finishes_on_its_closed_connection() {
         let (mut store, base, directory) = store_with_root("closed-commit", 4096);
         let value = descriptor();
-        store.hello(1, std::process::id(), value.clone()).unwrap();
+        store.hello(1, std::process::id(), None, value.clone()).unwrap();
         let id = value.namespace_id();
         let key = Key {
             consumed_tokens: 128,
@@ -5623,7 +5631,7 @@ mod tests {
     fn cancelled_closed_puts_do_not_submit_blocked_chunks() {
         let (mut store, base, directory) = store_with_root("detached-blocked", 4096);
         let value = descriptor();
-        store.hello(1, std::process::id(), value).unwrap();
+        store.hello(1, std::process::id(), None, value).unwrap();
         let id = store.sessions[&1].namespace;
         let (events, _receiver) = tokio::sync::mpsc::channel(4);
         store.submit_put(
@@ -5669,7 +5677,7 @@ mod tests {
         let value = descriptor();
         let id = store.register_namespace(value.clone()).unwrap();
         store
-            .hello(1, std::process::id(), value)
+            .hello(1, std::process::id(), None, value)
             .unwrap();
         let (get_events, _get_receiver) = tokio::sync::mpsc::channel(4);
         let (put_events, _put_receiver) = tokio::sync::mpsc::channel(4);
@@ -5740,7 +5748,7 @@ mod tests {
         let (mut store, base, directory) = store_with_root("failed-chunks", 4096);
         let value = descriptor();
         store
-            .hello(1, std::process::id(), value)
+            .hello(1, std::process::id(), None, value)
             .unwrap();
         let (events, _receiver) = tokio::sync::mpsc::channel(4);
         store.submit_put(
@@ -5794,7 +5802,7 @@ mod tests {
         let (mut store, base, directory) = store_with_root("oversize-read-fill", 96 * 1024);
         let descriptor = descriptor();
         store
-            .hello(1, std::process::id(), descriptor.clone())
+            .hello(1, std::process::id(), None, descriptor.clone())
             .unwrap();
         let id = store.sessions[&1].namespace;
         let key = Key {
@@ -5828,7 +5836,7 @@ mod tests {
         let (mut store, base, directory) = store_with_root("compacted-read-fill", 64 * 1024);
         let descriptor = descriptor();
         store
-            .hello(1, std::process::id(), descriptor.clone())
+            .hello(1, std::process::id(), None, descriptor.clone())
             .unwrap();
         let id = store.sessions[&1].namespace;
         let key = Key {
@@ -5876,7 +5884,7 @@ mod tests {
         // leave 32 KiB free as two separated 16 KiB holes.
         let (mut store, base, directory) = store_with_root("fragmented", 64 * 1024);
         let value = descriptor();
-        store.hello(1, std::process::id(), value.clone()).unwrap();
+        store.hello(1, std::process::id(), None, value.clone()).unwrap();
         let id = store.sessions[&1].namespace;
         let first = store.memory.allocate(16 * 1024).unwrap();
         let second = store.memory.allocate(16 * 1024).unwrap();
@@ -5957,7 +5965,7 @@ mod tests {
         let value = descriptor();
         store.register_namespace(value.clone()).unwrap();
         store
-            .hello(1, std::process::id(), value)
+            .hello(1, std::process::id(), None, value)
             .unwrap();
         let (get_events, _get_receiver) = tokio::sync::mpsc::channel(4);
         let (put_events, _put_receiver) = tokio::sync::mpsc::channel(4);
@@ -6040,7 +6048,7 @@ mod tests {
         config.staging = 8 * 1024 * 1024;
         let mut store = Store::open(config).unwrap();
         let value = descriptor();
-        store.hello(1, std::process::id(), value).unwrap();
+        store.hello(1, std::process::id(), None, value).unwrap();
         let id = store.sessions[&1].namespace;
         let (events, _receiver) = tokio::sync::mpsc::channel(4);
         store.submit_put(

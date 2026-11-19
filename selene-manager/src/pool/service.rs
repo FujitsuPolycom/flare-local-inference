@@ -6,13 +6,14 @@
 //! The gRPC `Pool` service: `Hello`, and one `Session` stream per instance process.
 
 use super::core::{Event, OpenPeer, PoolHandle};
+use crate::control::UnixConnectInfo;
 use crate::proto::v2::{
     self, ClientMessage, HelloReply, HelloRequest, ServerMessage, pool_server::Pool,
 };
 use std::pin::Pin;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
-use tonic::{Request, Response, Status, Streaming, transport::server::UdsConnectInfo};
+use tonic::{Request, Response, Status, Streaming};
 
 /// Outbound messages queued per session before it is considered stuck.
 const OUTBOUND: usize = 4096;
@@ -110,7 +111,7 @@ impl Pool for PoolService {
                 ..Default::default()
             }));
         }
-        let same_host = peer.unix && peer.uid == shared.uid && peer.gid == shared.gid;
+        let same_host = peer.shared_memory(shared.uid, shared.gid);
         let readiness = *shared.readiness.lock().unwrap();
         Ok(Response::new(HelloReply {
             status: v2::HelloStatus::HelloOk as i32,
@@ -157,22 +158,22 @@ impl Pool for PoolService {
 }
 
 fn peer<T>(request: &Request<T>) -> OpenPeer {
-    let credentials = request
-        .extensions()
-        .get::<UdsConnectInfo>()
-        .and_then(|info| info.peer_cred);
+    let info = request.extensions().get::<UnixConnectInfo>();
+    let credentials = info.and_then(|info| info.uds.peer_cred);
     match credentials {
         Some(c) => OpenPeer {
             unix: true,
             pid: c.pid().unwrap_or(0) as u32,
             uid: c.uid(),
             gid: c.gid(),
+            pidfd: info.and_then(|info| info.pidfd.clone()),
         },
         None => OpenPeer {
             unix: false,
             pid: 0,
             uid: 0,
             gid: 0,
+            pidfd: None,
         },
     }
 }

@@ -45,6 +45,7 @@ pub enum Mark {
 pub struct RenderedTemplate {
     pub text: String,
     pub marks: Vec<Mark>,
+    pub ordinary: Vec<std::ops::Range<usize>>,
 }
 
 pub struct CompiledTemplate {
@@ -69,7 +70,20 @@ impl CompiledTemplate {
         context: &Map<String, Json>,
         hints: &[(usize, usize)],
     ) -> Result<RenderedTemplate> {
-        vm::render(self, context, hints)
+        self.render_with_defaults(context, hints, &[])
+    }
+
+    /// Renders with the context variables named in `defaults` treated as template text: their
+    /// values are recipe or tokenizer defaults the request did not override, so the strings in
+    /// them are controls. Every other context value is request text and renders as ordinary
+    /// text in `RenderedTemplate::ordinary`.
+    pub fn render_with_defaults(
+        &self,
+        context: &Map<String, Json>,
+        hints: &[(usize, usize)],
+        defaults: &[&str],
+    ) -> Result<RenderedTemplate> {
+        vm::render(self, context, hints, defaults)
     }
 
     pub fn annotation_spans(&self) -> &[std::ops::Range<usize>] {

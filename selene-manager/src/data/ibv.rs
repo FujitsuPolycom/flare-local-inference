@@ -9,7 +9,7 @@ use super::channel::{Pair, Rdma};
 use super::{Region, invalid};
 use crate::regions::LocalRegions;
 use flare_selene::shared::rdma::{self, Handshake, Qp, ffi};
-use std::{io, mem, ptr, sync::Arc};
+use std::{io, mem, net::IpAddr, ptr, sync::Arc};
 
 /// One transfer's queue pair and the registrations it keeps alive.
 pub struct LocalRdma {
@@ -35,18 +35,18 @@ unsafe impl Send for Device {}
 unsafe impl Sync for Device {}
 
 impl Device {
-    /// Open the first device whose port is active and register both mapped regions.
+    /// Open the device matching the data listener address and register both regions.
     ///
     /// The device retains `regions` for its whole lifetime, so the mappings stay alive while the
     /// memory regions refer to them, and every bound is taken from the registered lengths rather
     /// than from a caller-supplied size.
-    pub fn open(regions: Arc<LocalRegions>) -> io::Result<Arc<Self>> {
+    pub fn open(regions: Arc<LocalRegions>, local_address: IpAddr) -> io::Result<Arc<Self>> {
         let arena = regions.mapping(Region::Arena);
         let staging = regions.mapping(Region::Staging);
         if arena.1 == 0 || staging.1 == 0 || arena.0.is_null() || staging.0.is_null() {
             return Err(invalid("both RDMA regions must be mapped"));
         }
-        let device = rdma::Device::open()?;
+        let device = rdma::Device::open(local_address)?;
         let pd = device.pd;
         let access = ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0 as i32;
         // SAFETY: both ranges are mapped by `regions`, which this value retains.
@@ -213,7 +213,7 @@ fn release_mrs(arena: *mut ffi::ibv_mr, staging: *mut ffi::ibv_mr) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::arena::Arena;
     use std::time::{Duration, Instant};
@@ -231,18 +231,23 @@ mod tests {
     fn a_loopback_pair_writes_only_the_private_destination() {
         let regions_a = regions();
         let regions_b = regions();
-        let Ok(device_a) = Device::open(regions_a.clone()) else {
+        let Some(local_address) = crate::testing::rdma_address() else {
             assert!(
                 std::env::var_os("SELENE_RDMA_REQUIRED").is_none(),
-                "no active RDMA device"
+                "no local address has an active RoCE v2 GID"
             );
-            eprintln!("skipping: no active RDMA device");
+            eprintln!("skipping: no local address has an active RoCE v2 GID");
             return;
         };
+        let device_a = Device::open(regions_a.clone(), local_address).unwrap();
         let mut a = device_a.pair().unwrap();
         // SAFETY: this private destination stays mapped until the pair and device are dropped.
         let device_b = unsafe {
-            flare_selene::pool::rdma::Device::open(regions_b.mapping(Region::Staging).0, BYTES)
+            flare_selene::pool::rdma::Device::open(
+                regions_b.mapping(Region::Staging).0,
+                BYTES,
+                local_address,
+            )
         }
         .unwrap();
         let b = flare_selene::pool::rdma::Pair::new(&device_b).unwrap();

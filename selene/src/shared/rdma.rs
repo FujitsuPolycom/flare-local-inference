@@ -5,6 +5,8 @@
 
 //! RDMA handshake and libibverbs device and queue-pair lifecycle (experimental).
 use std::io;
+#[cfg(any(feature = "rdma", test))]
+use std::net::IpAddr;
 
 /// Version, qpn, psn, gid, lid, staging rkey and base address.
 pub const HANDSHAKE_BYTES: usize = 4 + 4 + 4 + 16 + 2 + 4 + 8;
@@ -63,80 +65,50 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_string())
 }
 
+#[cfg(any(feature = "rdma", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GidEntry {
+    device: usize,
+    port: u8,
+    gid_index: u32,
+    gid: [u8; 16],
+    roce_v2: bool,
+    lid: u16,
+}
+
+#[cfg(any(feature = "rdma", test))]
+fn no_gid(local_address: IpAddr) -> io::Error {
+    invalid(&format!(
+        "no RDMA device has a RoCE v2 GID for {local_address}; RDMA needs the data connection on a RoCE interface"
+    ))
+}
+
+#[cfg(any(feature = "rdma", test))]
+fn select_gid(local_address: IpAddr, entries: &[GidEntry]) -> io::Result<GidEntry> {
+    let gid = match local_address {
+        IpAddr::V4(address) => address.to_ipv6_mapped().octets(),
+        IpAddr::V6(address) => address.octets(),
+    };
+    entries
+        .iter()
+        .find(|entry| entry.roce_v2 && entry.gid == gid)
+        .copied()
+        .ok_or_else(|| no_gid(local_address))
+}
+
 #[cfg(feature = "rdma")]
 mod verbs {
     use super::*;
     pub use ibverbs_sys as ffi;
     use std::{ptr, sync::Arc};
 
-    const PORT: u8 = 1;
     const PSN: u32 = 0x1234_5678;
-
-    /// The GID this host should advertise on `port`: RoCE v2 over a routable (IPv4-mapped or
-    /// global) address, else RoCE v2 over a link-local one, else any other valid entry. Two
-    /// ends can only talk if they use the same RoCE version, and a device lists several, so
-    /// index 0 is not a safe default. Returns the index and the GID.
-    ///
-    /// # Safety
-    ///
-    /// `context` must be an open device context.
-    pub unsafe fn pick_gid(
-        context: *mut ffi::ibv_context,
-        port: u8,
-    ) -> io::Result<(u32, [u8; 16])> {
-        let mut attr = ffi::ibv_port_attr::default();
-        // SAFETY: the same cast libibverbs' inline wrapper performs.
-        let status = unsafe {
-            ffi::ibv_query_port(
-                context,
-                port,
-                &mut attr as *mut ffi::ibv_port_attr as *mut ffi::_compat_ibv_port_attr,
-            )
-        };
-        if status != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut best: Option<(u32, [u8; 16], u8)> = None;
-        for index in 0..attr.gid_tbl_len.max(1) as u32 {
-            let mut entry = unsafe { std::mem::zeroed::<ffi::ibv_gid_entry>() };
-            // SAFETY: the context is open and `entry` is the size passed.
-            let status = unsafe {
-                ffi::_ibv_query_gid_ex(
-                    context,
-                    u32::from(port),
-                    index,
-                    &mut entry,
-                    0,
-                    std::mem::size_of::<ffi::ibv_gid_entry>(),
-                )
-            };
-            if status != 0 {
-                continue;
-            }
-            // SAFETY: the union was zeroed and filled by libibverbs.
-            let gid = unsafe { entry.gid.raw };
-            if gid == [0; 16] {
-                continue;
-            }
-            let link_local = gid[0] == 0xfe && gid[1] == 0x80;
-            let rank = match (entry.gid_type, link_local) {
-                (ffi::IBV_GID_TYPE_ROCE_V2, false) => 4,
-                (ffi::IBV_GID_TYPE_ROCE_V2, true) => 3,
-                (_, false) => 2,
-                (_, true) => 1,
-            };
-            if best.is_none_or(|(_, _, held)| rank > held) {
-                best = Some((index, gid, rank));
-            }
-        }
-        best.map(|(index, gid, _)| (index, gid))
-            .ok_or_else(|| invalid("the device has no usable GID"))
-    }
 
     /// An active device and its protection domain.
     pub struct Device {
         pub context: *mut ffi::ibv_context,
         pub pd: *mut ffi::ibv_pd,
+        port: u8,
         lid: u16,
         gid: [u8; 16],
         gid_index: u32,
@@ -148,28 +120,95 @@ mod verbs {
     unsafe impl Sync for Device {}
 
     impl Device {
-        pub fn open() -> io::Result<Arc<Self>> {
-            let (context, lid) = open_active_device()?;
-            let result = (|| {
-                // SAFETY: the context is open.
-                let (gid_index, gid) = unsafe { pick_gid(context, PORT) }?;
-                // SAFETY: the context is open.
-                let pd = unsafe { ffi::ibv_alloc_pd(context) };
-                if pd.is_null() {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(Arc::new(Self {
-                    context,
-                    pd,
-                    lid,
-                    gid,
-                    gid_index,
-                }))
-            })();
-            if result.is_err() {
-                // SAFETY: no registration or PD survived the failed open.
-                unsafe { ffi::ibv_close_device(context) };
+        pub fn open(local_address: IpAddr) -> io::Result<Arc<Self>> {
+            let mut count = 0;
+            // SAFETY: libibverbs owns the returned list until it is freed below.
+            let list = unsafe { ffi::ibv_get_device_list(&mut count) };
+            if list.is_null() {
+                return Err(io::Error::last_os_error());
             }
+            let result = (|| {
+                for index in 0..count as usize {
+                    // SAFETY: the list has `count` entries.
+                    let device = unsafe { *list.add(index) };
+                    if device.is_null() {
+                        continue;
+                    }
+                    // SAFETY: device belongs to the live libibverbs list.
+                    let context = unsafe { ffi::ibv_open_device(device) };
+                    if context.is_null() {
+                        continue;
+                    }
+                    let mut attr = ffi::ibv_device_attr::default();
+                    // SAFETY: the context is open and attr is writable.
+                    let status = unsafe { ffi::ibv_query_device(context, &mut attr) };
+                    let mut entries = Vec::new();
+                    if status == 0 {
+                        for port in 1..=attr.phys_port_cnt {
+                            let mut attr = ffi::ibv_port_attr::default();
+                            // SAFETY: the compat cast matches libibverbs' inline wrapper.
+                            let status = unsafe {
+                                ffi::ibv_query_port(
+                                    context,
+                                    port,
+                                    &mut attr as *mut ffi::ibv_port_attr
+                                        as *mut ffi::_compat_ibv_port_attr,
+                                )
+                            };
+                            if status != 0 || attr.state != ffi::ibv_port_state::IBV_PORT_ACTIVE {
+                                continue;
+                            }
+                            for gid_index in 0..attr.gid_tbl_len as u32 {
+                                let mut entry = unsafe { std::mem::zeroed::<ffi::ibv_gid_entry>() };
+                                // SAFETY: context is open and entry has the supplied size.
+                                let status = unsafe {
+                                    ffi::_ibv_query_gid_ex(
+                                        context,
+                                        u32::from(port),
+                                        gid_index,
+                                        &mut entry,
+                                        0,
+                                        std::mem::size_of::<ffi::ibv_gid_entry>(),
+                                    )
+                                };
+                                if status == 0 {
+                                    entries.push(GidEntry {
+                                        device: index,
+                                        port,
+                                        gid_index,
+                                        // SAFETY: libibverbs filled the union.
+                                        gid: unsafe { entry.gid.raw },
+                                        roce_v2: entry.gid_type == ffi::IBV_GID_TYPE_ROCE_V2,
+                                        lid: attr.lid,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    if let Ok(entry) = select_gid(local_address, &entries) {
+                        // SAFETY: the context is open.
+                        let pd = unsafe { ffi::ibv_alloc_pd(context) };
+                        if pd.is_null() {
+                            let error = io::Error::last_os_error();
+                            unsafe { ffi::ibv_close_device(context) };
+                            return Err(error);
+                        }
+                        return Ok(Arc::new(Self {
+                            context,
+                            pd,
+                            port: entry.port,
+                            lid: entry.lid,
+                            gid: entry.gid,
+                            gid_index: entry.gid_index,
+                        }));
+                    }
+                    // SAFETY: no PD or registration uses this context.
+                    unsafe { ffi::ibv_close_device(context) };
+                }
+                Err(no_gid(local_address))
+            })();
+            // SAFETY: all contexts were opened before freeing the list.
+            unsafe { ffi::ibv_free_device_list(list) };
             result
         }
     }
@@ -182,50 +221,6 @@ mod verbs {
                 ffi::ibv_close_device(self.context);
             }
         }
-    }
-
-    fn open_active_device() -> io::Result<(*mut ffi::ibv_context, u16)> {
-        let mut count = 0i32;
-        // SAFETY: `ibv_get_device_list` returns a null-terminated array owned by libibverbs.
-        let list = unsafe { ffi::ibv_get_device_list(&mut count) };
-        if list.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        let mut chosen = None;
-        for index in 0..count as usize {
-            // SAFETY: the array has `count` entries; entries may be null.
-            let device = unsafe { *list.add(index) };
-            if device.is_null() {
-                continue;
-            }
-            // SAFETY: `device` came from the list and has not been freed yet.
-            let context = unsafe { ffi::ibv_open_device(device) };
-            if context.is_null() {
-                continue;
-            }
-            let mut port = ffi::ibv_port_attr::default();
-            // SAFETY: the compat cast is the same one libibverbs' inline wrapper performs.
-            let status = unsafe {
-                ffi::ibv_query_port(
-                    context,
-                    PORT,
-                    &mut port as *mut ffi::ibv_port_attr as *mut ffi::_compat_ibv_port_attr,
-                )
-            };
-            if status == 0 && port.state == ffi::ibv_port_state::IBV_PORT_ACTIVE {
-                chosen = Some((context, port.lid));
-                break;
-            }
-            // SAFETY: this context was opened here and is not used again.
-            unsafe {
-                ffi::ibv_close_device(context);
-            }
-        }
-        // SAFETY: every device we intend to use was opened before this call.
-        unsafe {
-            ffi::ibv_free_device_list(list);
-        }
-        chosen.ok_or_else(|| invalid("no active RDMA device"))
     }
 
     /// A queue pair for one transfer, in INIT until connected.
@@ -294,7 +289,7 @@ mod verbs {
             let mut attr = ffi::ibv_qp_attr {
                 qp_state: ffi::ibv_qp_state::IBV_QPS_INIT,
                 pkey_index: 0,
-                port_num: PORT,
+                port_num: device.port,
                 qp_access_flags: access,
                 ..Default::default()
             };
@@ -332,7 +327,7 @@ mod verbs {
                 min_rnr_timer: 12,
                 ah_attr: ffi::ibv_ah_attr {
                     dlid: peer.lid,
-                    port_num: PORT,
+                    port_num: self.device.port,
                     is_global: u8::from(peer.gid != [0; 16]),
                     grh: ffi::ibv_global_route {
                         dgid: ffi::ibv_gid { raw: peer.gid },
@@ -431,6 +426,57 @@ pub use verbs::{Device, Qp, ffi};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gid_selection_follows_the_local_address_across_devices_and_ports() {
+        let ipv4: IpAddr = "172.16.1.6".parse().unwrap();
+        let ipv6: IpAddr = "2001:db8::6".parse().unwrap();
+        let mapped = "::ffff:172.16.1.6"
+            .parse::<std::net::Ipv6Addr>()
+            .unwrap()
+            .octets();
+        let entries = [
+            GidEntry {
+                device: 0,
+                port: 1,
+                gid_index: 0,
+                gid: mapped,
+                roce_v2: false,
+                lid: 0,
+            },
+            GidEntry {
+                device: 0,
+                port: 1,
+                gid_index: 1,
+                gid: "2001:db8::6"
+                    .parse::<std::net::Ipv6Addr>()
+                    .unwrap()
+                    .octets(),
+                roce_v2: true,
+                lid: 0,
+            },
+            GidEntry {
+                device: 1,
+                port: 2,
+                gid_index: 3,
+                gid: mapped,
+                roce_v2: true,
+                lid: 0,
+            },
+        ];
+        assert_eq!(select_gid(ipv4, &entries).unwrap(), entries[2]);
+        assert_eq!(select_gid(ipv6, &entries).unwrap(), entries[1]);
+        assert_eq!(
+            select_gid("::ffff:172.16.1.6".parse().unwrap(), &entries).unwrap(),
+            entries[2]
+        );
+        let error = select_gid(ipv4, &entries[..2]).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "no RDMA device has a RoCE v2 GID for 172.16.1.6; RDMA needs the data connection on a RoCE interface"
+        );
+        assert!(select_gid("172.16.1.7".parse().unwrap(), &entries).is_err());
+    }
 
     #[test]
     fn a_handshake_round_trips_and_refuses_the_wrong_length_or_version() {

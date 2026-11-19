@@ -586,3 +586,53 @@ async fn a_freed_window_credit_is_granted_without_waiting_for_the_clock() {
         "32 windows took {t1:?} on one credit and {t32:?} on 32"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn put_grants_are_record_relative_when_the_published_parent_is_stored() {
+    use v2::{client_message::M as C, server_message::M};
+    let mut host = host();
+    host.run();
+    let mut pool = Pool::connect(&host.config.socket).await;
+    let mut writer = open(&mut pool, "writer-relative-grants").await;
+    store_chain(&mut writer, 1, &[1024]).await;
+    writer
+        .send(C::PutBegin(v2::PutBegin {
+            put_id: 2,
+            key: Some(selene_manager::pool::key_to(key(2048))),
+            chain_pages: 32,
+            row: true,
+            has_published_parent: true,
+            published_parent: Some(selene_manager::pool::key_to(key(1024))),
+            published_tail_pages: 16,
+            bucket: pool::bucket_of(2048),
+            mode: v2::CopyMode::SharedWindows as i32,
+            ..Default::default()
+        }))
+        .await;
+    let accept = writer
+        .take_within(Duration::from_secs(5), &mut |message| match message {
+            M::PutAccept(accept) if accept.put_id == 2 => Some(accept.clone()),
+            _ => None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(accept.first_page, 16);
+    let window = writer
+        .take_within(Duration::from_secs(5), &mut |message| match message {
+            M::PutGrant(grant) if grant.put_id == 2 => grant.window,
+            _ => None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        window.first_page, 0,
+        "grant coordinates start at the accepted record"
+    );
+    writer.send(C::PutCancel(v2::PutCancel { put_id: 2 })).await;
+    writer
+        .send(C::FenceAck(v2::FenceAck {
+            subject: Some(v2::fence_ack::Subject::PutId(2)),
+            outcome: v2::FenceOutcome::Drained as i32,
+        }))
+        .await;
+}

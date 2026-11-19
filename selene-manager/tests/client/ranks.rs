@@ -447,6 +447,85 @@ fn every_rank_on_its_own_data_channel_restores_a_record() {
 }
 
 #[test]
+fn rank_agents_restore_manager_records_after_every_window_is_assembled() {
+    let manager = network_manager(false);
+    let world = 2;
+    // Four windows exceed the two credits; the last carries the row.
+    let pages = 193;
+    let history = history_of(4000);
+    let key = history.key_at(pages as u64 * PT).unwrap();
+    let (page, row) = whole(world);
+    let data = bytes_of(world, pages);
+    let sums = data[..pages * page]
+        .chunks_exact(page)
+        .map(checksum)
+        .collect();
+    let row_sum = checksum(&data[pages * page..]);
+    let mut writer = source(&manager, world);
+    wait("the writer", || writer.client.status() == PoolStatus::Ready);
+    writer
+        .client
+        .put(PutRequest {
+            key,
+            parent: None,
+            bucket: history.bucket_at(key.consumed_tokens).unwrap(),
+            chain_pages: pages as u64,
+            tail_pages: pages as u64,
+            row: true,
+            source: PutSource::Host(Box::new(RecordBytes {
+                data,
+                sums,
+                row: row_sum,
+                page_bytes: page,
+                row_bytes: row,
+            })),
+        })
+        .unwrap();
+    let mut stored = false;
+    wait("the manager to store the record", || {
+        let mut events = Vec::new();
+        writer.client.poll(&mut events).unwrap();
+        for event in events {
+            if let PoolEvent::Put { outcome, .. } = event {
+                assert!(
+                    matches!(outcome, flare_selene::pool::PutOutcome::Stored { .. }),
+                    "{outcome:?}"
+                );
+                stored = true;
+            }
+        }
+        stored
+    });
+    writer.client.close().unwrap();
+    let scratch: Vec<_> = (100..100 + pages as u32).collect();
+    for reach in [
+        [Reach::Network, Reach::Network],
+        [Reach::Local, Reach::Network],
+        [Reach::Local, Reach::Local],
+    ] {
+        let mut requester = instance_reaching(&manager, world, &reach);
+        requester.ready();
+        wait_offered(&requester.rank0, &history);
+        for _ in 0..2 {
+            let fetch = fetch_for(&requester.rank0, world, &history, pages, &scratch);
+            requester.rank0.fetch(fetch).unwrap();
+            let result = requester.event("the manager restore", |e| match e {
+                PoolEvent::Fetched { result, .. } => Some(
+                    result
+                        .as_ref()
+                        .map(|bytes| *bytes)
+                        .map_err(|failure| failure.error.to_string()),
+                ),
+                _ => None,
+            });
+            assert_eq!(result, Ok((pages * page + row) as u64));
+            assert_slices(&requester, world, pages, &scratch);
+        }
+        requester.close();
+    }
+}
+
+#[test]
 fn three_ranks_mix_shared_memory_and_channels() {
     let manager = network_manager(false);
     restore_through(&manager, 3, &[Reach::Local, Reach::Network, Reach::Local]);

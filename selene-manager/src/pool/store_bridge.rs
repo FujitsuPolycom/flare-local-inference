@@ -198,16 +198,24 @@ impl Core {
     // ------------------------------------------------------------------ links
 
     /// The process's store connection, opened on first use.
-    pub(super) fn link_for(&mut self, process: ProcKey, scope: ScopeId, pid: u32) -> Option<Link> {
+    pub(super) fn link_for(
+        &mut self,
+        process: ProcKey,
+        scope: ScopeId,
+        pid: u32,
+        shm: bool,
+    ) -> Option<Link> {
         if let Some(link) = self.procs.get(&process).and_then(|p| p.link) {
             return Some(link);
         }
         let descriptor: Descriptor = self.scopes.get(&scope)?.valid.descriptor.clone();
         let connection = self.new_store_connection()?;
         let namespace = descriptor.namespace_id();
+        let process_nonce = shm.then_some(process.1);
         self.store_call(|reply| StoreCommand::Hello {
             connection,
             pid,
+            process_nonce,
             descriptor,
             reply,
         })
@@ -361,7 +369,7 @@ impl Core {
             return Ok(());
         };
         let pid = self.sessions[&sid].pid;
-        let Some(link) = self.link_for(process, scope, pid) else {
+        let Some(link) = self.link_for(process, scope, pid, shm) else {
             self.put_refusal(
                 sid,
                 put_id,
@@ -596,7 +604,9 @@ impl Core {
                     offset: grant.offset,
                     length: grant.length,
                     record: grant.record,
-                    first_page: grant.page_first as u32,
+                    // Grant pages count from the accepted record's first page, as the
+                    // writer's coverage and the rank agents read them.
+                    first_page: grant.page_first as u32 - rec.accepted.expect("put accepted").1,
                     page_count: grant.page_count,
                     row: grant.row,
                 };

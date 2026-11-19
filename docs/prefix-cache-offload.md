@@ -1197,7 +1197,9 @@ With the `rdma` cargo feature and a manager started with `--rdma`, which the
 manager refuses to combine with TLS, unsliced
 claims can use RDMA WRITEs into private slots lent by the instance. Puts and rank
 legs use TCP. An instance without a device, or after one failed RDMA transfer,
-uses the stream.
+uses the stream. Each end uses the device whose RoCE v2 GID is the local address of
+the data connection, so that connection must run on the RoCE interface (host
+networking for containers), and the manager's data listener must name that address.
 
 Copy priority is fixed: neighbour GPU, host DRAM, host NVMe, then remote NVMe.
 There are no synthetic startup transfers or borrowed GPU scratch ids.
@@ -1220,6 +1222,12 @@ local chain under pressure, and an instance's own records leave the manager's
 index when its session ends. Restarting with wiped local disks therefore
 restores nothing unless records had already cascaded to the manager. This holds
 on a single host too.
+
+With a pool configured but no local memory or disk tier enabled, startup warns
+that the pool will receive no records from this instance. It can still restore
+records stored by other instances and serve cross-instance GPU exports. Enable
+`--prefix-cache-memory` and/or `--prefix-cache-disk` to let local records cascade
+to the manager.
 
 ## 3. Components and required test coverage
 

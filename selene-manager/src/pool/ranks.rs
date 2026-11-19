@@ -110,9 +110,10 @@ impl Core {
         if attach.rank == 0 || attach.rank >= world {
             return self.rank_refuse(&tx, S::RankBadRank);
         }
-        let shm_capable = peer.unix && peer.uid == self.euid && peer.gid == self.egid;
+        let shm_capable = peer.shared_memory(self.euid, self.egid);
         let rank0_shm = self.sessions[&sid].shm;
-        let mode = if shm_capable && rank0_shm {
+        let shm = shm_capable && rank0_shm;
+        let mode = if shm {
             v2::RankMode::RankShared
         } else {
             v2::RankMode::RankChannel
@@ -142,7 +143,6 @@ impl Core {
         self.next_session += 1;
         let aid = self.next_session;
         let key = (instance, nonce);
-        let started_pid = peer.unix.then_some(peer.pid).filter(|pid| *pid != 0);
         let entry = self.procs.entry(key).or_insert_with(|| super::core::Proc {
             pid: None,
             pidfd: None,
@@ -153,7 +153,12 @@ impl Core {
             link: None,
         });
         entry.idle_since = None;
-        entry.watch(started_pid);
+        entry.watch(&peer);
+        // A rank that copies through shared windows is a holder across a manager restart
+        // (PROTOCOL.md 8.6) even if it never puts, so its store connection is made now.
+        if shm {
+            self.link_for(key, self.sessions[&sid].scope, peer.pid, true);
+        }
         self.agents.insert(
             aid,
             Agent {
@@ -336,6 +341,7 @@ mod tests {
             pid: std::process::id(),
             uid: core.euid,
             gid: core.egid,
+            pidfd: None,
         }
     }
 
@@ -345,6 +351,7 @@ mod tests {
             pid: 0,
             uid: 0,
             gid: 0,
+            pidfd: None,
         }
     }
 
@@ -376,6 +383,39 @@ mod tests {
             )
             .expect("rank 0 opens");
         (sid, rx)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pid_zero_without_pidfd_gets_no_shared_memory() {
+        let mut core = core();
+        let mut peer = unix(&core);
+        peer.pid = 0;
+        let sid = open_rank0(&mut core, 2, RANK0, peer.clone());
+        assert!(!core.sessions[&sid].shm);
+        assert_eq!(core.sessions[&sid].export_slots, 0);
+        let visible = unix(&core);
+        open_rank0(&mut core, 2, RANK0, visible);
+        let (aid, got) = join(&mut core, attach(1, 2), peer);
+        assert!(aid.is_none());
+        assert_eq!(status(&got), S::RankNoDataListener);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pid_zero_rank_watches_peer_pidfd() {
+        let mut core = core();
+        let rank0 = unix(&core);
+        open_rank0(&mut core, 2, RANK0, rank0);
+        let mut peer = unix(&core);
+        peer.pid = 0;
+        let pidfd = std::sync::Arc::new(crate::local::watch_pid(std::process::id()).0.unwrap());
+        peer.pidfd = Some(pidfd.clone());
+        let (aid, got) = join(&mut core, attach(1, 2), peer);
+        assert!(aid.is_some());
+        assert_eq!(status(&got), S::RankOk);
+        let proc = &core.procs[&(INSTANCE, [2; 16])];
+        assert!(proc.pid.is_none());
+        assert!(std::sync::Arc::ptr_eq(proc.pidfd.as_ref().unwrap(), &pidfd));
+        assert_eq!(core.agents[&aid.unwrap()].mode, v2::RankMode::RankShared);
     }
 
     fn attach(rank: u32, nonce: u8) -> v2::RankAttach {
@@ -417,17 +457,32 @@ mod tests {
 
         let mut bad = attach(1, 1);
         bad.rank_secret = vec![0; 32];
-        assert_eq!(status(&join(&mut core, bad, me).1), S::RankBadSecret);
-        assert_eq!(status(&join(&mut core, attach(0, 1), me).1), S::RankBadRank);
-        assert_eq!(status(&join(&mut core, attach(3, 1), me).1), S::RankBadRank);
+        assert_eq!(
+            status(&join(&mut core, bad, me.clone()).1),
+            S::RankBadSecret
+        );
+        assert_eq!(
+            status(&join(&mut core, attach(0, 1), me.clone()).1),
+            S::RankBadRank
+        );
+        assert_eq!(
+            status(&join(&mut core, attach(3, 1), me.clone()).1),
+            S::RankBadRank
+        );
         let mut stale = attach(1, 1);
         stale.rank0_nonce = vec![5; 16];
-        assert_eq!(status(&join(&mut core, stale, me).1), S::RankNoSession);
+        assert_eq!(
+            status(&join(&mut core, stale, me.clone()).1),
+            S::RankNoSession
+        );
         let mut other = attach(1, 1);
         other.instance_id = vec![8; 16];
-        assert_eq!(status(&join(&mut core, other, me).1), S::RankNoSession);
+        assert_eq!(
+            status(&join(&mut core, other, me.clone()).1),
+            S::RankNoSession
+        );
 
-        let (aid, got) = join(&mut core, attach(1, 1), me);
+        let (aid, got) = join(&mut core, attach(1, 1), me.clone());
         assert!(aid.is_some());
         assert_eq!(status(&got), S::RankOk);
         let M::Attached(a) = &got[0] else { panic!() };
@@ -449,18 +504,18 @@ mod tests {
     async fn claims_wait_for_every_peer_rank() {
         let mut core = core();
         let me = unix(&core);
-        let sid = open_rank0(&mut core, 3, RANK0, me);
+        let sid = open_rank0(&mut core, 3, RANK0, me.clone());
         assert!(!core.ranks_ready(sid));
-        let (one, _) = join(&mut core, attach(1, 1), me);
+        let (one, _) = join(&mut core, attach(1, 1), me.clone());
         assert!(!core.ranks_ready(sid));
-        let (two, _) = join(&mut core, attach(2, 2), me);
+        let (two, _) = join(&mut core, attach(2, 2), me.clone());
         assert!(core.ranks_ready(sid));
         core.rank_closed(two.unwrap());
         assert!(
             !core.ranks_ready(sid),
             "a rank that detached gates claims again"
         );
-        let (two, _) = join(&mut core, attach(2, 3), me);
+        let (two, _) = join(&mut core, attach(2, 3), me.clone());
         assert!(core.ranks_ready(sid));
         core.rank_closed(one.unwrap());
         core.rank_closed(two.unwrap());
@@ -471,7 +526,7 @@ mod tests {
     async fn a_claim_while_the_regions_are_held_is_refused_distinctly_and_then_served() {
         let mut core = core();
         let me = unix(&core);
-        let (sid, mut rx) = open_rank0_with(&mut core, 2, RANK0, me);
+        let (sid, mut rx) = open_rank0_with(&mut core, 2, RANK0, me.clone());
         core.state = v2::ReadinessState::Ready;
         core.cfg
             .held
@@ -508,7 +563,7 @@ mod tests {
     async fn a_claim_or_put_of_an_instance_with_a_rank_missing_is_refused_at_once() {
         let mut core = core();
         let me = unix(&core);
-        let (sid, mut rx) = open_rank0_with(&mut core, 2, RANK0, me);
+        let (sid, mut rx) = open_rank0_with(&mut core, 2, RANK0, me.clone());
         core.state = v2::ReadinessState::Ready;
         while rx.try_recv().is_ok() {}
         core.claim(
@@ -550,9 +605,9 @@ mod tests {
     async fn a_replacement_agent_does_not_replace_the_obligations_of_the_old_one() {
         let mut core = core();
         let me = unix(&core);
-        let sid = open_rank0(&mut core, 2, RANK0, me);
-        let (old, _) = join(&mut core, attach(1, 1), me);
-        let (new, got) = join(&mut core, attach(1, 2), me);
+        let sid = open_rank0(&mut core, 2, RANK0, me.clone());
+        let (old, _) = join(&mut core, attach(1, 1), me.clone());
+        let (new, got) = join(&mut core, attach(1, 2), me.clone());
         assert_eq!(status(&got), S::RankOk);
         let (old, new) = (old.unwrap(), new.unwrap());
         assert!(
@@ -570,14 +625,14 @@ mod tests {
     async fn when_rank_zero_ends_existing_agents_only_drain_and_new_attachments_are_refused() {
         let mut core = core();
         let me = unix(&core);
-        let sid = open_rank0(&mut core, 2, RANK0, me);
-        let (aid, _) = join(&mut core, attach(1, 1), me);
+        let sid = open_rank0(&mut core, 2, RANK0, me.clone());
+        let (aid, _) = join(&mut core, attach(1, 1), me.clone());
         let aid = aid.unwrap();
         core.session_lost(sid);
         assert!(core.agents[&aid].drain_only);
         // The existing stream may drain, but a new attachment needs a live session.
         assert_eq!(
-            status(&join(&mut core, attach(1, 4), me).1),
+            status(&join(&mut core, attach(1, 4), me.clone()).1),
             S::RankNoSession
         );
     }
@@ -586,16 +641,16 @@ mod tests {
     async fn the_same_process_reconnecting_keeps_its_agents_and_another_process_does_not() {
         let mut core = core();
         let me = unix(&core);
-        open_rank0(&mut core, 2, RANK0, me);
-        let (aid, _) = join(&mut core, attach(1, 1), me);
+        open_rank0(&mut core, 2, RANK0, me.clone());
+        let (aid, _) = join(&mut core, attach(1, 1), me.clone());
         let aid = aid.unwrap();
         // The same process opens a second session.
-        let second = open_rank0(&mut core, 2, RANK0, me);
+        let second = open_rank0(&mut core, 2, RANK0, me.clone());
         assert!(!core.agents[&aid].drain_only, "a reconnect keeps the agent");
         assert!(core.ranks_ready(second));
         // Another process takes the instance over.
         let other = [2u8; 16];
-        let third = open_rank0(&mut core, 2, other, me);
+        let third = open_rank0(&mut core, 2, other, me.clone());
         assert!(
             core.agents[&aid].drain_only,
             "the old process's agent only drains"
@@ -608,7 +663,7 @@ mod tests {
     {
         let mut core = core();
         let me = unix(&core);
-        open_rank0(&mut core, 2, RANK0, me);
+        open_rank0(&mut core, 2, RANK0, me.clone());
         // No data listener: a network agent cannot be served.
         assert_eq!(
             status(&join(&mut core, attach(1, 1), tcp()).1),

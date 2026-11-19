@@ -16,18 +16,145 @@ use std::{
     fs,
     io::{self, Read, Write},
     net::TcpListener,
-    os::unix::fs::{FileTypeExt, PermissionsExt},
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::fs::{FileTypeExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    task::{Context, Poll},
     thread,
     time::{Duration, Instant},
 };
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::UnixStream,
+    sync::{Notify, mpsc, oneshot},
+};
 use tokio_stream::{StreamExt, wrappers::TcpListenerStream, wrappers::UnixListenerStream};
-use tonic::transport::Server;
+use tonic::transport::{
+    Server,
+    server::{Connected, UdsConnectInfo},
+};
+
+#[derive(Clone, Debug)]
+pub(crate) struct UnixConnectInfo {
+    pub uds: UdsConnectInfo,
+    pub pidfd: Option<Arc<OwnedFd>>,
+}
+
+struct UnixConnection {
+    stream: UnixStream,
+    info: UnixConnectInfo,
+}
+
+impl UnixConnection {
+    fn new(stream: UnixStream, pidfd_warning_logged: &mut bool) -> Self {
+        let uds = stream.connect_info();
+        let pidfd = if let Some(cred) = uds.peer_cred.filter(|cred| cred.pid() == Some(0)) {
+            match peer_pidfd(&stream) {
+                Ok(fd) => Some(Arc::new(fd)),
+                Err(error) => {
+                    if !*pidfd_warning_logged
+                        && cred.uid() == unsafe { libc::geteuid() }
+                        && cred.gid() == unsafe { libc::getegid() }
+                    {
+                        *pidfd_warning_logged = true;
+                        if error.raw_os_error() == Some(libc::ENOPROTOOPT) {
+                            eprintln!(
+                                "selene: no shared memory for a peer outside the manager's PID \
+                                 namespace: SO_PEERPIDFD requires Linux 6.5+; share a PID namespace \
+                                 or use --listen"
+                            );
+                        } else {
+                            eprintln!(
+                                "selene: no shared memory for a peer outside the manager's PID \
+                                 namespace: SO_PEERPIDFD failed: {error}"
+                            );
+                        }
+                    }
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        Self {
+            stream,
+            info: UnixConnectInfo { uds, pidfd },
+        }
+    }
+}
+
+fn peer_pidfd(stream: &UnixStream) -> io::Result<OwnedFd> {
+    let mut fd: libc::c_int = -1;
+    let mut length = std::mem::size_of_val(&fd) as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERPIDFD,
+            (&mut fd as *mut libc::c_int).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+impl Connected for UnixConnection {
+    type ConnectInfo = UnixConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        self.info.clone()
+    }
+}
+
+impl AsyncRead for UnixConnection {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for UnixConnection {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write_vectored(cx, bufs)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
 
 impl tonic::transport::server::Connected for Box<dyn crate::data::channel::Conn> {
     type ConnectInfo = ();
@@ -136,13 +263,14 @@ pub fn serve(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
     let (channel, channel_events) = match config.data_address()? {
         Some(address) => {
             let listener = std::net::TcpListener::bind(address)?;
+            let rdma = rdma_device(&config, &regions, listener.local_addr()?.ip())?;
             let (hub, events) = crate::data::channel::Hub::start(
                 runtime.handle(),
                 listener,
                 regions.clone(),
                 tls.clone(),
                 flare_selene::shared::MAX_WINDOW_PAGES,
-                rdma_device(&config, &regions)?,
+                rdma,
             )?;
             (Some(hub), Some(events))
         }
@@ -273,7 +401,10 @@ pub fn serve(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
     let network_stop = serve_stop.clone();
     let result = runtime.block_on(async move {
         let listener = tokio::net::UnixListener::from_std(listener)?;
-        let incoming = UnixListenerStream::new(listener);
+        let mut pidfd_warning_logged = false;
+        let incoming = UnixListenerStream::new(listener).map(move |stream| {
+            stream.map(|stream| UnixConnection::new(stream, &mut pidfd_warning_logged))
+        });
         let mut builder = Server::builder()
             .http2_keepalive_interval(Some(h2_keepalive))
             .http2_keepalive_timeout(Some(h2_timeout));
@@ -388,11 +519,12 @@ pub fn serve(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
 fn rdma_device(
     config: &crate::config::Config,
     regions: &Arc<crate::regions::LocalRegions>,
+    local_address: std::net::IpAddr,
 ) -> Result<Option<Arc<dyn crate::data::channel::Rdma>>> {
     if !config.rdma_enabled() {
         return Ok(None);
     }
-    let device = crate::data::ibv::Device::open(regions.clone())
+    let device = crate::data::ibv::Device::open(regions.clone(), local_address)
         .map_err(|error| invalid(format!("--rdma: {error}")))?;
     Ok(Some(Arc::new(device)))
 }
@@ -401,6 +533,7 @@ fn rdma_device(
 fn rdma_device(
     _: &crate::config::Config,
     _: &Arc<crate::regions::LocalRegions>,
+    _: std::net::IpAddr,
 ) -> Result<Option<Arc<dyn crate::data::channel::Rdma>>> {
     Ok(None)
 }
@@ -504,6 +637,39 @@ fn serve_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unix_connect_info_leaves_visible_pid_unwatched() {
+        let path =
+            std::env::temp_dir().join(format!("selene-peer-pidfd-{}.sock", std::process::id()));
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let client = UnixStream::connect(&path).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        fs::remove_file(path).unwrap();
+        match peer_pidfd(&stream) {
+            Err(error) if error.raw_os_error() == Some(libc::ENOPROTOOPT) => {
+                eprintln!("SO_PEERPIDFD unavailable; checking the visible-pid path");
+            }
+            result => {
+                let pidfd = result.unwrap();
+                assert_ne!(
+                    unsafe { libc::fcntl(pidfd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                    0
+                );
+            }
+        }
+        let mut warning_logged = false;
+        let connection = UnixConnection::new(stream, &mut warning_logged);
+        let info = connection.connect_info();
+        assert_eq!(
+            info.uds.peer_cred.unwrap().pid(),
+            Some(std::process::id() as i32)
+        );
+        assert!(info.uds.peer_addr.is_some());
+        assert!(info.pidfd.is_none());
+        assert!(!warning_logged);
+        drop(client);
+    }
 
     #[test]
     fn cleanup_shuts_down_a_stalled_owner_with_a_full_queue() {

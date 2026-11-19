@@ -346,6 +346,20 @@ def _fake_fill_output(out, value):
     pass
 
 
+def _compiled_runner(forward, backend, tmp_path, monkeypatch):
+    """Compile forward with the FX or AOT backend, round-tripping AOT through disk."""
+    from ignition.preparation.aot import aot_forward
+
+    monkeypatch.setattr("ignition.preparation.compilation.DEFAULT_CACHE_ROOT", tmp_path)
+    compiled = compile_forward(forward) if backend == "fx" else aot_forward(forward)
+    if backend == "aot":
+        path = tmp_path / "compiled.bin"
+        compiled.save_compiled_function(str(path))
+        with path.open("rb") as file:
+            compiled = torch.compiler.load_compiled_function(file)
+    return lambda: compiled() if backend == "fx" else compiled(forward)
+
+
 class StorageMutationForward:
     def __init__(self, offset):
         self.storage = torch.empty(1 << 19, dtype=torch.int32, device="cuda")
@@ -369,21 +383,10 @@ class StorageMutationForward:
 @pytest.mark.parametrize("offset", [0, 16])
 @torch.no_grad()
 def test_live_values_do_not_clone_backing_storage(backend, offset, tmp_path, monkeypatch):
-    from ignition.preparation.aot import aot_forward
     from ignition.preparation.compilation import _Invocation
 
-    monkeypatch.setattr("ignition.preparation.compilation.DEFAULT_CACHE_ROOT", tmp_path)
-
     forward = StorageMutationForward(offset)
-    compiled = compile_forward(forward) if backend == "fx" else aot_forward(forward)
-    if backend == "aot":
-        path = tmp_path / "mutations.bin"
-        compiled.save_compiled_function(str(path))
-        with path.open("rb") as file:
-            compiled = torch.compiler.load_compiled_function(file)
-
-    def run():
-        return compiled() if backend == "fx" else compiled(forward)
+    run = _compiled_runner(forward, backend, tmp_path, monkeypatch)
 
     addresses, sizes = [], []
     original = _Invocation.run
@@ -418,6 +421,48 @@ def test_live_values_do_not_clone_backing_storage(backend, offset, tmp_path, mon
         if offset:
             assert (forward.storage[:offset] == initial).all()
     graph.reset()
+
+
+class TemporarySliceForward:
+    def __init__(self):
+        self.source = torch.arange(1024, dtype=torch.float32, device="cuda").reshape(8, 64, 2)
+
+    def __call__(self):
+        live = self.source + 1
+        _fill_output(live, 3.)
+        storage = self.source + 1
+        for start in range(2, 8, 2):
+            _fill_output(storage[start:start + 2].view(torch.bfloat16).view(2, -1), float(start + 2))
+        return storage + live
+
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="explicit CUDA assignment required")
+@pytest.mark.parametrize("backend", ["fx", "aot"])
+@torch.no_grad()
+def test_temporary_typed_slices_preserve_mutation_offsets(backend, tmp_path, monkeypatch):
+    from ignition.preparation.compilation import _Invocation
+
+    forward = TemporarySliceForward()
+    run = _compiled_runner(forward, backend, tmp_path, monkeypatch)
+
+    offsets = []
+    original = _Invocation.run
+
+    def observe(invocation, reads, writes, integers=()):
+        for _, mutable, index, descriptor in invocation.operands:
+            if mutable and descriptor is not None and descriptor[0] == torch.bfloat16:
+                offsets.append(writes[index].storage_offset())
+        return original(invocation, reads, writes, integers)
+
+    monkeypatch.setattr(_Invocation, "run", observe)
+    torch.testing.assert_close(run(), forward(), rtol=0, atol=0)
+    assert any(offsets), "typed temporary owner must exercise a nonzero pool offset"
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = run()
+    forward.source.add_(3)
+    graph.replay()
+    torch.testing.assert_close(actual, forward(), rtol=0, atol=0)
 
 
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="explicit CUDA assignment required")

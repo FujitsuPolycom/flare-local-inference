@@ -9,7 +9,7 @@
 use flare_selene::pool::rdma;
 use flare_selene::shared::frame::{Carrier, NO_SLOT, ToInstance, ToManager, Window};
 use selene_manager::{arena::Arena, proto::v2};
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 use tokio::{net::TcpStream, time::timeout};
 
 const MAX_PAGES: u32 = 64;
@@ -17,7 +17,6 @@ const SLOT: usize = 1 << 20;
 
 pub struct Instance {
     staging: Arena,
-    device: Arc<rdma::Device>,
 }
 
 pub struct Dialed {
@@ -33,10 +32,7 @@ pub struct Received {
 impl Instance {
     pub fn new() -> Self {
         let staging = Arena::new(4 * SLOT).unwrap();
-        let (base, len) = staging.mapping();
-        // SAFETY: the arena stays mapped and in place for the life of the instance.
-        let device = unsafe { rdma::Device::open(base, len) }.expect("an RDMA device");
-        Self { staging, device }
+        Self { staging }
     }
 
     #[allow(clippy::mut_from_ref)]
@@ -52,7 +48,11 @@ impl Instance {
         use tokio::io::AsyncWriteExt;
         let mut stream = TcpStream::connect(&reference.address).await.unwrap();
         stream.write_all(&reference.token).await.unwrap();
-        let pair = rdma::Pair::new(&self.device).unwrap();
+        let (base, len) = self.staging.mapping();
+        // SAFETY: staging stays mapped for the life of the pair.
+        let device = unsafe { rdma::Device::open(base, len, stream.local_addr().unwrap().ip()) }
+            .expect("an RDMA device on the data connection's route");
+        let pair = rdma::Pair::new(&device).unwrap();
         ToManager::Hello(Carrier::Rdma(pair.handshake().encode().to_vec()))
             .write(&mut stream)
             .await

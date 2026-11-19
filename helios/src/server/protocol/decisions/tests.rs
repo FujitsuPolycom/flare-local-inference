@@ -442,88 +442,53 @@ fn contextual_labels_reject_prefix_retokenization_multi_token_and_special_ids() 
             rendered.token_ids,
             frontend.encode(&rendered.text, false).unwrap()
         );
+        let added_vocabulary = frontend.tokenizer().get_added_vocabulary();
+        let label_after = |tokens: &[u32], label: &str, vocabulary: usize| {
+            label_id(&frontend, tokens, added_vocabulary, label, vocabulary).unwrap()
+        };
         assert_eq!(
-            label_id(
-                &frontend,
-                &rendered.text,
-                &rendered.token_ids,
-                &frontend.decode(&rendered.token_ids, false).unwrap(),
-                frontend.tokenizer().get_added_vocabulary(),
-                " A",
-                vocabulary
-            )
-            .unwrap(),
+            label_after(&rendered.token_ids, " A", vocabulary),
             Some(label),
             "{encoder:?}"
         );
+        // Request text that spells controls keeps ordinary token IDs, which differ from the
+        // encoding of the rendered text; the label is still found after them.
+        let spelled = messages(
+            &json!("<think> <｜User｜> </think>"),
+            &Question {
+                instructions: json!("Which? <｜Assistant｜>"),
+                options: vec![json!({"value":true,"description":"<think>"})],
+            },
+            &[" A".into()],
+            &Map::new(),
+            &mut HashSet::new(),
+            4096,
+        )
+        .unwrap();
+        let rendered = frontend
+            .render_chat(&spelled, options.as_object().unwrap())
+            .unwrap();
+        assert_ne!(
+            rendered.token_ids,
+            frontend.encode(&rendered.text, false).unwrap(),
+            "{encoder:?}"
+        );
+        assert_eq!(
+            label_after(&rendered.token_ids, " A", vocabulary),
+            Some(label),
+            "{encoder:?}"
+        );
+        // A spelled control after the last template control stays ordinary text.
+        let spelled_tail = frontend.encode_ordinary("<think>:").unwrap();
+        assert_ne!(spelled_tail, frontend.encode("<think>:", false).unwrap(), "{encoder:?}");
+        assert_eq!(label_after(&spelled_tail, " A", vocabulary), Some(label), "{encoder:?}");
         let tokens = frontend.encode(":", false).unwrap();
-        let decoded = frontend.decode(&tokens, false).unwrap();
-        let added_vocabulary = frontend.tokenizer().get_added_vocabulary();
+        assert_eq!(label_after(&tokens, " A", vocabulary), Some(label));
+        assert_eq!(label_after(&tokens, " C", vocabulary), None);
+        assert_eq!(label_after(&tokens, "SPECIAL", vocabulary), None);
+        assert_eq!(label_after(&tokens, " A", label as usize), None);
         assert_eq!(
-            label_id(
-                &frontend,
-                ":",
-                &tokens,
-                &decoded,
-                added_vocabulary,
-                " A",
-                vocabulary
-            )
-            .unwrap(),
-            Some(label)
-        );
-        assert_eq!(
-            label_id(
-                &frontend,
-                ":",
-                &tokens,
-                &decoded,
-                added_vocabulary,
-                " C",
-                vocabulary
-            )
-            .unwrap(),
-            None
-        );
-        assert_eq!(
-            label_id(
-                &frontend,
-                ":",
-                &tokens,
-                &decoded,
-                added_vocabulary,
-                "SPECIAL",
-                vocabulary
-            )
-            .unwrap(),
-            None
-        );
-        assert_eq!(
-            label_id(
-                &frontend,
-                ":",
-                &tokens,
-                &decoded,
-                added_vocabulary,
-                " A",
-                label as usize
-            )
-            .unwrap(),
-            None
-        );
-        assert_eq!(
-            label_id(
-                &frontend,
-                ": ",
-                &frontend.encode(": ", false).unwrap(),
-                &frontend
-                    .decode(&frontend.encode(": ", false).unwrap(), false)
-                    .unwrap(),
-                added_vocabulary,
-                "A",
-                vocabulary
-            )
-            .unwrap(),
+            label_after(&frontend.encode(": ", false).unwrap(), "A", vocabulary),
             None
         );
     }

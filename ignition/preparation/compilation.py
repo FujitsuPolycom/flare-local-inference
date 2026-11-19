@@ -518,6 +518,9 @@ def _lower_storage(module):
             deferred.add(node)
         else:
             opaque.update(key_for(arg) for arg in tensor_operands(node) if key_for(arg) in bases)
+    temporary_owners = {}
+    for node, key in keys.items():
+        temporary_owners.setdefault(key, node)
     calls, mutation_calls = [], {}
     for node in originals:
         if node.op != 'call_function':
@@ -545,12 +548,23 @@ def _lower_storage(module):
             mutable = key in mutable_keys
             array, indices = (writes, write_indices) if mutable else (reads, read_indices)
             base = bases.get(key)
+            if base is None and mutable and len(dtypes[key]) > 1:
+                # Inductor can materialize a dtype view of a mutated temporary slice as a smaller
+                # allocation, then apply the slice's offset in the parent to it. The call receives the
+                # allocation that owns the storage, and _Invocation.run rebuilds the operand's view.
+                base = temporary_owners[key]
+                try:
+                    base.meta['val'].view(value.dtype)
+                except RuntimeError as error:
+                    raise ValueError(f'cannot view temporary storage-call owner {base} as {value.dtype} '
+                                     f'for operand {arg}') from error
             identity = key if base is not None else arg
             if identity not in indices:
                 indices[identity] = len(array)
                 array.append(base if base is not None else arg)
+            begin = regions[key][0] if key in bases else 0
             descriptor = (value.dtype, tuple(map(int, value.shape)), tuple(map(int, value.stride())),
-                          int(value.storage_offset()) - regions[key][0] // value.element_size()) if base is not None else None
+                          int(value.storage_offset()) - begin // value.element_size()) if base is not None else None
             operands.append((position, mutable, indices[identity], descriptor))
             leaves[position] = None
         invocation = _Invocation(target, leaves, tree, operands, integer_positions)

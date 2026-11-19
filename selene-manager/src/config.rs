@@ -219,6 +219,16 @@ impl Config {
         if self.rdma && self.listen.is_none() {
             return Err(invalid("--rdma applies to --listen"));
         }
+        if self.rdma
+            && self
+                .data_address()?
+                .is_some_and(|address| address.ip().is_unspecified())
+        {
+            return Err(invalid(
+                "--rdma needs a concrete data address on a RoCE interface: set --listen-data \
+                 (by default it follows the host of --listen)",
+            ));
+        }
         self.data_address()?;
         Ok(())
     }
@@ -541,6 +551,20 @@ mod tests {
             warnings[0].contains("data on 127.0.0.1:9100"),
             "{warnings:?}"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "rdma")]
+    fn rdma_requires_a_concrete_data_listener_address() {
+        let mut config = Config::defaults();
+        config.rdma = true;
+        for wildcard in ["0.0.0.0:9200", "[::]:9200"] {
+            config.listen = Some(wildcard.parse().unwrap());
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("set --listen-data"), "{error}");
+        }
+        config.listen_data = Some("172.16.1.6:9201".parse().unwrap());
+        config.validate().unwrap();
     }
 
     #[test]

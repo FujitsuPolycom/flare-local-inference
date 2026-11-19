@@ -511,6 +511,51 @@
     Close when XTML retains the text with tests, or docs/api.md states that the
     difference is intended.
 
+[ ] Add parser-start tests in helios/tests/parser_start.rs for MiniMax M3, Muse
+    Spark and dense Qwen3.8, whose Jinja prompts skip a marker spelled by request
+    text, with each checkpoint tokenizer and prepared chat template; the test
+    environment has none of them. Close when each recipe has a generation-prompt
+    case and a continued-message case.
+
+[ ] Run tests/frontend/test_muse_spark.py against the Muse Spark checkpoint. Its
+    expected token IDs for request text that spells controls (`<|eot|>`,
+    `<image>`, `<|start|>`, `<|eom|>`) encode request-owned spans without the
+    added vocabulary, as tests/frontend/test_nemotron.py does, and have not
+    been run because the checkpoint is gated and unavailable to the test
+    environment. Close when the test passes against the checkpoint.
+
+[ ] Check the literal-token path against tokenizers whose pre-tokenizer prepends
+    a space (Metaspace): a region re-encoded without the added vocabulary can
+    then tokenize differently from the first pass. The pinned tokenizer assets
+    do not use it. Close when frontend tests cover such a tokenizer or loading
+    rejects it.
+
+[ ] Record request ranges for the DeepSeek and Inkling native encoders. Their
+    prompts tokenize request text as ordinary text but carry no
+    `RenderedPrompt::ordinary` ranges, so the output-start search still matches
+    a reasoning or DSML opener that a continued assistant message spells. Close
+    when a spelled DSML opener in a continued message does not start ToolBody
+    and a spelled reasoning opener does not start Reasoning, with tests for both.
+
+[ ] Accept or reduce the latency of a Jinja prompt that spells a control token:
+    the region between added tokens that contains the spelling is encoded a
+    second time. helios/benches/template.rs times only the template renderer and
+    does not tokenize, so no committed harness covers this. A one-off timing of
+    Frontend::render_chat on one user message (16 CPU cores) took 0.52 to 0.54 s
+    for 300,000 GLM-5.3 tokens without a spelled control and 1.1 s with one
+    `<think>` spelling inside the message; for 600,000 tokens it took 1.1 s and
+    2.2 to 2.3 s. Close when a committed harness measures it and the cost is
+    accepted or reduced.
+
+[ ] Run helios/tests/ordinary_tokens.rs against the tokenizers it cannot load in
+    the test environment: MiniMax M3, Kimi K3 and K3.1, Muse Spark, Inkling 2
+    and dense Qwen3.8. It checks that request text without a control tokenizes
+    the same with and without the added vocabulary, that a request spelling no
+    control renders the first-pass encoding of its text, that spelling a control
+    leaves the controls the template writes unchanged, and that text spelling an
+    added token that is neither special nor named by the chat template (a
+    lexical token) keeps that token. Close when each tokenizer passes it.
+
 [ ] Qualify Qwen3.8 27B image input on SM120 with the recipe's declared
     storage. On a 32 GiB RTX 5090 the planner refuses an image plan with DFlash2
     at four requests; a core exported with the declared graph and vision storage

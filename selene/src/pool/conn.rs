@@ -799,7 +799,11 @@ pub(crate) fn register_memory(
         .transpose()?;
     if regions.is_none() && staging.is_none() {
         return Err(Error::new(
-            "the pool manager offered no usable shared memory or data staging; check for a different uid/gid from the manager or /dev/shm not shared between containers, and check its data listener",
+            "the pool manager offered no usable shared memory or data staging; check for a \
+             different uid/gid from the manager or /dev/shm not shared between containers. \
+             The manager and client may be in separate PID namespaces on a kernel without \
+             SO_PEERPIDFD (before Linux 6.5); share a PID namespace or connect over TCP to \
+             the manager's --listen address and check its data listener",
         ));
     }
     let mut registered = Vec::new();
@@ -910,6 +914,9 @@ mod tests {
             .to_string();
         assert!(reason.contains("different uid/gid"), "{reason}");
         assert!(reason.contains("/dev/shm not shared"), "{reason}");
+        assert!(reason.contains("PID namespaces on a kernel without"), "{reason}");
+        assert!(reason.contains("before Linux 6.5"), "{reason}");
+        assert!(reason.contains("SO_PEERPIDFD"), "{reason}");
     }
 
     #[test]

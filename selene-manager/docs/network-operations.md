@@ -45,7 +45,7 @@ selene --name pool --root /var/lib/selene --memory 16G --nvme 1T --staging 1G \
 - `--listen-data ADDR:PORT` is where those instances connect to copy bytes (see below). It
   defaults to the host of `--listen` on the next port (and to any free port when `--listen` names
   port 0). The address a grant names is the one the listener bound; when it is the unspecified
-  address (`0.0.0.0`), the instance connects to the host it reached the manager by. Publish this
+  address (`0.0.0.0`, refused with `--rdma`), the instance connects to the host it reached the manager by. Publish this
   port as you publish the first.
 - `--tls-cert` and `--tls-key` give the manager a TLS identity. Instances select
   the matching connection mode from the address table above.
@@ -110,9 +110,12 @@ and `server.pem` and `server-key.pem` to the manager.
 The default build and image never link libibverbs. Build with `--features rdma` (or use
 [`Dockerfile.rdma`](../Dockerfile.rdma)) and start with `--rdma`, which requires `--listen`; the
 [startup warnings and TLS restriction](#addresses-and-startup-warnings) apply. The container needs
-`--device /dev/infiniband` and `--ulimit memlock=-1:-1`. The manager opens the first device with
-an active port and registers its regions once for local access only; `--rdma` on a host with none
-refuses to start. The manager advertises no memory keys or region addresses. The instance lends
+`--device /dev/infiniband` and `--ulimit memlock=-1:-1`. With `--rdma`, the data listener
+must bind the address of a RoCE interface (not `0.0.0.0`), and the manager and its instances
+need host networking, because each end uses the device whose RoCE v2 GID is the local address of
+the data connection. The manager registers its regions on that device once, for local access
+only; startup fails naming the address when no device has it. The manager advertises no memory keys
+or region addresses. The instance lends
 only its private transfer staging, so it cannot use RDMA to address the manager arena.
 
 The manager does every RDMA transfer, one-sided, on a queue pair made for the transfer: it writes
@@ -120,10 +123,9 @@ unsliced claim windows into private slots the instance lends (`CREDIT`). Puts an
 use TCP. The instance must be built with the
 `rdma` feature (`flare-cli`'s `rdma` feature enables it in `flare-selene`) and have a device;
 otherwise, or after one RDMA transfer fails, it asks for the
-stream carrier on its connection, so a mixed pool works. Each end advertises a RoCE v2 GID, preferring
-a routable (IPv4-mapped or global) one over a link-local one, because two ends must use the same RoCE
-version and a device's GID index 0 is v1 on some NICs and v2 on others (Soft-RoCE); the path MTU is
-1024. Hardware RoCE and Soft-RoCE interoperate on that basis, but a Soft-RoCE end that receives writes
+stream carrier on its connection, so a mixed pool works. An instance whose data
+connection's local address has no RoCE v2 GID warns with that address and uses the stream. The path
+MTU is 1024. Hardware RoCE and Soft-RoCE interoperate on that basis, but a Soft-RoCE end that receives writes
 from a hardware NIC drops packets it cannot keep up with and the transfer collapses to a few MiB/s;
 use Soft-RoCE only for functional tests, or as the sending end. For a Soft-RoCE test host:
 
@@ -142,4 +144,4 @@ ibv_devices                                    # rxe0 should appear
 | Claims expire with `NO_PROGRESS` | The instance cannot reach `--listen-data` (firewall, a published port that is not the bound one), or it does not read fast enough. |
 | Windows quarantined (`selene_pool_quarantined_bytes`) | A data handler did not exit after its transfer was stopped; the manager logs a line only when an RDMA teardown failed (`RDMA teardown failed; transfer quarantined`). They return if the exit is seen, else at restart. |
 | TLS handshake failures | The certificate's SAN against the name clients dial; that the CA the clients hold signed the server certificate. |
-| `--rdma` refused | TLS options present, no `--listen`, a build without the `rdma` feature, or no RDMA device with an active port. |
+| `--rdma` refused | TLS options present, no `--listen`, a build without the `rdma` feature, a wildcard data listener, or no active RoCE v2 GID matching the data listener address. |

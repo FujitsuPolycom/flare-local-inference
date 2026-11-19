@@ -270,3 +270,107 @@ def test_lowered_opaque_writes_keep_caller_storage_and_intermediate_values(offse
                 assert torch.all(storage[:offset] == initial)
     finally:
         compilation._INVOCATIONS.reset(token)
+
+
+@torch.library.custom_op('flare_test_lifetimes::copy_from', mutates_args=('destination',))
+def _copy_from(destination: torch.Tensor, source: torch.Tensor) -> None:
+    destination.copy_(source)
+
+
+@_copy_from.register_fake
+def _fake_copy_from(destination, source):
+    pass
+
+
+def test_lowered_dtype_views_of_mutated_temporaries_pass_through_their_owner(monkeypatch):
+    seed = torch.arange(32.)
+
+    def forward():
+        storage = seed + 1
+        other = seed * 2
+        plain = seed - 1
+        _fill(storage[8:16].view(torch.bfloat16).view(4, 4), 5.)
+        _copy_from(storage[:8].view(torch.bfloat16), other[8:16].view(torch.bfloat16))
+        _fill(plain[4:8], 7.)
+        return storage, plain
+
+    expected = forward()
+    module = torch.fx.experimental.proxy_tensor.make_fx(forward)()
+    calls = compilation._lower_storage(module)
+    assert len(calls) == 3
+    module.recompile()
+    owners = []
+    original = compilation._Invocation.run
+
+    def observe(invocation, reads, writes, integers=()):
+        owners.append((len(reads), len(writes), [array.numel() for array in (*reads, *writes)]))
+        return original(invocation, reads, writes, integers)
+
+    monkeypatch.setattr(compilation._Invocation, 'run', observe)
+    token = compilation._INVOCATIONS.set(calls)
+    try:
+        torch.testing.assert_close(module(), expected, rtol=0, atol=0)
+    finally:
+        compilation._INVOCATIONS.reset(token)
+    # A mutated allocation that is also viewed as bfloat16 is passed whole. The read of a bfloat16 slice
+    # and the mutation of a slice that has only one dtype are passed as the slices themselves.
+    assert owners == [(0, 1, [32]), (1, 1, [16, 32]), (0, 1, [4])]
+
+
+def test_lowering_rejects_temporary_owner_that_cannot_be_viewed_as_operand_dtype():
+    def forward():
+        scratch = torch.zeros(7, dtype=torch.bfloat16)
+        _fill(scratch[2:6].view(torch.float32), 1.)
+
+    module = torch.fx.experimental.proxy_tensor.make_fx(forward)()
+    with pytest.raises(ValueError, match='cannot view temporary storage-call owner'):
+        compilation._lower_storage(module)
+
+
+@torch.library.custom_op('flare_test_lifetimes::gather_ranks', mutates_args=('output',))
+def _gather_ranks(source: torch.Tensor, output: torch.Tensor, world: int) -> None:
+    # Rank r contributes the candidates plus r, in rank order across each row.
+    columns = source.shape[1]
+    for rank in range(world):
+        output[:, rank * columns:(rank + 1) * columns].copy_(source + rank)
+
+
+@_gather_ranks.register_fake
+def _fake_gather_ranks(source, output, world):
+    pass
+
+
+@pytest.mark.parametrize(('world', 'rows'), [(3, 1), (3, 512), (3, 1152), (3, 1536), (3, 4096), (2, 1536), (4, 3584)])
+def test_compiled_dtype_view_gathers_write_every_slice_in_place(world, rows):
+    # The context-parallel indexer gathers each 512-row slice of packed float32 candidates into a
+    # float32 buffer through bfloat16 views of both, and merges the whole buffer afterwards.
+    from torch._inductor import standalone_compile
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    from ignition import runtime_patches
+
+    runtime_patches.apply()
+    seed = torch.randn(rows, 512, 2).to(torch.bfloat16).to(torch.float32)
+
+    def forward(seed):
+        candidates = seed.clone()
+        gathered = torch.zeros(rows, world * 512, 2)
+        for start in range(0, rows, 512):
+            end = min(start + 512, rows)
+            _gather_ranks(candidates[start:end].view(torch.bfloat16).view(end - start, -1),
+                          gathered[start:end].view(torch.bfloat16).view(end - start, -1), world)
+        return (gathered,)
+
+    packed = seed.view(torch.bfloat16).view(rows, -1)
+    expected = torch.cat([packed + rank for rank in range(world)], 1).view(torch.float32).view(rows, world * 512, 2)
+    module = make_fx(forward)(seed)
+    calls = compilation._lower_storage(module)
+    module.recompile()
+    compiled = standalone_compile(module, [seed], dynamic_shapes='from_example_inputs', aot=True,
+        options={'config_patches': {'memory_planning': True, 'memory_pool': 'combined', 'compile_threads': 1}})
+    token = compilation._INVOCATIONS.set(calls)
+    try:
+        observed, = compiled(seed)
+    finally:
+        compilation._INVOCATIONS.reset(token)
+    torch.testing.assert_close(observed.view(torch.int32), expected.view(torch.int32), rtol=0, atol=0)
