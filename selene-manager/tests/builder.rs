@@ -5,16 +5,11 @@
 
 use flare_selene::{CacheGeometry, Result, pool::{Budget, PoolBuilder, PoolPeers, PreparedPool}};
 use flare_selene::{
-    History,
     pool::{PoolOptions, PoolStatus},
     testing::{TestHistory, TrackingRegistrar as Registrar},
 };
 use selene_manager::testing::{Manager, wait};
-use std::{
-    sync::Arc,
-    thread,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, thread, time::Duration};
 fn unlimited() -> Budget {
     Budget {
         host: Ok(u64::MAX),
@@ -62,7 +57,11 @@ impl flare_selene::offload::CopierFactory for NoCopies {
         panic!("no copy engine should be constructed")
     }
 }
-fn start(manager: &Manager, registrar: Arc<Registrar>, budget: Budget) -> (PreparedPool, Vec<u64>) {
+fn start(
+    manager: &Manager,
+    registrar: Arc<Registrar>,
+    budget: Budget,
+) -> Result<(PreparedPool, Vec<u64>)> {
     let geometry = vec![flare_selene::testing::geometry(64, &[("kv", 4096)], 4096)];
     start_with_registrar(
         &PoolOptions { address: manager.address(), ca: None },
@@ -75,113 +74,77 @@ fn start(manager: &Manager, registrar: Arc<Registrar>, budget: Budget) -> (Prepa
         None,
         false,
     )
-    .unwrap()
 }
 #[test]
-fn over_budget_startup_registers_nothing_and_serves_local_only() {
+fn over_budget_startup_fails_before_registering_memory() {
     let mut manager = Manager::new();
     manager.run();
-    for budget in [
-        Budget {
-            host: Ok(1),
-            ..unlimited()
-        },
-        Budget {
-            devices: vec![(1, false)],
-            ..unlimited()
-        },
+    for (budget, expected) in [
+        (
+            Budget {
+                host: Ok(0),
+                ..unlimited()
+            },
+            "host budget has 0 bytes left",
+        ),
+        (
+            Budget {
+                devices: vec![(1, false)],
+                ..unlimited()
+            },
+            "budget has 1 bytes left",
+        ),
     ] {
         let registrar = Arc::new(Registrar::default());
-        let (prepared, charges) = start(&manager, registrar.clone(), budget);
-        wait("startup", || {
-            matches!(
-                prepared.client.as_ref().unwrap().status(),
-                PoolStatus::Disabled(_)
-            )
-        });
-        let PoolStatus::Disabled(reason) = prepared.client.as_ref().unwrap().status() else {
-            unreachable!()
-        };
-        assert!(
-            reason.contains("arena") && reason.contains("staging") && reason.contains("budget"),
-            "{reason}"
-        );
-        assert_eq!(charges, [0]);
-        assert!(
-            prepared
-                .client
-                .as_ref()
-                .unwrap()
-                .registered_regions()
-                .is_empty()
-        );
+        let reason = start(&manager, registrar.clone(), budget)
+            .err()
+            .expect("an unapproved pool must fail startup")
+            .to_string();
+        for text in [
+            "arena 8388608 bytes",
+            "staging 8388608 bytes",
+            "needs 16777216 host bytes",
+            expected,
+            "free host/device memory",
+            "remove --prefix-cache-pool",
+        ] {
+            assert!(reason.contains(text), "{reason}");
+        }
         assert!(registrar.calls.lock().unwrap().is_empty());
-        let mut store = prepared.attach(None).unwrap();
-        let mut history = TestHistory::new([3; 32]);
-        history.append(&[7; 128], &[]).unwrap();
-        assert!(store.lookup(&history, 0, u64::MAX).is_none());
-        let checkpoint = flare_selene::PublishedCheckpoint {
-            id: flare_selene::CheckpointId::new(1),
-            key: history.key_at(128).unwrap(),
-            parent: None,
-            bucket: [0; 16],
-            chain_pages: vec![flare_selene::PageId(1), flare_selene::PageId(2)],
-            tail_pages: 2,
-            slot: flare_selene::StateSlotId(1),
-        };
-        store.store(&checkpoint).unwrap();
-        store.close().unwrap();
     }
 }
 
 #[test]
-fn budget_rejection_emits_one_warning_per_instance() {
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "over_budget_startup_registers_nothing_and_serves_local_only",
-            "--nocapture",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert_eq!(
-        stderr
-            .lines()
-            .filter(|line| line.starts_with("warning:"))
-            .count(),
-        2,
-        "{stderr}"
-    );
-}
-
-#[test]
-fn an_absent_manager_times_out_before_local_readiness_and_never_attaches_late() {
-    let mut manager = Manager::new();
+fn an_absent_manager_fails_startup_without_registering_memory() {
+    let manager = Manager::new();
     let registrar = Arc::new(Registrar::default());
-    let started = Instant::now();
-    let (prepared, charges) = start(&manager, registrar.clone(), unlimited());
-    assert!(started.elapsed() >= flare_selene::pool::STARTUP_WAIT);
-    assert!(started.elapsed() < flare_selene::pool::STARTUP_WAIT + Duration::from_secs(5));
-    assert_eq!(charges, [0]);
-    assert!(matches!(
-        prepared.client.as_ref().unwrap().status(),
-        PoolStatus::Disabled(_)
-    ));
-    manager.run();
-    assert!(matches!(
-        prepared.client.as_ref().unwrap().status(),
-        PoolStatus::Disabled(_)
-    ));
+    let geometry = vec![flare_selene::testing::geometry(64, &[("kv", 4096)], 4096)];
+    let options = PoolOptions {
+        address: manager.address(),
+        ca: None,
+    };
+    let reason = PoolBuilder {
+        options: &options,
+        identity: [3; 32],
+        geometry: &geometry,
+        gpu_uuids: vec![[1; 16]],
+        registration_context: 0,
+        budget: unlimited(),
+        peers: None,
+        disk: false,
+    }
+    .start_with_wait(registrar.clone(), Duration::from_millis(20))
+    .err()
+    .expect("a configured pool must attach at startup")
+    .to_string();
+    for text in [
+        "did not answer within 20ms",
+        "No such file or directory",
+        "remove --prefix-cache-pool",
+    ] {
+        assert!(reason.contains(text), "{reason}");
+    }
     assert!(registrar.calls.lock().unwrap().is_empty());
-    let mut store = prepared.attach(None).unwrap();
-    store.poll(&mut Vec::new()).unwrap();
-    store.close().unwrap();
 }
 
 #[test]
@@ -209,6 +172,7 @@ fn startup_wait_precedes_readiness_and_restart_never_registers_again() {
         result
     });
     assert!(registrar.calls.lock().unwrap().is_empty());
+    assert!(readiness.recv_timeout(Duration::from_millis(20)).is_err());
     manager.run();
     readiness.recv_timeout(Duration::from_secs(5)).unwrap();
     let (mut prepared, charges) = startup.join().unwrap();

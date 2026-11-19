@@ -709,6 +709,11 @@ impl NativeModel {
                 gpu_bytes as f64 / (1u64 << 30) as f64,
                 host_bytes as f64 / (1u64 << 30) as f64,
             ));
+            if let Some(pool) = &options.prefix_cache.pool {
+                let phase = progress.phase("Reach prefix cache pool", None);
+                pool.reach(flare_selene::pool::STARTUP_WAIT)?;
+                phase.finish("manager reached");
+            }
             let phase = progress.phase("Load weights", Some(payload_bytes));
             phase.advance_bytes(0);
             model.parallel(&cores, &files, |rank, core, path| {

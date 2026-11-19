@@ -720,43 +720,42 @@ fn parallel_tool_controls_decode_to_the_same_limit() {
 }
 
 #[test]
-fn disabled_parallel_calls_fail_before_the_second_call_is_emitted() {
+fn disabled_parallel_calls_stop_before_the_second_call_is_emitted() {
     for protocol in [Protocol::Chat, Protocol::Messages, Protocol::Responses] {
         for choice in [ToolChoice::Auto, ToolChoice::Required, ToolChoice::Named("lookup".into())] {
             for parallel in [false, true] {
-                let mut enc = encoder_with_parallel(protocol, choice.clone(), parallel);
-                enc.start();
-                enc.apply(0, events()).unwrap();
-                let first = enc.outputs[0].blocks.clone();
-                let second = enc.apply(
-                    0,
-                    vec![
-                        Event::ToolBegin {
-                            index: 1,
-                            name: "lookup".into(),
-                            id: None,
-                        },
-                        Event::ToolArguments {
-                            index: 1,
-                            text: "{}".into(),
-                        },
+                for together in [false, true] {
+                    let mut enc = encoder_with_parallel(protocol, choice.clone(), parallel);
+                    let mut first = events();
+                    if !together {
+                        enc.apply(0, std::mem::take(&mut first)).unwrap();
+                    }
+                    first.extend([
+                        Event::ToolBegin { index: 1, name: if parallel { "lookup" } else { "unknown" }.into(), id: Some("second".into()) },
+                        Event::ToolArguments { index: 1, text: "{}".into() },
                         Event::ToolEnd { index: 1 },
-                    ],
-                );
-                if parallel {
-                    second.unwrap();
-                    enc.finish(0, Termination::Eos, 12, 0, None).unwrap();
-                } else {
-                    let error = second.unwrap_err();
-                    assert!(error.to_string().contains("more than one tool call"));
-                    assert_eq!(enc.outputs[0].blocks, first);
-                    let failed = enc.failure(&error);
-                    assert!(!failed.done);
-                    if protocol == Protocol::Responses {
-                        assert_eq!(failed.data["type"], "response.failed");
-                        assert_eq!(failed.data["response"]["parallel_tool_calls"], false);
-                    } else {
-                        assert!(failed.data["error"]["message"].is_string());
+                        Event::Content("after second".into()),
+                    ]);
+                    let frames = enc.apply(0, first).unwrap();
+                    assert_eq!(enc.tool_limit_reached, !parallel);
+                    if !parallel {
+                        assert!(!format!("{frames:?}").contains("second"));
+                        assert!(enc.apply(0, vec![Event::Content("ignored".into())]).unwrap().is_empty());
+                    }
+                    let cause = if parallel { Termination::Eos } else if together {
+                        Termination::UserStop
+                    } else { Termination::OutputLimit };
+                    enc.finish(0, cause, 12, 0, Some("discarded stop".into())).unwrap();
+                    if !parallel && protocol == Protocol::Messages {
+                        assert!(enc.response()["stop_sequence"].is_null());
+                    }
+                    let calls = enc.outputs[0].blocks.iter().filter(|b| matches!(b, super::super::output::Block::Tool { .. })).count();
+                    assert_eq!(calls, if parallel { 2 } else { 1 });
+                    match protocol {
+                        Protocol::Chat => assert_eq!(enc.response()["choices"][0]["finish_reason"], "tool_calls"),
+                        Protocol::Messages => assert_eq!(enc.response()["stop_reason"], "tool_use"),
+                        Protocol::Responses => assert_eq!(enc.response()["status"], "completed"),
+                        _ => unreachable!(),
                     }
                 }
             }

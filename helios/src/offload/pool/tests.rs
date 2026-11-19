@@ -17,7 +17,7 @@ fn unlimited() -> Budget {
     }
 }
 #[test]
-fn peer_registration_budget_disables_the_whole_ranked_instance() {
+fn peer_registration_budget_fails_startup() {
     use super::super::shard::{PoolOffer, pool_peer, pool_rank_zero};
     use crate::execution::RankStream;
     use std::net::{TcpListener, TcpStream};
@@ -65,7 +65,6 @@ fn peer_registration_budget_disables_the_whole_ranked_instance() {
                 peers,
                 false,
             )
-            .unwrap()
         });
         let peers = pool_rank_zero(offer(0), &mut [RankStream::Tcp(zero_stream)]).unwrap();
         let (mut zero, _) = start_with_registrar(
@@ -81,11 +80,14 @@ fn peer_registration_budget_disables_the_whole_ranked_instance() {
             false,
         )
         .unwrap();
-        let (peer, charges) = peer.join().unwrap();
-        assert!(peer.agent.is_some() && peer.client.is_none() && peer.records.is_none());
+        let result = peer.join().unwrap();
         if reject {
-            assert_eq!(charges, [0]);
-            assert!(!peer.approved());
+            let reason = result
+                .err()
+                .expect("an unapproved peer must fail startup")
+                .to_string();
+            assert!(reason.contains("budget"), "{reason}");
+            assert!(reason.contains("remove --prefix-cache-pool"), "{reason}");
             assert!(peer_registrar.calls.lock().unwrap().is_empty());
             wait("startup", || {
                 matches!(
@@ -94,23 +96,25 @@ fn peer_registration_budget_disables_the_whole_ranked_instance() {
                 )
             });
             zero.close().unwrap();
-        } else {
-            assert!(peer.approved());
-            wait("startup", || zero.client.as_ref().unwrap().status() == PoolStatus::Ready);
-            wait("startup", || peer.agent.as_ref().unwrap().status() == PoolStatus::Ready);
-            assert_eq!(
-                zero.identity.layout,
-                flare_selene::geometry::fingerprint(&vec![
-                    flare_selene::testing::geometry(
-                        64,
-                        &[("kv", 4096)],
-                        4096
-                    );
-                    2
-                ])
-            );
-            zero.close().unwrap();
+            continue;
         }
+        let (peer, _) = result.unwrap();
+        assert!(peer.agent.is_some() && peer.client.is_none() && peer.records.is_none());
+        assert!(peer.approved());
+        wait("startup", || zero.client.as_ref().unwrap().status() == PoolStatus::Ready);
+        wait("startup", || peer.agent.as_ref().unwrap().status() == PoolStatus::Ready);
+        assert_eq!(
+            zero.identity.layout,
+            flare_selene::geometry::fingerprint(&vec![
+                flare_selene::testing::geometry(
+                    64,
+                    &[("kv", 4096)],
+                    4096
+                );
+                2
+            ])
+        );
+        zero.close().unwrap();
         let options = PoolOptions { address: manager.address(), ca: None };
         let options = super::super::PrefixCacheOffload {
             pool: Some(options),

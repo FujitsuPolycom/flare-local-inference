@@ -396,12 +396,7 @@ impl Core {
         if !self.fits(needed) {
             return Ok(None);
         }
-        if self
-            .pool
-            .free_slots()
-            .saturating_sub(self.pool.intake_slots())
-            < needed
-        {
+        if self.free_retention_slots() < needed {
             self.thin_rows_for(needed);
         }
         if self.spill && self.retire_for(self.shortfall(needed)) {
@@ -709,15 +704,16 @@ impl Core {
         self.thin_rows_for(self.layout.row_slots().saturating_mul(2));
     }
 
+    fn free_retention_slots(&self) -> usize {
+        self.pool
+            .free_slots()
+            .saturating_sub(self.pool.intake_slots())
+    }
+
     fn thin_rows_for(&mut self, headroom: usize) {
         // Intake slots belong to transfers, not checkpoint retention. Reclaim
         // redundant rows before an incoming record evicts reusable endpoints.
-        if self
-            .pool
-            .free_slots()
-            .saturating_sub(self.pool.intake_slots())
-            > headroom
-        {
+        if self.free_retention_slots() > headroom {
             return;
         }
         // A single child does not prove its parent's row useless: a request that
@@ -725,29 +721,19 @@ impl Core {
         // differently) leaves the parent as the only resume point of the main
         // conversation. Reclaim the least recently used rows first, and only as
         // many as the headroom needs, so recently used parents keep theirs.
-        let mut queued: Vec<_> = std::mem::take(&mut self.thinning)
-            .into_iter()
-            .filter_map(|key| self.index.node(&key).map(|node| (node.accessed(), key)))
-            .collect();
-        queued.sort_unstable();
-        let mut queued = queued.into_iter();
-        for (_, key) in queued.by_ref() {
+        let mut queued = self.index.thinning_order(&mut self.thinning);
+        for key in queued.by_ref() {
             if !self.index.row_redundant(&key, false) {
                 continue;
             }
             if !self.thin(&key) {
                 self.thinning.insert(key);
             }
-            if self
-                .pool
-                .free_slots()
-                .saturating_sub(self.pool.intake_slots())
-                > headroom
-            {
+            if self.free_retention_slots() > headroom {
                 break;
             }
         }
-        self.thinning.extend(queued.map(|(_, key)| key));
+        self.thinning.extend(queued);
     }
 
     fn mark_durable(&mut self, key: &PrefixKey) -> Result<()> {
@@ -1330,6 +1316,10 @@ impl MemoryStore {
 
     pub(crate) fn drop_row(&mut self, key: &PrefixKey) -> bool {
         self.core.thin(key)
+    }
+
+    pub(crate) fn free_retention_slots(&self) -> usize {
+        self.core.free_retention_slots()
     }
 
     /// Remove an unpinned childless record and release its slots.

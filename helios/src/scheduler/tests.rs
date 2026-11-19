@@ -241,6 +241,64 @@ fn records(
     };
     records
 }
+
+#[test]
+fn waiting_prefills_do_not_simulate_checkpoint_storage() {
+    let mut scheduler = scheduler(4, 128, 16);
+    scheduler.prefill_graphs(&[128, 256, 512]).unwrap();
+    let mut graphs = duration_graphs(4);
+    for graph in &mut graphs {
+        graph.estimated_duration_ns = if graph.kind.is_prefill() { 4000 + graph.token_capacity as u64 * 1000 } else { 1 };
+    }
+    scheduler.measured_graph_durations(&graphs).unwrap();
+    scheduler.configure_policy(PolicyConfig {
+        checkpoint_extra_work_fraction: 0.5,
+        ..Default::default()
+    }).unwrap();
+    for slot in 0..4 {
+        let mut request = spec(1024, 1);
+        request.prompt[0] += slot + 100;
+        request.message_boundaries = vec![100, 900];
+        scheduler.admit(request).unwrap();
+    }
+    let mut first_cuts = 0;
+    for sequence in 1..=64 {
+        cache_memory::STORAGE_SIMULATIONS.set(0);
+        let plan = scheduler.plan().unwrap();
+        let simulations = cache_memory::STORAGE_SIMULATIONS.get();
+        // Two optional-cut quotes and one capture quote each simulate at most twice.
+        assert!(simulations <= 6, "{simulations} storage simulations in one plan");
+        let mut completions = state_records(&scheduler, &plan, sequence);
+        for (row, lane) in plan.lanes.iter().enumerate() {
+            if !plan.lane_kind(row).is_prefill() {
+                continue;
+            }
+            let request = scheduler.request(lane.request).unwrap();
+            let cut = scheduler.checkpoint_cut(request).unwrap_or(request.prompt_tokens);
+            let end = lane.start_position as usize + lane.tokens;
+            assert_eq!(end, cut.min(lane.start_position as usize + plan.token_capacity));
+            assert_eq!(plan.token_capacity, *scheduler.prefill_catalog.iter().find(|&&c| c >= lane.tokens).unwrap());
+            first_cuts += usize::from(end == 100);
+            let output = end == request.prompt_tokens;
+            completions[lane.request.slot as usize] = records(
+                lane.request, sequence, end as i64, i64::from(output),
+                if output { 42 } else { -1 }, 1,
+            )[lane.request.slot as usize].clone();
+        }
+        scheduler.advance_to(scheduler.now_ns + plan.estimated_duration_ns).unwrap();
+        scheduler.commit(&plan, Fence(sequence)).unwrap();
+        let generated = scheduler.complete(Fence(sequence), &completions, Default::default()).unwrap();
+        for token in generated {
+            scheduler.published_output(token.request, Fence(sequence)).unwrap();
+        }
+        if scheduler.slots.iter().filter_map(|slot| slot.request.as_ref()).all(|r| r.consumed_tokens >= 1024) {
+            break;
+        }
+    }
+    assert_eq!(first_cuts, 4);
+    assert!(scheduler.slots.iter().filter_map(|slot| slot.request.as_ref()).all(|r| r.consumed_tokens >= 1024));
+}
+
 fn init(scheduler: &mut RequestScheduler, fence: u64) {
     let step = scheduler.plan().unwrap();
     assert!(matches!(step.kind, GraphKind::Init | GraphKind::Restore));

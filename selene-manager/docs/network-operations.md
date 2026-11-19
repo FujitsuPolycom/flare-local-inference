@@ -29,9 +29,9 @@ With `--rdma` it also reports `selene: warning: RDMA enabled (experimental)`.
 RDMA bytes are unencrypted, so combining RDMA and TLS refuses startup. TLS
 requires both certificate and key; missing files or a mismatched pair also fail startup.
 For TCP clients, `Hello.encryption` must match the selected mode; a mismatch
-or a certificate failure disables the pool for that process with one diagnostic,
-without downgrading. A missing manager at instance startup produces one warning
-after the startup wait, then local tiers only; see
+or a certificate failure fails instance startup with a diagnostic. A missing
+manager fails startup after the bounded wait; start the manager first or remove
+`--prefix-cache-pool` to run local-only. See
 [pool attachment](../../docs/prefix-cache-offload.md#215-sharing-through-a-pool).
 
 ## Turning it on
@@ -137,7 +137,7 @@ ibv_devices                                    # rxe0 should appear
 
 | Symptom | Check |
 |---|---|
-| Remote instances run on local tiers only | The address and firewall; whether the instance trusts the manager's CA (the host's CA bundle or its CA file), and the one-line error it logged at start; `Hello.encryption`. |
+| Remote instances fail to attach at startup | The address and firewall; whether the instance trusts the manager's CA (the host's CA bundle or its CA file), and the one-line error it logged at start; `Hello.encryption`. |
 | `DATA_CHANNEL` claims or puts refused | The manager has no network listener (`INVALID_CLAIM`, or `PutRefused{INVALID}` saying so). |
 | Claims expire with `NO_PROGRESS` | The instance cannot reach `--listen-data` (firewall, a published port that is not the bound one), or it does not read fast enough. |
 | Windows quarantined (`selene_pool_quarantined_bytes`) | A data handler did not exit after its transfer was stopped; the manager logs a line only when an RDMA teardown failed (`RDMA teardown failed; transfer quarantined`). They return if the exit is seen, else at restart. |

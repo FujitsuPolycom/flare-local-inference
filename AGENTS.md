@@ -134,6 +134,19 @@ detail. Scale length to the change: a small fix may need only a short paragraph
 and relevant validation. The content and order are mandatory; particular headings
 and a fixed-length template are not.
 
+## Contact on PRs and issues
+
+Every PR and issue description has a Discord line after the technical
+explanation, so project developers can contact the person who opens it directly.
+The line gives that person's Discord username, for example
+`Discord: example_user`. Write the username without a leading `@`; GitHub treats
+`@name` as a mention of the GitHub account with that name. When the person
+provides no Discord username, the line states that explicitly:
+`Discord: no username provided`. Never omit the line. An agent opening a PR or
+issue gives the username of the person it acts for, never its own identity.
+When the agent does not know that username, it asks the person instead of
+guessing.
+
 ## Contribution scope and rejection criteria
 
 Flare prepares and serves supported model recipes on NVIDIA GPUs through

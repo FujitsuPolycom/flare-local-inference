@@ -57,6 +57,11 @@ Read(before, after, r) ==
     /\ after = [before EXCEPT !.rows[r].queued = @ - 1,
                              !.rows[r].received = @ + 1]
 
+CancelReader(before, after, r) ==
+    /\ before.rows[r].reader = 1
+    /\ before.rows[r].cancelled = 0
+    /\ after = [before EXCEPT !.rows[r].cancelled = 1]
+
 Release(before, after, rows, group) ==
     LET occupied == \E r \in Cells : rows[r].group = group /\ Owned(rows[r])
     IN after = [before EXCEPT !.rows = rows,
@@ -102,6 +107,7 @@ Next == (\E mask \in 1..(2 ^ Responses - 1), group \in Groups :
      \/ (\E r \in Cells : Emit(state, state', r)
              \/ Terminal(state, state', r, 1) \/ Terminal(state, state', r, 2)
              \/ Read(state, state', r) \/ DropReader(state, state', r)
+             \/ CancelReader(state, state', r)
              \/ RetireProducer(state, state', r) \/ ClosedEmit(state, state', r)
              \/ RepeatFail(state, state', r))
      \/ (\E mask \in 1..(2 ^ Responses - 1) : Reject(state, state', mask))
@@ -177,6 +183,7 @@ AllowedEdge(edge) ==
          [] action[1] = 8 -> Reject(before, after, action[2])
          [] action[1] = 9 -> ClosedEmit(before, after, action[2])
          [] action[1] = 10 -> RepeatFail(before, after, action[2])
+         [] action[1] = 11 -> CancelReader(before, after, action[2])
          [] OTHER -> FALSE
 
 Spec == Init /\ [][Next]_state

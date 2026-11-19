@@ -14,6 +14,9 @@ pub struct Error {
     message: String,
     source: Option<Arc<dyn StdError + Send + Sync>>,
     carried: bool,
+    /// The failure came from opening or reading a record file;
+    /// the record may be unusable.
+    record_read: bool,
 }
 
 impl Error {
@@ -22,6 +25,7 @@ impl Error {
             message: message.into(),
             source: None,
             carried: false,
+            record_read: false,
         }
     }
 
@@ -33,6 +37,7 @@ impl Error {
             message: message.into(),
             source: Some(Arc::new(source)),
             carried: false,
+            record_read: false,
         }
     }
 
@@ -47,6 +52,21 @@ impl Error {
         })
     }
 
+    pub(crate) fn with_record_read(mut self) -> Self {
+        self.record_read = true;
+        self
+    }
+
+    /// Whether this failure, or one it wraps, read a possibly unusable record.
+    pub(crate) fn is_record_read(&self) -> bool {
+        self.record_read
+            || self.source.as_ref().is_some_and(|source| {
+                source
+                    .downcast_ref::<Self>()
+                    .is_some_and(Self::is_record_read)
+            })
+    }
+
     /// Carry an error produced behind a seam, so the caller on the far side can
     /// recover it exactly. The message is the carried error's own.
     pub fn carrying(error: impl StdError + Send + Sync + 'static) -> Self {
@@ -54,6 +74,7 @@ impl Error {
             message: error.to_string(),
             source: Some(Arc::new(error)),
             carried: true,
+            record_read: false,
         }
     }
 

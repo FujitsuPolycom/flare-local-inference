@@ -147,6 +147,13 @@ before committing; a design acknowledgment cannot authorize them.
     changed prose. Rewrite deficient text before committing or publishing.
     PR descriptions, comments, and agent reports require prose review before
     publication.
+17. **Give a Discord contact on PRs and issues.** Every PR and issue description
+    has a line after the technical explanation that gives the opener's Discord
+    username, or states `Discord: no username provided` when the opener provides
+    none. Never omit the line. An agent gives the username of the person it acts
+    for and asks that person when it does not know it; never guess a username.
+    Follow
+    [contact on PRs and issues](../AGENTS.md#contact-on-prs-and-issues).
 
 ## Review and acknowledgment
 
