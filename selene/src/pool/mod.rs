@@ -34,7 +34,7 @@ pub mod rank;
 pub mod rdma;
 mod shared;
 mod shm;
-mod startup;
+pub(crate) mod startup;
 mod store;
 pub(crate) mod tiers;
 mod types;

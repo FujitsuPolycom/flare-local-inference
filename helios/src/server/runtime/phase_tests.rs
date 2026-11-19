@@ -941,8 +941,16 @@ fn forced_reasoning_close_obeys_text_stops_and_park_cancellation() {
             assert!(finished.is_empty());
             assert_eq!(worker.parked.len(), 1);
             if mode == 1 {
-                generation.cancelled.store(true, Ordering::Release);
+                let carried = worker.parked[0].1.carried;
+                generation.cancel();
                 worker.admit().unwrap();
+                let event = generation.events.try_recv().unwrap();
+                assert!(matches!(event, GenerationEvent::Finished {
+                    prompt_tokens: 1, generated_tokens: 3, reused_prompt_tokens,
+                    termination: crate::output::Termination::Cancelled, stop_sequence: None, ..
+                } if reused_prompt_tokens == carried.reused_prompt_tokens.unwrap_or(0)));
+                worker.admit().unwrap();
+                assert!(generation.events.try_recv().is_err(), "duplicate terminal event");
                 assert!(worker.parked.is_empty());
                 assert!(worker.active.iter().all(Option::is_none));
                 assert_eq!(worker.metrics.cancelled.load(Ordering::Relaxed), 1);
@@ -2001,7 +2009,7 @@ struct FakeStore {
     reused: Vec<crate::cache::PrefixKey>,
     /// Whether each `lookup_for` call carried a ticket.
     tickets_seen: Vec<bool>,
-    /// Tickets dropped without an answer.
+    /// Tickets released by their request.
     withdrawn: Arc<AtomicUsize>,
     exports: Vec<(flare_selene::ExportId, flare_selene::ExportChain)>,
     refused: Vec<(flare_selene::ExportId, flare_selene::ExportRefusal)>,
@@ -2009,6 +2017,7 @@ struct FakeStore {
     evictions_lost: usize,
     /// Tickets stay unanswered instead of answering with nothing.
     pending_tickets: bool,
+    refused_lookups: usize,
     /// Each eviction notice with the number of `store` calls made before it.
     evicted: Vec<(
         crate::cache::PrefixKey,
@@ -2043,6 +2052,7 @@ impl FakeStore {
             reject_export: false,
             evictions_lost: 0,
             pending_tickets: false,
+            refused_lookups: 0,
             evicted: Vec::new(),
         }
     }
@@ -2060,12 +2070,18 @@ impl flare_selene::HostStore for FakeStore {
         history: &dyn flare_selene::History,
     ) -> Option<flare_selene::pool::LookupTicket> {
         self.begun.push(history.token_count());
+        if self.refused_lookups != 0 {
+            self.refused_lookups -= 1;
+            return Some(flare_selene::pool::LookupTicket::none());
+        }
         let withdrawn = self.withdrawn.clone();
         Some(flare_selene::pool::LookupTicket::watched(
             if self.pending_tickets {
                 flare_selene::pool::LookupState::Pending
             } else {
-                flare_selene::pool::LookupState::None
+                flare_selene::pool::LookupState::Ready(Arc::new(flare_selene::pool::Answer {
+                    candidates: vec![],
+                }))
             },
             move || {
                 withdrawn.fetch_add(1, Ordering::Relaxed);
@@ -3020,12 +3036,149 @@ fn a_full_gpu_hit_starts_no_pool_lookup_or_admission_hold() {
 }
 
 #[test]
+fn a_refused_pool_lookup_retries_only_when_admission_is_eligible() {
+    let fixture = Fixture::new();
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    worker.scheduler.share_snapshot_pages(&vec![0..2; 16]).unwrap();
+    let (running, running_generation) = fixture.incoming(vec![7; 70], 4);
+    worker.enqueue(vec![running]);
+    worker.admit().unwrap();
+
+    let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
+    let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+    history.append(&incoming.prompt.tokens, &[]).unwrap();
+    let mut store = FakeStore::new(Some(host_hit(&history, 70)));
+    store.pooled = true;
+    store.refused_lookups = 2;
+    worker.attach_store(Some(Box::new(store)));
+    worker.prefill_rate = 1.0;
+    worker.enqueue(vec![incoming]);
+    assert_eq!(fake_store(&mut worker).begun, [70]);
+
+    worker.admit().unwrap();
+    assert_eq!(fake_store(&mut worker).begun, [70; 2]);
+    assert_eq!(worker.pending.len(), 1);
+    assert!(worker.pending[0].blocked.is_some());
+    assert!(worker.pending[0].pool_lookup_started.is_none());
+    assert!(matches!(
+        worker.pending[0].pool_lookup.as_ref().unwrap().state(),
+        flare_selene::pool::LookupState::None
+    ));
+    assert_eq!(worker.scheduler.stats().host_lookups, 0);
+
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(false));
+    assert_eq!(fake_store(&mut worker).begun, [70; 2]);
+    assert_eq!(fake_store(&mut worker).tickets_seen.len(), 1);
+    assert_eq!(worker.scheduler.stats().cache_lookups, 1);
+
+    running_generation.cancelled.store(true, Ordering::Release);
+    worker.admit().unwrap();
+    assert!(worker.pending.is_empty());
+    assert_eq!(fake_store(&mut worker).begun, [70; 3]);
+    assert_eq!(fake_store(&mut worker).fetched.len(), 1);
+    assert_eq!(worker.scheduler.stats().host_lookups, 1);
+    assert_eq!(worker.scheduler.stats().cache_lookups, 2);
+    assert_eq!(fixture.metrics.admitted.load(Ordering::Relaxed), 2);
+    let active = worker.active.iter().flatten().next().unwrap();
+    assert_eq!(
+        worker.scheduler.request(active.request).unwrap().phase,
+        RequestPhase::Inbound
+    );
+    drop(worker);
+    assert!(fixture.metrics.render().contains(
+        "flare_host_cache_lookup_outcomes_total{reason=\"admitted\"} 1\n"
+    ));
+}
+
+#[test]
+fn refused_pool_lookups_retry_only_for_selected_requests() {
+    let fixture = Fixture::new();
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.pooled = true;
+    store.refused_lookups = usize::MAX;
+    worker.attach_store(Some(Box::new(store)));
+    let mut generations = Vec::new();
+    let mut group = Vec::new();
+    for fill in 0..6 {
+        let (incoming, generation) = fixture.incoming(vec![fill; 70], 4);
+        generations.push(generation);
+        group.push(incoming);
+    }
+    worker.enqueue(group);
+    assert_eq!(fake_store(&mut worker).begun, [70; 6]);
+    worker.admit().unwrap();
+    assert_eq!(worker.active.iter().flatten().count(), 4);
+    assert_eq!(worker.pending.len(), 2);
+    assert_eq!(fake_store(&mut worker).begun, [70; 10]);
+    assert_eq!(fake_store(&mut worker).tickets_seen, [true; 4]);
+}
+
+// Retry on selection itself is covered by refused_pool_lookups_retry_only_for_selected_requests.
+#[test]
+fn a_first_pool_lookup_starts_while_blocked_and_retries_when_selected() {
+    let fixture = Fixture::new();
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.pooled = true;
+    store.refused_lookups = 1;
+    worker.attach_store(Some(Box::new(store)));
+    let (mut incoming, _generation) = fixture.incoming(vec![0; 70], 4);
+    incoming.prompt_score_end = 70;
+    let stats = worker.scheduler.stats();
+    incoming.blocked = Some((
+        worker.scheduler.completed(),
+        stats.free_pages,
+        stats.free_snapshots,
+        stats.free_slots,
+    ));
+    worker.enqueue(vec![incoming]);
+    assert!(fake_store(&mut worker).begun.is_empty());
+    worker.pending[0].prompt_scored = 70;
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(false));
+    assert_eq!(fake_store(&mut worker).begun, [70]);
+    assert!(worker.pending[0].blocked.is_some());
+    assert!(worker.pending[0].pool_lookup_started.is_none());
+
+    fake_store(&mut worker).pending_tickets = true;
+    worker.pending[0].blocked = None;
+    let mut incoming = worker.pending.pop_front().unwrap();
+    begin_pool_lookup(
+        &mut worker.scheduler,
+        worker.store.as_mut().unwrap().as_mut(),
+        &mut incoming,
+    );
+    incoming.pool_lookup_started =
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    worker.pending.push_back(incoming);
+    worker.admit().unwrap();
+    assert_eq!(fake_store(&mut worker).begun, [70; 2]);
+    assert_eq!(worker.pending.len(), 1);
+    assert!(worker.active.iter().all(Option::is_none));
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(false));
+    assert_eq!(fake_store(&mut worker).begun, [70; 2]);
+    worker.pending[0].pool_lookup.as_ref().unwrap().set_state(
+        flare_selene::pool::LookupState::Ready(Arc::new(flare_selene::pool::Answer {
+            candidates: vec![],
+        })),
+    );
+    worker.admit().unwrap();
+    assert_eq!(fake_store(&mut worker).begun, [70; 2]);
+    assert!(worker.pending.is_empty());
+    assert!(worker.active[0].is_some());
+}
+
+#[test]
 fn gpu_residency_is_rechecked_using_the_queued_history() {
     let fixture = Fixture::new();
     let (_sender, receiver) = mpsc::channel();
     let mut worker = fixture.worker(receiver);
     let mut store = FakeStore::new(None);
     store.pooled = true;
+    store.refused_lookups = 1;
     worker.attach_store(Some(Box::new(store)));
     let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
     worker.enqueue(vec![incoming]);
@@ -3034,6 +3187,7 @@ fn gpu_residency_is_rechecked_using_the_queued_history() {
     worker.admit().unwrap();
     let handle = worker.active[0].as_ref().unwrap().request;
     assert_eq!(worker.scheduler.request(handle).unwrap().prefix(), Some(checkpoint));
+    assert_eq!(fake_store(&mut worker).begun, [70]);
     assert!(fake_store(&mut worker).tickets_seen.is_empty());
 }
 
@@ -3301,6 +3455,10 @@ fn an_idle_worker_holds_a_pending_pool_lookup_until_answer_or_deadline() {
         assert_eq!(withdrawn.load(Ordering::Relaxed), 0);
 
         let pending = answer.is_none();
+        let retry = matches!(&answer, Some(LookupState::None));
+        if retry {
+            fake_store(&mut worker).pending_tickets = false;
+        }
         if let Some(answer) = answer {
             worker.pending[0]
                 .pool_lookup
@@ -3314,7 +3472,8 @@ fn an_idle_worker_holds_a_pending_pool_lookup_until_answer_or_deadline() {
         assert!(worker.active[0].is_some());
         assert!(worker.pending.is_empty());
         assert_eq!(worker.idle_wait(), Duration::from_millis(2));
-        assert_eq!(withdrawn.load(Ordering::Relaxed), usize::from(!pending));
+        assert_eq!(withdrawn.load(Ordering::Relaxed), usize::from(!pending) + usize::from(retry));
+        assert_eq!(fake_store(&mut worker).begun.len(), 1 + usize::from(retry));
         if pending {
             assert!(worker.active[0].as_ref().unwrap().incoming.pool_lookup.is_some());
             advance(&mut worker, GraphKind::Init, 1, None);
@@ -3344,7 +3503,11 @@ fn a_pending_pool_lookup_does_not_hold_other_requests() {
         Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
     let (ready, _ready_generation) = fixture.incoming(vec![1; 70], 4);
     worker.enqueue(vec![ready]);
-    worker.pending[1].pool_lookup.as_ref().unwrap().set_state(flare_selene::pool::LookupState::None);
+    worker.pending[1].pool_lookup.as_ref().unwrap().set_state(
+        flare_selene::pool::LookupState::Ready(Arc::new(flare_selene::pool::Answer {
+            candidates: vec![],
+        })),
+    );
     worker.admit().unwrap();
     assert!(worker.active[0].is_some());
     assert_eq!(worker.pending.len(), 1);
@@ -4201,6 +4364,135 @@ async fn unread_http_stream_preserves_all_tokens_and_its_terminal_event() {
         } else {
             assert_eq!(events.last().unwrap()["choices"][0]["finish_reason"], "length");
             assert!(body.ends_with("data: [DONE]\n\n"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn disabled_parallel_calls_complete_http_and_stop_decoding() {
+    use axum::{Extension, extract::State};
+    use crate::model::contract::{ToolParser, ToolParserKind};
+    use serde_json::{Value, json};
+    for path in ["/v1/chat/completions", "/v1/messages", "/v1/responses"] {
+        for stream in [false, true] {
+            let mut fixture = Fixture::reasoning();
+            fixture.config.contract.frontend.tools = Some(ToolParser {
+                kind: ToolParserKind::QwenCoder, wrapping_newlines: 0, tag_separator: String::new(),
+            });
+            let samples = ["</think>", "<tool_call>", "<function=lookup>",
+                "<parameter=n>", "c", "</parameter>", "</function>", "</tool_call>",
+                "<tool_call>", "<function=lookup>", "<parameter=n>", "d",
+                "</parameter>", "</function>", "</tool_call>"]
+                .map(|text| fixture.frontend.tokenizer().token_to_id(text).unwrap());
+            let (sender, receiver) = mpsc::sync_channel(4);
+            let state = http_state_for(fixture, sender, None);
+            let mut body = json!({"messages":[{"role":"user","content":"a"}],
+                "max_tokens":64, "stream":stream, "parallel_tool_calls":false,
+                "stream_options":{"include_usage":true},
+                "tools":[{"type":"function","function":{"name":"lookup","parameters":{
+                    "type":"object","properties":{"n":{"type":"string"}}}}}]});
+            if path == "/v1/messages" {
+                body["tools"] = json!([{"name":"lookup","input_schema":{"type":"object",
+                    "properties":{"n":{"type":"string"}}}}]);
+                body["tool_choice"] = json!({"type":"auto","disable_parallel_tool_use":true});
+            } else if path == "/v1/responses" {
+                body["input"] = json!("a");
+                body.as_object_mut().unwrap().remove("messages");
+                body["tools"] = json!([{"type":"function","name":"lookup","parameters":{
+                    "type":"object","properties":{"n":{"type":"string"}}}}]);
+            }
+            let ingress = Arc::new(state.ingress_slots.clone().acquire_owned().await.unwrap());
+            let request = axum::http::Request::builder().method("POST").uri(path)
+                .header("content-type", "application/json").header("anthropic-version", "2023-06-01")
+                .body(axum::body::Body::from(body.to_string())).unwrap();
+            let response = tokio::spawn(super::super::http::generate(State(state.clone()), Extension(ingress), request));
+            let mut incoming = tokio::task::spawn_blocking(move || {
+                receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap()
+            }).await.unwrap();
+            let cancellation = incoming[0].cancelled.clone();
+            let fixture = Fixture::reasoning();
+            // The worker consumes the prepared HTTP prompt through the ordinary scheduler.
+            let (worker_tx, worker_rx) = mpsc::channel();
+            incoming[0].prompt.data.vision_token_indices = vec![-1; incoming[0].prompt.tokens.len()];
+            worker_tx.send(incoming).unwrap();
+            let mut worker = fixture.worker(worker_rx);
+            assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+            let reader = tokio::spawn(async move {
+                let response = response.await.unwrap();
+                assert_eq!(response.status(), axum::http::StatusCode::OK);
+                axum::body::to_bytes(response.into_body(), 65536).await.unwrap()
+            });
+            let mut generated = 0;
+            for sequence in 1..64 {
+                if generated == samples.len() { break; }
+                let step = worker.plan(0).unwrap().0.unwrap();
+                worker.reserve_and_pack(&step, Fence(sequence)).unwrap();
+                let lane = &step.lanes[0];
+                let live = worker.scheduler.request(lane.request).unwrap();
+                let generates = matches!(step.kind, GraphKind::Decode | GraphKind::Resume)
+                    || (step.kind == GraphKind::Prefill
+                        && lane.start_position + lane.tokens as u64 == live.prompt_tokens as u64);
+                let token = generates.then(|| { let token = samples[generated]; generated += 1; token });
+                let frame = completion(&worker, &step, sequence, token);
+                worker.complete(step.kind, frame).unwrap();
+                worker.publish().unwrap();
+            }
+            assert_eq!(generated, samples.len());
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !cancellation.load(Ordering::Acquire) { tokio::task::yield_now().await; }
+            }).await.unwrap();
+            assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+            assert!(worker.active.iter().all(Option::is_none));
+            assert!(worker.plan(0).unwrap().0.is_none(), "request must not keep decoding");
+            let bytes = tokio::time::timeout(std::time::Duration::from_secs(5), reader).await.unwrap().unwrap();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            assert!(!text.contains(r#""d""#) && !text.contains(r#"\"d\""#), "{text}");
+            let frames: Vec<Value> = if stream {
+                text.lines().filter_map(|line| line.strip_prefix("data: "))
+                    .filter(|data| *data != "[DONE]").map(|data| serde_json::from_str(data).unwrap()).collect()
+            } else { vec![serde_json::from_slice(&bytes).unwrap()] };
+            assert!(frames.iter().all(|v| v["error"].is_null()), "{text}");
+            let last = frames.last().unwrap();
+            let response = if stream && path == "/v1/responses" { &last["response"] } else { last };
+            if path == "/v1/chat/completions" {
+                assert_eq!(response["usage"]["completion_tokens"], generated);
+                if stream {
+                    assert!(text.ends_with("data: [DONE]\n\n"));
+                    assert!(frames.iter().any(|v| v["choices"][0]["finish_reason"] == "tool_calls"));
+                    let calls: Vec<_> = frames.iter().filter_map(|v| v["choices"][0]["delta"]["tool_calls"].as_array()).flatten().collect();
+                    assert_eq!(calls.iter().filter(|v| v["id"].is_string()).count(), 1);
+                    assert!(calls.iter().all(|v| v["index"] == 0));
+                    assert_eq!(calls.iter().filter_map(|v| v["function"]["arguments"].as_str()).collect::<String>(), "{\"n\":\"c\"}");
+                } else {
+                    assert_eq!(response["choices"][0]["finish_reason"], "tool_calls");
+                    assert_eq!(response["choices"][0]["message"]["tool_calls"].as_array().unwrap().len(), 1);
+                    assert_eq!(response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"], "{\"n\":\"c\"}");
+                }
+            } else if path == "/v1/messages" {
+                if stream {
+                    assert_eq!(last["type"], "message_stop");
+                    let delta = frames.iter().find(|v| v["type"] == "message_delta").unwrap();
+                    assert_eq!(delta["delta"]["stop_reason"], "tool_use");
+                    assert_eq!(delta["usage"]["output_tokens"], generated);
+                    assert_eq!(frames.iter().filter(|v| v["type"] == "content_block_start" && v["content_block"]["type"] == "tool_use").count(), 1);
+                } else {
+                    assert_eq!(response["stop_reason"], "tool_use");
+                    assert_eq!(response["usage"]["output_tokens"], generated);
+                    let calls: Vec<_> = response["content"].as_array().unwrap().iter().filter(|v| v["type"] == "tool_use").collect();
+                    assert_eq!(calls.len(), 1);
+                    assert_eq!(calls[0]["input"], json!({"n":"c"}));
+                }
+            } else {
+                assert_eq!(response["status"], "completed");
+                assert_eq!(response["usage"]["output_tokens"], generated);
+                let calls: Vec<_> = response["output"].as_array().unwrap().iter().filter(|v| v["type"] == "function_call").collect();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0]["arguments"], "{\"n\":\"c\"}");
+                if stream {
+                    assert_eq!(last["type"], "response.completed");
+                    assert_eq!(frames.iter().filter(|v| v["type"] == "response.output_item.added" && v["item"]["type"] == "function_call").count(), 1);
+                }
+            }
         }
     }
 }

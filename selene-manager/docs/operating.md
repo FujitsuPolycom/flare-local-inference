@@ -79,8 +79,9 @@ formula or from the figure in the warning.
 
 `--nvme` bounds record reservations: the rounded arena extent for an in-memory
 record, or the padded file plus the two-window hold for a streamed put. It must exceed the
-largest record an instance can put, or the put is refused `OVERSIZE`. Keep it above `--memory`:
-DRAM eviction needs durability, so a full NVMe budget stops DRAM from making room.
+largest record an instance can put, or the put is refused `OVERSIZE` and the instance discards
+its local record. Keep it above `--memory`: DRAM eviction needs durability, so a full NVMe
+budget stops DRAM from making room.
 
 The arena and staging are preallocated files in `/dev/shm/selene/<name>-<hash>`, where the hash is
 the 32-hex-digit BLAKE2b digest of the absolute `--socket` path, so the shared-memory mount
@@ -178,12 +179,21 @@ confirming nothing is listening.
 An instance attaches to the pool once, at startup, and never later. Registering the manager's
 shared memory with the GPU consumes device memory, which a serving instance must not do, so Flare
 registers the manager's `arena` and `staging` files before it admits requests and only then. An
-instance that starts while the manager is down waits for it up to 10 seconds
-(`flare_selene::pool::STARTUP_WAIT`), then runs on its local tiers only, prints one warning, and does
-not attach when the manager comes up afterwards: restart it to use the pool. The same holds for an
-instance whose manager's certificate it does not trust, or whose protocol, encryption or scope
-differs, and for one running when the manager recreates its regions (a size changed): it keeps
-serving on its local tiers and prints one warning.
+instance that starts while the manager is down waits up to 30 seconds
+(`flare_selene::pool::STARTUP_WAIT`), matching the readiness probe window below.
+Registration time grows with the manager's `--memory` and `--staging` sizes and
+does not count against the startup wait; rank 0 and single-process session opening
+have a separate 40-second allowance, while peer agents wait without an opening
+deadline as long as their rank link is alive. Failure to attach stops instance startup
+with the cause and corrective action. This includes
+an untrusted certificate, incompatible protocol, encryption or scope, a rejected
+host/device memory budget, registration failure, and session-opening timeout.
+The `Reach prefix cache pool` phase checks the connection and `Hello` before weight
+loading. Registration and session opening still happen after weights load, so a
+manager that becomes unavailable during loading can fail startup after that I/O.
+Start the manager first if recovery takes longer; remove `--prefix-cache-pool` to run local-only.
+An already running instance whose manager recreates its regions (a size changed)
+keeps serving on its local tiers and prints one warning; restart it to use the pool.
 
 Order the manager first. With compose, give the manager a health check and make the instance wait
 for it:
@@ -244,10 +254,11 @@ refusal as a normal outcome and move to another candidate, another tier, or reco
 | `COPY_ERROR` / `CHECKSUM` | A read, write or checksum failed, or the copy was not exact. | Alert on repeats; check the device. |
 | `DEADLINE` / `NO_PROGRESS` | The claim ran past its deadline or stopped making progress (3s). | Look at copy throughput. |
 | put `PRESENT` | Already stored and committed: success, nothing transferred. | None. |
-| put `BUDGET` | Temporary arena, staging or durable-budget pressure: the writer keeps its local record and releases its selection. | Retry after manager progress or reconnect; add capacity if sustained. |
-| put `OVERSIZE` | Can never fit in this configuration. | Raise the budget or add `--root`. |
+| put `BUDGET` | Temporary arena, staging or durable-budget pressure: the writer retries once after a 50 ms backoff, then discards the local record on another `BUDGET` or `INFLIGHT` refusal. | Add capacity if sustained. |
+| put `INFLIGHT` | Another put of the same key is in flight: the writer retries once after a 50 ms backoff, then discards the local record on another `BUDGET` or `INFLIGHT` refusal. | None. |
+| put `OVERSIZE` | Can never fit in this configuration; the writer discards the local record. | Raise the budget or add `--root`. |
 | put `QUEUE` | The writer has `max_open_puts` (4) open. | None. |
-| put `INVALID` | Malformed, metadata that does not match the put, or a mode not allowed. | Alert: client and manager disagree. |
+| put `INVALID` | Malformed, metadata that does not match the put, or a mode not allowed; the writer discards the local record. | Alert: client and manager disagree. |
 | put `IO` | A device error. | Check the NVMe and the file system. |
 | put `PUT_NOT_READY` | Not ready (see Readiness). | None. |
 
@@ -296,11 +307,15 @@ running manager.
 
 ## Upgrades and clearing the cache
 
+Deployments that ran degraded on local tiers will now fail to start until the pool
+attaches. Grep logs for `using local tiers only` before upgrading.
+
 Stop the manager, replace the binary and start it with the same `--root`, `--name` and `--socket`.
 Durable records are validated and reused; instances reconnect, resync and refill the DRAM tier from
 their traffic. The protocol version must match the instances: a manager that does not speak the
-instance's version answers `Hello` with `VERSION_MISMATCH` and the instance runs on its local tiers
-until restarted. `--name`, `--socket`, `--listen`, `--listen-data` and the TLS files are restart-only.
+instance's version answers `Hello` with `VERSION_MISMATCH`. This fails instance startup;
+after startup it disables the pool until the instance restarts. `--name`, `--socket`,
+`--listen`, `--listen-data` and the TLS files are restart-only.
 
 The root holds one directory per model identity and layout fingerprint, named
 `<16 hex>-<32 hex>` from the first 8 bytes of the model identity and the 16-byte layout
@@ -316,7 +331,7 @@ in that root under its own name.
 | Symptom | Check |
 |---|---|
 | Manager exits at startup | Another manager on the same root or `--name`; a root that cannot do `O_DIRECT`; `the store cannot start its disk threads` (io_uring blocked: run with `--security-opt seccomp=selene-manager/deploy/seccomp-io-uring.json`, Docker's default profile plus the three io_uring calls; disabling seccomp is not needed); a certificate and key that do not match; `--rdma` with TLS. |
-| Instances run on local tiers only | The pool address, socket permissions, uid/gid equality, `/dev/shm/selene` mounted at the same path in both containers, `selene_pool_ready`. |
+| Instances fail to attach the configured pool at startup | The pool address, socket permissions, uid/gid equality, `/dev/shm/selene` mounted at the same path in both containers, `selene_pool_ready`. |
 | `NO_WINDOWS` | `--staging`; `selene_pool_quarantined_bytes`; many large exports at once. |
 | Quarantined bytes do not fall | A hung instance (it will clear when the process exits). |
 

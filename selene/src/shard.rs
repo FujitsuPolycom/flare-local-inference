@@ -629,13 +629,12 @@ impl Sharded {
             .results
             .iter()
             .enumerate()
-            .find_map(|(rank, result)| match result {
-                Some(Err(error)) => Some(Error::caused_by(
-                    format!("rank {rank}: {error}"),
-                    error.clone(),
-                )),
+            .filter_map(|(rank, result)| match result {
+                Some(Err(error)) => Some((rank, error)),
                 _ => None,
-            });
+            })
+            .min_by_key(|(_, error)| !error.is_record_read())
+            .map(|(rank, error)| Error::caused_by(format!("rank {rank}: {error}"), error.clone()));
         if let Some((store, error)) = pending.cleanup {
             // Preserve cleanup failures alongside the write failure.
             let leftover =
@@ -795,9 +794,16 @@ fn encode_event(kind: Kind, id: JobId, result: &Result<u64>) -> Vec<u8> {
     writer.u8(kind.code()).u64(id.0);
     match result {
         Ok(value) => writer.u8(1).u64(*value),
-        Err(error) => writer
-            .u8(if error.no_space() { 2 } else { 0 })
-            .text(&error.to_string()),
+        Err(error) => {
+            let code = if error.is_record_read() {
+                3
+            } else if error.no_space() {
+                2
+            } else {
+                0
+            };
+            writer.u8(code).text(&error.to_string())
+        }
     };
     writer.finish()
 }
@@ -813,6 +819,7 @@ fn decode_event(payload: &[u8]) -> Result<(Kind, JobId, Result<u64>)> {
             reader.text()?.to_owned(),
             std::io::Error::from(ErrorKind::StorageFull),
         )),
+        3 => Err(invalid(reader.text()?.to_owned()).with_record_read()),
         _ => return Err(invalid("invalid prefix record event result")),
     };
     reader.end()?;

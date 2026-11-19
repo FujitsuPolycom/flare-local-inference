@@ -14,7 +14,7 @@
 //! to the tokens a request adds beyond its resident GPU checkpoint.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
@@ -237,6 +237,19 @@ impl<L> Index<L> {
                     node.children == 1
                 }
         })
+    }
+
+    /// Drain queued row candidates in least-recently-used order, omitting removed records.
+    pub(crate) fn thinning_order(
+        &self,
+        queued: &mut HashSet<PrefixKey>,
+    ) -> impl Iterator<Item = PrefixKey> + use<L> {
+        let mut ordered: Vec<_> = std::mem::take(queued)
+            .into_iter()
+            .filter_map(|key| self.node(&key).map(|node| (node.accessed(), key)))
+            .collect();
+        ordered.sort_unstable();
+        ordered.into_iter().map(|(_, key)| key)
     }
 
     pub fn nodes(&self) -> impl Iterator<Item = &Node<L>> {

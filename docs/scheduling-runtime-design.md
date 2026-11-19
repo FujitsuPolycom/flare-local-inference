@@ -171,11 +171,24 @@ candidate serving two requests. Bounded cost-refresh probes are separate
 from ordinary selection. Selection does not enumerate exponentially many
 request subsets.
 
-Each prefill capacity competes using the actual tokens it can consume. Atomic
-image spans, system boundaries, and prompt length restrict logical work. A
-4096-token graph processing a 64-token tail earns 64 prompt units and at most one
-output token. There is no smallest-fitting-shape filter, duration ceiling,
-forced oldest-request filter, or per-chunk prefill lateness cost.
+Each prefill capacity competes using the checkpoint selection loop's predicted
+work, including optional cuts and their split and copy budgets
+([checkpoint retention](#prerequisites-and-completion)), without quoting snapshot
+storage. Estimates and quoted selections are cached separately within each
+planning scope. Both paths reuse a stored selection when it contains any
+non-anchor cut. Submission quotes storage for the winning prompt row. When no
+quote fails, estimated and submitted work agree. Storage shortage can change
+which cuts fit the work budget, so the estimate and quoted selection can differ
+in either direction. If the quoted work differs from the winning estimate, an
+ordinary prefill plan advances toward the quoted cut up to the catalog maximum and
+uses the smallest catalog capacity covering that work, with its cost and duration
+recomputed. If a required lookup is unavailable, it retains the winning candidate
+and clips work to that candidate's capacity. Mixed, refresh, and discovery plans
+retain their capacities and clip work to fit. Atomic image spans, feature windows,
+and prompt length also restrict logical work. A graph with 64 useful prompt tokens
+earns 64 prompt units and at most one output token, regardless of physical capacity.
+Candidate scoring has no smallest-fitting-shape filter, duration ceiling, forced
+oldest-request filter, or per-chunk prefill lateness cost.
 
 With no active decoder, the age term vanishes. Fully occupied large prefill
 graphs win when their useful value rate is highest. With decoding streams, a

@@ -182,7 +182,18 @@ pub fn walk_chain(
             break;
         }
         let parent_key = current.parent?;
-        let parent = index.get(source, parent_key, endpoint.tier)?;
+        let parent = index.get(source, parent_key, endpoint.tier).or_else(|| {
+            // The manager reads a chain record by record from its own memory or disk.
+            if source != SourceId::Manager {
+                return None;
+            }
+            let tier = if endpoint.tier == Tier::Dram {
+                Tier::Nvme
+            } else {
+                Tier::Dram
+            };
+            index.get(source, parent_key, tier)
+        })?;
         // The parent must end exactly where this node starts.
         if end_of(parent.key) != first || nodes.len() >= max_nodes {
             return None;
@@ -299,6 +310,26 @@ mod tests {
         let walk = walk_chain(&index, SOURCE, &endpoint, 64, 6, 100).unwrap();
         assert_eq!(walk.nodes.len(), 1);
         assert_eq!((walk.skip_pages, walk.pages), (2, 0));
+    }
+
+    #[test]
+    fn a_manager_chain_can_cross_memory_and_disk() {
+        for (parent_tier, child_tier) in [(Tier::Dram, Tier::Nvme), (Tier::Nvme, Tier::Dram)] {
+            let parent = entry(128, 1, None, 2, parent_tier);
+            let child = entry(256, 2, Some((128, 1)), 2, child_tier);
+            let mut index = ScopeIndex::default();
+            for source in [SourceId::Manager, SOURCE] {
+                index.upsert(source, parent.clone());
+                index.upsert(source, child.clone());
+            }
+            let walk = walk_chain(&index, SourceId::Manager, &child, 64, 1, 3).unwrap();
+            assert_eq!((walk.skip_pages, walk.pages), (1, 3));
+            assert_eq!(
+                walk.nodes.iter().map(|node| node.key).collect::<Vec<_>>(),
+                [parent.key, child.key],
+            );
+            assert!(walk_chain(&index, SOURCE, &child, 64, 1, 3).is_none());
+        }
     }
 
     #[test]

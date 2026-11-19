@@ -136,8 +136,8 @@ enum Level {
   LEVEL_UNSPECIFIED = 0;
   THIS_GPU = 1;        // never offered as a candidate.
   NEIGHBOUR_GPU = 2;   // Tier GPU in another instance on the same host.
-  HOST_DRAM = 3;       // Tier DRAM: own, a neighbour's, or a same-host manager's (its DRAM is level 3).
-  HOST_NVME = 4;       // Tier NVME: own, a neighbour's, or a same-host manager's.
+  HOST_DRAM = 3;       // DRAM: own, a neighbour's, or a same-host manager chain read entirely from DRAM.
+  HOST_NVME = 4;       // NVMe: own, a neighbour's, or any NVMe record read in a same-host manager chain.
   REMOTE_NVME = 5;     // Anything a manager on another host serves (its NVMe, and its DRAM too).
 }
 
@@ -179,8 +179,8 @@ enum HelloStatus {
   HELLO_STATUS_UNSPECIFIED = 0;
   HELLO_OK = 1;
   // The manager does not speak `protocol`. Only `status` and `protocol` of the
-  // reply are meaningful. The client logs one warning and uses local tiers only;
-  // it does not retry until restarted.
+  // reply are meaningful. The client fails startup, or disables an attached pool
+  // with one warning; it does not retry until restarted.
   VERSION_MISMATCH = 2;
 }
 
@@ -553,6 +553,8 @@ message ChainNode {
 // that fails.
 message Candidate {
   Level level = 1;
+  // Endpoint's tier. Manager chains may mix DRAM and NVMe, with level reflecting
+  // the slowest tier the claim reads; instance chains stay in one tier.
   Tier tier = 2;
   SourceRef source = 3;
   // The endpoint (the deepest record).

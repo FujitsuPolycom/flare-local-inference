@@ -85,6 +85,9 @@ impl Drop for Cleanup {
 /// flight, closes the sessions and releases everything.
 pub fn serve(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
     config.validate()?;
+    let (h2_keepalive, h2_timeout) = (H2_KEEPALIVE, H2_TIMEOUT);
+    #[cfg(any(test, feature = "test-support"))]
+    let (h2_keepalive, h2_timeout) = config.h2_keepalive.unwrap_or((h2_keepalive, h2_timeout));
     for warning in config.startup_warnings() {
         eprintln!("{warning}");
     }
@@ -272,8 +275,8 @@ pub fn serve(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
         let listener = tokio::net::UnixListener::from_std(listener)?;
         let incoming = UnixListenerStream::new(listener);
         let mut builder = Server::builder()
-            .http2_keepalive_interval(Some(H2_KEEPALIVE))
-            .http2_keepalive_timeout(Some(H2_TIMEOUT));
+            .http2_keepalive_interval(Some(h2_keepalive))
+            .http2_keepalive_timeout(Some(h2_timeout));
         let service = PoolServer::new(pool_service)
             .max_decoding_message_size(MAX_MESSAGE)
             .max_encoding_message_size(MAX_MESSAGE);

@@ -13,7 +13,7 @@ use super::{
 use crate::Result;
 use deepseek_recipe::stream::{
     ParsingOptions, ThinkingInitialStage,
-    output_parser::{ChunkKind, OutputAction, OutputActionSegment, OutputParser},
+    output_parser::{ArgumentsLabel, ChunkKind, OutputAction, OutputActionSegment, OutputParser},
 };
 use serde::de::{Deserializer, MapAccess, Visitor};
 use serde_json::Value;
@@ -25,6 +25,31 @@ const BUFFER_LIMIT: usize = 1024 * 1024;
 struct Call {
     name: String,
     arguments: String,
+    /// Where the current `string="false"` value starts in `arguments`.
+    literal: Option<usize>,
+}
+
+impl Call {
+    fn check_size(&self) -> Result<()> {
+        if self.name.len().saturating_add(self.arguments.len()) > BUFFER_LIMIT {
+            return Err("DeepSeek tool call exceeds the 1 MiB buffer bound".into());
+        }
+        Ok(())
+    }
+
+    /// Retain the model's text when it cannot be decoded as a value in the argument object.
+    fn close_literal(&mut self) {
+        let Some(start) = self.literal.take() else {
+            return;
+        };
+        let text = &self.arguments[start..];
+        // A one-element array consumes the same nesting level as the argument object
+        // and requires the parameter to contain exactly one JSON value.
+        if serde_json::from_str::<[Value; 1]>(&format!("[{text}]")).is_err() {
+            let retained = serde_json::to_string(text).expect("serializing a string cannot fail");
+            self.arguments.replace_range(start.., &retained);
+        }
+    }
 }
 
 pub struct DsmlOutput<const SPACED: bool> {
@@ -101,11 +126,20 @@ impl<const SPACED: bool> DsmlOutput<SPACED> {
                     }
                 }
                 OutputAction::LabelToolCallArguments(label) if !repeated => {
-                    self.call
+                    let call = self
+                        .call
                         .as_mut()
-                        .ok_or("DeepSeek tool arguments have no call")?
-                        .arguments
-                        .push_str(label.as_str());
+                        .ok_or("DeepSeek tool arguments have no call")?;
+                    if label == ArgumentsLabel::ArgumentSeparator {
+                        call.close_literal();
+                    }
+                    call.arguments.push_str(label.as_str());
+                    // The parser labels a string value's opening quote; other values follow bare.
+                    call.literal = match label {
+                        ArgumentsLabel::KeyValueSeparator => Some(call.arguments.len()),
+                        ArgumentsLabel::StringOpen => None,
+                        _ => call.literal,
+                    };
                 }
                 OutputAction::ToolCallArgumentsText {
                     is_string_value: string,
@@ -128,7 +162,9 @@ impl<const SPACED: bool> DsmlOutput<SPACED> {
                         .call
                         .take()
                         .ok_or("DeepSeek tool arguments have no call")?;
+                    call.close_literal();
                     call.arguments.push_str(closing_text);
+                    call.check_size()?;
                     validate_arguments(&call.arguments)?;
                     let index = self.calls;
                     events.extend([
@@ -156,10 +192,8 @@ impl<const SPACED: bool> DsmlOutput<SPACED> {
                 }
                 _ => {}
             }
-            if self.call.as_ref().is_some_and(|call| {
-                call.name.len().saturating_add(call.arguments.len()) > BUFFER_LIMIT
-            }) {
-                return Err("DeepSeek tool call exceeds the 1 MiB buffer bound".into());
+            if let Some(call) = &self.call {
+                call.check_size()?;
             }
             consumed = end;
             if self.verbatim {
@@ -582,6 +616,102 @@ mod prefixed_tool_tests {
 
     #[test]
     fn spaced_tool_body_accepts_every_utf8_split() {
+        check::<true>();
+    }
+}
+
+#[cfg(test)]
+mod retained_literal_tests {
+    use super::*;
+    use crate::output::tagged::{OutputConfig, OutputStart};
+    use crate::output::{Input, ModelOutput, Termination};
+    use crate::server::output::Accumulator;
+    use serde_json::json;
+
+    /// One call whose `string="false"` values are, in order, `values`, between two
+    /// `string="true"` parameters. The output is fed in two pieces split at every
+    /// character boundary, and then one character at a time.
+    fn arguments<const SPACED: bool>(values: &[&str]) -> Result<Vec<Value>> {
+        let separator = if SPACED { " " } else { "" };
+        let calls = if SPACED { "calls" } else { "tool_calls" };
+        let mut text = format!(
+            "thought</think><｜DSML｜{separator}{calls}>\n<｜DSML｜{separator}invoke name=\"run\">\n<｜DSML｜{separator}parameter name=\"label\" string=\"true\">a \"b\" \\.</｜DSML｜{separator}parameter>\n"
+        );
+        for (index, value) in values.iter().enumerate() {
+            text.push_str(&format!(
+                "<｜DSML｜{separator}parameter name=\"v{index}\" string=\"false\">{value}</｜DSML｜{separator}parameter>\n"
+            ));
+        }
+        text.push_str(&format!(
+            "<｜DSML｜{separator}parameter name=\"tail\" string=\"true\">[\"kept\\.\"</｜DSML｜{separator}parameter>\n</｜DSML｜{separator}invoke>\n</｜DSML｜{separator}{calls}>"
+        ));
+        let characters: Vec<_> = text
+            .char_indices()
+            .map(|(offset, character)| &text[offset..offset + character.len_utf8()])
+            .collect();
+        let mut feeds: Vec<Vec<&str>> = text
+            .char_indices()
+            .map(|(offset, _)| vec![&text[..offset], &text[offset..]])
+            .collect();
+        feeds.push(characters);
+        let mut results = Vec::new();
+        for feed in feeds {
+            let mut parser = DsmlOutput::<SPACED>::new(OutputConfig {
+                structured: false,
+                start: OutputStart::Reasoning,
+                tools: vec![json!({"type":"function", "function":{"name":"run"}})],
+            });
+            let mut output = Accumulator::new("request".into());
+            for piece in feed {
+                output.apply(parser.push(Input::Text(piece))?)?;
+            }
+            output.apply(parser.finish(Termination::Eos)?)?;
+            output.finish()?;
+            let message = output.message();
+            assert_eq!(message["tool_calls"].as_array().unwrap().len(), 1);
+            let text = message["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap();
+            results.push(serde_json::from_str(text).expect("arguments are a JSON object"));
+        }
+        results.dedup();
+        assert_eq!(results.len(), 1, "every feed parses alike");
+        Ok(results)
+    }
+
+    fn check<const SPACED: bool>() {
+        // Shell text written as JSON by hand: an invalid escape, an unescaped
+        // quote, an unterminated string, trailing text, and an empty value.
+        let invalid = [
+            r#"["grep -E '[0-9]+\.[0-9]+' a.log"]"#,
+            r#"{"command": "sed 's/"old"/new/g'"}"#,
+            r#""echo unterminated"#,
+            "3 apples",
+            "",
+        ];
+        let parsed = arguments::<SPACED>(&invalid).unwrap();
+        assert_eq!(parsed[0]["label"], "a \"b\" \\.");
+        for (index, raw) in invalid.iter().enumerate() {
+            assert_eq!(parsed[0][format!("v{index}")], json!(raw));
+        }
+        // A string parameter after a retained value is escaped as before.
+        assert_eq!(parsed[0]["tail"], "[\"kept\\.\"");
+        // Valid JSON values keep their type, also between and after retained ones.
+        let mixed = ["[1, \"a\\\\.b\"]", "nope", " {\"k\": null} ", "true"];
+        let parsed = arguments::<SPACED>(&mixed).unwrap();
+        assert_eq!(
+            parsed[0],
+            json!({"label": "a \"b\" \\.", "v0": [1, "a\\.b"], "v1": "nope", "v2": {"k": null}, "v3": true, "tail": "[\"kept\\.\""})
+        );
+    }
+
+    #[test]
+    fn compact_invalid_json_values_are_retained_as_strings() {
+        check::<false>();
+    }
+
+    #[test]
+    fn spaced_invalid_json_values_are_retained_as_strings() {
         check::<true>();
     }
 }

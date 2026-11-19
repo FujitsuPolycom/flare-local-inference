@@ -103,19 +103,22 @@ admission-count cutoff.
 The invariants independently derive required admission from the owner sets and
 compare it with observed semaphore availability. They also require event
 conservation while a reader survives, bounded total retained events, and
-cancellation of a producer whose reader was dropped. The producer contract in
-this model allows two nonterminal events and one terminal event per response,
-with queue capacity five. It does not prove the scheduler's output-limit
-arithmetic, payload byte sizes, or Tokio's internal queue implementation.
+cancellation of a producer whose reader was dropped. A live reader can also set
+cancellation while retaining its queued events and admission reservation, then
+receive a terminal event. The producer contract allows two nonterminal events
+and one terminal event per response, with queue capacity five. It does not prove
+the scheduler's output-limit arithmetic, payload byte sizes, or Tokio's internal
+queue implementation.
 
 `server::runtime::phase_tests::response_lifecycle_tests::native_responses_match_lifecycle_model`
 replays operation sequences through depth ten against production
 `ModelRuntime::generate_many`, `Incoming::emit` and `fail`, native event receivers,
-and the `Incoming` and `Generation` destructors. It observes semaphore permits,
-actual producer/reader ownership, and queue lengths. A 28-integer projection
-contains available permits, three group reservation sizes, and each cell's group,
-producer, reader, publication, consumption, queue, terminal, and cancellation
-fields. All observed edges are checked against `ResponseLifecycle.AllowedEdge`.
+`Generation::cancel`, and the `Incoming` and `Generation` destructors. It observes
+semaphore permits, actual producer/reader ownership, and queue lengths. A
+28-integer projection contains available permits, three group reservation sizes,
+and each cell's group, producer, reader, publication, consumption, queue, terminal,
+and cancellation fields. All observed edges are checked against
+`ResponseLifecycle.AllowedEdge`.
 Equivalent projected states are pruned; this is bounded conformance, not
 exhaustive exploration of all Rust state. Repeated grouped admission and release
 also exercises reuse of the same runtime.

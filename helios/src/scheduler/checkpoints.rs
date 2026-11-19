@@ -8,7 +8,7 @@
 
 use super::*;
 
-pub(super) type SelectionCache = HashMap<RequestHandle, (CheckpointAccounting, bool, bool)>;
+pub(super) type SelectionCache = HashMap<(RequestHandle, bool), (CheckpointAccounting, bool, bool)>;
 
 pub(super) struct PlanningScope<'a>(&'a std::cell::RefCell<Option<SelectionCache>>);
 
@@ -214,17 +214,25 @@ impl RequestScheduler {
     }
 
     fn checkpoint_selection(&self, request: &LiveRequest) -> (CheckpointAccounting, bool, bool) {
+        self.checkpoint_selection_cached(request, true)
+    }
+
+    fn checkpoint_selection_cached(
+        &self,
+        request: &LiveRequest,
+        quote_storage: bool,
+    ) -> (CheckpointAccounting, bool, bool) {
         if let Some(value) = self
             .checkpoint_selections
             .borrow()
             .as_ref()
-            .and_then(|cache| cache.get(&request.handle))
+            .and_then(|cache| cache.get(&(request.handle, quote_storage)))
         {
             return value.clone();
         }
-        let selection = self.checkpoint_selection_uncached(request);
+        let selection = self.checkpoint_selection_uncached(request, quote_storage);
         if let Some(cache) = self.checkpoint_selections.borrow_mut().as_mut() {
-            cache.insert(request.handle, selection.clone());
+            cache.insert((request.handle, quote_storage), selection.clone());
         }
         selection
     }
@@ -232,6 +240,7 @@ impl RequestScheduler {
     fn checkpoint_selection_uncached(
         &self,
         request: &LiveRequest,
+        quote_storage: bool,
     ) -> (CheckpointAccounting, bool, bool) {
         let mut accounting = request.checkpoints.clone();
         if accounting
@@ -333,7 +342,7 @@ impl RequestScheduler {
                 .filter(|cut| cut.endpoint > start)
                 .count()
                 - usize::from(request.anchor_guard.is_some() && start < anchor);
-            if self
+            if quote_storage && self
                 .quote_snapshots_preserving(1, rows, self.checkpoint_headroom(), rank)
                 .is_none()
             {
@@ -349,6 +358,15 @@ impl RequestScheduler {
         }
         accounting.cuts.sort_unstable_by_key(|cut| cut.endpoint);
         (accounting, unknown, budget)
+    }
+
+    pub(super) fn estimated_checkpoint_cut(&self, request: &LiveRequest) -> Option<usize> {
+        let (accounting, _, _) = self.checkpoint_selection_cached(request, false);
+        accounting
+            .cuts
+            .iter()
+            .find(|cut| cut.endpoint > request.consumed_tokens as usize)
+            .map(|cut| cut.endpoint)
     }
 
     pub(super) fn checkpoint_cut(&self, request: &LiveRequest) -> Option<usize> {
@@ -674,6 +692,80 @@ mod tests {
             );
         }
         measure(scheduler, GraphKind::Snapshot, 1, 1);
+    }
+
+    #[test]
+    fn prefill_capacity_matches_submitted_work_without_snapshot_storage() {
+        for (prompt_tokens, capacity, refresh) in [
+            (200, 256, false),
+            (300, 512, false),
+            (1024, 512, false),
+            (300, 256, true),
+        ] {
+            let mut scheduler = super::super::tests::scheduler(1, 128, 16);
+            scheduler.prefill_graphs(&[128, 256, 512]).unwrap();
+            linear_costs(&mut scheduler);
+            scheduler
+                .configure_policy(PolicyConfig {
+                    checkpoint_extra_work_fraction: 0.5,
+                    ..Default::default()
+                })
+                .unwrap();
+            let mut spec = super::super::tests::spec(prompt_tokens, 1);
+            spec.message_boundaries = vec![100, prompt_tokens];
+            let handle = scheduler.admit(spec).unwrap();
+            let records = |sequence: i64, consumed: usize| {
+                let output = consumed == prompt_tokens;
+                let mut records = vec![CompletionRecord::default(); 4];
+                records[handle.slot as usize] = CompletionRecord {
+                    generation: handle.generation as i64,
+                    submission_sequence: sequence,
+                    consumed_tokens: consumed as i64,
+                    generated_tokens: i64::from(output),
+                    token_id: if output { 42 } else { -1 },
+                    status: 1,
+                    ..Default::default()
+                };
+                records
+            };
+            let init = scheduler.plan().unwrap();
+            assert_eq!(init.kind, GraphKind::Init);
+            scheduler.commit(&init, Fence(1)).unwrap();
+            scheduler
+                .complete(Fence(1), &records(1, 0), Default::default())
+                .unwrap();
+            let origin = if refresh {
+                scheduler
+                    .advance_to(scheduler.policy.estimate_ttl_ns)
+                    .unwrap();
+                measure(&mut scheduler, GraphKind::Snapshot, 1, 1);
+                scheduler.refresh.credit_ns = refresh::CREDIT_CAP_NS;
+                let plan = scheduler.plan().unwrap();
+                assert_eq!(plan.token_capacity, capacity);
+                assert!(matches!(plan.origin, PlanOrigin::RefreshStart(_)));
+                plan.origin
+            } else {
+                PlanOrigin::Ordinary
+            };
+            let mut held = Vec::new();
+            while let Some(snapshot) = scheduler.reserve_snapshot(0) {
+                held.push(snapshot);
+            }
+            assert_eq!(held.len(), 16);
+            assert_eq!(scheduler.free_snapshots.len(), 0);
+            let request = scheduler.request(handle).unwrap();
+            assert_eq!(scheduler.estimated_checkpoint_cut(request), Some(100));
+            assert_eq!(scheduler.checkpoint_cut(request), Some(prompt_tokens));
+            let plan = scheduler.plan().unwrap();
+            assert_eq!(plan.kind, GraphKind::Prefill);
+            assert_eq!(
+                (plan.token_capacity, plan.lanes[0].tokens),
+                (capacity, prompt_tokens.min(capacity))
+            );
+            assert_eq!(plan.estimated_duration_ns(), capacity as u64 * 1000);
+            assert_eq!(plan.selected_cost.retained_ns, capacity as u64 * 1000);
+            assert_eq!(plan.origin, origin);
+        }
     }
 
     #[test]

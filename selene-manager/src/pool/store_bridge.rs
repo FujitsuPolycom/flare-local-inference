@@ -362,12 +362,12 @@ impl Core {
         };
         let pid = self.sessions[&sid].pid;
         let Some(link) = self.link_for(process, scope, pid) else {
-            let detail = if pid == 0 {
-                "the peer's process id is not visible; share a PID namespace with the manager"
-            } else {
-                "no connection to the manager's store"
-            };
-            self.put_refusal(sid, put_id, v2::Reason::Io, detail);
+            self.put_refusal(
+                sid,
+                put_id,
+                v2::Reason::Io,
+                "no connection to the manager's store",
+            );
             return Ok(());
         };
         let descriptor = self.scopes[&scope].valid.descriptor.clone();

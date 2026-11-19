@@ -48,8 +48,8 @@ pub(crate) struct Link {
     pub approve: Option<Approve>,
 }
 
-const HELLO_TIMEOUT: Duration = Duration::from_secs(3);
-const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const HELLO_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const FIRST_BACKOFF: Duration = Duration::from_millis(100);
 /// Reconnect promptly so a restarted manager can release the previous run's region hold.
 pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(1);
@@ -70,12 +70,12 @@ pub(crate) fn check_hello(
 ) -> std::result::Result<(), String> {
     if reply.status == wire::HelloStatus::VersionMismatch as i32 || reply.protocol != PROTOCOL {
         return Err(format!(
-            "the pool manager speaks protocol {}, this client speaks {PROTOCOL}; using local tiers only",
+            "the pool manager speaks protocol {}, this client speaks {PROTOCOL}; use matching manager and instance versions",
             reply.protocol
         ));
     }
     if reply.status != wire::HelloStatus::HelloOk as i32 {
-        return Err("the pool manager refused Hello; using local tiers only".into());
+        return Err("the pool manager refused Hello; check the manager's configuration".into());
     }
     if !matches!(
         wire::Encryption::try_from(reply.encryption),
@@ -83,7 +83,7 @@ pub(crate) fn check_hello(
     ) || connected_with.is_some_and(|mode| reply.encryption != mode as i32)
     {
         return Err(format!(
-            "the pool manager declares {:?} but this client connected with {connected_with:?}; using local tiers only",
+            "the pool manager declares {:?} but this client connected with {connected_with:?}; use the matching pool address encryption mode",
             wire::Encryption::try_from(reply.encryption)
         ));
     }
@@ -108,14 +108,12 @@ pub(crate) enum Attempt {
 }
 
 pub(crate) fn run(mut engine: Engine, link: Link) -> Result<()> {
+    let _startup = super::startup::StartupGuard(link.startup.clone());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| Error::caused_by("cannot start the pool runtime", e))?;
-    let result = runtime.block_on(serve(&mut engine, &link));
-    // Whatever ended the thread, `start` must not keep waiting for it.
-    link.startup.close();
-    result
+    runtime.block_on(serve(&mut engine, &link))
 }
 
 async fn serve(engine: &mut Engine, link: &Link) -> Result<()> {
@@ -125,25 +123,23 @@ async fn serve(engine: &mut Engine, link: &Link) -> Result<()> {
         if link.stop.load(Ordering::SeqCst) {
             break;
         }
-        if never_attaching(engine, link) {
-            // `PoolClient::start` gave up and said so: stay on the local tiers.
-            engine.shared.fail_lookups();
-            idle_until_stop(engine, link).await;
-            break;
-        }
         let started = Instant::now();
         match attempt(engine, link).await {
             Attempt::Disabled(reason) => {
-                eprintln!("warning: {reason}");
+                // After startup, changed regions disable the pool until restart.
+                if link.startup.is_open() {
+                    eprintln!("warning: {reason}");
+                }
+                link.startup.fail(reason.clone());
                 engine.shared.set_status(PoolStatus::Disabled(reason));
-                link.startup.close();
                 engine.shared.fail_lookups();
                 engine.close_ranks();
                 idle_until_stop(engine, link).await;
                 break;
             }
             Attempt::Retry(why) => {
-                if engine.attachment.is_some() && !warned {
+                link.startup.retry(why.clone());
+                if link.startup.is_open() && !warned {
                     warned = true;
                     eprintln!(
                         "warning: the pool manager is not reachable ({why}); using local tiers while retrying the existing attachment"
@@ -283,6 +279,16 @@ fn tls_failure(error: &(dyn std::error::Error + 'static)) -> Option<String> {
     None
 }
 
+fn retry_reason(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut reason = error.to_string();
+    let mut cause = error.source();
+    while let Some(error) = cause {
+        reason.push_str(&format!(": {error}"));
+        cause = error.source();
+    }
+    reason
+}
+
 pub(crate) async fn connect(
     link: &Link,
 ) -> std::result::Result<
@@ -311,7 +317,7 @@ pub(crate) async fn connect(
                     }
                 }))
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|error| retry_reason(&error))?;
             Ok((channel, wire::Encryption::Plaintext, None))
         }
         PoolAddress::Tcp(address) | PoolAddress::TcpPlaintext(address) => {
@@ -352,7 +358,7 @@ pub(crate) async fn connect(
             }
             .map_err(|e| match tls_failure(&e) {
                 Some(why) => Unreachable::Untrusted(why),
-                None => Unreachable::Retry(e.to_string()),
+                None => Unreachable::Retry(retry_reason(&e)),
             })?;
             let encryption = if tls.is_some() {
                 wire::Encryption::Tls
@@ -382,15 +388,7 @@ struct Established {
     tx: mpsc::Sender<wire::ClientMessage>,
 }
 
-/// The startup window closed with the client unattached, so it never will be.
-fn never_attaching(engine: &Engine, link: &Link) -> bool {
-    engine.attachment.is_none() && link.startup.is_closed()
-}
-
 async fn attempt(engine: &mut Engine, link: &Link) -> Attempt {
-    if never_attaching(engine, link) {
-        return Attempt::Ended;
-    }
     engine.shared.set_status(PoolStatus::Connecting);
     // Stopping interrupts connecting; once a session is open the engine owns it.
     let established = tokio::select! {
@@ -417,6 +415,7 @@ async fn attempt(engine: &mut Engine, link: &Link) -> Attempt {
         checked_limits(hello.limits),
         regions,
     );
+    link.startup.opened();
     run_session(engine, link, &mut stream, tx).await;
     Attempt::Ended
 }
@@ -434,7 +433,7 @@ pub(crate) async fn reach(
 > {
     let (channel, connected_with, tls) = connect(link).await.map_err(|error| match error {
         Unreachable::Retry(why) => Attempt::Retry(why),
-        Unreachable::Untrusted(why) => Attempt::Disabled(format!("cannot verify the pool manager over TLS ({why}); trust its CA on this host or give the CA file; using local tiers only")),
+        Unreachable::Untrusted(why) => Attempt::Disabled(format!("cannot verify the pool manager over TLS ({why}); trust its CA on this host or give --prefix-cache-pool-ca")),
     })?;
     let mut client = wire::pool_client::PoolClient::new(channel);
     let hello = match tokio::time::timeout(
@@ -467,7 +466,7 @@ async fn establish(engine: &mut Engine, link: &Link) -> std::result::Result<Esta
     if let Some(ranks) = &mut engine.ranks {
         ranks.bind(engine.st.instance_id);
     }
-    let (regions, dial) = match attach(engine, link, &hello, tls) {
+    let (regions, dial) = match attach(engine, link, &hello, tls).await {
         Ok(memory) => memory,
         Err(attempt) => return Err(attempt),
     };
@@ -520,14 +519,14 @@ async fn establish(engine: &mut Engine, link: &Link) -> std::result::Result<Esta
         Ok(wire::OpenStatus::OpenOk) => {}
         Ok(wire::OpenStatus::InvalidScope) => {
             return Err(Attempt::Disabled(
-                "the pool manager refused this instance's scope; using local tiers only".into(),
+                "the pool manager refused this instance's scope; check manager and instance versions and cache geometry".into(),
             ));
         }
         other => return Err(Attempt::Retry(format!("session not opened ({other:?})"))),
     }
     if opened.scope_id != st.scope_id {
         return Err(Attempt::Disabled(
-            "the pool manager and this instance disagree on the scope id; using local tiers only"
+            "the pool manager and this instance disagree on the scope id; use matching manager and instance versions"
                 .into(),
         ));
     }
@@ -584,12 +583,12 @@ pub(crate) fn dial(
 }
 
 /// What this connection copies through: the manager's shared regions, this process's own
-/// data-channel staging, or nothing.
+/// data-channel staging.
 ///
 /// The first connect decides, and registers what it needs while registration is open. Every
 /// later connect must find what the first attached to: the same shared files continue with the
 /// existing registrations; different ones turn the pool off, since they cannot be registered now.
-fn attach(
+async fn attach(
     engine: &mut Engine,
     link: &Link,
     hello: &wire::HelloReply,
@@ -631,25 +630,24 @@ fn attach(
             }
         }
         Some(Attachment::Net) => Ok((None, network.and_then(|address| dial(engine, address)))),
-        Some(Attachment::Nothing) => Ok((None, None)),
         None => {
             // The first connect: the only time anything is registered.
             if !link.startup.begin() {
                 return Err(Attempt::Ended);
             }
             let net_shape = network.map(|_| engine.net_shape(&limits));
-            let prepared = register_memory(
-                hello.shared_memory.as_ref(),
+            let prepared = register_memory_blocking(
+                hello.shared_memory.clone(),
                 net_shape.filter(|_| hello.shared_memory.is_none()),
                 engine.registrar(),
                 engine.st.context,
-                link.approve.as_ref(),
-            );
+                link.approve.clone(),
+            )
+            .await;
             let (regions, staging, registered) = match prepared {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     engine.close_registration();
-                    link.startup.done(Vec::new());
                     return Err(Attempt::Disabled(error.to_string()));
                 }
             };
@@ -659,8 +657,7 @@ fn attach(
                     shared: hello.shared_memory.clone().expect("mapped"),
                     regions: regions.clone(),
                 },
-                None if engine.net.is_some() => Attachment::Net,
-                None => Attachment::Nothing,
+                None => Attachment::Net,
             });
             let net = if engine.net.is_some() {
                 network.and_then(|address| dial(engine, address))
@@ -668,7 +665,7 @@ fn attach(
                 None
             };
             engine.close_registration();
-            link.startup.done(registered);
+            link.startup.registered(registered);
             Ok((regions, net))
         }
     }
@@ -703,6 +700,30 @@ pub(crate) fn regions_changed(
     )
 }
 
+pub(crate) async fn register_memory_blocking(
+    shared: Option<wire::SharedMemory>,
+    staging: Option<(u32, u64)>,
+    registrar: Arc<dyn crate::HostRegistrar + Send + Sync>,
+    context: usize,
+    approve: Option<Approve>,
+) -> Result<(
+    Option<Arc<Regions>>,
+    Option<Arc<net::Staging>>,
+    Vec<RegisteredRegion>,
+)> {
+    tokio::task::spawn_blocking(move || {
+        register_memory(
+            shared.as_ref(),
+            staging,
+            registrar.as_ref(),
+            context,
+            approve.as_ref(),
+        )
+    })
+    .await
+    .unwrap_or_else(|error| Err(Error::caused_by("pool registration task failed", error)))
+}
+
 pub(crate) fn register_memory(
     shared: Option<&wire::SharedMemory>,
     staging: Option<(u32, u64)>,
@@ -714,6 +735,7 @@ pub(crate) fn register_memory(
     Option<Arc<net::Staging>>,
     Vec<RegisteredRegion>,
 )> {
+    let started = Instant::now();
     let mut plan = Vec::new();
     if let Some(shared) = shared {
         plan.extend([
@@ -742,27 +764,44 @@ pub(crate) fn register_memory(
             .collect::<Vec<_>>()
             .join(", ");
         return Err(crate::Error::new(format!(
-            "the pool's host memory ({sizes}) was not approved ({reason}); using local tiers only"
+            "the pool's host memory ({sizes}) was not approved ({reason}); free host/device memory or reduce the manager's --memory and --staging sizes"
         )));
     }
-    let regions = shared.and_then(|shared| {
-        let mapped = Regions::map(shared).and_then(|mut regions| {
-            regions.arena.register(registrar, context)?;
-            regions.staging.register(registrar, context)?;
-            Ok(Arc::new(regions))
-        });
-        mapped
-            .inspect_err(|error| {
-                eprintln!("warning: cannot use the pool's shared memory ({error})")
-            })
-            .ok()
-    });
-    let staging = staging.and_then(|(slots, bytes)| {
-        net::Staging::new(registrar, context, slots, bytes)
-            .inspect_err(|error| eprintln!("warning: cannot use the pool's data channel ({error})"))
-            .ok()
-            .map(Arc::new)
-    });
+    let regions = shared
+        .map(|shared| {
+            Regions::map(shared)
+                .and_then(|mut regions| {
+                    regions.arena.register(registrar, context)?;
+                    regions.staging.register(registrar, context)?;
+                    Ok(Arc::new(regions))
+                })
+                .map_err(|error| {
+                    let reason = format!(
+                        "cannot register the pool's shared memory ({error}); \
+                         check shared-file access and GPU registration resources"
+                    );
+                    Error::caused_by(reason, error)
+                })
+        })
+        .transpose()?;
+    let staging = staging
+        .map(|(slots, bytes)| {
+            net::Staging::new(registrar, context, slots, bytes)
+                .map_err(|error| {
+                    let reason = format!(
+                        "cannot register the pool's data staging ({error}); \
+                         check GPU registration resources"
+                    );
+                    Error::caused_by(reason, error)
+                })
+                .map(Arc::new)
+        })
+        .transpose()?;
+    if regions.is_none() && staging.is_none() {
+        return Err(Error::new(
+            "the pool manager offered no usable shared memory or data staging; check for a different uid/gid from the manager or /dev/shm not shared between containers, and check its data listener",
+        ));
+    }
     let mut registered = Vec::new();
     if let Some(regions) = &regions {
         registered.push(registered_region(ARENA_FILE, &regions.arena));
@@ -771,6 +810,12 @@ pub(crate) fn register_memory(
     if let Some(staging) = &staging {
         registered.push(registered_region("data-staging", staging.region()));
     }
+    let bytes: usize = registered.iter().map(|region| region.bytes).sum();
+    eprintln!(
+        "registered {:.1} GiB of pool memory in {:.1} s",
+        bytes as f64 / (1u64 << 30) as f64,
+        started.elapsed().as_secs_f64()
+    );
     Ok((regions, staging, registered))
 }
 
@@ -857,6 +902,35 @@ fn flush(engine: &mut Engine, tx: &mpsc::Sender<wire::ClientMessage>) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn missing_shared_memory_names_container_access_causes() {
+        let reason = register_memory(None, None, &super::super::startup::ClosedRegistrar, 0, None)
+            .err()
+            .expect("no memory must fail startup")
+            .to_string();
+        assert!(reason.contains("different uid/gid"), "{reason}");
+        assert!(reason.contains("/dev/shm not shared"), "{reason}");
+    }
+
+    #[test]
+    fn registration_failure_is_returned_instead_of_discarding_the_staging() {
+        let reason = register_memory(
+            None,
+            Some((1, 4096)),
+            &super::super::startup::ClosedRegistrar,
+            0,
+            None,
+        )
+        .err()
+        .expect("registration failure must be returned")
+        .to_string();
+        assert!(
+            reason.contains("cannot register the pool's data staging"),
+            "{reason}"
+        );
+        assert!(reason.contains("registration is closed"), "{reason}");
+    }
+
     fn reply(
         status: wire::HelloStatus,
         protocol: u32,
@@ -893,7 +967,7 @@ mod tests {
             wire::Encryption::Plaintext,
         );
         let reason = check_hello(&mismatch, Some(wire::Encryption::Plaintext)).unwrap_err();
-        assert!(reason.contains("protocol 1") && reason.contains("local tiers"));
+        assert!(reason.contains("protocol 1") && reason.contains("matching"));
         let other = reply(wire::HelloStatus::HelloOk, 3, wire::Encryption::Plaintext);
         assert!(check_hello(&other, Some(wire::Encryption::Plaintext)).is_err());
     }

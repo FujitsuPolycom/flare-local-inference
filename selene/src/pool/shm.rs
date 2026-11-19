@@ -187,6 +187,4 @@ pub(crate) enum Attachment {
     },
     /// This process's own registered staging, for a manager on another host.
     Net,
-    /// Nothing was registered; copies are off for the life of the process.
-    Nothing,
 }

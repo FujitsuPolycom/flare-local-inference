@@ -43,7 +43,7 @@ impl Engine {
         }
         let (slots, slot_bytes) = self.net_shape(limits);
         let staging = Arc::new(Staging::new(
-            self.registrar(),
+            self.registrar().as_ref(),
             self.st.context,
             slots,
             slot_bytes,

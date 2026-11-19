@@ -218,8 +218,8 @@ impl Engine {
         self.ranks = Some(ranks);
     }
 
-    pub(crate) fn registrar(&self) -> &dyn HostRegistrar {
-        &*self.registrar
+    pub(crate) fn registrar(&self) -> Arc<dyn HostRegistrar + Send + Sync> {
+        self.registrar.clone()
     }
 
     /// Registration is over: from here every attempt to register host memory fails.
