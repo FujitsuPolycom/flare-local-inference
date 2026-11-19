@@ -327,8 +327,12 @@ impl RequestScheduler {
     }
 
     pub(super) fn prefill_work(&self, request: &LiveRequest, capacity: usize) -> usize {
+        self.prefill_work_through(request, capacity, self.estimated_checkpoint_cut(request))
+    }
+
+    fn prefill_work_through(&self, request: &LiveRequest, capacity: usize, cut: Option<usize>) -> usize {
         let start = request.consumed_tokens as usize;
-        let mut end = self.checkpoint_cut(request)
+        let mut end = cut
             .unwrap_or(request.prompt_tokens)
             .min(start.saturating_add(capacity))
             .min(request.prefill_limit());
@@ -816,7 +820,19 @@ impl RequestScheduler {
         duration_ns: u64,
         value: LaneValue,
     ) -> f64 {
-        let tokens = self.lane_tokens(r, kind, capacity);
+        self.lane_value_for_tokens(
+            r, kind, self.lane_tokens(r, kind, capacity), duration_ns, value,
+        )
+    }
+
+    fn lane_value_for_tokens(
+        &self,
+        r: &LiveRequest,
+        kind: GraphKind,
+        tokens: usize,
+        duration_ns: u64,
+        value: LaneValue,
+    ) -> f64 {
         match kind {
             GraphKind::Prefill | GraphKind::ScoredPrefill => value.prefill(
                 tokens,
@@ -1118,7 +1134,7 @@ impl RequestScheduler {
         };
         let ordinary = *candidates[..ordinary_count].iter().max_by(|a, b| compare(a, b))?;
         if ordinary.rate.duration_ns == 0 {
-            return self.available_plan(ordinary, log_scale, PlanOrigin::Discovery);
+            return self.available_plan(ordinary, &values, age_price, log_scale, PlanOrigin::Discovery);
         }
         if self.refresh_ready() {
             let mut targets: Vec<_> = self.costs.stale_keys().filter(|key| *key != ordinary.cost_key())
@@ -1137,20 +1153,37 @@ impl RequestScheduler {
                 }
             }
             if let Some((_, target, candidate)) = best {
-                return self.available_plan(candidate, log_scale, PlanOrigin::RefreshStart(target));
+                return self.available_plan(candidate, &values, age_price, log_scale, PlanOrigin::RefreshStart(target));
             }
         }
         if self.refresh.acceptance_ready() && self.speculative_fixed_width.is_none() {
             if let Some(candidate) = self.acceptance_probe(ordinary, &values, age_price) {
-                return self.available_plan(candidate, log_scale, PlanOrigin::AcceptanceStart);
+                return self.available_plan(candidate, &values, age_price, log_scale, PlanOrigin::AcceptanceStart);
             }
         }
-        self.available_plan(ordinary, log_scale, PlanOrigin::Ordinary)
+        self.available_plan(ordinary, &values, age_price, log_scale, PlanOrigin::Ordinary)
     }
 
-    fn available_plan(
-        &self, candidate: Candidate, log_scale: f64, origin: PlanOrigin,
+    pub(super) fn available_plan(
+        &self,
+        mut candidate: Candidate,
+        values: &[LaneValue; REQUEST_LANES],
+        age_price: f64,
+        log_scale: f64,
+        origin: PlanOrigin,
     ) -> Option<ScheduledPlan> {
+        if candidate.kind.is_prefill() && matches!(origin, PlanOrigin::Ordinary) {
+            let slot = bits(candidate.mask).next().unwrap();
+            let request = self.slots[slot].request.as_ref().unwrap();
+            let cut = self.checkpoint_cut(request);
+            if self.prefill_work_through(request, candidate.capacity, cut) != candidate.work {
+                if let Some(resized) =
+                    self.resize_prefill(candidate, request, cut, values[slot], age_price)
+                {
+                    candidate = resized;
+                }
+            }
+        }
         let plan = self.materialize(candidate, log_scale, origin);
         // A winning feedback operation drains the queue instead of yielding to
         // lower-value work that would keep its execution window occupied.
@@ -1161,7 +1194,35 @@ impl RequestScheduler {
         Some(plan)
     }
 
-    fn materialize(&self, candidate: Candidate, log_scale: f64, origin: PlanOrigin) -> ScheduledPlan {
+    fn resize_prefill(
+        &self,
+        mut candidate: Candidate,
+        request: &LiveRequest,
+        cut: Option<usize>,
+        value: LaneValue,
+        age_price: f64,
+    ) -> Option<Candidate> {
+        let catalog = self.prefill_catalog(candidate.kind);
+        let work = self.prefill_work_through(request, *catalog.last()?, cut);
+        let capacity = *catalog.iter().find(|&&capacity| capacity >= work)?;
+        let duration_ns = self.costs.duration(candidate.kind, candidate.batch, capacity)?;
+        candidate.capacity = capacity;
+        candidate.work = work;
+        candidate.duration_ns = duration_ns;
+        candidate.rate = ValueRate::new(
+            duration_ns,
+            self.lane_value_for_tokens(request, candidate.kind, work, duration_ns, value),
+            age_price,
+        );
+        Some(candidate)
+    }
+
+    fn materialize(
+        &self,
+        candidate: Candidate,
+        log_scale: f64,
+        origin: PlanOrigin,
+    ) -> ScheduledPlan {
         let lengths = (candidate.packed_token_capacity != 0).then(||
             candidate.host_lengths.unwrap_or_else(||
                 self.round_lengths_optimistic(candidate.mask, candidate.batch, candidate.draft_tokens,
@@ -1184,11 +1245,13 @@ impl RequestScheduler {
                 request: r.handle,
                 start_position: r.scheduled_consumed,
                 tokens: if kind.is_prefill() {
-                    if candidate.kind == GraphKind::Mixed {
-                        self.prefill_work(r, candidate.prefill_capacity)
+                    let capacity = if candidate.kind == GraphKind::Mixed {
+                        candidate.prefill_capacity
                     } else {
-                        candidate.work
-                    }
+                        candidate.capacity
+                    };
+                    let cut = self.checkpoint_cut(r);
+                    self.prefill_work_through(r, capacity, cut)
                 } else {
                     if candidate.packed_token_capacity != 0 {
                         lengths.as_ref().unwrap()[slot]

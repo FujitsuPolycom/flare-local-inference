@@ -355,7 +355,7 @@ estimated graph duration, less a duration-proportional waiting cost for requests
 that are decoding or awaiting terminal retirement. Each loaded
 prefill capacity up to `prefill_chunk_size` competes on the prompt tokens it can
 actually consume, which the next selected message boundary, atomic image spans,
-and the prompt end limit. No rule pads a logical length to the smallest covering
+and the prompt end limit. Candidate scoring does not require the smallest covering
 capacity. Among candidates of one graph kind and cohort that perform the same
 logical work, selection first discards any shape whose capacities are all at
 least as large as another candidate's and larger in at least one. An unmeasured

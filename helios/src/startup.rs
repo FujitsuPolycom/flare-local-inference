@@ -27,9 +27,22 @@ pub struct StartupProgress {
 /// Stable identifiers for core loading stages; labels are presentation text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartupStage {
-    Other, VerifyStoredData, PrepareModel, InitializeGpu, PlanCache, AllocateCache,
-    AllocateModelMemory, LoadWeights, PrepareKernels, PrepareExecution,
-    PrepareEmbeddingTables, PrepareHostPrefixCache, LoadTokenizer, StartServer, ShutdownServer,
+    Other,
+    VerifyStoredData,
+    PrepareModel,
+    InitializeGpu,
+    PlanCache,
+    AllocateCache,
+    AllocateModelMemory,
+    ReachPrefixCachePool,
+    LoadWeights,
+    PrepareKernels,
+    PrepareExecution,
+    PrepareEmbeddingTables,
+    PrepareHostPrefixCache,
+    LoadTokenizer,
+    StartServer,
+    ShutdownServer,
 }
 
 impl StartupStage {
@@ -42,6 +55,7 @@ impl StartupStage {
             Self::PlanCache => "plan_cache",
             Self::AllocateCache => "allocate_cache",
             Self::AllocateModelMemory => "allocate_model_memory",
+            Self::ReachPrefixCachePool => "reach_prefix_cache_pool",
             Self::LoadWeights => "load_weights",
             Self::PrepareKernels => "prepare_kernels",
             Self::PrepareExecution => "prepare_execution",
@@ -61,6 +75,7 @@ impl StartupStage {
             "Plan cache" => Self::PlanCache,
             "Allocate cache" => Self::AllocateCache,
             "Allocate model memory" => Self::AllocateModelMemory,
+            "Reach prefix cache pool" => Self::ReachPrefixCachePool,
             "Load weights" => Self::LoadWeights,
             "Prepare kernels" => Self::PrepareKernels,
             "Prepare execution" => Self::PrepareExecution,

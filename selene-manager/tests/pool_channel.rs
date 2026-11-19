@@ -169,6 +169,39 @@ async fn d1_a_remote_instance_stores_and_restores_a_chain_over_tcp() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn d1_a_remote_put_with_an_absent_parent_stores_and_restores_a_root() {
+    let net = net();
+    let mut tcp = net.tcp().await;
+    let mut writer = open(&mut tcp, "writer").await;
+    match channel::put_record(
+        &mut writer,
+        &Security::Plain,
+        1,
+        key(2048),
+        Some(key(1024)),
+        Damage::default(),
+    )
+    .await
+    {
+        PutResult::Stored(bytes) => assert!(bytes > 0),
+        other => panic!("put failed: {other:?}"),
+    }
+    let mut reader = open(&mut tcp, "reader").await;
+    let candidate = reader.manager_candidate(1, 2048).await;
+    let (got, granted) = restore(&mut reader, &Security::Plain, 1, &candidate, 1).await;
+    assert_eq!(granted.records.len(), 1);
+    assert_eq!(granted.records[0].first_page, 0);
+    assert_eq!(granted.total_pages, 32);
+    assert!(granted.row);
+    assert_eq!(got, expected(&[2048], 0, 0, true));
+    reader.copy_result(1, v2::CopyOutcome::CopyOk).await;
+    assert_eq!(
+        reader.claim_terminal(1).await.state,
+        v2::ClaimState::Copied as i32
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn d1_a_restore_may_start_mid_record() {
     let net = net();
     let mut tcp = net.tcp().await;

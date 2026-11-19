@@ -453,6 +453,12 @@ pub(super) async fn generate(
                 Poll::Pending
             })
             .await;
+            if encoder.tool_limit_reached
+                && !matches!(&event, GenerationEvent::Finished { .. }
+                    | GenerationEvent::AdmissionRejected(_) | GenerationEvent::Error(_))
+            {
+                continue;
+            }
             let result = match event {
                 GenerationEvent::PromptLogprobs { start, tokens, values } => encoder.prompt_logprobs(index, start, &tokens, &values),
                 GenerationEvent::LogprobToken(value) => decoders[index]
@@ -502,7 +508,7 @@ pub(super) async fn generate(
                 } => {
                     reused_total += reused_prompt_tokens;
                     let result = decoders[index]
-                        .finish(termination)
+                        .finish(if encoder.tool_limit_reached { crate::output::Termination::Cancelled } else { termination })
                         .and_then(|events| encoder.apply(index, events))
                         .and_then(|mut frames| {
                             encoder.report_reasoning_tokens(
@@ -539,6 +545,11 @@ pub(super) async fn generate(
                 }
                 GenerationEvent::AdmissionRejected(e) | GenerationEvent::Error(e) => Err(e),
             };
+            if encoder.tool_limit_reached {
+                if let Some(generation) = &generations[index] {
+                    generation.cancel();
+                }
+            }
             match result {
                 Ok(frames) => {
                     for frame in frames {

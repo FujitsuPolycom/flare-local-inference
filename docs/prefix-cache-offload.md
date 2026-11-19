@@ -273,15 +273,18 @@ A node is evictable only when its store's policy allows it: the memory store sta
 disk store evicts any unpinned node, and the composite restricts the memory
 store to durable nodes.
 
-Disk drops a non-root record's row once its only child commits, keeping the
-pages. DRAM retains these redundant rows while its free retention space exceeds
-two continuation rows. Reserved transfer intake does not count as retention
-headroom. When that threshold is reached, or an incoming record needs more
-space than is free, DRAM reclaims eligible redundant rows before evicting other
-records. It reclaims them in least-recently-used order and stops once the
-headroom is restored: a single child does not show that its parent's row is
-unused, because a request that branches from the parent leaves that row as the
-only resume point of the conversation it branched from. Readers and spills
+DRAM and disk retain redundant non-root rows while the tier's free retention
+space exceeds two continuation rows. Disk counts only committed children when
+deciding whether a row is redundant. Reserved transfer intake does not count
+as retention headroom. When that threshold is reached, or an incoming record
+needs more space than is free, the tier reclaims eligible redundant rows before
+evicting other records. It reclaims them in least-recently-used order and stops
+once the headroom is restored: a single child does not show that its parent's
+row is unused, because a request that branches from the parent leaves that row
+as the only resume point of the conversation it branched from. With a pool
+configured, disk maintenance reclaims redundant rows before it hands leaves to
+the pool. A composite spill keeps the row, so the disk tier writes the row of
+every spilled parent and truncates it later under pressure. Readers and spills
 delay row removal until their pins are released.
 DRAM releases row slots, disk truncates at the row segment, and later spills
 omit removed rows. A rewind or later fork restores its retained endpoint when
@@ -675,7 +678,10 @@ If no resource holder remains or the budget expires, admission tries recomputati
 If recomputation also lacks capacity, it waits for resource changes without
 repeated timeout retries. A successful admission clears the wait accounting so
 readmission after preemption starts a separate wait. Pooled lookups keep their
-ticket and validated history across retries and recheck GPU residency.
+validated history across retries and recheck GPU residency. Pending and ready
+tickets are retained; a ticket with no answer is replaced only when its request
+is selected for admission. First lookups start even while capacity is blocked,
+once prompt scoring is complete.
 A newly created ticket starts the inbound job through `fetch`. On inbound failure the worker cancels each
 waiter and pushes its `Incoming` to the front of the pending queue with host
 lookup disabled for that attempt.
@@ -969,7 +975,10 @@ registered staging together and exits with the error, rather than releasing
 memory its transfers may still use.
 
 Rank event framing and aggregation preserve filesystem-space pressure so a
-failed copy can defer until progress after every rank drains.
+failed copy can defer until progress after every rank drains. When ranks fail
+a restore for different reasons, a record-read failure on any rank wins, so the
+unreadable record stops being offered.
+Event result codes require every rank to run the same build.
 
 ### 2.15 Sharing through a pool
 
@@ -986,14 +995,20 @@ sees no export requests. Local and pooled instances use the same copy-at-publish
 and GPU eviction policy from section 2.10. A pooled instance reads
 its own memory and disk tiers first; the pool supplies what they lack.
 
-The loader attaches once before sizing and allocating GPU caches. The
-`Wait for prefix cache pool` startup phase waits up to ten seconds for the
-manager's first Hello. HTTP admission opens after loading and worker readiness;
-if the manager is absent, the instance starts on local tiers and never attaches
-later. Connection retries during that startup window are silent. At the deadline,
-one warning says the manager did not answer, local tiers will be used, and the
-instance will not attach later. An instance that attached at startup retries
-its attachment after a lost connection.
+The loader checks the connection and `Hello` in `Reach prefix cache pool` before
+loading weights, then attaches once before sizing and allocating GPU caches. The
+`Wait for prefix cache pool` startup phase waits up to 30 seconds for the
+manager's first Hello, matching the manager operating guide's 30 one-second
+readiness probes. Registration time grows with the manager's `--memory` and
+`--staging` sizes and does not count against the startup wait; session opening
+has a separate 40-second allowance. Configuring a pool makes attachment required:
+a timeout, refused connection, registration failure or rejected memory budget fails startup with
+the cause and corrective action. Start the manager before the instance when
+recovery exceeds that window, or remove `--prefix-cache-pool` to run with local
+tiers only. HTTP admission opens after loading and worker readiness. CUDA
+registration consumes device memory, so the client cannot attach for the first
+time after cache sizing or request admission. An instance that attached at
+startup retries its existing attachment after a lost connection.
 
 Before any CUDA registration, the complete Hello plan must fit both budgets:
 the manager's arena plus staging on this host, or the client's data staging for
@@ -1004,9 +1019,10 @@ rounded up separately for each region, as for local registered tiers. Integrated
 GPUs also share the host-byte charge once per host. The check preserves runtime
 headroom, explicit memory limits and minimum execution/KV capacity; accepted
 charges reduce the remaining cache budget. A plan exceeding either budget
-registers nothing and produces one warning naming its sizes and the reason,
-then serving uses local tiers. Failure to observe host supply also refuses the
-pool with that reason.
+registers nothing and fails startup, naming the region sizes and required versus
+available bytes. Free host/device memory or reduce the manager's `--memory` and
+`--staging` sizes. Failure to observe host supply also fails startup with that
+reason.
 
 The startup registrar requires identical CUDA and host addresses. Its owning
 registrations survive a manager restart when the region generation, paths and
@@ -1066,8 +1082,8 @@ same completion events the store produces.
   `HostStore::evictions_lost`, so the pool client announces holdings again.
 - **Lookups.** When a request reaches the worker, the worker builds its prefix
   history once and calls `begin_lookup`; the store returns a ticket whose state
-  never waits for a reply, and the ticket stays on the request while it queues.
-  Admission passes it to `lookup_for`, which answers from the local tiers and
+  never waits for a reply.
+  Admission passes the ticket to `lookup_for`, which answers from the local tiers and
   adds pool candidates only if the ticket is ready. A pending lookup holds
   admission for at most its grace period: 2 ms locally, or four measured control
   round trips for a network manager, bounded between 2 and 250 ms. After that,
@@ -1077,9 +1093,10 @@ same completion events the store produces.
   no prefill has been submitted. This rechecks history, cost and capacity through
   the same admission path, without extending the grace period. Requests with
   conditioned inputs keep their original decision because image preparation may
-  already own their slot. A request that waits on capacity keeps its ticket;
-  completion clears its capacity block, allowing another attempt without a
-  resource change. A cancelled request drops its ticket. Readmission without the
+  already own their slot. A request waiting on capacity retains a pending or
+  ready ticket; completion clears its capacity block, allowing another attempt
+  without a resource change. A ticket that will never be answered (state
+  none) is replaced only when its request is selected for admission. A cancelled request drops its ticket. Readmission without the
   store after a failed restore starts no new lookup.
 - **Restore deadlines.** Claims allow 10 seconds of setup plus transfer time at
   a conservative 8 MiB/s; the manager clamps setup to its configured limit
@@ -1098,20 +1115,26 @@ same completion events the store produces.
   progress trigger one coalesced maintenance pass per model-thread poll.
   Selection is bounded by the spill and move caps, without sorting all
   parked records. Full queues delay demotion and never discard a parked copy.
-  Refusals, submission errors and repeated handover failures keep records local,
-  release selection and retry only after manager progress or a short backoff.
+  Invalid or oversized puts discard the source. Budget or in-flight refusals
+  retain selection for one retry after a 50 ms backoff, then discard the source
+  on either refusal. Pool events do not shorten this backoff.
+  Other refusals, submission errors and repeated handover failures keep records
+  local, release selection and retry only after manager progress or a short backoff.
   Manager loss releases waiting selections; started moves keep their pins until
   their drained terminal event. While a manager is unavailable or busy, local
   disk LRU makes room; with DRAM alone, durable DRAM LRU is the local end.
   Local mode uses the same parked/spill path and LRU unlink at the end of its
   chain, with the same completed-maintenance budget accounting. Only end-of-chain eviction,
-  expiry, infeasible footprints (`Oversize`) and terminal disk I/O errors discard data.
+  expiry, invalid or oversized puts, repeated budget or in-flight refusals and
+  terminal disk I/O errors discard data.
   A host offer announces the GPU holding and starts its first host copy;
   GPU eviction sends its eviction notice and never starts a late copy.
 - **Retention metrics.** `flare_host_cache_held_total{tier}` counts record
   holding events. `flare_host_cache_dropped_total{tier,reason}` counts local
-  end-of-chain, oversize and terminal I/O drops (`end_of_chain`, `oversize`,
-  `io_error`). Tiers are `dram` and `nvme`. The `parked_records` count is
+  end-of-chain, oversized publication, terminal I/O and pool refusal drops
+  (`end_of_chain`, `oversize`, `io_error`, `pool_refused`). Pool refusal drops
+  include invalid or oversized puts and budget or in-flight refusals after one
+  retry. Tiers are `dram` and `nvme`. The `parked_records` count is
   exported as `flare_host_cache_parked_records`, a gauge.
   `flare_host_cache_store_skipped_total` counts publications that started no
   copy, including duplicates and retries.

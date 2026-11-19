@@ -45,6 +45,8 @@ pub struct Config {
     pub faults: crate::disk::Faults,
     #[cfg(any(test, feature = "test-support"))]
     pub limits: flare_selene::shared::Limits,
+    #[cfg(any(test, feature = "test-support"))]
+    pub h2_keepalive: Option<(std::time::Duration, std::time::Duration)>,
 }
 
 impl Default for Config {
@@ -95,6 +97,8 @@ impl Config {
             faults: Default::default(),
             #[cfg(any(test, feature = "test-support"))]
             limits: Default::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            h2_keepalive: None,
         }
     }
 

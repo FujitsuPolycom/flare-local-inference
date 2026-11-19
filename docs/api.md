@@ -356,7 +356,8 @@ deferred by the GPU headroom check before acquiring checkpoint pins.
 
 Host retention also exports `flare_host_cache_held_total{tier}` and
 `flare_host_cache_dropped_total{tier,reason}`, with `dram` and `nvme` tiers and
-`end_of_chain`, `oversize`, `io_error` drop reasons. The gauge
+`end_of_chain`, `oversize`, `io_error`, and `pool_refused` (pooled deployments only)
+drop reasons. The gauge
 `flare_host_cache_parked_records` counts complete DRAM copies awaiting disk
 writes. `flare_host_cache_store_skipped_total` includes duplicates and
 retries; it is not a dropped-record counter. Local checkpoint pool capacity is
@@ -401,8 +402,14 @@ its output limit; recognized but incomplete calls at natural completion are erro
 DeepSeek reasoning and both DSML tool syntaxes use the pinned official
 `deepseek-recipe` state machine. Helios adapts its actions into the same neutral
 events, validates nonempty tool names and JSON objects with nonempty, unique
-argument names, and publishes each call when its arguments complete. Closing the
-outer calls block ends parsed output; subsequent generated text is discarded.
+argument names, and publishes each call when its arguments complete. A parameter
+marked `string="false"` keeps its JSON type if its text decodes as one value
+inside the argument object. If decoding fails, Helios retains the original
+text as a JSON string. This includes valid JSON exceeding 126 levels of array
+or object nesting within the parameter. The combined size of the UTF-8 tool
+name and complete JSON argument object is limited to 1 MiB, including escapes
+and delimiters. Helios rejects a larger call before publishing it. Closing the
+outer calls block ends parsed output and discards subsequent generated text.
 The official parser owns markup recognition, including its tolerance of omitted
 or partial tags. Structured answers become verbatim when ordinary answer content
 begins, preserving scalar JSON, Lark output, and markup inside string values.
@@ -472,7 +479,7 @@ Named selection presents only the selected tool definition to the model, retaini
 conversation history and adding no instructions or decoding constraints.
 Buffered and streaming responses omit ordinary assistant answer text while
 preserving reasoning and tool arguments. Usage includes all generated tokens,
-including omitted answer text. Every emitted call must target the selected tool,
+including omitted answer text. Every returned call must target the selected tool,
 and at least one completed call is required. A call to another tool fails before
 that call is emitted. Missing and incomplete calls fail as in required mode.
 
@@ -481,8 +488,11 @@ undeclared tools are returned with their generated names and arguments in both
 buffered and streaming responses across all three chat APIs. Clients can repair
 or reject these calls and provide feedback in a subsequent turn. Declared schemas
 guide argument conversion where the tool syntax requires it; unknown tools have
-no schema for that conversion. Malformed envelopes, empty names, and invalid
-argument syntax still fail parsing. Required mode needs at least one declared
+no schema for that conversion. Malformed envelopes and empty names still fail
+parsing. Tagged parameters, as in GLM, retain malformed JSON values as strings.
+DeepSeek retains the original text of a `string="false"` parameter that cannot
+be decoded inside the argument object. Invalid JSON in a whole argument document
+or a typed XTML value fails parsing. Required mode needs at least one declared
 tool, adds an instruction to call a tool to the prompt, and validates that
 generation produced at least one
 completed call to a declared tool. Sampling is unchanged; no calls are fabricated
@@ -504,10 +514,22 @@ bounded llguidance compiler as structured output.
 
 `parallel_tool_calls: false` permits at most one tool call per response.
 Anthropic's `tool_choice.disable_parallel_tool_use: true` applies the same limit.
-The output validator fails the response when a second call begins, before emitting
-that call. Buffered requests receive HTTP 500; streams receive a terminal error
-and may already have delivered the first call. Combined with required mode, a
-successful response contains exactly one call. Generation uses ordinary sampling.
+When a second call begins, the server discards it and cancels further generation.
+The response completes normally with the first call and usage: Chat uses
+`finish_reason: "tool_calls"`, Messages uses `stop_reason: "tool_use"`, and
+Responses emits a completed response containing the first tool call.
+This applies to buffered and streamed requests. Combined with required mode, a
+successful response contains exactly one call. The limit is checked before
+validating the discarded call's name. Generation uses ordinary sampling.
+Usage counts every generated token, including discarded output. Detection follows
+the HTTP reader's pace: a slow or paused client delays cancellation while the
+worker continues decoding. Cancellation is processed at submission boundaries;
+already queued work retains its normal fences. If the worker processes
+cancellation before natural completion, runtime metrics count the request as
+cancelled rather than completed, despite the successful API response.
+Raw token IDs and Chat logprobs published before the parser recognizes the second
+call can include its opening tokens. Buffered token IDs can contain fewer entries
+than the generated-token usage count.
 
 Parallel tool results with unique IDs matching the preceding assistant's calls
 are normalized to call order before chat-template rendering. Each result's text

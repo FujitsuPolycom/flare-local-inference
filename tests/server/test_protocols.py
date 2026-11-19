@@ -439,7 +439,7 @@ def test_required_tool_choice_missing_call_is_a_terminal_error(clients, streamin
 
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("protocol", ["chat/completions", "messages", "responses"])
-def test_multiple_tool_calls_fail_when_parallel_calls_are_disabled(clients, protocol, streaming):
+def test_multiple_tool_calls_complete_with_one_when_parallel_calls_are_disabled(clients, protocol, streaming):
     _, _, http = clients
     history = [{"role": "user", "content": (
         "The queries alpha and beta are independent. Call lookup for BOTH queries in parallel "
@@ -469,33 +469,53 @@ def test_multiple_tool_calls_fail_when_parallel_calls_are_disabled(clients, prot
         body["tool_choice"] = {"type": "auto", "disable_parallel_tool_use": True}
     else:
         body["parallel_tool_calls"] = False
+    if protocol == "chat/completions" and streaming:
+        body["stream_options"] = {"include_usage": True}
     response = http.post("/v1/" + protocol, json={**body, "stream": streaming}, headers=headers)
-    if not streaming:
-        assert response.status_code == 500
-        assert "more than one tool call" in response.json()["error"]["message"]
-    else:
-        response.raise_for_status()
-        assert "[DONE]" not in response.text
-        data = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+    assert response.status_code == 200
+    if streaming:
+        data = [json.loads(line[6:]) for line in response.text.splitlines()
+                if line.startswith("data: ") and line[6:] != "[DONE]"]
+        assert all("error" not in event for event in data)
         terminal = data[-1]
         if protocol == "responses":
-            assert terminal["type"] == "response.failed"
-            error = terminal["response"]["error"]
-            assert not any(e["type"] in {"response.completed", "response.incomplete"} for e in data)
+            assert terminal["type"] == "response.completed"
+            output = terminal["response"]
+            assert output["status"] == "completed"
             calls = [e for e in data if e["type"] == "response.output_item.added"
                      and e["item"]["type"] == "function_call"]
+            assert len([b for b in output["output"] if b["type"] == "function_call"]) == 1
+            usage = output["usage"]
         elif protocol == "messages":
-            error = terminal["error"]
-            assert not any(e.get("type") == "message_stop" for e in data)
-            calls = [e for e in data if e.get("type") == "content_block_start"
+            assert terminal["type"] == "message_stop"
+            delta = next(e for e in data if e["type"] == "message_delta")
+            assert delta["delta"]["stop_reason"] == "tool_use"
+            assert delta["delta"]["stop_sequence"] is None
+            calls = [e for e in data if e["type"] == "content_block_start"
                      and e["content_block"]["type"] == "tool_use"]
+            usage = delta["usage"]
         else:
-            error = terminal["error"]
-            assert not any(c.get("finish_reason") for e in data for c in e.get("choices", []))
+            assert response.text.endswith("data: [DONE]\n\n")
+            assert any(c.get("finish_reason") == "tool_calls"
+                       for e in data for c in e.get("choices", []))
             calls = [call for e in data for c in e.get("choices", [])
                      for call in c.get("delta", {}).get("tool_calls", []) if call.get("id")]
-        assert "more than one tool call" in error["message"]
-        assert len(calls) <= 1
+            usage = terminal["usage"]
+    else:
+        output = response.json()
+        usage = output["usage"]
+        if protocol == "chat/completions":
+            assert output["choices"][0]["finish_reason"] == "tool_calls"
+            calls = output["choices"][0]["message"]["tool_calls"]
+        elif protocol == "messages":
+            assert output["stop_reason"] == "tool_use"
+            assert output["stop_sequence"] is None
+            calls = [b for b in output["content"] if b["type"] == "tool_use"]
+        else:
+            assert output["status"] == "completed"
+            calls = [b for b in output["output"] if b["type"] == "function_call"]
+    assert len(calls) == 1
+    assert usage["completion_tokens" if protocol == "chat/completions" else "output_tokens"] > 0
 
 
 def test_messages_inline_system_text_and_empty_controls(clients):

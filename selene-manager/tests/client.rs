@@ -748,7 +748,7 @@ fn a_restore_through_the_real_manager_still_works_after_the_manager_restarts() {
 }
 
 fn counted(manager: &Manager, registrar: &Arc<CountingRegistrar>, wait: Duration) -> PoolClient {
-    counted_approving(manager, registrar, wait, None)
+    counted_approving(manager, registrar, wait, None).unwrap()
 }
 
 fn counted_approving(
@@ -756,7 +756,7 @@ fn counted_approving(
     registrar: &Arc<CountingRegistrar>,
     wait: Duration,
     approve: Option<flare_selene::pool::Approve>,
-) -> PoolClient {
+) -> Result<PoolClient> {
     let (copier, _gpu) = SimulatedGpu::shared(&geo()).unwrap();
     let mut config = config(manager, 1);
     config.approve = approve;
@@ -768,7 +768,78 @@ fn counted_approving(
         flare_selene::testing::Roots::System,
         wait,
     )
-    .unwrap()
+}
+
+struct SlowRegistrar {
+    counting: CountingRegistrar,
+    runtime_progress: AtomicBool,
+}
+
+impl SlowRegistrar {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            counting: CountingRegistrar::default(),
+            runtime_progress: AtomicBool::new(false),
+        })
+    }
+}
+
+impl flare_selene::HostRegistrar for SlowRegistrar {
+    fn register(
+        &self,
+        context: usize,
+        address: usize,
+        bytes: usize,
+    ) -> Result<Box<dyn flare_selene::Registration>> {
+        if self.counting.calls.lock().unwrap().is_empty() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let _ = tx.send(());
+            });
+            thread::sleep(Duration::from_secs(1));
+            self.runtime_progress
+                .store(rx.try_recv().is_ok(), Ordering::SeqCst);
+        }
+        flare_selene::HostRegistrar::register(&self.counting, context, address, bytes)
+    }
+
+    fn map_split(
+        &self,
+        requests: &[(usize, i32, usize)],
+    ) -> Result<Box<dyn flare_selene::SplitMapping>> {
+        flare_selene::HostRegistrar::map_split(&self.counting, requests)
+    }
+}
+
+fn short_keepalive_manager() -> Manager {
+    let mut manager = Manager::new();
+    manager.config.h2_keepalive = Some((Duration::from_millis(100), Duration::from_millis(200)));
+    manager.run();
+    manager
+}
+
+#[test]
+fn slow_registration_keeps_the_pool_connection_alive_until_open() {
+    let manager = short_keepalive_manager();
+    let registrar = SlowRegistrar::new();
+    let (copier, _gpu) = SimulatedGpu::shared(&geo()).unwrap();
+    let mut client = PoolClient::start(
+        config(&manager, 1),
+        None,
+        copier,
+        registrar.clone(),
+        flare_selene::pool::Roots::System,
+        STARTUP_WAIT,
+    )
+    .unwrap();
+    wait("the pool session to be ready", || {
+        client.status() == PoolStatus::Ready
+    });
+    assert_eq!(client.registered_regions().len(), 2);
+    assert_eq!(registrar.counting.calls.lock().unwrap().len(), 2);
+    assert!(registrar.runtime_progress.load(Ordering::SeqCst));
+    client.close().unwrap();
 }
 
 fn inode(manager: &Manager, file: &str) -> u64 {
@@ -837,7 +908,7 @@ fn the_plan_arrives_whole_before_any_registration_and_a_reconnect_asks_nothing()
     let mut manager = Manager::start();
     let registrar = Arc::new(CountingRegistrar::default());
     let (approve, seen) = recording(&registrar, Ok(()));
-    let client = counted_approving(&manager, &registrar, STARTUP_WAIT, Some(approve));
+    let client = counted_approving(&manager, &registrar, STARTUP_WAIT, Some(approve)).unwrap();
     {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
@@ -868,30 +939,24 @@ fn the_plan_arrives_whole_before_any_registration_and_a_reconnect_asks_nothing()
 }
 
 #[test]
-fn a_rejected_plan_registers_nothing_and_turns_the_pool_off() {
+fn a_rejected_plan_fails_startup_without_registration() {
     let manager = Manager::start();
     let registrar = Arc::new(CountingRegistrar::default());
     let (approve, seen) = recording(&registrar, Err("over the host budget".into()));
-    let mut client = counted_approving(&manager, &registrar, STARTUP_WAIT, Some(approve));
+    let reason = counted_approving(&manager, &registrar, STARTUP_WAIT, Some(approve))
+        .err()
+        .expect("approval rejection must fail startup")
+        .to_string();
+    for text in [
+        "over the host budget",
+        "arena",
+        "staging",
+        "remove --prefix-cache-pool",
+    ] {
+        assert!(reason.contains(text), "{reason}");
+    }
     assert_eq!(seen.lock().unwrap().len(), 1);
     assert!(registrar.calls.lock().unwrap().is_empty());
-    assert!(client.registered_regions().is_empty());
-    // The thread answers startup first and sets the status just after.
-    wait("the pool to be disabled", || {
-        matches!(client.status(), PoolStatus::Disabled(_))
-    });
-    let PoolStatus::Disabled(reason) = client.status() else {
-        panic!("{:?}", client.status());
-    };
-    assert!(
-        reason.contains("over the host budget")
-            && reason.contains("arena")
-            && reason.contains("staging"),
-        "{reason}"
-    );
-    assert_eq!(seen.lock().unwrap().len(), 1);
-    assert!(registrar.calls.lock().unwrap().is_empty());
-    client.close().unwrap();
 }
 
 #[test]
@@ -925,46 +990,128 @@ fn a_changed_staging_size_turns_the_pool_off_for_a_running_instance() {
 }
 
 #[test]
-fn a_manager_that_is_not_there_at_startup_is_never_attached_to_later() {
-    const CHILD: &str = "FLARE_TEST_POOL_STARTUP_WARNING";
-    if std::env::var_os(CHILD).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "a_manager_that_is_not_there_at_startup_is_never_attached_to_later",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .output()
-            .unwrap();
-        let stderr = String::from_utf8(output.stderr).unwrap();
-        assert!(output.status.success(), "{stderr}");
-        assert_eq!(stderr.matches("warning:").count(), 1, "{stderr}");
-        assert!(
-            stderr.contains("did not answer within 400ms of startup"),
-            "{stderr}"
-        );
-        assert!(stderr.contains("local tiers only"), "{stderr}");
-        assert!(stderr.contains("will not attach to the pool later"), "{stderr}");
-        return;
+fn pool_thread_unwind_during_registration_fails_startup() {
+    use flare_selene::{HostRegistrar, Registration, SplitMapping};
+    struct PanickingRegistrar;
+    impl HostRegistrar for PanickingRegistrar {
+        fn register(
+            &self,
+            context: usize,
+            address: usize,
+            bytes: usize,
+        ) -> Result<Box<dyn Registration>> {
+            OkRegistrar.register(context, address, bytes)
+        }
+        fn map_split(&self, requests: &[(usize, i32, usize)]) -> Result<Box<dyn SplitMapping>> {
+            OkRegistrar.map_split(requests)
+        }
     }
-    let mut manager = Manager::start();
-    manager.stop();
-    let _ = std::fs::remove_file(&manager.config.socket);
-    let registrar = Arc::new(CountingRegistrar::default());
-    let started = Instant::now();
-    let mut client = counted(&manager, &registrar, Duration::from_millis(400));
-    assert!(started.elapsed() < Duration::from_secs(5));
-    assert!(client.registered_regions().is_empty());
-    let PoolStatus::Disabled(reason) = client.status() else {
-        panic!("{:?}", client.status());
-    };
-    assert!(reason.contains("local tiers only"), "{reason}");
+    impl Drop for PanickingRegistrar {
+        fn drop(&mut self) {
+            panic!("registrar owner dropped before startup registration completed");
+        }
+    }
+    let manager = Manager::start();
+    for rank in [false, true] {
+        let config = config(&manager, 1);
+        let (copier, _gpu) = SimulatedGpu::shared(&geo()).unwrap();
+        let (zero, peer) = flare_selene::pool::rank::memory_links();
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = if rank {
+                let geometry = vec![geo()[0].clone(); 2];
+                flare_selene::pool::RankAgent::start(flare_selene::pool::AgentConfig {
+                    address: config.address,
+                    ca: None,
+                    scope: Scope::new([7; 32], fingerprint(&geometry), &geometry).unwrap(),
+                    rank: 1,
+                    world: 2,
+                    link: peer,
+                    copier,
+                    registrar: Arc::new(PanickingRegistrar),
+                    registration_context: 0,
+                    gpu_uuid: [3; 16],
+                    records: None,
+                    approve: None,
+                })
+                .map(|_| ())
+            } else {
+                PoolClient::start(
+                    config,
+                    None,
+                    copier,
+                    Arc::new(PanickingRegistrar),
+                    flare_selene::pool::Roots::System,
+                    STARTUP_WAIT,
+                )
+                .map(|_| ())
+            };
+            send.send(result).unwrap();
+        });
+        let reason = receive
+            .recv_timeout(Duration::from_secs(2))
+            .expect("pool thread unwind must wake startup")
+            .expect_err("a panicking pool thread must fail startup")
+            .to_string();
+        assert!(
+            reason.contains("pool thread stopped before attachment completed"),
+            "{reason}"
+        );
+        worker.join().unwrap();
+        drop(zero);
+    }
+}
 
-    // The manager comes up after the instance gave up on it.
+#[test]
+fn the_weight_load_probe_reaches_hello_without_opening_a_session() {
+    let mut manager = Manager::new();
+    let options = flare_selene::pool::PoolOptions {
+        address: manager.address(),
+        ca: None,
+    };
+    let reason = options
+        .reach(Duration::from_millis(20))
+        .unwrap_err()
+        .to_string();
+    assert!(reason.contains("did not answer within 20ms"), "{reason}");
+    assert!(reason.contains("No such file or directory"), "{reason}");
+    manager.config.metrics = Some(free_address());
     manager.run();
-    assert!(matches!(client.status(), PoolStatus::Disabled(_)));
-    client.close().unwrap();
+    options.reach(Duration::from_secs(2)).unwrap();
+    wait("Hello without a session", || {
+        manager
+            .metrics()
+            .lines()
+            .any(|line| line == "selene_pool_sessions 0")
+    });
+}
+
+#[test]
+fn an_absent_manager_returns_an_actionable_startup_error() {
+    let manager = Manager::new();
+    let registrar = Arc::new(CountingRegistrar::default());
+    let (copier, _) = SimulatedGpu::shared(&geo()).unwrap();
+    let started = Instant::now();
+    let reason = PoolClient::start(
+        config(&manager, 1),
+        None,
+        copier,
+        registrar.clone(),
+        flare_selene::testing::Roots::System,
+        Duration::from_millis(400),
+    )
+    .err()
+    .expect("a configured pool must attach at startup")
+    .to_string();
+    assert!(started.elapsed() < Duration::from_secs(5));
+    for text in [
+        "did not answer within 400ms",
+        "No such file or directory",
+        "start the manager before the instance",
+        "remove --prefix-cache-pool",
+    ] {
+        assert!(reason.contains(text), "{reason}");
+    }
     assert!(registrar.calls.lock().unwrap().is_empty());
 }
 

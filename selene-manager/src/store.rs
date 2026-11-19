@@ -1187,25 +1187,6 @@ impl Store {
             self.reject_put(&events, proto::Reason::Present as u8);
             return;
         }
-        if self.sessions[&connection].pid == 0
-            && request.published_parent.is_some_and(|parent| {
-                !self.namespaces[&id]
-                    .tree
-                    .node(&parent)
-                    .is_some_and(|node| node.row)
-            })
-        {
-            // A remote session names the exact ancestor its record continues, and the writer
-            // stores that ancestor first. A local Put only hints at its parent and falls back
-            // to a root below when the hint is unusable.
-            self.metrics.puts_error += 1;
-            self.reject_put_detail(
-                &events,
-                proto::Reason::Invalid as u8,
-                "published parent is not stored",
-            );
-            return;
-        }
         let initial_bucket = match &initial_old {
             Some(node) => {
                 if node.bucket != request.bucket {
@@ -4732,7 +4713,7 @@ mod tests {
     }
 
     #[test]
-    fn a_put_naming_an_absent_parent_asks_for_ancestry_repair() {
+    fn a_pid_zero_put_with_an_absent_parent_falls_back_to_a_root() {
         let (mut store, directory) = store("parent");
         let value = descriptor();
         let id = store.register_namespace(value.clone()).unwrap();
@@ -4763,12 +4744,14 @@ mod tests {
         });
         store.pump();
         match receiver.try_recv().unwrap().unwrap() {
-            PutAnswer::Refused(refused) => assert!(
-                refused.detail.contains("published parent"),
-                "unexpected detail: {}",
-                refused.detail
-            ),
-            _ => panic!("expected a refusal"),
+            PutAnswer::Accept(accept) => {
+                assert!(accept.parent.is_none());
+                assert_eq!(accept.first_page, 0);
+                let header = crate::record::new_header(&value, key, None, [0; 16], 2).unwrap();
+                assert_eq!(accept.record_bytes, header.length_with_row());
+            }
+            PutAnswer::Refused(refused) => panic!("expected a root accept: {}", refused.detail),
+            _ => panic!("expected an accept"),
         }
         drop(store);
         let _ = fs::remove_dir_all(directory);

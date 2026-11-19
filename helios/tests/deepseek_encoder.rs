@@ -486,7 +486,7 @@ fn legacy_settings_keep_jinja() {
     assert_eq!(settings.image_placeholder_token_id, None);
     assert!(
         serde_json::from_value::<FrontendSettings>(
-            json!({"tokenizer":{},"eos_token_ids":[],"prompt_encoder":3})
+            json!({"tokenizer":{},"eos_token_ids":[],"prompt_encoder":-1})
         )
         .is_err()
     );
@@ -513,8 +513,14 @@ fn legacy_templates_receive_image_blocks_and_return_original_sources() {
         ["data:image/png;base64,A", "data:image/png;base64,B"]
     );
     let rendered: Value = serde_json::from_str(&prompt.text).unwrap();
-    assert_eq!(rendered[0]["content"][1], json!({"type":"image"}));
-    assert_eq!(rendered[0]["content"][2], json!({"type":"image"}));
+    assert_eq!(
+        rendered[0]["content"][1],
+        json!({"type":"image","image_index":0})
+    );
+    assert_eq!(
+        rendered[0]["content"][2],
+        json!({"type":"image","image_index":1})
+    );
 }
 
 #[test]

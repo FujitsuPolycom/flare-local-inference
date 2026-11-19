@@ -111,8 +111,8 @@ pub struct AgentConfig {
     pub records: Option<Box<dyn RankRecords>>,
     /// Called once at startup with everything this agent is about to register (the manager's
     /// shared files and/or its own data-channel staging), after the manager's first Hello and
-    /// before any registration. `Err(reason)` registers nothing: the agent is disabled with one
-    /// warning, and rank 0 turns the pool off for every rank. `None` approves.
+    /// before any registration. `Err(reason)` registers nothing and fails startup.
+    /// `None` approves.
     pub approve: Option<Approve>,
 }
 
@@ -126,7 +126,7 @@ pub struct RankAgent {
 }
 
 impl RankAgent {
-    /// Start the agent's thread and return at once.
+    /// Start the agent's thread and wait for registration and manager attachment.
     pub fn start(config: AgentConfig) -> Result<RankAgent> {
         Self::start_with(config, super::net::Roots::System)
     }
@@ -192,35 +192,30 @@ impl RankAgent {
             .name("selene-rank-agent".into())
             .spawn(move || run(agent))
             .map_err(|e| Error::caused_by("cannot start the rank agent thread", e))?;
-        let registered = match startup.wait(super::client::STARTUP_WAIT) {
-            Ok(registered) => registered,
-            Err(timed_out) => {
-                if timed_out {
-                    let reason = format!(
-                        "the pool manager did not answer within {:?} of startup; this rank \
-                         will not attach to the pool later (start the manager before the instance)",
-                        super::client::STARTUP_WAIT
-                    );
-                    eprintln!("warning: rank {}: {reason}", config.rank);
-                    *status.lock().unwrap() = PoolStatus::Disabled(reason);
-                }
-                Vec::new()
-            }
-        };
-        Ok(RankAgent {
+        let mut agent = RankAgent {
             stop,
             wake,
             status,
             thread: Some(thread),
-            registered,
-        })
+            registered: Vec::new(),
+        };
+        agent.registered = match startup.wait_with_opening(super::client::STARTUP_WAIT, None) {
+            Ok(registered) => registered,
+            Err(error) => {
+                if let Err(close_error) = agent.close() {
+                    eprintln!("warning: cannot close the failed rank agent: {close_error}");
+                }
+                return Err(error);
+            }
+        };
+        Ok(agent)
     }
 
     pub fn status(&self) -> PoolStatus {
         self.status.lock().unwrap().clone()
     }
 
-    /// The ranges registered at startup. Empty when the agent did not attach.
+    /// The ranges registered before the manager accepted this agent.
     pub fn registered_regions(&self) -> &[RegisteredRegion] {
         &self.registered
     }
@@ -339,12 +334,14 @@ struct Agent {
 }
 
 fn run(mut agent: Agent) -> Result<()> {
+    let _startup = super::startup::StartupGuard(agent.startup.clone());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| Error::caused_by("cannot start the rank agent runtime", e))?;
     runtime.block_on(async {
         let result = agent.serve().await;
+        agent.startup.close();
         agent.finish().await;
         let status = agent.status.clone();
         let mut status = status.lock().unwrap();
@@ -358,6 +355,7 @@ fn run(mut agent: Agent) -> Result<()> {
 impl Agent {
     fn set_status(&mut self, status: PoolStatus) {
         if let PoolStatus::Disabled(reason) = &status {
+            self.startup.fail(reason.clone());
             // All ranks use the pool or none do: rank 0 hears it.
             self.end.send_rank(Msg::Disabled {
                 reason: reason.clone(),
@@ -380,18 +378,26 @@ impl Agent {
         let mut backoff = FIRST_BACKOFF;
         let mut warned = false;
         loop {
-            if self.stopping() || self.end.failed() {
+            if self.stopping() {
+                return Ok(());
+            }
+            if self.end.failed() {
+                self.startup
+                    .fail("the rank links closed before pool attachment completed");
                 return Ok(());
             }
             let started = Instant::now();
             match self.attempt().await {
                 Attempt::Disabled(why) => {
-                    eprintln!("warning: rank {}: {why}", self.rank);
+                    if self.startup.is_open() {
+                        eprintln!("warning: rank {}: {why}", self.rank);
+                    }
                     self.set_status(PoolStatus::Disabled(why));
                     return Ok(());
                 }
                 Attempt::Retry(why) => {
-                    if !warned {
+                    self.startup.retry(why.clone());
+                    if self.startup.is_open() && !warned {
                         warned = true;
                         eprintln!(
                             "warning: rank {}: cannot attach to the pool manager ({why}); retrying the existing attachment",
@@ -416,7 +422,12 @@ impl Agent {
                     reason: "the manager attachment ended".into(),
                 });
             }
-            if self.stopping() || self.end.failed() {
+            if self.stopping() {
+                return Ok(());
+            }
+            if self.end.failed() {
+                self.startup
+                    .fail("the rank links closed before pool attachment completed");
                 return Ok(());
             }
             self.set_status(PoolStatus::Local);
@@ -508,8 +519,9 @@ impl Agent {
                         return true;
                     }
                     Incoming::Message(Msg::Close) => {
-                        *self.status.lock().unwrap() =
-                            PoolStatus::Disabled("rank 0 is not using the pool".into());
+                        self.set_status(PoolStatus::Disabled(
+                            "rank 0 is not using the pool".into(),
+                        ));
                         return false;
                     }
                     Incoming::Message(_) => {}
@@ -541,7 +553,12 @@ impl Agent {
         let link = self.link();
         let mut backoff = FIRST_BACKOFF;
         loop {
-            if self.stopping() || self.end.failed() {
+            if self.stopping() {
+                return false;
+            }
+            if self.end.failed() {
+                self.startup
+                    .fail("the rank links closed before pool attachment completed");
                 return false;
             }
             if self.startup.is_closed() {
@@ -557,19 +574,18 @@ impl Agent {
                     }
                     let staging = (!hello.data_transports.is_empty())
                         .then(|| (self.staging_slots(&hello), self.slot_bytes(&hello)));
-                    let prepared = conn::register_memory(
-                        hello.shared_memory.as_ref(),
+                    let prepared = conn::register_memory_blocking(
+                        hello.shared_memory.clone(),
                         staging,
-                        &*self.registrar,
+                        self.registrar.clone(),
                         self.context,
-                        self.approve.as_ref(),
-                    );
+                        self.approve.clone(),
+                    )
+                    .await;
                     let (regions, staging, registered) = match prepared {
                         Ok(prepared) => prepared,
                         Err(error) => {
                             self.registrar = Arc::new(super::startup::ClosedRegistrar);
-                            self.startup.done(Vec::new());
-                            eprintln!("warning: rank {}: {error}", self.rank);
                             self.set_status(PoolStatus::Disabled(error.to_string()));
                             return false;
                         }
@@ -578,22 +594,22 @@ impl Agent {
                         .map(|regions| (hello.shared_memory.clone().expect("mapped"), regions));
                     self.staging = staging;
                     self.registrar = Arc::new(super::startup::ClosedRegistrar);
-                    self.startup.done(registered);
+                    self.startup.registered(registered);
                     return true;
                 }
                 Err(Attempt::Disabled(why)) => {
-                    self.startup.close();
-                    eprintln!("warning: rank {}: {why}", self.rank);
                     self.set_status(PoolStatus::Disabled(why));
                     return false;
                 }
-                Err(_) => {
+                Err(Attempt::Retry(why)) => {
+                    self.startup.retry(why);
                     let until = Instant::now() + backoff;
                     while Instant::now() < until && !self.stopping() {
                         let _ = tokio::time::timeout(IDLE_TICK, self.wake.notified()).await;
                     }
                     backoff = (backoff * 2).min(MAX_BACKOFF);
                 }
+                Err(Attempt::Ended) => return false,
             }
         }
     }
@@ -684,6 +700,7 @@ impl Agent {
             tx,
         });
         self.set_status(PoolStatus::Ready);
+        self.startup.opened();
         self.deliver_owed();
         self.end.send_rank(Msg::Attached {
             manager_incarnation: hello.manager_incarnation,

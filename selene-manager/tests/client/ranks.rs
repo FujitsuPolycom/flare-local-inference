@@ -169,7 +169,7 @@ struct Faults {
     /// listed has a wrong persisted checksum in its files.
     host: Option<(usize, Option<usize>)>,
     /// What the peers' agents register through.
-    registrar: Option<Arc<super::CountingRegistrar>>,
+    registrar: Option<Arc<dyn flare_selene::HostRegistrar + Send + Sync>>,
     /// The peers' agents ask this before registering.
     approve: Option<flare_selene::pool::Approve>,
 }
@@ -1335,6 +1335,25 @@ fn three_ranks_mixing_shared_memory_and_channels_spill_their_files_slices() {
 }
 
 #[test]
+fn slow_agent_registration_keeps_its_runtime_responsive_and_attaches() {
+    let manager = super::short_keepalive_manager();
+    let registrar = super::SlowRegistrar::new();
+    let faults = Faults {
+        registrar: Some(registrar.clone()),
+        ..Default::default()
+    };
+    let requester = instance_with(&manager, 2, &[Reach::Local, Reach::Local], 2, &faults);
+    requester.ready();
+    wait("the agent to attach", || {
+        requester.agents[0].status() == PoolStatus::Ready
+    });
+    assert_eq!(requester.agents[0].registered_regions().len(), 2);
+    assert_eq!(registrar.counting.calls.lock().unwrap().len(), 2);
+    assert!(registrar.runtime_progress.load(Ordering::SeqCst));
+    requester.close();
+}
+
+#[test]
 fn an_agent_registers_at_startup_and_never_again_across_a_manager_restart() {
     let mut manager = Manager::start();
     let counting = Arc::new(super::CountingRegistrar::default());
@@ -1396,30 +1415,181 @@ fn an_agent_is_asked_about_its_whole_plan_before_it_registers_anything() {
 }
 
 #[test]
-fn an_agent_whose_plan_is_refused_registers_nothing_and_turns_the_pool_off_on_every_rank() {
+fn an_agent_waits_for_rank_zero_to_open_late() {
     let manager = Manager::start();
+    let (zero, peer) = memory_links();
     let counting = Arc::new(super::CountingRegistrar::default());
-    let faults = Faults {
-        registrar: Some(counting.clone()),
-        approve: Some(Arc::new(|_: &[flare_selene::pool::PlannedRegion]| {
-            Err("over the memory budget".to_string())
-        })),
-        ..Default::default()
-    };
-    let requester = instance_with(&manager, 2, &[Reach::Local, Reach::Local], 2, &faults);
-    wait("the agent to be disabled", || {
-        matches!(requester.agents[0].status(), PoolStatus::Disabled(_))
+    let registered = counting.clone();
+    let address = PoolAddress::Unix(manager.config.socket.clone());
+    let (copier, _gpu1) = SimulatedGpu::shared(&[local()]).unwrap();
+    let agent = thread::spawn(move || {
+        RankAgent::start(AgentConfig {
+            address,
+            ca: None,
+            scope: scope(2),
+            rank: 1,
+            world: 2,
+            link: peer,
+            copier,
+            registrar: counting,
+            registration_context: 0,
+            gpu_uuid: [3; 16],
+            records: None,
+            approve: None,
+        })
     });
-    assert!(counting.calls.lock().unwrap().is_empty());
-    assert!(requester.agents[0].registered_regions().is_empty());
-    wait("rank 0 to turn the pool off", || {
-        matches!(requester.rank0.status(), PoolStatus::Disabled(_))
+    wait("the agent's registration", || {
+        registered.calls.lock().unwrap().len() == 2
     });
-    requester.close();
+    thread::sleep(Duration::from_millis(100));
+    let waiting = !agent.is_finished();
+    let (copier, _gpu0) = SimulatedGpu::shared(&[local()]).unwrap();
+    let mut rank0 = PoolClient::start(
+        config(&manager, 2, vec![[2; 16], [3; 16]]),
+        Some(vec![zero]),
+        copier,
+        Arc::new(OkRegistrar),
+        flare_selene::pool::Roots::System,
+        flare_selene::pool::STARTUP_WAIT,
+    )
+    .unwrap();
+    let result = agent.join().unwrap();
+    assert!(waiting, "the agent stopped before rank zero opened");
+    let mut agent = result.unwrap();
+    assert_eq!(agent.status(), PoolStatus::Ready);
+    agent.close().unwrap();
+    rank0.close().unwrap();
 }
 
 #[test]
-fn when_rank_zero_turns_the_pool_off_its_agents_do_too() {
+fn an_agent_refused_by_the_manager_fails_startup_after_registration() {
+    use flare_selene::shard::{Reader, Writer};
+    let manager = Manager::start();
+    let (zero, mut peer) = memory_links();
+    let (copier, _gpu0) = SimulatedGpu::shared(&[local()]).unwrap();
+    let mut rank0 = PoolClient::start(
+        config(&manager, 2, vec![[2; 16], [3; 16]]),
+        Some(vec![zero]),
+        copier,
+        Arc::new(OkRegistrar),
+        flare_selene::pool::Roots::System,
+        flare_selene::pool::STARTUP_WAIT,
+    )
+    .unwrap();
+    let (mut forwarding, agent_link) = memory_links();
+    // Complete the rank-link greeting so rank zero sends its session binding.
+    let mut greeting = Writer::new(18);
+    greeting
+        .u32(1)
+        .u32(2)
+        .blob(&[9; 16])
+        .blob(&scope(2).layout_fingerprint)
+        .blob(&[3; 16]);
+    peer.enqueue(&greeting.finish()).unwrap();
+    for _ in 0..2 {
+        wait("rank zero's Hello and Bind", || {
+            let Some((tag, bytes)) = peer.receive().unwrap() else {
+                return false;
+            };
+            let mut frame = Writer::new(tag);
+            if tag == 13 {
+                // Keep the real session identity but make the manager reject the secret.
+                let mut reader = Reader(&bytes);
+                let mut secret = reader.blob().unwrap().to_vec();
+                secret[0] ^= 1;
+                frame.blob(&secret).blob(reader.blob().unwrap());
+            } else {
+                frame.bytes(&bytes);
+            }
+            forwarding.enqueue(&frame.finish()).unwrap();
+            true
+        });
+    }
+    let counting = Arc::new(super::CountingRegistrar::default());
+    let (copier, _gpu1) = SimulatedGpu::shared(&[local()]).unwrap();
+    let result = RankAgent::start(AgentConfig {
+        address: PoolAddress::Unix(manager.config.socket.clone()),
+        ca: None,
+        scope: scope(2),
+        rank: 1,
+        world: 2,
+        link: agent_link,
+        copier,
+        registrar: counting.clone(),
+        registration_context: 0,
+        gpu_uuid: [3; 16],
+        records: None,
+        approve: None,
+    });
+    let reason = result
+        .err()
+        .expect("manager rejection must fail agent startup")
+        .to_string();
+    assert!(reason.contains("RankBadSecret"), "{reason}");
+    assert_eq!(counting.calls.lock().unwrap().len(), 2);
+    assert_eq!(*counting.drops.lock().unwrap(), 2);
+    rank0.close().unwrap();
+}
+
+#[test]
+fn closed_rank_links_fail_agent_startup_with_the_cause() {
+    let manager = Manager::start();
+    let (zero, peer) = memory_links();
+    drop(zero);
+    let (copier, _gpu) = SimulatedGpu::shared(&[local()]).unwrap();
+    let reason = RankAgent::start(AgentConfig {
+        address: PoolAddress::Unix(manager.config.socket.clone()),
+        ca: None,
+        scope: scope(2),
+        rank: 1,
+        world: 2,
+        link: peer,
+        copier,
+        registrar: Arc::new(OkRegistrar),
+        registration_context: 0,
+        gpu_uuid: [3; 16],
+        records: None,
+        approve: None,
+    })
+    .err()
+    .expect("closed rank links must fail startup")
+    .to_string();
+    assert!(
+        reason.contains("rank links closed") || reason.contains("rank link failed"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn an_agent_whose_plan_is_refused_fails_startup() {
+    let manager = Manager::start();
+    let counting = Arc::new(super::CountingRegistrar::default());
+    let (_zero, peer) = memory_links();
+    let (copier, _gpu) = SimulatedGpu::shared(&[local()]).unwrap();
+    let reason = RankAgent::start(AgentConfig {
+        address: PoolAddress::Unix(manager.config.socket.clone()),
+        ca: None,
+        scope: scope(2),
+        rank: 1,
+        world: 2,
+        link: peer,
+        copier,
+        registrar: counting.clone(),
+        registration_context: 0,
+        gpu_uuid: [3; 16],
+        records: None,
+        approve: Some(Arc::new(|_| Err("over the memory budget".into()))),
+    })
+    .err()
+    .expect("a refused rank must fail startup")
+    .to_string();
+    assert!(reason.contains("over the memory budget"), "{reason}");
+    assert!(reason.contains("remove --prefix-cache-pool"), "{reason}");
+    assert!(counting.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn rank_zero_approval_rejection_fails_startup_and_stops_its_agents() {
     let manager = Manager::start();
     let (copier, _gpu) = SimulatedGpu::shared(&[local()]).unwrap();
     let (zero, peer) = memory_links();
@@ -1435,7 +1605,10 @@ fn when_rank_zero_turns_the_pool_off_its_agents_do_too() {
         flare_selene::pool::Roots::System,
         flare_selene::pool::STARTUP_WAIT,
     )
-    .unwrap();
+    .err()
+    .expect("rank zero must fail startup")
+    .to_string();
+    assert!(rank0.contains("over the memory budget"), "{rank0}");
     let (copier, _gpu1) = SimulatedGpu::shared(&[local()]).unwrap();
     let agent = RankAgent::start(AgentConfig {
         address: PoolAddress::Unix(manager.config.socket.clone()),
@@ -1451,11 +1624,11 @@ fn when_rank_zero_turns_the_pool_off_its_agents_do_too() {
         records: None,
         approve: None,
     })
-    .unwrap();
-    wait("rank 0 to be disabled", || {
-        matches!(rank0.status(), PoolStatus::Disabled(_))
-    });
-    wait("the agent to follow", || {
-        matches!(agent.status(), PoolStatus::Disabled(_))
-    });
+    .err()
+    .expect("rank zero's refusal must fail agent startup")
+    .to_string();
+    assert!(
+        agent.contains("rank 0 is not using the pool") || agent.contains("rank links closed"),
+        "{agent}"
+    );
 }

@@ -148,9 +148,10 @@ pub struct StoreStats {
     pub progress: u64,
     pub store_skipped: u64,
     pub store_failed: u64,
-    /// DRAM, NVMe holding events. Drops: each tier, then end_of_chain/oversize/io_error.
+    /// DRAM, NVMe holding events.
     pub held: [u64; 2],
-    pub dropped: [u64; 6],
+    /// Each tier's end_of_chain/oversize/io_error, then DRAM/NVMe pool_refused.
+    pub dropped: [u64; 8],
     pub expired: [u64; 2],
     /// Rows eagerly dropped in DRAM and NVMe, excluding pressure compaction.
     pub rows_thinned: [u64; 2],
@@ -213,7 +214,7 @@ pub struct Retiring {
 pub enum Retirement {
     /// The next tier holds a committed copy: the tier drops its own.
     Moved,
-    /// A terminal I/O failure permits discarding the source.
+    /// The move cannot be completed; discard the source.
     Dropped,
     /// Keep the source and retry after progress.
     Failed,
@@ -263,7 +264,8 @@ pub trait HostStore {
     /// reference its registered host buffers and GPU destinations.
     fn close(&mut self) -> Result<()>;
 
-    /// Whether request lookups should start while queued for this shared store.
+    /// Whether pool lookups start while queued and replace a ticket that will
+    /// never be answered when the request is next selected for admission.
     fn pooled(&self) -> bool {
         false
     }
@@ -282,8 +284,9 @@ pub trait HostStore {
     /// worker delivered them, so the announced holdings may be stale and must be
     /// announced again in full.
     fn evictions_lost(&mut self) {}
-    /// Start looking for pool candidates for a request that just queued. `None`
-    /// when no lookup is wanted or possible.
+    /// Start looking for pool candidates when a request queues, or replace a
+    /// ticket that will never be answered when the request is next selected for
+    /// admission. `None` when no lookup is wanted or possible.
     fn begin_lookup(&mut self, _history: &dyn History) -> Option<LookupTicket> {
         None
     }

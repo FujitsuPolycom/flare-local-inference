@@ -283,7 +283,7 @@ pub(super) struct Metrics {
     host_per_rank_records: [AtomicU64; 2],
     host_abandoned_stores: AtomicU64,
     host_slots: [AtomicU64; 3],
-    host_dropped: [AtomicU64; 6],
+    host_dropped: [AtomicU64; 8],
     host_parked: AtomicU64,
     host_fetched: AtomicU64,
     host_fetch_failed: AtomicU64,
@@ -592,7 +592,7 @@ impl Metrics {
 
     pub fn render(&self) -> String {
         let mut text = String::with_capacity(4096);
-        text.push_str("# HELP flare_host_cache_held_total Records held because the next tier could not accept them.\n# TYPE flare_host_cache_held_total counter\n# HELP flare_host_cache_dropped_total Host records dropped at the local end or through oversize or I/O errors.\n# TYPE flare_host_cache_dropped_total counter\n");
+        text.push_str("# HELP flare_host_cache_held_total Records held because the next tier could not accept them.\n# TYPE flare_host_cache_held_total counter\n# HELP flare_host_cache_dropped_total Host records dropped at the local end, through oversize or I/O errors, or by a refused pool put.\n# TYPE flare_host_cache_dropped_total counter\n");
         text.push_str("# TYPE flare_host_cache_expired_total counter\n");
         text.push_str("# HELP flare_host_cache_rows_thinned_total Rows eagerly dropped after a child commits.\n# TYPE flare_host_cache_rows_thinned_total counter\n");
         text.push_str("# HELP flare_host_cache_packed_records_total Records stored with identical rank bytes packed once.\n# TYPE flare_host_cache_packed_records_total counter\n# HELP flare_host_cache_per_rank_records_total Records stored with separate rank bytes.\n# TYPE flare_host_cache_per_rank_records_total counter\n# HELP flare_host_cache_abandoned_stores_total Stores abandoned after later rank bytes differed.\n# TYPE flare_host_cache_abandoned_stores_total counter\n");
@@ -627,14 +627,17 @@ impl Metrics {
                 "flare_host_cache_held_total{{tier=\"{tier}\"}} {}",
                 self.host_held[i].load(Ordering::Relaxed)
             );
-            for (reason, counter) in ["end_of_chain", "oversize", "io_error"]
-                .into_iter()
-                .zip(&self.host_dropped[i * 3..i * 3 + 3])
+            for (reason, index) in [
+                ("end_of_chain", i * 3),
+                ("oversize", i * 3 + 1),
+                ("io_error", i * 3 + 2),
+                ("pool_refused", 6 + i),
+            ]
             {
                 let _ = writeln!(
                     text,
                     "flare_host_cache_dropped_total{{tier=\"{tier}\",reason=\"{reason}\"}} {}",
-                    counter.load(Ordering::Relaxed)
+                    self.host_dropped[index].load(Ordering::Relaxed)
                 );
             }
         }
@@ -1537,7 +1540,7 @@ mod tests {
             per_rank_records: [9, 10],
             abandoned_stores: 11,
             held: [3, 4],
-            dropped: [1, 2, 3, 4, 5, 6],
+            dropped: [1, 2, 3, 4, 5, 6, 7, 8],
             outbound_rate: 2.5e9,
             ..StoreStats::default()
         });
@@ -1586,13 +1589,16 @@ mod tests {
                 "flare_host_cache_held_total{{tier=\"{tier}\"}} {}\n",
                 i + 3
             )));
-            for (j, reason) in ["end_of_chain", "oversize", "io_error"]
-                .into_iter()
-                .enumerate()
+            for (reason, value) in [
+                ("end_of_chain", i * 3 + 1),
+                ("oversize", i * 3 + 2),
+                ("io_error", i * 3 + 3),
+                ("pool_refused", 7 + i),
+            ]
             {
                 assert!(text.contains(&format!(
                     "flare_host_cache_dropped_total{{tier=\"{tier}\",reason=\"{reason}\"}} {}\n",
-                    i * 3 + j + 1
+                    value
                 )));
             }
         }

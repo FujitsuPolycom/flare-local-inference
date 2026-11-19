@@ -527,6 +527,9 @@ impl<S: crate::store::TierStore, P: PoolPort> HostStore for PooledStore<S, P> {
         stats.fetched += self.pool_fetched;
         stats.fetch_failed += self.pool_fetch_failed;
         stats.bytes_in += self.pool_bytes_in;
+        for (index, count) in self.cascade.dropped.iter().enumerate() {
+            stats.dropped[6 + index] += count;
+        }
         stats
     }
 

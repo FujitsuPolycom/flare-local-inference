@@ -733,7 +733,7 @@ impl InboundRecord {
                 Ok(()) => {}
                 Err(error) => {
                     file.state = FileState::Closed;
-                    self.fail(error);
+                    self.fail(error.with_record_read());
                 }
             },
             Operation::ReadPages | Operation::ReadRow => {
@@ -762,7 +762,7 @@ impl InboundRecord {
                 }
                 match reply.result {
                     Ok(()) => self.bytes += reply.bytes,
-                    Err(error) => self.fail(error),
+                    Err(error) => self.fail(error.with_record_read()),
                 }
             }
             Operation::Close => file.state = FileState::Closed,
@@ -2075,9 +2075,24 @@ impl DiskStore {
     }
 
     pub(crate) fn thin_rows(&mut self) {
-        let mut thinning = std::mem::take(&mut self.thinning).into_iter();
+        self.thin_rows_for(self.layout.row_record_bytes.saturating_mul(2));
+    }
+
+    fn free_retention_bytes(&self) -> u64 {
+        self.budget
+            .as_ref()
+            .map_or(self.limit, |budget| budget.checkpoint_limit())
+            .min(self.limit)
+            .saturating_sub(self.used)
+    }
+
+    fn thin_rows_for(&mut self, headroom: u64) {
+        if self.free_retention_bytes() > headroom {
+            return;
+        }
+        let mut queued = self.index.thinning_order(&mut self.thinning);
         while self.maintenance.len() < MAINTENANCE_IN_FLIGHT {
-            let Some(key) = thinning.next() else {
+            let Some(key) = queued.next() else {
                 break;
             };
             if !self.index.row_redundant(&key, true) || !self.index[&key].row {
@@ -2090,8 +2105,11 @@ impl DiskStore {
                 self.index.drop_row(&key);
                 self.stats.rows_thinned[1] += 1;
             }
+            if self.free_retention_bytes() > headroom {
+                break;
+            }
         }
-        self.thinning.extend(thinning);
+        self.thinning.extend(queued);
     }
 
     /// Evict until `bytes` more fit under the limit; false when nothing
@@ -2101,19 +2119,17 @@ impl DiskStore {
         if bytes > self.limit {
             return Ok(false);
         }
-        while self.used.saturating_add(bytes)
-            > self
-                .budget
-                .as_ref()
-                .map_or(self.limit, |b| b.checkpoint_limit())
-                .min(self.limit)
-        {
+        if !self.preserve_committed && self.free_retention_bytes() < bytes {
+            self.thin_rows_for(bytes);
+        }
+        while self.free_retention_bytes() < bytes {
             if self.preserve_committed {
                 return Ok(false);
             }
             if self.spill && self.retire_for(bytes) {
                 return Ok(false);
             }
+            // At the truncate cap, whole-record eviction can precede further row reclaim.
             match self.index.evict(true, |_| true) {
                 Some(Eviction::Leaves(nodes)) => {
                     self.stats.dropped[3] += nodes.len() as u64;
@@ -2154,10 +2170,12 @@ impl DiskStore {
         let progress = self.stats().progress;
         if !self.preserve_committed && self.spill && self.maintenance_progress != progress {
             self.maintenance_progress = progress;
-            self.retire_for(
-                crate::store::headroom(self.limit, self.largest)
-                    .saturating_add(self.pending_bytes()),
-            );
+            let target = crate::store::headroom(self.limit, self.largest)
+                .saturating_add(self.pending_bytes());
+            // Leaves already held for handover free their bytes on their own.
+            let held: u64 = self.held.values().sum();
+            self.thin_rows_for(target.saturating_sub(held));
+            self.retire_for(target);
         }
     }
 
@@ -2244,6 +2262,7 @@ impl DiskStore {
 
     /// Return a removed node's bytes to the budget and unlink its file.
     fn unlink(&mut self, node: Node<DiskRecord>) -> Result<()> {
+        self.thinning.remove(&node.key);
         self.used = self.used.saturating_sub(node.location.bytes);
         if node.location.bytes == 0 {
             return Ok(());
@@ -2321,6 +2340,7 @@ impl DiskStore {
     /// row or a file until the last child is removed.
     fn discard(&mut self, key: &PrefixKey) -> Result<()> {
         self.index.unpin(key)?;
+        self.thinning.remove(key);
         let node = self
             .index
             .node_mut(key)
@@ -2429,13 +2449,15 @@ impl DiskStore {
                         self.stats.reused_tokens += job.tokens;
                         self.inbound_rate.observe(*bytes, job.started.elapsed());
                     }
-                    Err(_) => {
+                    Err(error) => {
                         self.stats.fetch_failed += 1;
-                        // A record that could not be restored is not offered
-                        // again. Its pages stay in the index for descendants
-                        // that hold it as an ancestor; only its row, which
-                        // makes it a lookup match, is dropped.
-                        if let Some(endpoint) = job.nodes.last() {
+                        // Only failures opening or reading the record file
+                        // invalidate the lookup row; other failures keep it.
+                        if error.is_record_read()
+                            && let Some(endpoint) = job.nodes.last()
+                        {
+                            // Its pages stay in the index for descendants that
+                            // hold it as an ancestor; only its lookup row is dropped.
                             self.index.drop_row(endpoint);
                         }
                     }
@@ -2895,7 +2917,7 @@ mod tests {
     }
 
     #[test]
-    fn eager_thinning_keeps_recovered_roots_branches_and_both_leaves() {
+    fn pressure_thinning_keeps_recovered_roots_branches_and_both_leaves() {
         let full = history(256);
         let headers = [
             header(&geometry(), &full, 64, None),
@@ -2909,9 +2931,157 @@ mod tests {
             .map(|(i, h)| scanned(&directory(), h.clone(), i as u64, true))
             .collect();
         let (mut store, log) = store_with(records, 1 << 30);
+        store.set_limit(store.used());
         store.thin_rows();
         assert!(store.index.nodes().all(|n| n.row));
         assert!(log.borrow().calls.is_empty());
+    }
+
+    #[test]
+    fn parent_rows_survive_headroom_and_pressure_reclaims_in_access_order() {
+        let full = history(5 * PAGE_TOKENS);
+        let headers: Vec<_> = (1..=5)
+            .map(|turn| {
+                header(
+                    &geometry(),
+                    &full,
+                    turn * PAGE_TOKENS,
+                    (turn > 1).then(|| (turn - 1) * PAGE_TOKENS),
+                )
+            })
+            .collect();
+        let records = headers
+            .iter()
+            .enumerate()
+            .map(|(age, h)| scanned(&directory(), h.clone(), age as u64, true))
+            .collect();
+        let (mut store, log) = store_with(records, 1 << 30);
+        let used = store.used();
+        store.set_limit(used + 2 * ROW_RECORD + 1);
+        store.poll(&mut Vec::new()).unwrap();
+        assert!(store.index.nodes().all(|node| node.row));
+        assert!(log.borrow().calls.is_empty());
+
+        store.reused(headers[1].key);
+        store.index.pin(&headers[2].key).unwrap();
+        store.set_limit(used + 2 * ROW_RECORD);
+        store.poll(&mut Vec::new()).unwrap();
+        assert!(store.index[&headers[1].key].row);
+        assert!(store.index[&headers[2].key].row);
+        assert!(!store.index[&headers[3].key].row);
+        assert_eq!(store.stats().rows_thinned, [0, 1]);
+        assert_eq!(store.used(), used - ROW_RECORD);
+
+        store.index.unpin(&headers[2].key).unwrap();
+        assert!(store.make_room(3 * ROW_RECORD + 1).unwrap());
+        assert!(!store.index[&headers[2].key].row);
+        assert!(store.index[&headers[1].key].row);
+        assert!(store.index[&headers[0].key].row && store.index[&headers[4].key].row);
+        assert_eq!(store.index.len(), headers.len());
+        assert_eq!(store.stats().rows_thinned, [0, 2]);
+        assert!(matches!(log.borrow().calls.as_slice(),
+            [Call::Truncate { path: first, .. }, Call::Truncate { path: second, .. }]
+                if *first == store.record(&headers[3].key).unwrap().path
+                && *second == store.record(&headers[2].key).unwrap().path));
+    }
+
+    #[test]
+    fn maintenance_reclaims_parent_rows_before_retiring_leaves() {
+        let full = history(66 * PAGE_TOKENS);
+        let headers = [
+            header(&geometry(), &full, 64 * PAGE_TOKENS, None),
+            header(&geometry(), &full, 65 * PAGE_TOKENS, Some(64 * PAGE_TOKENS)),
+            header(&geometry(), &full, 66 * PAGE_TOKENS, Some(65 * PAGE_TOKENS)),
+        ];
+        let records = headers
+            .iter()
+            .enumerate()
+            .map(|(age, h)| scanned(&directory(), h.clone(), age as u64, true))
+            .collect();
+        let (mut store, log) = store_with(records, 1 << 30);
+        store.set_limit(store.used() * 10 / 9 - ROW_RECORD / 2);
+        let target = crate::store::headroom(store.limit, store.largest);
+        assert!(store.free_retention_bytes() > 2 * ROW_RECORD);
+        assert!(store.free_retention_bytes() < target);
+        assert!(store.free_retention_bytes() + ROW_RECORD > target);
+        let _announcer = announced(&mut store);
+        store.set_spill(true);
+        store.poll(&mut Vec::new()).unwrap();
+        assert!(!store.index[&headers[1].key].row);
+        assert!(store.take_retiring().is_empty());
+        assert!(store.held.is_empty());
+        assert_eq!(store.index.len(), headers.len());
+        assert!(store.index[&headers[2].key].row);
+        assert!(matches!(log.borrow().calls.as_slice(),
+            [Call::Truncate { length, .. }] if *length == headers[1].row_segment));
+    }
+
+    #[test]
+    fn thinning_queue_keeps_only_resident_records_after_removal_and_eviction() {
+        for removal in ["expire", "evict", "discard", "retire"] {
+            let (mut store, _) = store_with(Vec::new(), 1 << 30);
+            let _announcer = announced(&mut store);
+            for salt in 1..=64 {
+                let mut full = PrefixHistory::new(IDENTITY);
+                full.append(&vec![salt; 192], &[]).unwrap();
+                let headers = [
+                    header(&geometry(), &full, 64, None),
+                    header(&geometry(), &full, 128, Some(64)),
+                    header(&geometry(), &full, 192, Some(128)),
+                ];
+                for header in &headers {
+                    assert!(
+                        store
+                            .reserve_record(
+                                header.key,
+                                header.parent,
+                                header.bucket,
+                                header.tail_pages as usize,
+                                true,
+                                true,
+                            )
+                            .unwrap()
+                            .is_some()
+                    );
+                    store
+                        .commit_record(header.key, Ok(header.length_with_row()), None)
+                        .unwrap();
+                }
+                assert!(store.thinning.contains(&headers[1].key));
+                for header in headers.iter().rev() {
+                    match removal {
+                        "expire" => store.expire(header.key).unwrap(),
+                        "evict" => {
+                            let Some(Eviction::Leaves(nodes)) = store.index.evict(false, |_| true)
+                            else {
+                                panic!("the chain must have an evictable leaf");
+                            };
+                            for node in nodes {
+                                store.unlink(node).unwrap();
+                            }
+                        }
+                        "discard" => {
+                            store.index.pin(&header.key).unwrap();
+                            store.discard(&header.key).unwrap();
+                        }
+                        "retire" => {
+                            store.flush_announcements();
+                            assert!(store.retire_for(store.limit));
+                            assert_eq!(store.take_retiring()[0].key, header.key);
+                            store.retired(&header.key, Retirement::Moved).unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert!(
+                        store.thinning.iter().all(|key| store.index.contains(key)),
+                        "stale thinning keys after chain {salt}, removal={removal}"
+                    );
+                    assert!(store.thinning.len() <= store.index.len());
+                }
+                assert!(store.index.is_empty());
+                assert!(store.thinning.is_empty());
+            }
+        }
     }
 
     #[test]
@@ -2927,6 +3097,7 @@ mod tests {
             .map(|h| scanned(&directory(), h.clone(), 0, true))
             .collect();
         let (mut store, log) = store_with(records, 1 << 30);
+        store.set_limit(store.used() + 2 * ROW_RECORD);
         let announcer = Announcer::new(Arc::new(tokio::sync::Notify::new()));
         announcer.begin_session();
         store.announce_records(announcer.clone());
@@ -2984,6 +3155,7 @@ mod tests {
             .map(|header| scanned(&directory(), header.clone(), 0, true))
             .collect();
         let (mut store, log) = store_with(recovered, 1 << 30);
+        store.set_limit(store.used() - (records - 2) * ROW_RECORD);
         store.poll(&mut Vec::new()).unwrap();
         assert_eq!(store.maintenance.len(), maintenance_limit);
         assert_eq!(log.borrow().calls.len(), maintenance_limit);
@@ -3040,6 +3212,7 @@ mod tests {
             .map(|h| scanned(&directory(), h.clone(), 0, true))
             .collect();
         let (mut store, log) = store_with(records, 1 << 30);
+        store.set_limit(store.used() + 2 * ROW_RECORD);
         let used = store.used();
         let hit = store.lookup(&full, 0, u64::MAX).unwrap();
         store
@@ -3092,6 +3265,7 @@ mod tests {
             .map(|h| scanned(&directory(), h.clone(), 0, true))
             .collect();
         let (mut store, log) = store_with(records, 1 << 30);
+        store.set_limit(store.used() + 2 * ROW_RECORD);
         store.index.pin(&parent.key).unwrap();
         store.poll(&mut Vec::new()).unwrap();
         store.expire(child.key).unwrap();
@@ -3322,7 +3496,7 @@ mod tests {
             matches!(&events[..], [StoreEvent::Deferred { checkpoint, reason: StoreReason::Budget }] if *checkpoint == record.id)
         );
         assert!(store.outbound.is_empty());
-        assert_eq!(store.stats().dropped, [0; 6]);
+        assert_eq!(store.stats().dropped, [0; 8]);
         assert_eq!(store.stats().held[1], 1);
         assert!(!store.index.contains(&record.key));
     }
@@ -3882,7 +4056,45 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_restore_is_not_offered_again() {
+    fn a_transient_restore_failure_keeps_the_record_offered() {
+        let geometry = geometry();
+        let directory = directory();
+        let full = history(2000);
+        let root = header(&geometry, &full, 700, None);
+        let leaf = header(&geometry, &full, 1990, Some(700));
+        let records = vec![
+            scanned(&directory, root, 0, true),
+            scanned(&directory, leaf.clone(), 1, true),
+        ];
+        let total: u64 = records.iter().map(|record| record.bytes).sum();
+        let (mut store, log) = store_with(records, 2 * total);
+        let hit = store.lookup(&full, 0, u64::MAX).unwrap();
+        assert_eq!(hit.key, leaf.key);
+        let ticket = InboundTicket {
+            key: hit.key,
+            pages: (100..100 + hit.pages as u32).map(PageId).collect(),
+            slot: StateSlotId(2),
+        };
+        store.fetch(hit, ticket).unwrap();
+        let events = complete(
+            &log,
+            TransportEvent::Fetched {
+                id: JobId(1),
+                result: Err(invalid("copy cancelled")),
+            },
+            &mut store,
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [StoreEvent::Fetched { key, result: Err(_) }] if *key == leaf.key
+        ));
+        assert!(store.index().nodes().all(|node| !node.pinned()));
+        assert_eq!(store.stats().fetch_failed, 1);
+        assert_eq!(store.lookup(&full, 700, u64::MAX).unwrap().key, leaf.key);
+    }
+
+    #[test]
+    fn a_record_read_failure_is_not_offered_again() {
         let geometry = geometry();
         let directory = directory();
         let full = history(2000);
@@ -3905,7 +4117,7 @@ mod tests {
         store.fetch(hit, ticket).unwrap();
         log.borrow_mut().events.push(TransportEvent::Fetched {
             id: JobId(1),
-            result: Err(invalid("page checksum mismatch")),
+            result: Err(invalid("page checksum mismatch").with_record_read()),
         });
         let mut events = Vec::new();
         store.poll(&mut events).unwrap();
@@ -4380,13 +4592,14 @@ mod tests {
         }
         assert_eq!(store.used(), total - 2 * ROW_RECORD);
 
+        // Redundant child rows are reclaimed before eviction compacts the root.
         // The root's truncate fails: its file keeps the row bytes, so the
         // record regains its length and the budget its bytes; the child's
         // succeeds and changes nothing further.
         let events = complete(
             &log,
             TransportEvent::Truncated {
-                id: JobId(1),
+                id: JobId(2),
                 result: Err("busy".into()),
             },
             &mut store,
@@ -4401,7 +4614,7 @@ mod tests {
         complete(
             &log,
             TransportEvent::Truncated {
-                id: JobId(2),
+                id: JobId(1),
                 result: Ok(()),
             },
             &mut store,
@@ -4461,8 +4674,8 @@ mod tests {
         let (mut store, log) = store_with(records, total);
         store.index_mut().pin(&leaf.key).unwrap();
 
-        // With the only leaf pinned, the oldest single-child ancestors lose
-        // their rows, oldest first, and the record still does not fit.
+        // With the leaf pinned, reclaim the redundant child row before
+        // eviction compacts the root. The record still does not fit.
         let key = full.key_at(300).unwrap();
         let bucket = full.bucket_at(300).unwrap();
         assert!(
@@ -4484,10 +4697,10 @@ mod tests {
                     ..
                 },
             ] => {
-                assert_eq!(*first, directory.join(record::file_name(&root.key)));
-                assert_eq!(*first_length, root.row_segment);
-                assert_eq!(*second, directory.join(record::file_name(&child.key)));
-                assert_eq!(*second_length, child.row_segment);
+                assert_eq!(*first, directory.join(record::file_name(&child.key)));
+                assert_eq!(*first_length, child.row_segment);
+                assert_eq!(*second, directory.join(record::file_name(&root.key)));
+                assert_eq!(*second_length, root.row_segment);
             }
             other => panic!("unexpected calls {other:?}"),
         }
@@ -5064,7 +5277,7 @@ mod tests {
         match &transport_events(&mut staged, 1)[..] {
             [TransportEvent::Fetched { id, result }] => {
                 assert_eq!(*id, JobId(4));
-                assert!(result.is_err());
+                assert!(result.as_ref().unwrap_err().is_record_read());
             }
             other => panic!("unexpected events {other:?}"),
         }
@@ -5086,6 +5299,7 @@ mod tests {
         match &transport_events(&mut staged, 1)[..] {
             [TransportEvent::Fetched { id, result }] => {
                 assert_eq!(*id, JobId(5));
+                assert!(result.as_ref().unwrap_err().is_record_read());
                 assert!(
                     result
                         .as_ref()
@@ -5290,6 +5504,7 @@ mod tests {
         match &transport_events(&mut staged, 1)[..] {
             [TransportEvent::Fetched { id, result }] => {
                 assert_eq!(*id, JobId(3));
+                assert!(!result.as_ref().unwrap_err().is_record_read());
                 assert!(
                     result
                         .as_ref()
@@ -6236,6 +6451,7 @@ mod tests {
             ));
             checkpoints.push(c);
         }
+        store.set_limit(store.used());
         let middle = &checkpoints[1];
         let deadline = Instant::now() + Duration::from_secs(10);
         while fs::metadata(&store.record(&middle.key).unwrap().path)

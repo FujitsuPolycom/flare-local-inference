@@ -102,10 +102,9 @@ impl Responses {
                     row.terminal == 2,
                     "response queue must cover its complete output allowance"
                 );
-                assert_eq!(
-                    producer.cancelled.load(Ordering::Acquire),
-                    row.reader.is_none()
-                );
+                if row.reader.is_none() {
+                    assert!(producer.cancelled.load(Ordering::Acquire));
+                }
             }
             if let Some(reader) = &row.reader {
                 assert_eq!(row.sent, row.received + reader.events.len() as u64);
@@ -183,6 +182,7 @@ impl Responses {
                     row.terminal = 2;
                 }
             }
+            11 => row.reader.as_ref().unwrap().cancel(),
             _ => unreachable!(),
         }
         if row.reader.is_none() && row.producer.is_none() {
@@ -228,6 +228,9 @@ impl Responses {
                 }
             }
             if let Some(reader) = &row.reader {
+                if !reader.cancelled.load(Ordering::Acquire) {
+                    actions.push([11, id, 0]);
+                }
                 actions.push([5, id, 0]);
                 if !reader.events.is_empty() {
                     actions.push([4, id, 0]);
@@ -247,6 +250,7 @@ fn native_responses_match_lifecycle_model() {
     let mut kinds = BTreeSet::new();
     let mut shared_retention = false;
     let mut completed_unread = false;
+    let mut cancelled_terminal = false;
     while let Some(path) = paths.pop_front() {
         let mut state = Responses::new(&fixture);
         for action in &path {
@@ -282,6 +286,11 @@ fn native_responses_match_lifecycle_model() {
                         .as_ref()
                         .is_some_and(|reader| !reader.events.is_empty())
             });
+            cancelled_terminal |= next.rows.iter().any(|row| {
+                row.terminal == 1 && row.reader.as_ref().is_some_and(|reader| {
+                    reader.cancelled.load(Ordering::Acquire)
+                })
+            });
             edges.insert((before.clone(), action, after.clone()));
             if visited.insert(after) {
                 let mut extended = path.clone();
@@ -290,8 +299,8 @@ fn native_responses_match_lifecycle_model() {
             }
         }
     }
-    assert_eq!(kinds, (1..=10).collect());
-    assert!(shared_retention && completed_unread);
+    assert_eq!(kinds, (1..=11).collect());
+    assert!(shared_retention && completed_unread && cancelled_terminal);
     let mut recycled = Responses::new(&fixture);
     for _ in 0..3 {
         for action in [
