@@ -135,6 +135,24 @@ class _Linear(torch.nn.Module):
         return output
 
 
+class _TorchFlashAttention:
+    scratch = None
+
+    def __init__(self, capacity):
+        self.capacity = capacity
+
+    def functional(self, *, session):
+        return self
+
+    def __call__(self, query, key, value, cu_seqlens):
+        from torch.nn.attention.varlen import varlen_attn_out
+
+        # Inactive rows are outside the cumulative lengths and need defined output.
+        output = torch.zeros_like(query)
+        varlen_attn_out(output, query, key, value, cu_seqlens, cu_seqlens, self.capacity, self.capacity)
+        return output
+
+
 class _Attention(torch.nn.Module):
     def __init__(self, module, scratch, metadata, weights, *, session, name, shared=None,
                  projection_workspace=None, attention_workspace=None, attention_math_mode="flash",
@@ -146,10 +164,15 @@ class _Attention(torch.nn.Module):
             session=session, name=f"{name}.qkv", bias=module.qkv.bias, workspace=projection_workspace)
         self.proj = _bind_projection(scratch.attention, weights["proj"], scratch.projected,
             session=session, name=f"{name}.proj", bias=module.proj.bias, workspace=projection_workspace)
-        self.attention = shared.attention if shared is not None else PreparedVarlenAttention(
-            scratch.query, scratch.key, scratch.value, metadata.cu_seqlens,
-            scratch.attention.view_as(scratch.query), session=session, workspace=attention_workspace,
-            name=name, math_mode=attention_math_mode)
+        if shared is not None:
+            self.attention = shared.attention
+        elif attention_math_mode == "torch_flash":
+            self.attention = _TorchFlashAttention(scratch.query.shape[0])
+        else:
+            self.attention = PreparedVarlenAttention(
+                scratch.query, scratch.key, scratch.value, metadata.cu_seqlens,
+                scratch.attention.view_as(scratch.query), session=session, workspace=attention_workspace,
+                name=name, math_mode=attention_math_mode)
 
     def forward(self, hidden_states, cu_seqlens, position_embeddings=None, **kwargs):
         projected = self.qkv(hidden_states).view(-1, 3, 16, 72)
@@ -180,8 +203,8 @@ class PreparedVision:
                  projection_workspace: ScratchArena | torch.Tensor | None = None,
                  attention_workspace: ScratchArena | torch.Tensor | None = None,
                  attention_math_mode: str = "flash"):
-        if attention_math_mode not in ("flash", "eager_bf16"):
-            raise ValueError("vision attention math mode must be flash or eager_bf16")
+        if attention_math_mode not in ("flash", "eager_bf16", "torch_flash"):
+            raise ValueError(f"unknown vision attention math mode {attention_math_mode!r}")
         config = module.config
         if (config.hidden_size, config.num_heads, config.intermediate_size, config.depth) != (1152, 16, 4304, 27):
             raise ValueError("vision geometry differs from the checkpoint contract")

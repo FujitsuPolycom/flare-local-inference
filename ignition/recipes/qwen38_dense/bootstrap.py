@@ -51,7 +51,9 @@ from .config import PAGE_TOKENS
 from .contract import PATCH_CAPACITIES, prepare as prepare_contract
 from .decoder import PreparedDecoder, Scratch
 from .pool import ContinuationPool, continuation_layout, page_bytes
-from .vision_state import FEATURES, IMAGE_TOKEN_ID, PreparedVisionGeneration, VisionInputs
+from .vision_state import (
+    FEATURES, IMAGE_TOKEN_ID, PreparedVisionGeneration, VisionInputs, vision_attention_math_mode,
+)
 from .weights import ModelWeights
 from .dflash import SpeculativePreparation
 from ignition.preparation.bootstrap import BasePreparationConfig
@@ -358,7 +360,8 @@ def prepare(snapshot, config, *, progress=None, core_storage):
                     module = Qwen3_5VisionModel(Qwen3_5VisionConfig.from_dict(weights.config.vision))
                 module.eval().requires_grad_(False)
                 encoder = PreparedVision(module, s, VisionMetadata.allocate(capacity, 1, device), weights.vision,
-                    session=session, name=f"vision{capacity}", projection_workspace=arena, attention_workspace=arena)
+                    session=session, name=f"vision{capacity}", projection_workspace=arena, attention_workspace=arena,
+                    attention_math_mode=vision_attention_math_mode(device))
                 encoder.functional(session=session)
                 add(f"vision{capacity}", PreparedVisionGeneration(encoder, vision_inputs, vision_state, completion,
                     frame, sequence), "vision", 1, capacity, vision_fields, None)

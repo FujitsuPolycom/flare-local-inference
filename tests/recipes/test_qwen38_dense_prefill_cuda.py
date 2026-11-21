@@ -358,6 +358,7 @@ def test_image_prompt_features_and_logits_match_transformers_reference():
         IMAGE_TOKEN_ID,
         PreparedVisionGeneration,
         VisionInputs,
+        vision_attention_math_mode,
     )
     from ignition.recipes.qwen38_dense.weights import ModelWeights
 
@@ -460,6 +461,7 @@ def test_image_prompt_features_and_logits_match_transformers_reference():
             vmodule, vscratch, VisionMetadata.allocate(num_patches, 1, device),
             weights.vision, session=session, name="qwen.ref.vision",
             projection_workspace=arena, attention_workspace=arena,
+            attention_math_mode=vision_attention_math_mode(device),
         )
         prefill_meta = Metadata.allocate(prefill_cap, 1, blocks, device)
         prefill_scratch = Scratch.allocate(prefill_cap, 1, weights.config, device)

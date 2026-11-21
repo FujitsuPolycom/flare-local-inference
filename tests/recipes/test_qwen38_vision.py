@@ -317,6 +317,7 @@ def test_dense_vision_encoder_native_replay(dense_manifest, capacity, record_pro
         get_vision_position_ids, get_vision_interpolation_indices_and_weights,
     )
     from ignition.components.weights import DirectWeightLoader
+    from ignition.recipes.qwen38_dense.vision_state import vision_attention_math_mode
 
     if not os.environ.get("CUDA_VISIBLE_DEVICES"):
         pytest.fail("assign a CUDA device explicitly")
@@ -343,7 +344,8 @@ def test_dense_vision_encoder_native_replay(dense_manifest, capacity, record_pro
     metadata = VisionMetadata.allocate(capacity, 1, device)
     buffer = torch.zeros((capacity, 1536), dtype=torch.float32, device=device)
     with PreparationSession(device=device, autotune=False, compile_workers=0) as session:
-        prepared = PreparedVision(module, scratch, metadata, weights, session=session)
+        prepared = PreparedVision(module, scratch, metadata, weights, session=session,
+                                  attention_math_mode=vision_attention_math_mode(device))
         prepared.functional(session=session)
         session.freeze()
         stream = torch.cuda.Stream(device=device)
