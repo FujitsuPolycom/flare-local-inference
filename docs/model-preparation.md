@@ -420,12 +420,19 @@ Image export and serving with declared storage are qualified for `qwen3.8-27b`
 on DGX Spark GB10 (SM121), including single-image, multi-image, and
 restored-prefix image requests with DFlash2 enabled and disabled, and published
 feature and prompt/decode logit comparison against the BF16-dequantized
-Transformers reference. On a 32 GiB RTX 5090 (SM120), the recipe exports and
-serves images at four concurrent requests with one vision slot, a 2,048-token
-prefill chunk, and DFlash2 enabled. The core declares 95 graphs and 24.41 GiB of
-fixed device storage. A single request with four images uses one vision slot.
-`docs/TODO.txt` tracks the SM120 numerical comparison, QAD image qualification,
-and biased BF16 vision projections on SM103.
+Transformers reference.
+
+On a 32 GiB RTX 5090 (SM120), the dense vision tower uses the Transformers
+patch convolution and Torch variable-length FlashAttention. The compiled
+configuration uses four request slots, one vision slot, a 2,048-token prefill
+chunk, and DFlash2. Its core declares 95 graphs and 24.41 GiB of fixed device
+mappings. Native serving is validated with a four-image prompt, image prefix
+restoration, and four overlapping requests with one image request and three
+text requests. Vision replay is checked against Transformers on the RTX 5090
+at all four patch capacities. The image prompt feature and logit test
+compares the RTX 5090 prepared path with the BF16 Transformers forward on GB10.
+`docs/TODO.txt` tracks QAD image qualification and biased BF16 vision
+projections on SM103.
 
 ```sh
 .venv/bin/ignition export qwen3.8-27b --gpus 0 --max-concurrency 4 \

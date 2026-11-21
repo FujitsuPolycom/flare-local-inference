@@ -679,7 +679,3 @@
     `recipes/qwen38/vision.py` binds checkpoint BF16 projections through
     `UnquantizedProjection`, whose bias keeps them off the SM103 dense GEMM path
     in `ignition/components/linear.py`; SM103 execution is unqualified.
-
-[ ] Compare published image features and prompt logits of Qwen3.8 27B with the
-    Transformers reference on SM120. The comparison passed on DGX Spark GB10
-    (SM121); remove this entry when it also passes on SM120.
