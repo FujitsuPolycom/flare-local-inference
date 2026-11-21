@@ -669,13 +669,6 @@
     is not found. Close when the test passes in every case or each remaining
     failure has a stated cause.
 
-[ ] Qualify Qwen3.8 27B image input on SM120 with the recipe's declared
-    storage. On a 32 GiB RTX 5090 the planner refuses an image plan with DFlash2
-    at four requests; use `--language-model-only` for text-only preparation or
-    lower `--max-concurrency` / `--no-mtp`. Remove this entry when an image core
-    exported with the declared storage has served image prompts on SM120. See
-    model-preparation.md "Qwen3.8 27B".
-
 [ ] Qualify Qwen3.8 27B QAD (`qwen3.8-27b-qad`) image input. The checkpoint
     shares the `qwen38_dense` recipe and defaults to four image slots, but only
     `qwen3.8-27b` (`nvidia/Qwen3.8-27B-NVFP4`) has been exported and served with

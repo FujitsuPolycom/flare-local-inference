@@ -399,9 +399,11 @@ image-enabled preparation stores a 256-byte larger row (158,149,120 bytes, or
 `qwen38-dense.graph-inputs.v2` with the slot count and patch capacities. Because
 default `qwen3.8-27b` and `qwen3.8-27b-qad` plans reserve image storage (for
 four image slots on one 32 GiB SM120 GPU at four requests, fixed storage rises
-from 27.64 GiB to 29.22 GiB), the planner refuses the default four-request
-DFlash2 image plan on a 32 GiB RTX 5090; pass `--language-model-only` to retain
-the 27.64 GiB text-only footprint, or lower `--max-concurrency` / `--no-mtp`.
+from 27.64 GiB to 29.22 GiB), the planner refuses the default four-slot DFlash2
+image plan with 31 GiB free on an RTX 5090. Use `--image-concurrency 1` for the
+qualified profile below. `--language-model-only` retains the 27.64 GiB
+text-only footprint, and lower `--max-concurrency` or `--no-mtp` can reduce
+the memory requirement.
 Combining `--language-model-only` with `--image-concurrency`, requesting image
 preparation against a snapshot without `model.visual.*` weights, or requesting
 image slots in `qwen3.8-27b` `ignition bench` is a usage error.
@@ -418,9 +420,17 @@ Image export and serving with declared storage are qualified for `qwen3.8-27b`
 on DGX Spark GB10 (SM121), including single-image, multi-image, and
 restored-prefix image requests with DFlash2 enabled and disabled, and published
 feature and prompt/decode logit comparison against the BF16-dequantized
-Transformers reference. Image export for `qwen3.8-27b-qad`, image export with
-declared storage on SM120, and biased BF16 vision projections on SM103 are not
-yet qualified (see `docs/TODO.txt`).
+Transformers reference. On a 32 GiB RTX 5090 (SM120), the recipe exports and
+serves images at four concurrent requests with one vision slot, a 2,048-token
+prefill chunk, and DFlash2 enabled. The core declares 95 graphs and 24.41 GiB of
+fixed device storage. A single request with four images uses one vision slot.
+`docs/TODO.txt` tracks the SM120 numerical comparison, QAD image qualification,
+and biased BF16 vision projections on SM103.
+
+```sh
+.venv/bin/ignition export qwen3.8-27b --gpus 0 --max-concurrency 4 \
+  --image-concurrency 1 --prefill-chunk-size 2048 --autotune-effort off
+```
 
 Prepare on the same GPU architecture as the serving device:
 
