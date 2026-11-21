@@ -16,8 +16,8 @@ FEATURES = 16384
 PATCHES = 16384
 
 
-def vision_attention_math_mode(device):
-    """Use Torch FlashAttention for the dense BF16 vision tower on SM120."""
+def vision_math_mode(device):
+    """Use canonical patch convolution and Torch FlashAttention on SM120."""
     return "torch_flash" if torch.cuda.get_device_capability(device) == (12, 0) else "flash"
 
 

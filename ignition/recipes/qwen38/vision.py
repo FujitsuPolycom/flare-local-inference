@@ -202,9 +202,9 @@ class PreparedVision:
                  weights: VisionWeights, *, session: PreparationSession, name: str = "vision",
                  projection_workspace: ScratchArena | torch.Tensor | None = None,
                  attention_workspace: ScratchArena | torch.Tensor | None = None,
-                 attention_math_mode: str = "flash"):
-        if attention_math_mode not in ("flash", "eager_bf16", "torch_flash"):
-            raise ValueError(f"unknown vision attention math mode {attention_math_mode!r}")
+                 math_mode: str = "flash"):
+        if math_mode not in ("flash", "eager_bf16", "torch_flash"):
+            raise ValueError(f"unknown vision math mode {math_mode!r}")
         config = module.config
         if (config.hidden_size, config.num_heads, config.intermediate_size, config.depth) != (1152, 16, 4304, 27):
             raise ValueError("vision geometry differs from the checkpoint contract")
@@ -221,10 +221,13 @@ class PreparedVision:
         for path, tensor in weights.parameters.items():
             parent, _, attribute = path.rpartition(".")
             setattr(module.get_submodule(parent), attribute, torch.nn.Parameter(tensor, requires_grad=False))
-        # Conv3d rounds the projection before adding the BF16 bias.
-        self.patch_embed = _Linear(UnquantizedProjection(scratch.patches,
-            module.patch_embed.proj.weight.flatten(1), scratch.hidden,
-            session=session, name=f"{name}.patch_embed"), module.patch_embed.proj.bias)
+        if math_mode == "torch_flash":
+            # Keep the checkpoint's Conv3d rounding at the entrance to the vision tower.
+            self.patch_embed = module.patch_embed
+        else:
+            self.patch_embed = _Linear(UnquantizedProjection(scratch.patches,
+                module.patch_embed.proj.weight.flatten(1), scratch.hidden,
+                session=session, name=f"{name}.patch_embed"), module.patch_embed.proj.bias)
         module.rotary_pos_emb = rotary(config).to(device)
         for i, block in enumerate(module.blocks):
             prefix = f"blocks.{i}"
@@ -232,7 +235,7 @@ class PreparedVision:
                 {key: weights.projections[f"{prefix}.attn.{key}"] for key in ("qkv", "proj")},
                 session=session, name=f"{name}.blocks.{i}.attn",
                 shared=module.blocks[0].attn if i else None, projection_workspace=projection_workspace,
-                attention_workspace=attention_workspace, attention_math_mode=attention_math_mode, rope=rope)
+                attention_workspace=attention_workspace, attention_math_mode=math_mode, rope=rope)
             for key, source, destination in (("linear_fc1", scratch.hidden, scratch.intermediate),
                                               ("linear_fc2", scratch.intermediate, scratch.projected)):
                 original = getattr(block.mlp, key)
@@ -255,7 +258,8 @@ class PreparedVision:
         self.output_rows = torch.arange(capacity // 4, device=device)
 
     def functional(self, *, session):
-        self.patch_embed.projection.functional(session=session)
+        if isinstance(self.patch_embed, _Linear):
+            self.patch_embed.projection.functional(session=session)
         self.module.blocks[0].attn.attention.functional(session=session)
         for block in self.module.blocks:
             block.attn.qkv.functional(session=session)

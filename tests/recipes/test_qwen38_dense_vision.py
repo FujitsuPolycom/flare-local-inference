@@ -505,7 +505,7 @@ def test_dense_vision_generation_publishes_and_injects_wide_features():
     from ignition.preparation.scratch import ScratchArena
     from ignition.recipes.qwen38.vision import PreparedVision, VisionMetadata, VisionScratch
     from ignition.recipes.qwen38_dense.vision_state import (
-        IMAGE_TOKEN_ID, PreparedVisionGeneration, VisionInputs, vision_attention_math_mode,
+        IMAGE_TOKEN_ID, PreparedVisionGeneration, VisionInputs, vision_math_mode,
     )
     from transformers.vision_utils import (
         get_vision_interpolation_indices_and_weights, get_vision_position_ids,
@@ -531,7 +531,7 @@ def test_dense_vision_generation_publishes_and_injects_wide_features():
     with PreparationSession(device=device, autotune=False, compile_workers=0) as session:
         encoder = PreparedVision(module, scratch, VisionMetadata.allocate(256, 1, device),
             weights, session=session, projection_workspace=arena, attention_workspace=arena,
-            attention_math_mode=vision_attention_math_mode(device))
+            math_mode=vision_math_mode(device))
         encoder.functional(session=session)
         session.freeze()
         operation = PreparedVisionGeneration(encoder, inputs, state, completion, frame, sequence)
