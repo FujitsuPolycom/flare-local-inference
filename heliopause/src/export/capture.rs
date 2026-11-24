@@ -993,6 +993,7 @@ struct DownloadSlot {
 struct Downloader<'a> {
     cuda: &'a Cuda,
     stream: Handle,
+    fence: u64,
     slots: Vec<DownloadSlot>,
     drained: bool,
     downloaded: u64,
@@ -1001,16 +1002,31 @@ struct Downloader<'a> {
 }
 impl<'a> Downloader<'a> {
     const CHUNK: usize = 8 << 20;
+    const FENCE_BYTES: usize = 64;
     fn new(cuda: &'a Cuda) -> ExportResult<Self> {
         let mut this = Self {
             cuda,
             stream: std::ptr::null_mut(),
+            fence: 0,
             slots: Vec::new(),
             drained: true,
             downloaded: 0,
             #[cfg(test)]
             copies: 0,
         };
+        cu!(
+            cuda,
+            "cuMemAlloc_v2",
+            (*mut u64, usize),
+            &mut this.fence,
+            Self::FENCE_BYTES
+        )
+        .map_err(|error| {
+            invalid(format!(
+                "allocating {}-byte D2H fence buffer: {error}",
+                Self::FENCE_BYTES
+            ))
+        })?;
         cu!(
             cuda,
             "cuStreamCreate",
@@ -1053,6 +1069,43 @@ impl<'a> Downloader<'a> {
         self.drained = true;
         Ok(())
     }
+    /// Drain posted PCIe device-to-host writes into coherent host memory before
+    /// stream or event completion.
+    ///
+    /// With PCIe Relaxed Ordering enabled, stream synchronization or a recorded
+    /// completion event can become visible to the host before the trailing cache
+    /// lines of an asynchronous device-to-host transfer land in pinned host RAM.
+    /// Queueing a same-stream non-posted host-to-device read from the end of the
+    /// staged host range forces prior posted writes to complete in host memory
+    /// before subsequent synchronization returns.
+    fn flush_d2h_tail(&self, host: *const u8, len: usize) -> ExportResult<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        if host.is_null() || len > Self::CHUNK || self.fence == 0 {
+            return Err(invalid(format!(
+                "invalid D2H tail fence span ({len} bytes at {host:p}, fence {:#x})",
+                self.fence
+            )));
+        }
+        let count = len.min(Self::FENCE_BYTES);
+        let tail = unsafe { host.add(len - count) }.cast::<c_void>();
+        cu!(
+            self.cuda,
+            "cuMemcpyHtoDAsync_v2",
+            (u64, *const c_void, usize, Handle),
+            self.fence,
+            tail,
+            count,
+            self.stream
+        )
+        .map_err(|error| {
+            invalid(format!(
+                "flushing {count}-byte D2H tail into fence {:#x}: {error}",
+                self.fence
+            ))
+        })
+    }
     fn read(&mut self, address: u64, memory: &str, output: &mut [u8]) -> ExportResult<()> {
         if memory == "mapped_host" {
             unsafe {
@@ -1082,6 +1135,7 @@ impl<'a> Downloader<'a> {
                 "reading {memory} storage at {:#x}+{}: {error}",
                 address + (index * Self::CHUNK) as u64, chunk.len()
             )))?;
+            self.flush_d2h_tail(pointer.cast::<u8>(), chunk.len())?;
             self.drain()?;
             chunk.copy_from_slice(unsafe {
                 std::slice::from_raw_parts(pointer.cast::<u8>(), chunk.len())
@@ -1125,9 +1179,12 @@ impl<'a> Downloader<'a> {
             } else {
                 1 - pending[0]
             };
-            let slot = &mut self.slots[index];
-            slot.offset = offset;
-            slot.nbytes = size;
+            let (slot_ptr, slot_event) = {
+                let slot = &mut self.slots[index];
+                slot.offset = offset;
+                slot.nbytes = size;
+                (slot.pointer, slot.event)
+            };
             self.drained = false;
             self.downloaded += size as u64;
             #[cfg(test)]
@@ -1136,7 +1193,7 @@ impl<'a> Downloader<'a> {
                 self.cuda,
                 "cuMemcpyDtoHAsync_v2",
                 (Handle, u64, usize, Handle),
-                slot.pointer,
+                slot_ptr,
                 allocation.address + offset,
                 size,
                 self.stream
@@ -1144,11 +1201,12 @@ impl<'a> Downloader<'a> {
                 "scanning allocation {:?} ({}) at {:#x}+{}, offset {offset}: {error}",
                 allocation.name, allocation.memory, allocation.address + offset, size
             )))?;
+            self.flush_d2h_tail(slot_ptr.cast::<u8>(), size)?;
             cu!(
                 self.cuda,
                 "cuEventRecord",
                 (Handle, Handle),
-                slot.event,
+                slot_event,
                 self.stream
             )?;
             pending.push_back(index);
@@ -1188,6 +1246,11 @@ impl Drop for Downloader<'_> {
         if !self.stream.is_null() {
             let _ = (|| -> ExportResult<()> {
                 cu!(self.cuda, "cuStreamDestroy_v2", (Handle), self.stream)
+            })();
+        }
+        if self.fence != 0 {
+            let _ = (|| -> ExportResult<()> {
+                cu!(self.cuda, "cuMemFree_v2", (u64), self.fence)
             })();
         }
     }
@@ -1508,9 +1571,13 @@ impl PackedDownload<'_, '_> {
     fn queue(&mut self, index: usize, offset: u64) -> ExportResult<()> {
         let count = (self.size - offset).min(Downloader::CHUNK as u64) as usize;
         let downloader = &mut self.downloader;
-        let slot = &mut downloader.slots[index];
-        slot.offset = offset;
-        slot.nbytes = count;
+        let (slot_ptr, slot_event) = {
+            let slot = &mut downloader.slots[index];
+            slot.offset = offset;
+            slot.nbytes = count;
+            (slot.pointer.cast::<u8>(), slot.event)
+        };
+        let mut d2h_end = 0usize;
         let mut logical = 0;
         let mut copied = 0usize;
         for &(start, length) in self.spans {
@@ -1520,16 +1587,21 @@ impl PackedDownload<'_, '_> {
             }
             let relative = offset.saturating_sub(logical);
             let bytes = (length - relative).min((count - copied) as u64) as usize;
+            let span_start = start + relative;
             let output = unsafe {
-                std::slice::from_raw_parts_mut(slot.pointer.cast::<u8>().add(copied), bytes)
+                std::slice::from_raw_parts_mut(slot_ptr.add(copied), bytes)
             };
             let whole = [(0, self.allocation.nbytes)];
             let ranges = self.allocation.snapshot_spans.as_deref().unwrap_or(&whole);
-            copy_recorded_ranges(ranges, self.allocation.nbytes, start + relative, output, |source, output| {
+            copy_recorded_ranges(ranges, self.allocation.nbytes, span_start, output, |source, output| {
+                if output.is_empty() {
+                    return Ok(());
+                }
                 downloader.drained = false;
                 downloader.downloaded += output.len() as u64;
                 #[cfg(test)]
                 { downloader.copies += 1; }
+                d2h_end = copied + (source - span_start) as usize + output.len();
                 cu!(downloader.cuda, "cuMemcpyDtoHAsync_v2", (Handle, u64, usize, Handle),
                     output.as_mut_ptr().cast(), self.allocation.address + source, output.len(), downloader.stream)
                     .map_err(|error| invalid(format!(
@@ -1548,11 +1620,12 @@ impl PackedDownload<'_, '_> {
                 "packed allocation payload extends beyond stored spans",
             ));
         }
+        downloader.flush_d2h_tail(slot_ptr, d2h_end)?;
         cu!(
             downloader.cuda,
             "cuEventRecord",
             (Handle, Handle),
-            slot.event,
+            slot_event,
             downloader.stream
         )?;
         self.pending.push_back(index);
@@ -1662,13 +1735,20 @@ impl<'a, 'cuda> WeightDownload<'a, 'cuda> {
         let destination = span.destination_offset.checked_add(self.next_offset)
             .ok_or_else(|| invalid("weight span offset overflow"))?;
         let downloader = &mut self.downloader;
-        let slot = &mut downloader.slots[index];
-        slot.offset = destination;
-        slot.nbytes = size;
-        let buffer = unsafe { std::slice::from_raw_parts_mut(slot.pointer.cast::<u8>(), size) };
+        let (slot_ptr, slot_event) = {
+            let slot = &mut downloader.slots[index];
+            slot.offset = destination;
+            slot.nbytes = size;
+            (slot.pointer.cast::<u8>(), slot.event)
+        };
+        let buffer = unsafe { std::slice::from_raw_parts_mut(slot_ptr, size) };
         let whole = [(0, allocation.nbytes)];
         let ranges = allocation.snapshot_spans.as_deref().unwrap_or(&whole);
+        let mut d2h_end = 0usize;
         copy_recorded_ranges(ranges, allocation.nbytes, destination, buffer, |offset, output| {
+            if output.is_empty() {
+                return Ok(());
+            }
             if allocation.memory == "mapped_host" {
                 unsafe {
                     std::ptr::copy_nonoverlapping((allocation.address + offset) as *const u8,
@@ -1679,6 +1759,7 @@ impl<'a, 'cuda> WeightDownload<'a, 'cuda> {
                 downloader.downloaded += output.len() as u64;
                 #[cfg(test)]
                 { downloader.copies += 1; }
+                d2h_end = (offset - destination) as usize + output.len();
                 cu!(downloader.cuda, "cuMemcpyDtoHAsync_v2", (Handle, u64, usize, Handle),
                     output.as_mut_ptr().cast(), allocation.address + offset, output.len(), downloader.stream)
                     .map_err(|error| invalid(format!(
@@ -1689,7 +1770,8 @@ impl<'a, 'cuda> WeightDownload<'a, 'cuda> {
             Ok(())
         })?;
         if allocation.memory != "mapped_host" {
-            cu!(downloader.cuda, "cuEventRecord", (Handle, Handle), slot.event, downloader.stream)?;
+            downloader.flush_d2h_tail(slot_ptr, d2h_end)?;
+            cu!(downloader.cuda, "cuEventRecord", (Handle, Handle), slot_event, downloader.stream)?;
         }
         self.pending.push_back((index, self.next_span, 0));
         self.next_offset += size as u64;
@@ -4027,6 +4109,167 @@ mod tests {
         })();
         cuda.synchronize()?;
         if address != 0 { cu!(&cuda, "cuMemFree_v2", (u64), address)?; }
+        cu!(&cuda, "cuCtxDestroy_v2", (Handle), context)?;
+        cu!(&cuda, "cuCtxSetCurrent", (Handle), previous as Handle)?;
+        result
+    }
+
+    #[test]
+    fn d2h_tail_fence_skips_empty_transfers_and_rejects_invalid_bounds() {
+        let cuda = metadata_cuda();
+        let mut downloader = Downloader {
+            cuda: &cuda,
+            stream: std::ptr::null_mut(),
+            fence: 0x1000,
+            slots: Vec::new(),
+            drained: true,
+            downloaded: 0,
+            copies: 0,
+        };
+        let staged = [0x5Au8; 16];
+        downloader.flush_d2h_tail(std::ptr::null(), 0).unwrap();
+        downloader.flush_d2h_tail(staged.as_ptr(), 0).unwrap();
+        assert!(downloader.flush_d2h_tail(std::ptr::null(), 8).is_err());
+        assert!(
+            downloader
+                .flush_d2h_tail(staged.as_ptr(), Downloader::CHUNK + 1)
+                .is_err()
+        );
+        downloader.fence = 0;
+        assert!(downloader.flush_d2h_tail(staged.as_ptr(), 8).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly assigned CUDA device"]
+    fn downloader_repeated_transfers_preserve_trailing_bytes() -> ExportResult<()> {
+        let cuda = Cuda::new()?;
+        cu!(&cuda, "cuInit", (u32), 0)?;
+        let previous = cuda.current()?;
+        let mut context = std::ptr::null_mut();
+        cu!(&cuda, "cuCtxCreate_v2", (*mut Handle, u32, c_int), &mut context, 0, 0)?;
+        const BLOCK: usize = 64 << 10;
+        const BLOCKS: usize = 256;
+        const TAIL_WINDOW: usize = 256;
+        let size = BLOCK * BLOCKS;
+        let mut address = 0u64;
+        let result = (|| -> ExportResult<()> {
+            let mut host = vec![0u8; size];
+            for (block, chunk) in host.chunks_exact_mut(BLOCK).enumerate() {
+                let tag = (block as u64 + 1) << 32;
+                for (word_index, slot) in chunk.chunks_exact_mut(8).enumerate() {
+                    slot.copy_from_slice(&(tag | word_index as u64).to_le_bytes());
+                }
+            }
+            let check_block = |path: &str, iteration: usize, block: usize, actual: &[u8]| {
+                let offset = block * BLOCK;
+                let expected = &host[offset..offset + BLOCK];
+                let tail_start = BLOCK - TAIL_WINDOW;
+                assert_eq!(
+                    &actual[tail_start..],
+                    &expected[tail_start..],
+                    "{path} corrupted trailing {TAIL_WINDOW} bytes of block {block} on iteration {iteration}"
+                );
+                assert_eq!(
+                    actual, expected,
+                    "{path} corrupted block {block} on iteration {iteration}"
+                );
+            };
+            cu!(&cuda, "cuMemAlloc_v2", (*mut u64, usize), &mut address, size)?;
+            cu!(&cuda, "cuMemcpyHtoD_v2", (u64, *const u8, usize), address, host.as_ptr(), size)?;
+            cuda.synchronize()?;
+            let mut downloader = Downloader::new(&cuda)?;
+            let mut actual = vec![0u8; BLOCK];
+
+            for iteration in 0..4096usize {
+                let block = iteration % BLOCKS;
+                let offset = block * BLOCK;
+                downloader.read(address + offset as u64, "device", &mut actual)?;
+                check_block("Downloader::read", iteration, block, &actual);
+            }
+
+            let allocation = allocation("stress", address, size as u64);
+            let for_each_spans: Vec<_> = (0..2048usize)
+                .map(|iteration| (((iteration % BLOCKS) * BLOCK) as u64, BLOCK as u64))
+                .collect();
+            let mut visited = 0usize;
+            downloader.for_each(&allocation, &for_each_spans, |offset, bytes| {
+                let block = (offset as usize) / BLOCK;
+                assert_eq!(block, visited % BLOCKS);
+                check_block("Downloader::for_each", visited, block, bytes);
+                visited += 1;
+                Ok(())
+            })?;
+            assert_eq!(visited, for_each_spans.len());
+
+            for iteration in 0..2048usize {
+                let block = iteration % BLOCKS;
+                let spans = [((block * BLOCK) as u64, BLOCK as u64)];
+                let mut packed = PackedDownload {
+                    downloader: &mut downloader,
+                    allocation: &allocation,
+                    spans: &spans,
+                    size: BLOCK as u64,
+                    pending: std::collections::VecDeque::new(),
+                    next: 0,
+                };
+                packed.fill(0, &mut actual)?;
+                check_block("PackedDownload::fill(single-block)", iteration, block, &actual);
+            }
+            downloader.drain()?;
+
+            const BLOCKS_PER_CHUNK: usize = Downloader::CHUNK / BLOCK;
+            const PACKED_CHUNKS: usize = 16;
+            let packed_spans: Vec<_> = (0..PACKED_CHUNKS * BLOCKS_PER_CHUNK)
+                .map(|step| {
+                    let chunk = step / BLOCKS_PER_CHUNK;
+                    let within = step % BLOCKS_PER_CHUNK;
+                    let block = (chunk * 7 + within) % BLOCKS;
+                    ((block * BLOCK) as u64, BLOCK as u64)
+                })
+                .collect();
+            let mut chunk_actual = vec![0u8; Downloader::CHUNK];
+            let mut packed = PackedDownload {
+                downloader: &mut downloader,
+                allocation: &allocation,
+                spans: &packed_spans,
+                size: (PACKED_CHUNKS * Downloader::CHUNK) as u64,
+                pending: std::collections::VecDeque::new(),
+                next: 0,
+            };
+            for chunk in 0..PACKED_CHUNKS {
+                packed.fill((chunk * Downloader::CHUNK) as u64, &mut chunk_actual)?;
+                for (within, block_bytes) in chunk_actual.chunks_exact(BLOCK).enumerate() {
+                    let step = chunk * BLOCKS_PER_CHUNK + within;
+                    let block = (chunk * 7 + within) % BLOCKS;
+                    check_block("PackedDownload::fill(pipelined)", step, block, block_bytes);
+                }
+            }
+            drop(packed);
+            downloader.drain()?;
+
+            let weight_spans: Vec<_> = (0..2048usize)
+                .map(|iteration| weight_payload::PayloadSpan {
+                    payload_offset: (iteration * BLOCK) as u64,
+                    allocation: allocation.name.clone(),
+                    destination_offset: ((iteration % BLOCKS) * BLOCK) as u64,
+                    nbytes: BLOCK as u64,
+                })
+                .collect();
+            let allocs = [allocation];
+            let mut reader = WeightDownload::new(&mut downloader, &allocs, &weight_spans)?;
+            for (iteration, span) in weight_spans.iter().enumerate() {
+                reader.read_into(&span.allocation, span.destination_offset, &mut actual)?;
+                let block = (span.destination_offset as usize) / BLOCK;
+                check_block("WeightDownload::read_into", iteration, block, &actual);
+            }
+            drop(reader);
+            downloader.drain()?;
+            Ok(())
+        })();
+        cuda.synchronize()?;
+        if address != 0 {
+            cu!(&cuda, "cuMemFree_v2", (u64), address)?;
+        }
         cu!(&cuda, "cuCtxDestroy_v2", (Handle), context)?;
         cu!(&cuda, "cuCtxSetCurrent", (Handle), previous as Handle)?;
         result

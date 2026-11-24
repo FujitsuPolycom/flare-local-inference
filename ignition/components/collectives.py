@@ -95,6 +95,20 @@ def _fake_all_reduce_dep(source, output, dependencies, handle):
     pass
 
 
+@torch.library.custom_op("flare::pcie_all_reduce_addend_dep", mutates_args=("output",))
+def _all_reduce_addend_dep(source: torch.Tensor, addend: torch.Tensor, output: torch.Tensor,
+                           dependencies: list[torch.Tensor], handle: int) -> None:
+    owner = _OWNERS[handle]
+    from ignition.preparation.startup_tuning import record_consumer
+    record_consumer(owner)
+    owner.runtime.all_reduce(source, out=output, addend=addend, plan=owner.plan)
+
+
+@_all_reduce_addend_dep.register_fake
+def _fake_all_reduce_addend_dep(source, addend, output, dependencies, handle):
+    pass
+
+
 @torch.library.custom_op("flare::start_all_reduce", mutates_args=("output",))
 def _start_all_reduce(source: torch.Tensor, output: torch.Tensor, dependencies: list[torch.Tensor],
                       handle: int, stream: int) -> None:
@@ -320,8 +334,11 @@ class PreparedAllReduce:
                 torch.add(source, addend, out=output)
             else:
                 output.copy_(source)
-        elif addend is not None and self.fused_addend and not dependencies:
-            _all_reduce_addend(source, addend, output, self.handle)
+        elif addend is not None and self.fused_addend:
+            if dependencies:
+                _all_reduce_addend_dep(source, addend, output, list(dependencies), self.handle)
+            else:
+                _all_reduce_addend(source, addend, output, self.handle)
         else:
             if addend is not None:
                 source = source + addend

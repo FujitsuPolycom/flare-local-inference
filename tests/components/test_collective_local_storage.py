@@ -11,7 +11,7 @@ from torch.fx.experimental.proxy_tensor import make_fx
 
 from ignition.components.collectives import (
     ConcurrentAllGather, ConcurrentGatherShards, ConcurrentReduceScatter,
-    PreparedAllGather, PreparedChunkedAllGather,
+    PreparedAllGather, PreparedAllReduce, PreparedChunkedAllGather,
     PreparedGatherShards, PreparedReduceScatter,
 )
 
@@ -117,3 +117,22 @@ def test_concurrent_reduce_scatter_and_gather_shards_trace():
     j_gs, = [n for n in graph.nodes if n.target == torch.ops.flare.join_gather_shards.default]
     assert j_rs.args[:3] == s_rs.args[:3]
     assert j_gs.args[:3] == s_gs.args[:3]
+
+
+def test_functional_all_reduce_fused_addend_with_dependencies():
+    source = torch.ones((2, 4), dtype=torch.bfloat16)
+    addend = torch.full((2, 4), 2.0, dtype=torch.bfloat16)
+    reduce = PreparedAllReduce(source, torch.empty_like(source), runtime=None,
+        session=None, coordinator=None, name="reduce").functional(session=None)
+    reduce.single, reduce.fused_addend, reduce.handle = False, True, 0
+
+    def forward(value, extra, dep):
+        return reduce(value, addend=extra, dependencies=(dep,))
+
+    graph = make_fx(forward, tracing_mode="fake")(source, addend, torch.ones(1)).graph
+    call, = [node for node in graph.nodes if node.target == torch.ops.flare.pcie_all_reduce_addend_dep.default]
+    assert call.args[0].op == "placeholder"
+    assert call.args[1].op == "placeholder"
+    assert call.args[2].target == torch.ops.aten.empty_strided.default
+    assert call.args[3][0].op == "placeholder"
+    assert not any(node.target == torch.ops.aten.add.Tensor for node in graph.nodes)
