@@ -25,6 +25,7 @@ fn main() {
             .field_attribute(".flare.runtime.RebuildManifest.native_dense_activations", "#[serde(default)]")
             .field_attribute(".flare.runtime.RebuildManifest.lock_gpu_clocks", "#[serde(default)]")
             .field_attribute(".flare.runtime.RebuildManifest.reproduction_args", "#[serde(default)]")
+            .field_attribute(".flare.runtime.RebuildManifest.row_shard_prefill", "#[serde(default)]")
             .field_attribute(
                 ".flare.runtime.ExecutionGraph.packed_token_capacity",
                 "#[serde(default)]",

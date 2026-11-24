@@ -168,6 +168,7 @@ def run(args):
         lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
         force_moe_decode_a16=args.force_moe_decode_a16,
         shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning,
+        row_shard_prefill=args.row_shard_prefill,
         image_concurrency=args.image_concurrency, mixed_prefill=args.mixed_prefill,
         prompt_logprobs=args.prompt_logprobs, expert_scale_compression=args.expert_scale_compression,
         online_mxfp8=args.online_mxfp8, online_mxfp8_scope=args.online_mxfp8_scope,
@@ -242,6 +243,7 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
             "tensor_parallel", "prefill_chunk", "stream_overlap", "context_parallel", "context_parallel_size",
             "native_dense_activations", "force_moe_decode_a16", "autotune_effort", "collective_tuning", "collective_ladder", "compile_workers",
             "speculative_token_capacity", "speculation", "expert_scale_compression", "mla_compute_mode",
+            "row_shard_prefill",
             "online_mxfp8", "online_mxfp8_scope", "language_model_only")}}
 
     if settings.speculation_study:

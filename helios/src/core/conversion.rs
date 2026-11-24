@@ -9321,4 +9321,18 @@ mod tests {
         // Acyclic diamond: D -> B and D -> C.
         assert!(!derivation_introduces_cycle(&emitted, &copy_recipe(4, &[2, 3])));
     }
+
+    #[test]
+    fn rebuild_manifest_row_shard_prefill_defaults_false_for_legacy_json_and_round_trips() {
+        let mut legacy = serde_json::to_value(runtime::RebuildManifest::default()).unwrap();
+        assert!(legacy.as_object_mut().unwrap().remove("row_shard_prefill").is_some());
+        let omitted: runtime::RebuildManifest = serde_json::from_value(legacy).unwrap();
+        assert!(!omitted.row_shard_prefill);
+
+        let mut enabled = omitted.clone();
+        enabled.row_shard_prefill = true;
+        let decoded = runtime::RebuildManifest::decode(enabled.encode_to_vec().as_slice()).unwrap();
+        assert!(decoded.row_shard_prefill);
+        assert!(rebuild_compatible(&Some(omitted), &Some(decoded)));
+    }
 }

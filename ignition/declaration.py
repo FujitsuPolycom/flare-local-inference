@@ -237,6 +237,9 @@ class Recipe:
     namespace. Export writes locally; it does not upload or select a signing identity.
     `b12x_environment` holds the b12x settings the recipe prepares with. b12x reads them
     only from its environment, so Ignition sets them for the preparing process.
+    `row_shard_prefill_world_sizes` lists the tensor-parallel world sizes (at least two ranks)
+    that support reducing prefill branch outputs into contiguous per-rank row shards; empty
+    leaves `--row-shard-prefill` unsupported.
     """
 
     name: str
@@ -294,6 +297,8 @@ class Recipe:
     joint_tuning: bool = False
     # Tensor-parallel world sizes that support vocabulary-parallel speculative sampling.
     vocabulary_parallel_world_sizes: tuple[int, ...] = ()
+    # Tensor-parallel world sizes that support row-sharded prefill reductions and gathers.
+    row_shard_prefill_world_sizes: tuple[int, ...] = ()
 
     def mixed_shapes(self, concurrency, chunk, speculation):
         from ignition.components.capacity import mixed_shapes, serving_modes
@@ -317,6 +322,9 @@ class Recipe:
             raise ValueError("b12x settings name B12X_ variables with string values")
         if self.speculation is not None and set(self.plain_ranks) != set(self.ranks):
             raise ValueError("a recipe that speculates declares its costs without speculation for every rank count")
+        if any(type(size) is not int or size < 2 or size not in self.ranks
+               for size in self.row_shard_prefill_world_sizes):
+            raise ValueError("row_shard_prefill_world_sizes must name tensor-parallel sizes >= 2 declared in ranks")
         for name, method in self.speculative_methods.items():
             if name not in ("mtp", "dspark", "dflash2") or set(method.ranks) != set(self.ranks):
                 raise ValueError("speculative methods require known names and every declared tensor-parallel size")

@@ -10,7 +10,9 @@ import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 
 from ignition.components.collectives import (
-    ConcurrentAllGather, PreparedAllGather, PreparedChunkedAllGather,
+    ConcurrentAllGather, ConcurrentGatherShards, ConcurrentReduceScatter,
+    PreparedAllGather, PreparedChunkedAllGather,
+    PreparedGatherShards, PreparedReduceScatter,
 )
 
 
@@ -80,3 +82,38 @@ def test_functional_gather_trace_uses_invocation_dependencies():
     call, = [node for node in graph.nodes if node.target == torch.ops.flare.pcie_all_gather.default]
     assert call.args[2][0].op == "placeholder"
     assert call.args[1].target == torch.ops.aten.empty_strided.default
+
+
+def test_concurrent_reduce_scatter_and_gather_shards_trace():
+    full = torch.ones((8, 8), dtype=torch.bfloat16)
+    shard = torch.ones((2, 8), dtype=torch.bfloat16)
+
+    rs = PreparedReduceScatter(full, full.clone(), runtime=None, session=None, coordinator=None, name="rs")
+    rs.single, rs.dma, rs.handle, rs.concurrent_input = False, True, 0, None
+    rs.output = shard.clone()
+    crs = object.__new__(ConcurrentReduceScatter)
+    crs.reduce, crs.stream_handle = rs, 1
+    crs.functional(session=None)
+
+    gs = PreparedGatherShards(shard, shard.clone(), runtime=None, session=None, coordinator=None, name="gs")
+    gs.single, gs.dma, gs.handle, gs.concurrent_input = False, True, 1, None
+    gs.output = full.clone()
+    cgs = object.__new__(ConcurrentGatherShards)
+    cgs.gather, cgs.stream_handle = gs, 1
+    cgs.functional(session=None)
+
+    def forward(x, dep):
+        p_rs = crs.start(x, dependencies=(dep,))
+        local = x + 1
+        out_sh = crs.finish(p_rs, local)
+        p_gs = cgs.start(out_sh, dependencies=(out_sh,))
+        local2 = out_sh + 2
+        return cgs.finish(p_gs, local2)
+
+    graph = make_fx(forward, tracing_mode="fake")(full, torch.ones(1)).graph
+    s_rs, = [n for n in graph.nodes if n.target == torch.ops.flare.start_reduce_scatter.default]
+    j_rs, = [n for n in graph.nodes if n.target == torch.ops.flare.join_reduce_scatter.default]
+    s_gs, = [n for n in graph.nodes if n.target == torch.ops.flare.start_gather_shards.default]
+    j_gs, = [n for n in graph.nodes if n.target == torch.ops.flare.join_gather_shards.default]
+    assert j_rs.args[:3] == s_rs.args[:3]
+    assert j_gs.args[:3] == s_gs.args[:3]

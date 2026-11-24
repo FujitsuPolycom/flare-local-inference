@@ -235,6 +235,11 @@ def _preparation_arguments(running, *, model_default="defaults.model", recipes=(
     advanced.add_argument("--joint-tuning", action="store_true",
                           help="jointly tune DeepSeek V4.1 attention projection plans across the prepared"
                                " prefill, decode, and speculative shapes (default: off)")
+    advanced.add_argument("--row-shard-prefill", action="store_true",
+                          help="reduce eligible prefill branch outputs into one contiguous row shard per"
+                               " rank, run row-local residual mixing on that shard, and gather normalized"
+                               " branch inputs back to full rows (supported TP recipes; default: full-row"
+                               " all-reduce)")
     advanced.add_argument("--lock-gpu-clocks", action="store_true",
                           help="lock each tuning GPU to its maximum supported graphics clock during"
                                " autotuning; requires root or noninteractive sudo for nvidia-smi")

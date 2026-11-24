@@ -323,3 +323,7 @@
     dense Qwen3.8, and read each one's pre-tokenizer for Metaspace (see the test
     header). Close when each passes and none uses Metaspace, or loading rejects
     one that does.
+
+[ ] Qualify --row-shard-prefill on SM103 GPUs and remove the SM103 planning
+    refusal in ignition/planning.py once tensor-parallel export and native
+    serving pass on SM103.
