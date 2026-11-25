@@ -159,19 +159,27 @@ impl DecodedHistory {
         (output, count)
     }
 
-    pub(crate) fn lookup(&self, context: &[u32], maximum: usize) -> (Vec<i64>, usize) {
-        if maximum == 0 { return (vec![-1; maximum.min(super::speculation::COPY_DRAFT_CAPACITY)], 0) }
+    pub(crate) fn lookup_with_match_len(&self, context: &[u32], maximum: usize) -> (Vec<i64>, usize, usize) {
+        let cap = maximum.min(super::speculation::COPY_DRAFT_CAPACITY);
+        if cap == 0 { return (vec![-1; cap], 0, 0) }
         if context.len() >= 8 {
             if let Some(&position) = self.eight.get(&Key(context[context.len() - 8..].try_into().unwrap())) {
-                return self.continuation(position, 8, maximum);
+                let (tokens, count) = self.continuation(position, 8, cap);
+                return (tokens, count, 8);
             }
         }
         if context.len() >= 4 {
             if let Some(&position) = self.four.get(&Key(context[context.len() - 4..].try_into().unwrap())) {
-                return self.continuation(position, 4, maximum);
+                let (tokens, count) = self.continuation(position, 4, cap);
+                return (tokens, count, 4);
             }
         }
-        (vec![-1; maximum.min(super::speculation::COPY_DRAFT_CAPACITY)], 0)
+        (vec![-1; cap], 0, 0)
+    }
+
+    pub(crate) fn lookup(&self, context: &[u32], maximum: usize) -> (Vec<i64>, usize) {
+        let (tokens, count, _) = self.lookup_with_match_len(context, maximum);
+        (tokens, count)
     }
 }
 

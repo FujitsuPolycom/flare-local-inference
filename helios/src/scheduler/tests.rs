@@ -1991,6 +1991,139 @@ fn shared_drafts_learn_committed_outputs_without_prompt_backfill_or_slot_joining
 }
 
 #[test]
+fn request_sam_proposes_prompt_continuations_and_isolates_requests() {
+    let mut s = scheduler(2, 64, 4);
+    s.enable_history_drafts().unwrap();
+    s.enable_speculation(&[1, 2, 4, 8]).unwrap();
+    s.fixed_speculative_width(Some(8)).unwrap();
+
+    // Prompt A contains a copiable span [10, 20, 30, 40, 50, 60, 70, 80] and ends with [10, 20, 30].
+    let mut prompt_a: Vec<u32> = (500..565).collect();
+    prompt_a[10..18].copy_from_slice(&[10, 20, 30, 40, 50, 60, 70, 80]);
+    prompt_a[62..65].copy_from_slice(&[10, 20, 30]);
+    let mut spec_a = spec(65, 32);
+    spec_a.prompt = prompt_a;
+    let a = s.admit(spec_a).unwrap();
+
+    // Prompt B ends with [10, 20, 30] but never saw [40, 50, 60, 70, 80].
+    let mut prompt_b: Vec<u32> = (700..765).collect();
+    prompt_b[62..65].copy_from_slice(&[10, 20, 30]);
+    let mut spec_b = spec(65, 32);
+    spec_b.prompt = prompt_b;
+    let b = s.admit(spec_b).unwrap();
+
+    // Initialize both requests.
+    let step = s.plan().unwrap();
+    assert_eq!(step.kind, GraphKind::Init);
+    s.commit(&step, Fence(1)).unwrap();
+    let mut init_rec = vec![CompletionRecord::default(); 2];
+    for h in [a, b] {
+        init_rec[h.slot as usize] = CompletionRecord {
+            generation: h.generation as i64,
+            submission_sequence: 1,
+            token_id: -1,
+            status: 1,
+            ..Default::default()
+        };
+    }
+    s.complete(Fence(1), &init_rec, Default::default()).unwrap();
+
+    // Prefill A (emits first output token `40`) and B (emits first output token `40`).
+    let mut fence_id = 2u64;
+    while s.request(a).unwrap().phase != RequestPhase::Decode
+        || s.request(b).unwrap().phase != RequestPhase::Decode
+    {
+        let step = s.plan().unwrap();
+        s.commit(&step, Fence(fence_id)).unwrap();
+        let mut recs = vec![CompletionRecord::default(); 2];
+        for lane in &step.lanes {
+            let req = s.request(lane.request).unwrap();
+            let consumed = if step.kind.is_prefill() {
+                lane.start_position + lane.tokens as u64
+            } else {
+                req.consumed_tokens
+            };
+            let samples = step.kind.is_prefill() && consumed == req.prompt_tokens as u64;
+            recs[lane.request.slot as usize] = CompletionRecord {
+                generation: lane.request.generation as i64,
+                submission_sequence: fence_id as i64,
+                consumed_tokens: consumed as i64,
+                generated_tokens: if samples { 1 } else { req.generated_tokens as i64 },
+                token_id: if samples { 40 } else { -1 },
+                status: 1,
+                ..Default::default()
+            };
+        }
+        s.complete(Fence(fence_id), &recs, Default::default()).unwrap();
+        fence_id += 1;
+    }
+
+    // Request A matches [10, 20, 30, 40] directly in its own prompt with zero prior output matches.
+    let (ids_a, count_a) = s.request_history_proposal(a, 7);
+    assert_eq!(count_a, 7);
+    assert_eq!(&ids_a[..4], &[50, 60, 70, 80]);
+
+    // Shared cross-request history did NOT ingest prompt A, and Request B sees zero prompt leakage.
+    assert_eq!(s.history_proposal(&[10, 20, 30, 40], 7).1, 0);
+    assert_eq!(s.request_history_proposal(b, 7).1, 0);
+
+    // Output edits in Request A override its earlier prompt continuation on recency.
+    s.cancel(b).unwrap();
+    let step = s.plan().unwrap();
+    assert_eq!(step.kind, GraphKind::Speculative);
+    s.commit(&step, Fence(fence_id)).unwrap();
+    let mut comp = vec![CompletionRecord::default(); 2];
+    comp[a.slot as usize] = CompletionRecord {
+        generation: a.generation as i64,
+        submission_sequence: fence_id as i64,
+        consumed_tokens: 72,
+        generated_tokens: 8,
+        token_id: 40,
+        status: 1,
+        vector: Some(crate::execution::TokenVector {
+            emitted_count: 7,
+            offered_drafts: 7,
+            accepted_drafts: 6,
+            verification_width: 8,
+            tokens: vec![99, 98, 97, 10, 20, 30, 40, -1],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    s.complete(Fence(fence_id), &comp, Default::default()).unwrap();
+    fence_id += 1;
+    let (ids_after, count_after) = s.request_history_proposal(a, 7);
+    assert_eq!(count_after, 7);
+    assert_eq!(&ids_after[..3], &[99, 98, 97]);
+
+    // A failed completion (status == 3) must not corrupt A's SAM state.
+    let before_out_len = s.request(a).unwrap().sam().unwrap().output_len();
+    let step = s.plan().unwrap();
+    s.commit(&step, Fence(fence_id)).unwrap();
+    let mut failed = vec![CompletionRecord::default(); 2];
+    failed[a.slot as usize] = CompletionRecord {
+        generation: a.generation as i64,
+        submission_sequence: fence_id as i64,
+        consumed_tokens: 72,
+        generated_tokens: 8,
+        token_id: -1,
+        status: 3,
+        error_code: 1,
+        vector: Some(crate::execution::TokenVector {
+            emitted_count: 0,
+            offered_drafts: 0,
+            accepted_drafts: 0,
+            verification_width: 8,
+            tokens: vec![-1; 8],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    s.complete(Fence(fence_id), &failed, Default::default()).unwrap();
+    assert_eq!(s.request(a).unwrap().sam().unwrap().output_len(), before_out_len);
+}
+
+#[test]
 fn draft_boundary_page_remains_private_across_published_prefix_branches() {
     let mut scheduler = scheduler(2, 16, 4);
     scheduler.enable_speculation(&[1, 2, 4, 8]).unwrap();

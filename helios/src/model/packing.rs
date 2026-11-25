@@ -399,8 +399,8 @@ impl Inputs {
             for (row, lane) in frame.step.lanes.iter().enumerate() {
                 let live = frame.scheduler.request(lane.request)?;
                 if frame.step.lane_kind(row) == GraphKind::Speculative && live.copy_allowed() {
-                    history_proposals[row] = Some(frame.scheduler.history_proposal(
-                        live.tokens(),
+                    history_proposals[row] = Some(frame.scheduler.request_history_proposal(
+                        lane.request,
                         lane.tokens.saturating_sub(1),
                     ));
                 }

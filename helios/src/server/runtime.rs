@@ -2142,7 +2142,10 @@ impl<'a> Worker<'a> {
                     continue;
                 }
                 let proposal = prepare_copy_proposal(
-                    self.scheduler.history_proposal(live.tokens(), if live.host_stops() { 0 } else { copy_capacity }),
+                    self.scheduler.request_history_proposal(
+                        request.request,
+                        if live.host_stops() { 0 } else { copy_capacity },
+                    ),
                     live.consumed_tokens,
                     request.incoming.prompt.grammar.as_ref(),
                     &self.config.eos_token_ids,

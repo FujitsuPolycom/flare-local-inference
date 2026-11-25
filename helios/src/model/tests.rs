@@ -844,6 +844,113 @@ fn copy_staging_uses_physical_slots_stochastic_defaults_and_bonus_mask() {
 }
 
 #[test]
+fn history_draft_packing_forwards_per_request_prompt_sam_continuations() {
+    let mut config = config();
+    config.speculative_widths = (1..=8).collect();
+    config.speculative_fixed_width = Some(8);
+    config.history_drafts = true;
+    add_copy_inputs(&mut config);
+    let mut scheduler = RequestScheduler::new(
+        config.identity,
+        config.limits,
+        scheduler_capabilities(&config),
+    )
+    .unwrap();
+    scheduler
+        .measured_graph_durations(&self::manifest(&config).graphs)
+        .unwrap();
+    scheduler
+        .enable_speculation(&config.speculative_widths)
+        .unwrap();
+    scheduler.enable_history_drafts().unwrap();
+    scheduler.fixed_speculative_width(Some(8)).unwrap();
+
+    // Prompt embeds [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20] and ends with [10, 11, 12].
+    let mut prompt: Vec<u32> = (100..165).collect();
+    prompt[8..19].copy_from_slice(&[10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
+    prompt[62..65].copy_from_slice(&[10, 11, 12]);
+    let handle = scheduler
+        .admit(RequestSpec {
+            message_boundaries: vec![],
+            prompt: prompt.clone(),
+            conditioning: vec![],
+            max_new_tokens: 16,
+            grammar_constrained: false,
+            host_stops: false,
+            prompt_logprobs: false,
+            growable_output: false,
+        })
+        .unwrap();
+    let mut admissions: [Option<Admission>; 4] = std::array::from_fn(|_| None);
+    admissions[handle.slot as usize] = Some(Admission {
+        handle,
+        sampling: SamplingParameters::default(),
+        max_new_tokens: 16,
+        prompt: prompt.clone(),
+        data: PromptData {
+            positions: (0..65).map(|p| [p; 3]).collect(),
+            vision_token_indices: vec![-1; 65],
+            ..Default::default()
+        },
+        grammar_mask: None,
+        ignore_eos: false,
+        prompt_logprobs: false,
+    });
+
+    // Init -> Prefill (emits `13`, completing [10, 11, 12, 13]) -> Snapshot.
+    let mut fence = 1u64;
+    while scheduler.request(handle).unwrap().phase != crate::scheduler::RequestPhase::Decode {
+        let step = scheduler.plan().unwrap();
+        scheduler.commit(&step, Fence(fence)).unwrap();
+        let req = scheduler.request(handle).unwrap();
+        let consumed = if step.kind.is_prefill() {
+            step.lanes[0].start_position + step.lanes[0].tokens as u64
+        } else {
+            req.consumed_tokens
+        };
+        let samples = step.kind.is_prefill() && consumed == req.prompt_tokens as u64;
+        let mut records = vec![CompletionRecord::default(); 4];
+        records[handle.slot as usize] = CompletionRecord {
+            generation: handle.generation as i64,
+            submission_sequence: fence as i64,
+            consumed_tokens: consumed as i64,
+            generated_tokens: if samples { 1 } else { req.generated_tokens as i64 },
+            token_id: if samples { 13 } else { -1 },
+            status: 1,
+            ..Default::default()
+        };
+        scheduler.complete(Fence(fence), &records, Default::default()).unwrap();
+        fence += 1;
+    }
+
+    // Speculative round packs SAM prompt-copy tokens [14..=20] directly into copy_token_ids.
+    let mut inputs = Inputs::new(&config, &self::manifest(&config)).unwrap();
+    let step = scheduler.plan().unwrap();
+    assert_eq!((step.kind, step.token_capacity), (GraphKind::Speculative, 8));
+    scheduler.commit(&step, Fence(fence)).unwrap();
+    crate::model::pack_inputs(&mut inputs, &config, &scheduler, &step, &admissions).unwrap();
+    let uploads = inputs.uploads();
+    let copy_ids: Vec<i64> = uploads
+        .iter()
+        .find(|u| u.buffer == "copy_token_ids")
+        .unwrap()
+        .bytes
+        .chunks_exact(8)
+        .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    let copy_count: Vec<i32> = uploads
+        .iter()
+        .find(|u| u.buffer == "copy_token_count")
+        .unwrap()
+        .bytes
+        .chunks_exact(4)
+        .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    assert_eq!(copy_count, [7]);
+    assert_eq!(copy_ids, [14, 15, 16, 17, 18, 19, 20]);
+}
+
+#[test]
 fn copy_proposal_capacity_tracks_prepared_token_and_grammar_extents() {
     for width in [8, 16] {
         let mut config = config();

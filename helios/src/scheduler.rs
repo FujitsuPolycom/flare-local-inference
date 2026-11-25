@@ -20,6 +20,7 @@ pub(crate) use cost::observed_duration_ns;
 pub use policy::{PolicyConfig, RequestAccounting};
 use refresh::PlanOrigin;
 pub use sharing::{EvictedCheckpoint, NextAdmission};
+pub mod sam;
 pub mod speculation;
 pub(crate) mod decoded_history;
 mod rounds;
@@ -261,6 +262,7 @@ pub struct LiveRequest {
     prefill_spans: Vec<std::ops::Range<usize>>,
     copy_proposal: Option<speculation::CopyProposal>,
     pub(crate) decoded_sequence: decoded_history::DecodedSequence,
+    sam: Option<sam::PromptOutputSAM>,
     growable_output: bool,
     /// Finishing to free its pages; the runtime readmits its history instead of completing it.
     preempted: bool,
@@ -377,6 +379,9 @@ impl LiveRequest {
         self.copy_proposal
             .as_ref()
             .filter(|p| p.consumed == self.consumed_tokens)
+    }
+    pub fn sam(&self) -> Option<&sam::PromptOutputSAM> {
+        self.sam.as_ref()
     }
     pub fn pages(&self) -> impl Iterator<Item = PageId> + '_ {
         self.shared_pages.iter().chain(&self.private_pages).copied()
@@ -1090,6 +1095,52 @@ impl RequestScheduler {
         self.decoded_history.as_ref().map_or((vec![-1; maximum], 0), |history| history.lookup(context, maximum))
     }
 
+    /// Returns copy draft proposals for a live request by querying its per-request
+    /// prompt+output suffix automaton first, falling back to the shared decoded-history
+    /// ring when the shared ring has a strictly longer match or the per-request SAM misses.
+    pub fn request_history_proposal(
+        &self,
+        handle: RequestHandle,
+        maximum: usize,
+    ) -> (Vec<i64>, usize) {
+        let maximum = maximum
+            .min(self.capabilities.completion_token_capacity.saturating_sub(1))
+            .min(speculation::COPY_DRAFT_CAPACITY);
+        if maximum == 0 || self.decoded_history.is_none() {
+            return (vec![-1; maximum], 0);
+        }
+        let Ok(request) = self.request(handle) else {
+            return (vec![-1; maximum], 0);
+        };
+        let vocabulary = self.capabilities.vocabulary;
+        let sam_proposal = request.sam.as_ref().and_then(|sam| {
+            let mut proposal = sam.propose(maximum)?;
+            // Multimodal prompts may contain placeholder token IDs outside the model vocabulary.
+            if let Some(invalid) = proposal
+                .tokens
+                .iter()
+                .position(|&token| (token as usize) >= vocabulary)
+            {
+                proposal.tokens.truncate(invalid);
+            }
+            (!proposal.tokens.is_empty()).then_some(proposal)
+        });
+        let shared = self
+            .decoded_history
+            .as_ref()
+            .map(|history| history.lookup_with_match_len(request.tokens(), maximum));
+        match (sam_proposal, shared) {
+            (Some(sam), Some((shared_tokens, shared_count, shared_match_len)))
+                if shared_count > 0 && shared_match_len > sam.match_len =>
+            {
+                (shared_tokens, shared_count)
+            }
+            (Some(sam), _) => sam.into_padded_i64(maximum),
+            (None, Some((shared_tokens, shared_count, _))) => (shared_tokens, shared_count),
+            (None, None) => (vec![-1; maximum], 0),
+        }
+    }
+
     #[cfg(feature = "server")]
     pub(crate) fn resume_decoded_sequence(
         &mut self,
@@ -1110,7 +1161,11 @@ impl RequestScheduler {
         let mut sequence = self.request(handle)?.decoded_sequence;
         if let Some(history) = &mut self.decoded_history {
             history.append(&mut sequence, token);
-            self.request_mut(handle)?.decoded_sequence = sequence;
+            let request = self.request_mut(handle)?;
+            request.decoded_sequence = sequence;
+            if let Some(sam) = &mut request.sam {
+                sam.push_token(token);
+            }
         }
         Ok(())
     }
@@ -1724,6 +1779,10 @@ impl RequestScheduler {
         let demand_epoch = checkpoints.demand_epoch;
         if let Some(id) = lookup.checkpoint { self.cache.touch(id, demand_epoch)?; }
         let message_boundaries = spec.message_boundaries;
+        let sam = self
+            .decoded_history
+            .is_some()
+            .then(|| sam::PromptOutputSAM::new(&spec.prompt));
         self.slots[slot].generation = generation;
         self.slots[slot].request = Some(LiveRequest {
             image_slot: None,
@@ -1755,6 +1814,7 @@ impl RequestScheduler {
             error_code: None,
             copy_proposal: None,
             decoded_sequence: Default::default(),
+            sam,
             history,
             tokens: spec.prompt,
             prefix,
@@ -2845,6 +2905,9 @@ impl RequestScheduler {
                 if records[slot].status != 3 {
                     let request = self.slots[slot].request.as_mut().unwrap();
                     history.append(&mut request.decoded_sequence, event.token);
+                    if let Some(sam) = &mut request.sam {
+                        sam.push_token(event.token);
+                    }
                 }
             }
         }
