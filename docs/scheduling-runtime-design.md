@@ -105,39 +105,58 @@ generated tokens.
 Unobserved suffixes retain their means.
 
 When pricing candidate shapes on a GPU-confidence model, the stored per-request
-confidence forecast is adjusted by two global online corrections derived solely
-from completed rounds:
+confidence forecast is adjusted by two online corrections derived solely from
+completed rounds:
 
-1. **Per-depth drafter calibration (`DepthCalibration`):** A global per-depth
-   ratio `clamp(realized / predicted, 0.0, 2.0)` (defaulting to `1.0` when
-   `predicted <= 1e-6`), initialized with `realized == predicted == 0.5^d` at
-   prior weight `4.0` and updated with an EWMA weight capped at `32.0`
-   (effective steady-state step `1/32`, ~22-observation half-life). Updates use
-   the exact offered, determined prefix outcomes computed once in
+1. **Hierarchical per-request, per-depth drafter calibration (`RequestCalibration`
+   + `DepthCalibration`):** A slow round-level global prior `DepthCalibration`
+   (`clamp(realized / predicted, 0.0, 2.0)`, defaulting to `1.0` when
+   `predicted <= 1e-6`, initialized at `realized == predicted == 0.5^d` with
+   prior weight `4.0`, updated **once per completed round** from the mean
+   realized and predicted survival across contributing lanes with EWMA cap
+   `64.0`) provides instant model-wide protection for brand-new requests (e.g.,
+   if a drafter breaks globally) while preventing a single correlated
+   large-batch dip from overwriting the prior in one step. Each live request
+   maintains its own aged per-depth `RequestCalibration` (seeded
+   scale-invariantly at `anchor = max(predicted, 0.05)` with prior weight `2.0`
+   from the live global factor on its first observation at that depth, EWMA cap
+   `32.0`, 128-token half-life aging matching `PrefixEstimate`) so sequential
+   workloads, context lengths, and heterogeneous concurrent lanes do not bleed
+   calibration across requests, and censored unobserved depths decay their prior
+   weight so a single funded acceptance probe can escape stale priors. Updates
+   use the exact offered, determined prefix outcomes computed once in
    `complete_inner` (Rao-Blackwellized with `completion_speculative_survival`
    when reported, else binary acceptance/rejection). Pricing multiplies each
-   depth's stored mean by its calibration factor, adds the optimistic margin
-   `(upper - mean)` during funded acceptance learning, clamps to `[0, 1]`, and
-   enforces nonincreasing prefix survival across depths.
+   depth's stored mean by the request's calibration factor, adds the Hoeffding
+   optimistic margin using the minimum aged weight of the confidence forecast
+   and verification calibration during funded acceptance learning, clamps to
+   `[0, 1]`, and enforces nonincreasing prefix survival across depths.
 2. **Cross-lane order-statistic allocation surplus (`SurplusHistory`):** Inside
-   a packed GPU-allocated round (`B >= 2`, `P < B * W`), the device allocator
-   observes fresh per-step confidences across all active lanes and allocates
-   the `P - B` draft slots to the highest-confidence `(lane, depth)` pairs of
-   that step. By Jensen's inequality, `E[sum Top-(P-B)(S_step)] >= sum
-   Top-(P-B)(E[S])`, so pricing packed rounds from time-averaged lane curves
-   systematically undervalues crowded packed graphs relative to plain `W=1`
-   and uncrowded small batches. The scheduler maintains a 64-entry rolling ring
-   buffer of paired `(actual_calibrated, pre_step_forecast)` lane curves (min
-   `4` samples), computes the normalized Lorenz concentration ratio over linear
-   calibrated survival at quota `r = (P - b) / b`, scales the excess surplus by
-   `(1 - 1/b) * min(alpha, 1.0)` (so it applies in full at `alpha = 1.0` and
-   dampens smoothly when `alpha < 1.0` already applies a concave boost), clamps
-   to `[1.0, 2.0]`, and caps total draft value by the physical `draft_budget`
+   a packed GPU-allocated round (`B >= 2`, `P < B * W`, `depth >= 1`), the
+   device allocator observes fresh per-step confidences across all active lanes
+   and allocates the `P - B` draft slots to the highest-confidence
+   `(lane, depth)` pairs of that step. By Jensen's inequality, `E[sum
+   Top-(P-B)(S_step)] >= sum Top-(P-B)(E[S])`, so pricing packed rounds from
+   time-averaged lane curves systematically undervalues crowded packed graphs
+   relative to plain `W=1` and uncrowded small batches. The scheduler maintains
+   two 256-entry rolling ring buffers (8 full `C=32` / 4 full `C=64` rounds): a
+   deep ring for `depth >= 2` paired `(actual_calibrated, pre_step_forecast)`
+   lane curves and a dedicated depth-1 (`width = 2`) ring fed by every round
+   with `depth >= 1` so sustained `W=2` traffic keeps depth-1 surplus fresh
+   without evicting deeper curves. Table construction (`min 4` samples) uses the
+   deepest `eff_depth` in `2..=depth` with at least `4` entries in the deep
+   ring (falling back to the depth-1 ring when querying `depth == 1` or when no
+   deeper history exists yet, never extrapolating beyond observed depths),
+   computes the normalized Lorenz concentration ratio over linear calibrated
+   survival at quota `r = (P - b) / b`, scales the excess surplus by `(1 - 1/b)
+   * min(alpha, 1.0)` (so it applies in full at `alpha = 1.0` and dampens
+   smoothly when `alpha < 1.0` already applies a concave boost), clamps to
+   `[1.0, 2.0]`, and caps total draft value by the physical `draft_budget`
    maximum (100% survival per allocated draft row). The normalized ratio equals
    `1.0` identically for single-lane cohorts (`b = 1`), uncrowded graphs
-   (`P - b >= total_ceiling_drafts`), pure mean shifts, and pure
-   between-request heterogeneity (preventing double-counting of per-request
-   forecasts).
+   (`P - b >= total_ceiling_drafts` or `r >= eff_depth`), pure mean shifts, and
+   pure between-request heterogeneity (preventing double-counting of
+   per-request forecasts).
 
 Ordinary selection uses the calibrated historical means (plus cross-lane
 allocation surplus on crowded GPU-allocated shapes); funded acceptance learning
