@@ -251,6 +251,7 @@ mod imp {
         d_batch_meta: DeviceBuffer,
         dev_plans: Vec<DevicePlan>,
         h_pinned: PinnedHost,
+        d2h_event: Event,
         h_meta: PinnedHost,
         h_scalars: PinnedHost,
         h_batch_meta: PinnedHost,
@@ -396,6 +397,7 @@ mod imp {
                 d_batch_meta: stream.alloc_device(BATCH_META_BYTES).map_err(io_err)?,
                 dev_plans,
                 h_pinned: stream.mapped_host_buffer(max_pkt).map_err(io_err)?,
+                d2h_event: stream.blocking_event().map_err(io_err)?,
                 h_meta,
                 h_scalars: stream.mapped_host_buffer(64).map_err(io_err)?,
                 h_batch_meta: stream.mapped_host_buffer(BATCH_META_BYTES).map_err(io_err)?,
@@ -1265,27 +1267,17 @@ mod imp {
             )
         }
 
-        /// Encode a batch of up to `page_batch_cap` non-matrix KV pages in one GPU wave
-        /// (2 stream syncs and 1 contiguous D2H DMA for the entire batch).
+        /// Queue GPU kernels (gather, CRC32, transforms, rANS32, compaction, stored CRC32) and
+        /// metadata D2H for one page batch on `stream` without waiting on host.
         #[allow(clippy::too_many_arguments)]
-        pub fn encode_pages_batch_with<F>(
+        fn launch_encode_pages_batch_kernels(
             &mut self,
             plan: &GpuPlan,
-            units: &[PackedUnit],
-            profile: &[u8; 32],
             spans_per_page: &[Vec<DeviceSpan>],
             stream: &Stream,
-            event: &Event,
-            mut f: F,
-        ) -> Result<u64>
-        where
-            F: FnMut(PackedUnit, &[u8]),
-        {
-            let batch = units.len();
-            if batch == 0 {
-                return Ok(0);
-            }
-            if batch != spans_per_page.len()
+        ) -> Result<()> {
+            let batch = spans_per_page.len();
+            if batch == 0
                 || batch > self.page_batch_cap
                 || plan.num_mats() != 0
                 || plan.num_chunks() == 0
@@ -1457,7 +1449,7 @@ mod imp {
                 launch_1d(
                     bf.fn_build_plan_batch,
                     1,
-                    1,
+                    MAX_PAGE_BATCH as u32,
                     0,
                     stream,
                     &mut [
@@ -1528,7 +1520,7 @@ mod imp {
                 )?;
             }
 
-            // 7. Read back compact batch metadata (`1544` bytes) in ONE sync.
+            // 7. Queue compact batch metadata (`1544` bytes) D2H.
             unsafe {
                 stream
                     .copy_dtoh_async(
@@ -1536,36 +1528,21 @@ mod imp {
                         self.d_batch_meta.ptr(),
                         BATCH_OFF_TOTAL_BYTES + 8,
                     )
-                    .map_err(io_err)?;
+                    .map_err(io_err)
             }
-            sync_stream(stream, event)?;
+        }
 
-            let bm = self.h_batch_meta.bytes();
-            let total_batch_bytes = u64::from_le_bytes(
-                bm[BATCH_OFF_TOTAL_BYTES..BATCH_OFF_TOTAL_BYTES + 8]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
-            if total_batch_bytes > self.h_pinned.bytes().len() {
-                return Err(invalid("GPU batch output exceeds pinned staging buffer"));
-            }
-
-            // 8. ONE contiguous pinned D2H of all `batch` finished packets + ONE sync.
-            if total_batch_bytes > 0 {
-                unsafe {
-                    stream
-                        .copy_dtoh_async(
-                            self.h_pinned.address() as _,
-                            self.buf_b.ptr(),
-                            total_batch_bytes,
-                        )
-                        .map_err(io_err)?;
-                }
-                sync_stream(stream, event)?;
-            }
-
-            let bm = self.h_batch_meta.bytes();
-            let pinned = &self.h_pinned.bytes()[..total_batch_bytes];
+        fn emit_encoded_batch<F>(
+            bm: &[u8],
+            pinned: &[u8],
+            units: &[PackedUnit],
+            n: usize,
+            profile: &[u8; 32],
+            f: &mut F,
+        ) -> u64
+        where
+            F: FnMut(PackedUnit, &[u8]),
+        {
             let mut stored_total = 0u64;
             for (p, base_unit) in units.iter().enumerate() {
                 let pkt_off = u64::from_le_bytes(
@@ -1612,7 +1589,102 @@ mod imp {
                     f(unit, slice);
                 }
             }
+            stored_total
+        }
+
+        /// Encode one or more page batches in an overlapped host/GPU pipeline:
+        /// overlaps batch `N`'s CPU slab copy and literal hashing (`f`) with batch `N+1`'s GPU
+        /// execution on `stream` using the single existing pinned host staging buffer
+        /// (0 extra GPU VRAM and 0 extra pinned host RAM; batch `N+1`'s D2H is only queued after
+        /// batch `N`'s synchronous host emission finishes).
+        #[allow(clippy::too_many_arguments)]
+        pub fn encode_pages_batches_with<F>(
+            &mut self,
+            plan: &GpuPlan,
+            batches: &[(&[PackedUnit], &[Vec<DeviceSpan>])],
+            profile: &[u8; 32],
+            stream: &Stream,
+            event: &Event,
+            mut f: F,
+        ) -> Result<u64>
+        where
+            F: FnMut(PackedUnit, &[u8]),
+        {
+            if batches.is_empty() {
+                return Ok(0);
+            }
+            for &(units, spans) in batches {
+                if units.len() != spans.len() {
+                    return Err(invalid("GPU page batch unit/span count mismatch"));
+                }
+            }
+            let n = plan.original_bytes();
+            let mut stored_total = 0u64;
+            let mut saved_meta = [0u8; BATCH_OFF_TOTAL_BYTES + 8];
+            let pinned_cap = self.h_pinned.bytes().len();
+
+            self.launch_encode_pages_batch_kernels(plan, batches[0].1, stream)?;
+            for b in 0..batches.len() {
+                sync_stream(stream, event)?;
+                saved_meta.copy_from_slice(&self.h_batch_meta.bytes()[..BATCH_OFF_TOTAL_BYTES + 8]);
+                let total_batch_bytes = u64::from_le_bytes(
+                    saved_meta[BATCH_OFF_TOTAL_BYTES..BATCH_OFF_TOTAL_BYTES + 8]
+                        .try_into()
+                        .unwrap(),
+                ) as usize;
+                if total_batch_bytes > pinned_cap {
+                    return Err(invalid("GPU batch output exceeds pinned staging buffer"));
+                }
+                if total_batch_bytes > 0 {
+                    unsafe {
+                        stream
+                            .copy_dtoh_async(
+                                self.h_pinned.address() as _,
+                                self.buf_b.ptr(),
+                                total_batch_bytes,
+                            )
+                            .map_err(io_err)?;
+                    }
+                    stream.record(&self.d2h_event).map_err(io_err)?;
+                }
+                // Queue next batch's GPU kernels immediately in stream order (executes right after
+                // batch `b`'s D2H finishes reading `buf_b`), overlapping GPU work with CPU emission.
+                // Batch `b+1` only writes device buffers and `d_batch_meta` until the next loop
+                // iteration, so `self.h_pinned` stays exclusively owned by host emission below.
+                if b + 1 < batches.len() {
+                    self.launch_encode_pages_batch_kernels(plan, batches[b + 1].1, stream)?;
+                }
+                if total_batch_bytes > 0 {
+                    self.d2h_event.synchronize().map_err(io_err)?;
+                }
+                let pinned = &self.h_pinned.bytes()[..total_batch_bytes];
+                stored_total +=
+                    Self::emit_encoded_batch(&saved_meta, pinned, batches[b].0, n, profile, &mut f);
+            }
             Ok(stored_total)
+        }
+
+        /// Encode a batch of up to `page_batch_cap` non-matrix KV pages in one GPU wave
+        /// (2 stream syncs and 1 contiguous D2H DMA for the entire batch).
+        #[cfg(all(test, feature = "runtime-core"))]
+        #[allow(clippy::too_many_arguments)]
+        pub fn encode_pages_batch_with<F>(
+            &mut self,
+            plan: &GpuPlan,
+            units: &[PackedUnit],
+            profile: &[u8; 32],
+            spans_per_page: &[Vec<DeviceSpan>],
+            stream: &Stream,
+            event: &Event,
+            f: F,
+        ) -> Result<u64>
+        where
+            F: FnMut(PackedUnit, &[u8]),
+        {
+            if units.is_empty() {
+                return Ok(0);
+            }
+            self.encode_pages_batches_with(plan, &[(units, spans_per_page)], profile, stream, event, f)
         }
 
         /// Verify stored CRC32 on GPU, decode a batch of `GKV1/v2` non-matrix page packets on GPU,
@@ -2180,6 +2252,31 @@ mod imp {
                 )
                 .unwrap();
             assert_eq!(encoded.len(), N_PAGES);
+            // Multi-batch single-buffer pipeline must be bit-exact with single-batch output
+            // across consecutive batches.
+            let mut piped: Vec<(PackedUnit, Vec<u8>)> = Vec::with_capacity(N_PAGES);
+            let split_batches = [
+                (&b_units[0..3], &b_src_spans[0..3]),
+                (&b_units[3..6], &b_src_spans[3..6]),
+                (&b_units[6..8], &b_src_spans[6..8]),
+            ];
+            bcodec
+                .encode_pages_batches_with(
+                    &p_gplan,
+                    &split_batches,
+                    &profile,
+                    &stream,
+                    &event,
+                    |u, bytes| piped.push((u, bytes.to_vec())),
+                )
+                .unwrap();
+            assert_eq!(piped.len(), N_PAGES);
+            for p in 0..N_PAGES {
+                assert_eq!(piped[p].0.stored_crc, encoded[p].0.stored_crc);
+                assert_eq!(piped[p].0.original_crc, encoded[p].0.original_crc);
+                assert_eq!(piped[p].0.raw_xxh3, encoded[p].0.raw_xxh3);
+                assert_eq!(piped[p].1, encoded[p].1);
+            }
             for (p, (u, bytes)) in encoded.iter().enumerate() {
                 if p == 3 {
                     assert_eq!(u.representation, Representation::Literal as i32);
@@ -2317,12 +2414,11 @@ mod imp {
             1
         }
         #[allow(clippy::too_many_arguments)]
-        pub fn encode_pages_batch_with<F>(
+        pub fn encode_pages_batches_with<F>(
             &mut self,
             _: &GpuPlan,
-            _: &[PackedUnit],
+            _: &[(&[PackedUnit], &[Vec<DeviceSpan>])],
             _: &[u8; 32],
-            _: &[Vec<DeviceSpan>],
             _: &Stream,
             _: &Event,
             _: F,

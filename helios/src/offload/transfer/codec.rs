@@ -232,60 +232,57 @@ impl RankCodec {
                     1
                 };
                 if batch_cap > 1 && job.pages.len() > 1 {
+                    // Pipeline up to 4 batches per lock acquisition so host slab copies overlap
+                    // with GPU encoding while bounding mutex hold time and span-list allocation
+                    // so concurrent foreground restores can still acquire the codec between waves.
+                    const MAX_PIPELINE_BATCHES: usize = 4;
+                    let wave_pages = batch_cap * MAX_PIPELINE_BATCHES;
                     let mut page_offset = 0usize;
-                    for chunk in job.pages.chunks(batch_cap) {
-                        let mut units = Vec::with_capacity(chunk.len());
-                        let mut spans_per_page = Vec::with_capacity(chunk.len());
-                        for (i, (page, _)) in chunk.iter().enumerate() {
-                            spans_per_page.push(device_spans(
-                                geometry,
-                                layout,
-                                false,
-                                u64::from(page.0),
-                            )?);
-                            units.push(PackedUnit {
-                                kind: Kind::Page as i32,
-                                logical_index: first + (page_offset + i) as u64,
-                                stored_rank: rank as u32,
-                                ..Default::default()
-                            });
+                    for wave in job.pages.chunks(wave_pages) {
+                        let mut owned_batches: Vec<(Vec<PackedUnit>, Vec<Vec<DeviceSpan>>)> =
+                            Vec::with_capacity(wave.len().div_ceil(batch_cap));
+                        for chunk in wave.chunks(batch_cap) {
+                            let mut units = Vec::with_capacity(chunk.len());
+                            let mut spans_per_page = Vec::with_capacity(chunk.len());
+                            for (i, (page, _)) in chunk.iter().enumerate() {
+                                spans_per_page.push(device_spans(
+                                    geometry,
+                                    layout,
+                                    false,
+                                    u64::from(page.0),
+                                )?);
+                                units.push(PackedUnit {
+                                    kind: Kind::Page as i32,
+                                    logical_index: first + (page_offset + i) as u64,
+                                    stored_rank: rank as u32,
+                                    ..Default::default()
+                                });
+                            }
+                            owned_batches.push((units, spans_per_page));
+                            page_offset += chunk.len();
                         }
                         let start = Instant::now();
+                        let batch_refs: Vec<(&[PackedUnit], &[Vec<DeviceSpan>])> = owned_batches
+                            .iter()
+                            .map(|(u, s)| (u.as_slice(), s.as_slice()))
+                            .collect();
                         let stored_len = {
                             let mut guard = gpu.codec.lock().unwrap();
-                            let res = if chunk.len() > 1 {
-                                guard.encode_pages_batch_with(
-                                    page_plan,
-                                    &units,
-                                    &self.gpu_profile,
-                                    &spans_per_page,
-                                    stream,
-                                    event,
-                                    |unit, bytes| capture.push_slice(unit, bytes),
-                                )
-                            } else {
-                                guard.encode_from_device_with(
-                                    page_plan,
-                                    units.into_iter().next().unwrap(),
-                                    &self.gpu_profile,
-                                    &spans_per_page[0],
-                                    stream,
-                                    event,
-                                    |unit, bytes| {
-                                        let slen = unit.stored_length;
-                                        capture.push_slice(unit, bytes);
-                                        slen
-                                    },
-                                )
-                            };
+                            let res = guard.encode_pages_batches_with(
+                                page_plan,
+                                &batch_refs,
+                                &self.gpu_profile,
+                                stream,
+                                event,
+                                |unit, bytes| capture.push_slice(unit, bytes),
+                            );
                             sync_on_err(stream, res)
                         }
                         .map_err(decode_error)?;
                         stats.transform_ns += start.elapsed().as_nanos() as u64;
                         stored += stored_len;
-                        transferred += (page_bytes * chunk.len()) as u64;
-                        page_offset += chunk.len();
                     }
+                    transferred += (page_bytes * job.pages.len()) as u64;
                 } else {
                     for (i, (page, _)) in job.pages.iter().enumerate() {
                         let spans = device_spans(geometry, layout, false, u64::from(page.0))?;

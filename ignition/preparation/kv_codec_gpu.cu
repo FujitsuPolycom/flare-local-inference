@@ -901,54 +901,87 @@ static __device__ __forceinline__ void rans32_encode_chunk_impl(
         return;
     }
 
-    __shared__ U hist4_sh[4][256];
-    __shared__ U hist_sh[256];
+    __shared__ union {
+        U hist4[4][256];
+        uint16_t wbuf[RANS_LANES][64];
+        B lane_tmp[4][RANS_LANE_CAP_BYTES];
+    } scratch_sh;
     __shared__ U freq_sh[256];
     __shared__ U cdf_sh[256];
     __shared__ U rcp_m_sh[256];
     __shared__ U rcp_sh_sh[256];
-    __shared__ U rem_sh[256];
+    __shared__ U warp_tmp_sh[8];
+    __shared__ U warp_max_h_sh[8];
+    __shared__ int warp_max_s_sh[8];
+    __shared__ int warp_only_sh[8];
+    __shared__ U active_freqs_sh[152];
     __shared__ B hdr_sh[RANS_HDR_RESERVE];
     __shared__ U states_sh[RANS_LANES];
     __shared__ uint16_t lane_words_sh[RANS_LANES];
-    __shared__ uint16_t wbuf_sh[RANS_LANES][64]; // 4 KiB write-combining burst buffer
-    __shared__ B lane_tmp_sh[RANS_LANE_CAP_BYTES];
+    __shared__ U lane_dst_offs_sh[RANS_LANES];
+    __shared__ int active_sh;
+    __shared__ int max_sym_sh;
     __shared__ int mode_sh;      // 0 = raw fallback, 1 = RLE, 2/3 = rANS
     __shared__ int tbl_bytes_sh;
     __shared__ int overflow_sh;
     __shared__ int total_len_sh;
 
-    hist4_sh[0][tid] = 0u;
-    hist4_sh[1][tid] = 0u;
-    hist4_sh[2][tid] = 0u;
-    hist4_sh[3][tid] = 0u;
+    scratch_sh.hist4[0][tid] = 0u;
+    scratch_sh.hist4[1][tid] = 0u;
+    scratch_sh.hist4[2][tid] = 0u;
+    scratch_sh.hist4[3][tid] = 0u;
     __syncthreads();
 
     int bank = tid & 3;
     for (size_t i = tid; i < raw_sz; i += 256) {
-        atomicAdd(&hist4_sh[bank][src[i]], 1u);
+        atomicAdd(&scratch_sh.hist4[bank][src[i]], 1u);
     }
     __syncthreads();
 
-    hist_sh[tid] = hist4_sh[0][tid] + hist4_sh[1][tid] + hist4_sh[2][tid] + hist4_sh[3][tid];
+    U h = scratch_sh.hist4[0][tid] + scratch_sh.hist4[1][tid]
+        + scratch_sh.hist4[2][tid] + scratch_sh.hist4[3][tid];
+
+    int wid = tid >> 5;
+    int lane = tid & 31;
+    unsigned lane_lt_mask = (1u << lane) - 1u;
+
+    // 1. Warp/CTA-parallel active count, only_sym, and deterministic max_sym (lowest symbol wins ties).
+    unsigned nz_mask = __ballot_sync(0xFFFFFFFFu, h > 0u);
+    U mh = h;
+    int ms = tid;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        U oh = __shfl_down_sync(0xFFFFFFFFu, mh, off);
+        int os = __shfl_down_sync(0xFFFFFFFFu, ms, off);
+        if (oh > mh || (oh == mh && os < ms)) {
+            mh = oh;
+            ms = os;
+        }
+    }
+    if (lane == 0) {
+        warp_tmp_sh[wid] = (U)__popc(nz_mask);
+        warp_only_sh[wid] = (nz_mask != 0u) ? (wid * 32 + (31 - __clz(nz_mask))) : -1;
+        warp_max_h_sh[wid] = mh;
+        warp_max_s_sh[wid] = ms;
+    }
     __syncthreads();
 
     if (tid == 0) {
         int active = 0;
         int only_sym = 0;
-        int max_sym = 0;
-        U max_h = 0u;
-        for (int s = 0; s < 256; ++s) {
-            U h = hist_sh[s];
-            if (h > 0u) {
-                active++;
-                only_sym = s;
-                if (h > max_h) {
-                    max_h = h;
-                    max_sym = s;
-                }
+        U best_h = 0u;
+        int best_s = 0;
+        #pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            active += (int)warp_tmp_sh[w];
+            if (warp_only_sh[w] >= 0) only_sym = warp_only_sh[w];
+            if (warp_max_h_sh[w] > best_h || (warp_max_h_sh[w] == best_h && warp_max_s_sh[w] < best_s)) {
+                best_h = warp_max_h_sh[w];
+                best_s = warp_max_s_sh[w];
             }
         }
+        active_sh = active;
+        max_sym_sh = best_s;
         if (active == 1 && raw_sz > 2) {
             slot[0] = 1u;
             slot[1] = (B)only_sym;
@@ -957,104 +990,7 @@ static __device__ __forceinline__ void rans32_encode_chunk_impl(
         } else if (active <= 1 || raw_sz <= 256) {
             mode_sh = 0;
         } else {
-            // Largest-remainder (Hamilton) normalization: reserve 1 per active symbol, allocate
-            // floor((h * budget) / raw_sz), then distribute the remainder to symbols with the
-            // largest fractional remainders instead of dumping all mass onto `max_sym`.
-            uint64_t budget = (uint64_t)(RANS_PROB_SCALE - active);
-            U sum = 0u;
-            for (int s = 0; s < 256; ++s) {
-                U h = hist_sh[s];
-                if (h == 0u) {
-                    freq_sh[s] = 0u;
-                    rem_sh[s] = 0u;
-                } else {
-                    uint64_t prod = (uint64_t)h * budget;
-                    U f = 1u + (U)(prod / (uint64_t)raw_sz);
-                    freq_sh[s] = f;
-                    rem_sh[s] = (U)(prod % (uint64_t)raw_sz);
-                    sum += f;
-                }
-            }
-            U left = (U)RANS_PROB_SCALE - sum;
-            if (left > 0u) {
-                U lo = 0u, hi = (U)raw_sz;
-                while (lo < hi) {
-                    U mid = (lo + hi) >> 1;
-                    U cnt = 0u;
-                    for (int s = 0; s < 256; ++s) {
-                        if (hist_sh[s] > 0u && freq_sh[s] < 4095u && rem_sh[s] >= mid) cnt++;
-                    }
-                    if (cnt > left) lo = mid + 1u;
-                    else hi = mid;
-                }
-                for (int s = 0; s < 256; ++s) {
-                    if (hist_sh[s] > 0u && freq_sh[s] < 4095u && rem_sh[s] >= lo && left > 0u) {
-                        freq_sh[s]++;
-                        left--;
-                    }
-                }
-                if (left > 0u && lo > 0u) {
-                    U tie = lo - 1u;
-                    for (int s = 0; s < 256 && left > 0u; ++s) {
-                        if (hist_sh[s] > 0u && freq_sh[s] < 4095u && rem_sh[s] == tie) {
-                            freq_sh[s]++;
-                            left--;
-                        }
-                    }
-                }
-                if (left > 0u) {
-                    freq_sh[max_sym] += left;
-                }
-            }
-
-            U c = 0u;
-            for (int s = 0; s < 256; ++s) {
-                cdf_sh[s] = c;
-                c += freq_sh[s];
-            }
-
-            // Serialize compact frequency table header into hdr_sh.
-            if (active <= 150) {
-                mode_sh = 2;
-                hdr_sh[0] = 2u;
-                hdr_sh[1] = (B)(active - 1);
-                int pos = 2;
-                U active_freqs[150];
-                int k = 0;
-                for (int s = 0; s < 256; ++s) {
-                    if (freq_sh[s] > 0u) {
-                        hdr_sh[pos++] = (B)s;
-                        active_freqs[k++] = freq_sh[s];
-                    }
-                }
-                int i = 0;
-                while (i + 1 < k) {
-                    U a = active_freqs[i];
-                    U b = active_freqs[i + 1];
-                    hdr_sh[pos++] = (B)(a & 0xFFu);
-                    hdr_sh[pos++] = (B)(((a >> 8) & 0x0Fu) | ((b & 0x0Fu) << 4));
-                    hdr_sh[pos++] = (B)((b >> 4) & 0xFFu);
-                    i += 2;
-                }
-                if (i < k) {
-                    U a = active_freqs[i];
-                    hdr_sh[pos++] = (B)(a & 0xFFu);
-                    hdr_sh[pos++] = (B)((a >> 8) & 0x0Fu);
-                }
-                tbl_bytes_sh = pos;
-            } else {
-                mode_sh = 3;
-                hdr_sh[0] = 3u;
-                int pos = 1;
-                for (int s = 0; s < 256; s += 2) {
-                    U a = freq_sh[s];
-                    U b = freq_sh[s + 1];
-                    hdr_sh[pos++] = (B)(a & 0xFFu);
-                    hdr_sh[pos++] = (B)(((a >> 8) & 0x0Fu) | ((b & 0x0Fu) << 4));
-                    hdr_sh[pos++] = (B)((b >> 4) & 0xFFu);
-                }
-                tbl_bytes_sh = pos; // 385
-            }
+            mode_sh = (active <= 150) ? 2 : 3;
         }
     }
     __syncthreads();
@@ -1066,14 +1002,160 @@ static __device__ __forceinline__ void rans32_encode_chunk_impl(
         return;
     }
 
-    // All 256 threads compute their symbol's exact division reciprocal IN PARALLEL!
-    {
-        U f = freq_sh[tid];
+    // 2. Parallel largest-remainder (Hamilton) normalization across all 256 symbols simultaneously.
+    int active = active_sh;
+    U f = 0u;
+    U rem = 0u;
+    if (h > 0u) {
+        uint64_t budget = (uint64_t)(RANS_PROB_SCALE - active);
+        uint64_t prod = (uint64_t)h * budget;
+        f = 1u + (U)(prod / (uint64_t)raw_sz);
+        rem = (U)(prod % (uint64_t)raw_sz);
+    }
+
+    // Sum initial `f` across 8 warps.
+    U wf = f;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        wf += __shfl_down_sync(0xFFFFFFFFu, wf, off);
+    }
+    if (lane == 0) warp_tmp_sh[wid] = wf;
+    __syncthreads();
+
+    U init_sum = warp_tmp_sh[0] + warp_tmp_sh[1] + warp_tmp_sh[2] + warp_tmp_sh[3]
+               + warp_tmp_sh[4] + warp_tmp_sh[5] + warp_tmp_sh[6] + warp_tmp_sh[7];
+    __syncthreads();
+    U left = (U)RANS_PROB_SCALE - init_sum;
+
+    if (left > 0u) {
+        bool elig = (h > 0u && f < 4095u);
+        U lo = 0u, hi = (U)raw_sz;
+        while (lo < hi) {
+            U mid = (lo + hi) >> 1;
+            unsigned m = __ballot_sync(0xFFFFFFFFu, elig && rem >= mid);
+            if (lane == 0) warp_tmp_sh[wid] = (U)__popc(m);
+            __syncthreads();
+            U cnt = warp_tmp_sh[0] + warp_tmp_sh[1] + warp_tmp_sh[2] + warp_tmp_sh[3]
+                  + warp_tmp_sh[4] + warp_tmp_sh[5] + warp_tmp_sh[6] + warp_tmp_sh[7];
+            __syncthreads();
+            if (cnt > left) lo = mid + 1u;
+            else hi = mid;
+        }
+        // Increment symbols with `rem >= lo` in ascending symbol order (bit-exact with serial loop).
+        unsigned ge_m = __ballot_sync(0xFFFFFFFFu, elig && rem >= lo);
+        if (lane == 0) warp_tmp_sh[wid] = (U)__popc(ge_m);
+        __syncthreads();
+        U ge_base = 0u;
+        #pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            if (w < wid) ge_base += warp_tmp_sh[w];
+        }
+        U ge_total = warp_tmp_sh[0] + warp_tmp_sh[1] + warp_tmp_sh[2] + warp_tmp_sh[3]
+                   + warp_tmp_sh[4] + warp_tmp_sh[5] + warp_tmp_sh[6] + warp_tmp_sh[7];
+        __syncthreads();
+        if (elig && rem >= lo) {
+            U rank = ge_base + (U)__popc(ge_m & lane_lt_mask);
+            if (rank < left) f++;
+        }
+        left = (ge_total >= left) ? 0u : (left - ge_total);
+        if (left > 0u && lo > 0u) {
+            U tie = lo - 1u;
+            unsigned eq_m = __ballot_sync(0xFFFFFFFFu, elig && rem == tie);
+            if (lane == 0) warp_tmp_sh[wid] = (U)__popc(eq_m);
+            __syncthreads();
+            U eq_base = 0u;
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                if (w < wid) eq_base += warp_tmp_sh[w];
+            }
+            U eq_total = warp_tmp_sh[0] + warp_tmp_sh[1] + warp_tmp_sh[2] + warp_tmp_sh[3]
+                       + warp_tmp_sh[4] + warp_tmp_sh[5] + warp_tmp_sh[6] + warp_tmp_sh[7];
+            __syncthreads();
+            if (elig && rem == tie) {
+                U rank = eq_base + (U)__popc(eq_m & lane_lt_mask);
+                if (rank < left) f++;
+            }
+            left = (eq_total >= left) ? 0u : (left - eq_total);
+        }
+        if (left > 0u && tid == max_sym_sh) {
+            f += left;
+        }
+    }
+    freq_sh[tid] = f;
+
+    // 3. Parallel 256-element exclusive prefix sum for `cdf_sh[tid]` + parallel division reciprocals.
+    U scan = f;
+    #pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+        U prev = __shfl_up_sync(0xFFFFFFFFu, scan, off);
+        if (lane >= off) scan += prev;
+    }
+    if (lane == 31) warp_tmp_sh[wid] = scan;
+    __syncthreads();
+    U cdf_base = 0u;
+    #pragma unroll
+    for (int w = 0; w < 8; ++w) {
+        if (w < wid) cdf_base += warp_tmp_sh[w];
+    }
+    __syncthreads();
+    cdf_sh[tid] = cdf_base + scan - f;
+
+    if (f > 0u) {
+        prep_div_u32(f, rcp_m_sh[tid], rcp_sh_sh[tid]);
+    } else {
+        rcp_m_sh[tid] = 0u;
+        rcp_sh_sh[tid] = 0u;
+    }
+
+    // 4. Parallel frequency-table header serialization into `hdr_sh`.
+    if (mode_sh == 2) {
+        unsigned act_m = __ballot_sync(0xFFFFFFFFu, f > 0u);
+        if (lane == 0) warp_tmp_sh[wid] = (U)__popc(act_m);
+        __syncthreads();
+        U act_base = 0u;
+        #pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            if (w < wid) act_base += warp_tmp_sh[w];
+        }
         if (f > 0u) {
-            prep_div_u32(f, rcp_m_sh[tid], rcp_sh_sh[tid]);
-        } else {
-            rcp_m_sh[tid] = 0u;
-            rcp_sh_sh[tid] = 0u;
+            U k = act_base + (U)__popc(act_m & lane_lt_mask);
+            hdr_sh[2 + k] = (B)tid;
+            active_freqs_sh[k] = f;
+        }
+        __syncthreads();
+        int pairs = active >> 1;
+        if (tid < pairs) {
+            U a = active_freqs_sh[tid * 2];
+            U b = active_freqs_sh[tid * 2 + 1];
+            int pos = 2 + active + tid * 3;
+            hdr_sh[pos] = (B)(a & 0xFFu);
+            hdr_sh[pos + 1] = (B)(((a >> 8) & 0x0Fu) | ((b & 0x0Fu) << 4));
+            hdr_sh[pos + 2] = (B)((b >> 4) & 0xFFu);
+        }
+        if (tid == 0) {
+            hdr_sh[0] = 2u;
+            hdr_sh[1] = (B)(active - 1);
+            int pos = 2 + active + pairs * 3;
+            if (active & 1) {
+                U a = active_freqs_sh[active - 1];
+                hdr_sh[pos++] = (B)(a & 0xFFu);
+                hdr_sh[pos++] = (B)((a >> 8) & 0x0Fu);
+            }
+            tbl_bytes_sh = pos;
+        }
+    } else {
+        __syncthreads();
+        if (tid < 128) {
+            U a = freq_sh[tid * 2];
+            U b = freq_sh[tid * 2 + 1];
+            int pos = 1 + tid * 3;
+            hdr_sh[pos] = (B)(a & 0xFFu);
+            hdr_sh[pos + 1] = (B)(((a >> 8) & 0x0Fu) | ((b & 0x0Fu) << 4));
+            hdr_sh[pos + 2] = (B)((b >> 4) & 0xFFu);
+        }
+        if (tid == 0) {
+            hdr_sh[0] = 3u;
+            tbl_bytes_sh = 385;
         }
     }
     __syncthreads();
@@ -1099,13 +1181,13 @@ static __device__ __forceinline__ void rans32_encode_chunk_impl(
                     ovf = 1;
                     break;
                 }
-                wbuf_sh[lane][63 - bcnt] = (uint16_t)(x & 0xFFFFu);
+                scratch_sh.wbuf[lane][63 - bcnt] = (uint16_t)(x & 0xFFFFu);
                 bcnt++;
                 nwords++;
                 if (bcnt == 64) {
                     uint16_t *dst_w = lane_end_u16 - nwords;
                     #pragma unroll 8
-                    for (int j = 0; j < 64; ++j) dst_w[j] = wbuf_sh[lane][j];
+                    for (int j = 0; j < 64; ++j) dst_w[j] = scratch_sh.wbuf[lane][j];
                     bcnt = 0;
                 }
                 x >>= 16;
@@ -1116,7 +1198,7 @@ static __device__ __forceinline__ void rans32_encode_chunk_impl(
         }
         if (!ovf && bcnt > 0) {
             uint16_t *dst_w = lane_end_u16 - nwords;
-            for (int j = 0; j < bcnt; ++j) dst_w[j] = wbuf_sh[lane][64 - bcnt + j];
+            for (int j = 0; j < bcnt; ++j) dst_w[j] = scratch_sh.wbuf[lane][64 - bcnt + j];
         }
         states_sh[lane] = x;
         lane_words_sh[lane] = (uint16_t)nwords;
@@ -1125,27 +1207,24 @@ static __device__ __forceinline__ void rans32_encode_chunk_impl(
     }
     __syncthreads();
 
-    if (tid == 0) {
-        int hdr_len = tbl_bytes_sh + RANS_LANES * 4 + RANS_LANES * 2;
-        int payload = 0;
-        for (int l = 0; l < RANS_LANES; ++l) {
-            payload += (int)lane_words_sh[l] * 2;
+    if (tid < RANS_LANES) {
+        int l = tid;
+        U len_b = (U)lane_words_sh[l] * 2u;
+        U scan_b = len_b;
+        #pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+            U prev = __shfl_up_sync(0xFFFFFFFFu, scan_b, off);
+            if (l >= off) scan_b += prev;
         }
-        int tot = hdr_len + payload;
-        if (overflow_sh || (size_t)tot >= raw_sz) {
-            total_len_sh = -1;
-        } else {
-            // Append final states + lane word counts to hdr_sh.
-            int p = tbl_bytes_sh;
-            for (int l = 0; l < RANS_LANES; ++l) {
-                store_u32_le(hdr_sh + p, states_sh[l]);
-                p += 4;
-            }
-            for (int l = 0; l < RANS_LANES; ++l) {
-                store_u16_le(hdr_sh + p, lane_words_sh[l]);
-                p += 2;
-            }
-            total_len_sh = tot;
+        lane_dst_offs_sh[l] = scan_b - len_b;
+        int hdr_len = tbl_bytes_sh + RANS_LANES * 6;
+        int p_st = tbl_bytes_sh + l * 4;
+        store_u32_le(hdr_sh + p_st, states_sh[l]);
+        int p_nw = tbl_bytes_sh + RANS_LANES * 4 + l * 2;
+        store_u16_le(hdr_sh + p_nw, lane_words_sh[l]);
+        if (l == 31) {
+            int tot = hdr_len + (int)scan_b;
+            total_len_sh = (overflow_sh || (size_t)tot >= raw_sz) ? -1 : tot;
         }
     }
     __syncthreads();
@@ -1160,17 +1239,26 @@ static __device__ __forceinline__ void rans32_encode_chunk_impl(
     for (int i = tid; i < hdr_len; i += 256) {
         slot[i] = hdr_sh[i];
     }
-    int dst_off = hdr_len;
-    for (int l = 0; l < RANS_LANES; ++l) {
+    // 4-lane-parallel compaction (2 warps = 64 threads per lane, 8 iterations = 16 barriers
+    // instead of 64, aliased with hist4/wbuf to keep total CTA shared memory ~15 KiB for high occupancy).
+    // Safe because hdr_len <= 577 < RANS_HDR_RESERVE (640), so dst of group g never overlaps src of > g.
+    int sub_lane = tid & 63;
+    int grp_lane = tid >> 6; // 0..3
+    for (int g = 0; g < 8; ++g) {
+        int l = g * 4 + grp_lane;
         int len_l = (int)lane_words_sh[l] * 2;
         if (len_l > 0) {
             const B *src_l = slot + RANS_HDR_RESERVE + (size_t)(l + 1) * RANS_LANE_CAP_BYTES - len_l;
-            for (int i = tid; i < len_l; i += 256) lane_tmp_sh[i] = src_l[i];
-            __syncthreads();
-            for (int i = tid; i < len_l; i += 256) slot[dst_off + i] = lane_tmp_sh[i];
-            __syncthreads();
-            dst_off += len_l;
+            B *tmp = scratch_sh.lane_tmp[grp_lane];
+            for (int i = sub_lane; i < len_l; i += 64) tmp[i] = src_l[i];
         }
+        __syncthreads();
+        if (len_l > 0) {
+            B *dst_l = slot + hdr_len + lane_dst_offs_sh[l];
+            const B *tmp = scratch_sh.lane_tmp[grp_lane];
+            for (int i = sub_lane; i < len_l; i += 64) dst_l[i] = tmp[i];
+        }
+        __syncthreads();
     }
     if (tid == 0) {
         *chunk_word_out = (U)total_len_sh;
@@ -1549,9 +1637,10 @@ __global__ void kv_compact_packet_gpu(
     }
 }
 
-// Multi-page batched packet plan builder for non-matrix page batches (`grid = 1`, `block = 1`).
-// Packs all `batch` packets contiguously into `d_pkt` (leaving `orig_bytes` literal slots for
-// incompressible pages), writing `GKV1/v2` headers + chunk directories for compressible pages.
+// Multi-page batched packet plan builder for non-matrix page batches (`grid = 1`, `block = 1..64`).
+// Strides across `blockDim.x` so both `block = 64` (parallel) and `block = 1` (older binaries)
+// pack all `batch` (<= 64) packets contiguously into `d_pkt` (leaving `orig_bytes` literal slots
+// for incompressible pages), computing per-page directories and writing `GKV1/v2` headers.
 __global__ void kv_build_packet_plan_batch_gpu(
     B *d_pkt,
     const U *chunk_words,
@@ -1563,12 +1652,15 @@ __global__ void kv_build_packet_plan_batch_gpu(
     U num_chunks_per_page,
     int batch
 ) {
-    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    if (blockIdx.x != 0) return;
+    __shared__ uint64_t page_used_sh[64];
+    __shared__ uint64_t page_off_sh[64];
+    __shared__ U page_pos_sh[64];
+
     U meta = (U)HEADER_BYTES + num_chunks_per_page * 4u;
-    uint64_t batch_pos = 0ull;
-    for (int p = 0; p < batch; ++p) {
-        U base_c = (U)p * num_chunks_per_page;
+    for (int p = threadIdx.x; p < batch; p += blockDim.x) {
         U pos = meta;
+        U base_c = (U)p * num_chunks_per_page;
         for (U c = 0; c < num_chunks_per_page; ++c) {
             U w = chunk_words[base_c + c];
             U len = w & ~RAW_FLAG;
@@ -1576,9 +1668,27 @@ __global__ void kv_build_packet_plan_batch_gpu(
             pos += len;
         }
         total_pkt_arr[p] = (uint64_t)pos;
-        pkt_out_offs[p] = batch_pos;
-        if (pos < orig_bytes) {
-            B *hdr = d_pkt + batch_pos;
+        page_pos_sh[p] = pos;
+        page_used_sh[p] = (pos < orig_bytes) ? (uint64_t)pos : (uint64_t)orig_bytes;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        uint64_t batch_pos = 0ull;
+        for (int i = 0; i < batch; ++i) {
+            page_off_sh[i] = batch_pos;
+            batch_pos += page_used_sh[i];
+        }
+        *total_batch_bytes_out = batch_pos;
+    }
+    __syncthreads();
+
+    for (int p = threadIdx.x; p < batch; p += blockDim.x) {
+        uint64_t out_off = page_off_sh[p];
+        pkt_out_offs[p] = out_off;
+        if (page_pos_sh[p] < orig_bytes) {
+            U base_c = (U)p * num_chunks_per_page;
+            B *hdr = d_pkt + out_off;
             store_u32_le(hdr + 0, GKV1_MAGIC);
             store_u32_le(hdr + 4, GKV1_VERSION);
             store_u32_le(hdr + 8, orig_bytes);
@@ -1588,12 +1698,8 @@ __global__ void kv_build_packet_plan_batch_gpu(
             for (U c = 0; c < num_chunks_per_page; ++c) {
                 store_u32_le(hdr + HEADER_BYTES + c * 4u, chunk_words[base_c + c]);
             }
-            batch_pos += (uint64_t)pos;
-        } else {
-            batch_pos += (uint64_t)orig_bytes;
         }
     }
-    *total_batch_bytes_out = batch_pos;
 }
 
 // Compacts all chunks (and raw literals for incompressible pages) across `batch` pages in one launch.
