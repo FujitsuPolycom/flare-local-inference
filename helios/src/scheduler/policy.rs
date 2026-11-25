@@ -86,6 +86,7 @@ pub(super) struct Candidate {
     pub prefill_slot: Option<usize>,
     pub work: usize,
     pub duration_ns: u64,
+    pub expected: f64,
     pub rate: ValueRate,
     pub feedback: bool,
     pub host_lengths: Option<[usize; REQUEST_LANES]>,
@@ -967,6 +968,21 @@ impl RequestScheduler {
                 age_price,
             )
             .unwrap_or_else(|| (selected, ValueRate::new(duration_ns, expected, age_price)));
+        let expected = if duration_ns == 0 || kind.is_prefill() {
+            expected
+        } else {
+            bits(selected)
+                .map(|slot| {
+                    self.lane_value(
+                        self.slots[slot].request.as_ref().unwrap(),
+                        kind,
+                        capacity,
+                        0,
+                        values[slot],
+                    )
+                })
+                .sum()
+        };
         output.push(Candidate { host_lengths: None, draft_tokens: drafts, packed_token_capacity: packed,
             kind,
             mask: selected,
@@ -986,6 +1002,7 @@ impl RequestScheduler {
                 0
             },
             duration_ns,
+            expected,
             rate,
             feedback,
         });
@@ -1134,9 +1151,22 @@ impl RequestScheduler {
                     .filter(|(s, _)| mask & (1 << s) != 0)
                     .map(|(_, v)| v)
                     .sum::<f64>();
+                let mut refresh_expected = decoders[..count]
+                    .iter()
+                    .filter(|(s, _)| mask & (1 << s) != 0)
+                    .map(|&(slot, _)| {
+                        let r = self.slots[slot].request.as_ref().unwrap();
+                        if optimistic {
+                            values[slot].decode(self.optimistic_tokens(r, self.speculative_tokens(r, width)), 0.0)
+                        } else {
+                            self.lane_value(r, decode, width, 0, values[slot])
+                        }
+                    })
+                    .sum::<f64>();
                 if let Some((slot, value)) = prompt {
                     mask |= 1 << slot;
                     expected += value;
+                    refresh_expected += value;
                 }
                 if mask == 0 {
                     continue;
@@ -1150,6 +1180,7 @@ impl RequestScheduler {
                     prefill_slot: prompt.map(|(s, _)| s),
                     work: 0,
                     duration_ns,
+                    expected: refresh_expected,
                     rate: ValueRate::new(duration_ns, expected, age_price),
                     feedback: true,
                 });
@@ -1167,14 +1198,14 @@ impl RequestScheduler {
         let mut candidates = self.candidates.borrow_mut();
         self.candidates(&mut candidates, &values, age_price);
         let ordinary_count = self.prune_padding(&mut candidates);
-        let compare = |a: &Candidate, b: &Candidate| {
+        let compare_by = |a: &Candidate, b: &Candidate, a_rate: ValueRate, b_rate: ValueRate| {
             let last = |c: &Candidate| {
                 bits(c.mask)
                     .map(|s| self.slots[s].request.as_ref().unwrap().last_use.0 as u128)
                     .sum::<u128>()
             };
-            a.rate
-                .compare(b.rate)
+            a_rate
+                .compare(b_rate)
                 .then(a.mask.count_ones().cmp(&b.mask.count_ones()))
                 .then(last(b).cmp(&last(a)))
                 .then(b.batch.cmp(&a.batch))
@@ -1186,6 +1217,13 @@ impl RequestScheduler {
                 .then(b.prefill_capacity.cmp(&a.prefill_capacity))
                 .then(b.mask.cmp(&a.mask))
         };
+        let compare = |a: &Candidate, b: &Candidate| compare_by(a, b, a.rate, b.rate);
+        let compare_refresh = |a: &Candidate, b: &Candidate| compare_by(
+            a,
+            b,
+            ValueRate::new(0, a.expected, age_price),
+            ValueRate::new(0, b.expected, age_price),
+        );
         let ordinary = *candidates[..ordinary_count].iter().max_by(|a, b| compare(a, b))?;
         if ordinary.rate.duration_ns == 0 {
             return self.available_plan(ordinary, &values, age_price, log_scale, PlanOrigin::Discovery);
@@ -1194,7 +1232,7 @@ impl RequestScheduler {
             let mut targets: Vec<_> = self.costs.stale_keys().filter(|key| *key != ordinary.cost_key())
                 .map(|key| (self.costs.refresh_order(key), key)).collect();
             targets.sort_by_key(|(order, _)| *order);
-            let mut best: Option<(u64, cost::Key, Candidate)> = None;
+            let mut best: Option<((bool, u64), cost::Key, Candidate)> = None;
             let mut choices = Vec::new();
             for (order, target) in targets {
                 if best.is_some_and(|(best_order, _, _)| best_order < order) { break; }
@@ -1216,8 +1254,8 @@ impl RequestScheduler {
                     }
                     true
                 }));
-                if let Some(candidate) = choices.iter().copied().max_by(compare) {
-                    if best.is_none_or(|(_, _, previous)| compare(&candidate, &previous).is_gt()) {
+                if let Some(candidate) = choices.iter().copied().max_by(compare_refresh) {
+                    if best.is_none_or(|(_, _, previous)| compare_refresh(&candidate, &previous).is_gt()) {
                         best = Some((order, target, candidate));
                     }
                 }
@@ -1311,13 +1349,16 @@ impl RequestScheduler {
         let slot = request.handle.slot as usize;
         let kind = if mixed { GraphKind::Prefill } else { candidate.kind };
         let mut expected = self.lane_value_for_tokens(request, kind, work, duration_ns, values[slot]);
+        let mut refresh_expected = expected;
         if mixed {
             let decode = if self.speculative_widths.is_empty() { GraphKind::Decode } else { GraphKind::Speculative };
-            expected += bits(candidate.mask & !(1 << slot)).map(|slot| {
-                self.lane_value(self.slots[slot].request.as_ref().unwrap(), decode,
-                    candidate.capacity, duration_ns, values[slot])
-            }).sum::<f64>();
+            for slot in bits(candidate.mask & !(1 << slot)) {
+                let r = self.slots[slot].request.as_ref().unwrap();
+                expected += self.lane_value(r, decode, candidate.capacity, duration_ns, values[slot]);
+                refresh_expected += self.lane_value(r, decode, candidate.capacity, 0, values[slot]);
+            }
         }
+        candidate.expected = refresh_expected;
         candidate.rate = ValueRate::new(
             duration_ns,
             expected,

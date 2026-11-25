@@ -424,36 +424,43 @@ because a saved plan can outlive the estimate's freshness interval.
 
 ## Funded timing refresh
 
-Ordinary valid completions earn `0.002 / 0.998` times their measured execution
-duration, capped at 5 ms. For queued executions, credited time is the maximum
-positive device interval; for isolated executions it is the larger of that
-interval and wall time. Initial discovery earns no credit. Idle discards
+Ordinary valid completions earn `0.002 / 0.998` times their measured compute
+execution duration (excluding measured readiness wait), capped at 5 ms. For
+queued executions, credited time is the maximum positive device interval minus
+measured readiness wait; for isolated executions it is the larger of that
+interval and wall time, minus measured readiness wait. Initial discovery earns
+no credit. Idle retains earned credit and negative debt; abort discards
 positive credit and preserves debt.
 
 Full credit permits one stale alternative to displace the ordinary measured
-winner. Feasible alternatives are ordered by the later of their last valid
-observation and last attempted dispatch, then by ordinary useful-value ranking.
-Attempts advance only on committed execution. Invalid timing does not make
-the estimate fresh, and its isolated wall time pays for the attempt.
-Ordinary winners update their costs through normal service without spending
-refresh credit.
+winner. Feasible stale alternatives are partitioned into two tiers: entries not
+yet attempted since becoming stale come before entries whose committed attempt
+while stale did not produce a valid observation, ordered by oldest attempt.
+Within the active tier, candidates rank by indeterminate-duration expected
+useful value, then more served requests, less recently used requests, and
+smaller physical padding. Attempts advance only on committed execution. Invalid
+timing does not make the estimate fresh, and its isolated wall time pays for
+the attempt. Ordinary winners update their costs through normal service without
+spending refresh credit.
 
 A funded speculative refresh executes one complete captured program. It pays
-that program's actual duration once, including proposal and verification work.
-Cancellation suppresses publication without inventing a timing observation.
-Another episode requires full credit after the preceding episode closes.
+that program's compute execution duration (excluding measured readiness wait)
+once, including proposal and verification work. Cancellation suppresses
+publication without inventing a timing observation. Another episode requires
+full credit after the preceding episode closes.
 
-For credited ordinary duration `O`, refresh duration `P`, and the actual duration
-`D` of the current or last refresh episode:
+For credited ordinary compute duration `O`, timing-refresh compute duration
+`P`, and the compute duration `D` of the current or last refresh episode:
 
 ```text
 P <= 0.002 / 0.998 * O + D.
 ```
 
-The allowance bounds aggregate expense with one nonpreemptible episode overrun;
-it does not cap individual decode stalls. Funding the first refresh requires
-2,495 ms of credited ordinary execution. Repeated shorter busy periods separated
-by idle can leave unused graph estimates stale indefinitely.
+The allowance bounds aggregate compute expense with one nonpreemptible episode
+overrun; it does not cap individual decode stalls. Funding the first refresh
+requires 2,495 ms of cumulative credited ordinary compute execution, which
+accumulates across idle-separated requests because idle intervals add neither
+credit nor ordinary duration.
 
 ## Funded acceptance learning
 
@@ -471,11 +478,12 @@ An acceptance episode pays one complete graph interval, including readiness
 stalls. Forecast observations stop at each lane's frozen `min(D + 1, W)`
 ceiling. Timing and acceptance ledgers never charge the same execution. An
 already-started episode can incur debt; another episode waits for full credit.
-Idle clears positive credit and preserves debt. For ordinary duration `O`,
-acceptance-probe duration `P`, and one episode's actual duration `D`, the bound is
+Idle retains earned credit and negative debt; abort clears positive credit and
+preserves debt. For ordinary physical duration `O`, acceptance-probe duration
+`P`, and one episode's actual duration `D`, the bound is
 `P <= 0.01 / 0.99 * O + D`. Initial cost discovery is accounted separately.
-Cost-model estimates are median replay durations corrected for measured
-readiness stalls; exploration budgets use raw physical time.
+Cost-model estimates and timing-refresh budgets exclude measured readiness
+stalls; acceptance-learning budgets use raw physical time.
 `flare_scheduler_execution_nanoseconds_total` and
 `flare_scheduler_executions_total` expose ordinary, discovery, timing-refresh,
 and acceptance-learning execution separately.

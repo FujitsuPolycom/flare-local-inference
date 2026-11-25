@@ -704,6 +704,8 @@ impl RequestScheduler {
         if mask == 0 { return None; }
         let value = offers.iter().filter(|&&(slot, _, _)| mask & (1 << slot) != 0)
             .map(|offer| offer.2).sum();
+        let expected = prefixes.iter().filter(|&&(slot, _, _)| mask & (1 << slot) != 0)
+            .map(|&(slot, _, tokens)| values[slot].decode(tokens, 0.0)).sum();
         let mut host_lengths = [0; REQUEST_LANES];
         for &(slot, length, _) in &offers {
             if mask & (1 << slot) != 0 { host_lengths[slot] = length; }
@@ -711,7 +713,7 @@ impl RequestScheduler {
         Some(Candidate { host_lengths: Some(host_lengths), draft_tokens: shape.drafts, kind: GraphKind::Speculative,
             mask, batch: shape.batch, capacity: shape.width, packed_token_capacity: shape.tokens,
             prefill_capacity: 0, prefill_slot: None, work: 0, duration_ns: shape.nanos,
-            rate: ValueRate::new(shape.nanos, value, age), feedback: false })
+            expected, rate: ValueRate::new(shape.nanos, value, age), feedback: false })
     }
 
     pub(super) fn packed_round_candidates(&self, output: &mut Vec<Candidate>,
@@ -791,16 +793,18 @@ impl RequestScheduler {
             };
             let nanos = shape.nanos;
             let mut base = [0.0; REQUEST_LANES];
+            let mut base_zero = [0.0; REQUEST_LANES];
             let mut full = [0.0; REQUEST_LANES];
             let mut limits = [0; REQUEST_LANES];
             for &slot in &available {
                 let request = self.slots[slot].request.as_ref().unwrap();
                 base[slot] = values[slot].decode(1.0, nanos as f64 / 1e6);
+                base_zero[slot] = values[slot].decode(1.0, 0.0);
                 full[slot] = base[slot] + ranks[slot].iter().take(shape.tokens - 1)
                     .map(|&rank| gains[rank]).sum::<f64>();
                 limits[slot] = self.speculative_tokens(request, (shape.drafts + 1).min(shape.width));
             }
-            let mut best: Option<(u64, f64, Option<[usize; REQUEST_LANES]>)> = None;
+            let mut best: Option<(u64, f64, f64, Option<[usize; REQUEST_LANES]>)> = None;
             // Alternate bounded orderings expose long useful prefixes, delivery
             // fairness, and short tails. Every cohort is priced by its causal
             // prefix allocation and the full measured physical B/D/W/P round.
@@ -820,21 +824,23 @@ impl RequestScheduler {
                 let mut host_lengths = [0; REQUEST_LANES];
                 // A lane's value changes only when its host prefix length does.
                 let mut lane_terms = [(0, 0.0); REQUEST_LANES];
-                let (mut mask, mut pending_value, mut draft_value, mut draft_cap, mut total_ceiling_drafts) =
-                    (0u64, 0., 0., 0., 0usize);
+                let (mut mask, mut pending_value, mut pending_value_zero, mut draft_value, mut draft_cap, mut total_ceiling_drafts) =
+                    (0u64, 0., 0., 0., 0., 0usize);
                 for (count, &(slot, _)) in order.iter().take(shape.batch.min(shape.tokens)).enumerate() {
                     mask |= 1 << slot;
                     pending_value += base[slot];
-                    let value = if let Some(ranking) = &host_ranking {
+                    pending_value_zero += base_zero[slot];
+                    let (value, value_zero) = if let Some(ranking) = &host_ranking {
                         ranking.extend_cohort(slot, &mut host_lengths, &mut frontier, shape.tokens - count - 1);
-                        bits(mask).map(|slot| {
+                        let total = bits(mask).map(|slot| {
                             if lane_terms[slot].0 != host_lengths[slot] {
                                 let expected = 1.0 + ranking.probabilities[slot][..host_lengths[slot] - 1]
                                     .iter().sum::<f64>();
                                 lane_terms[slot] = (host_lengths[slot], values[slot].decode(expected, nanos as f64 / 1e6));
                             }
                             lane_terms[slot].1
-                        }).sum()
+                        }).sum();
+                        (total, 0.0)
                     } else {
                         // The heap retains the best P-count speculative positions.
                         // Its capacity decreases as pending rows enter; discarded
@@ -859,21 +865,27 @@ impl RequestScheduler {
                         } else {
                             draft_value
                         };
-                        pending_value + effective_draft
+                        (pending_value + effective_draft, pending_value_zero + effective_draft)
                     };
-                    if best.is_none_or(|(old_mask, old_value, _)|
+                    if best.is_none_or(|(old_mask, old_value, _, _)|
                         value > old_value || (value == old_value &&
                             (mask.count_ones(), std::cmp::Reverse(mask)) >
                             (old_mask.count_ones(), std::cmp::Reverse(old_mask)))) {
-                        best = Some((mask, value, host_ranking.as_ref().map(|_| host_lengths)));
+                        best = Some((mask, value, value_zero, host_ranking.as_ref().map(|_| host_lengths)));
                     }
                 }
             }
-            if let Some((mask, value, host_lengths)) = best {
+            if let Some((mask, value, mut expected, host_lengths)) = best {
+                if let (Some(ranking), Some(lengths)) = (&host_ranking, host_lengths) {
+                    expected = bits(mask).map(|slot| {
+                        let tokens = 1.0 + ranking.probabilities[slot][..lengths[slot] - 1].iter().sum::<f64>();
+                        values[slot].decode(tokens, 0.0)
+                    }).sum();
+                }
                 output.push(Candidate { host_lengths, draft_tokens: shape.drafts, kind: GraphKind::Speculative,
                     mask, batch: shape.batch, capacity: shape.width, packed_token_capacity: shape.tokens,
                     prefill_capacity: 0, prefill_slot: None, work: 0, duration_ns: nanos,
-                    rate: ValueRate::new(nanos, value, age), feedback: false,
+                    expected, rate: ValueRate::new(nanos, value, age), feedback: false,
                     });
             }
         }

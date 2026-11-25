@@ -28,6 +28,15 @@ pub(crate) fn observed_duration_ns(timing: ExecutionTiming) -> Option<u64> {
         .map(|ns| if timing.queued { ns } else { ns.max(timing.wall_ns) })
 }
 
+pub(crate) fn observed_compute_duration_ns(timing: ExecutionTiming) -> Option<u64> {
+    let wait_ns = timing.readiness.map_or(0, |intervals| intervals.wait_ns());
+    observed_duration_ns(timing).map(|duration| duration.saturating_sub(wait_ns))
+}
+
+pub(crate) fn timing_refresh_duration_ns(timing: ExecutionTiming) -> u64 {
+    observed_compute_duration_ns(timing).unwrap_or(timing.wall_ns)
+}
+
 /// Prefers the shortest positive measured duration, yielding `0` only when every
 /// aggregated shape is unmeasured.
 pub(super) fn min_measured_duration(current: Option<u64>, nanos: u64) -> Option<u64> {
@@ -241,8 +250,15 @@ impl ActionCosts {
             && !estimate.fresh(self.now_ns, self.ttl_ns)).map(|(key, _)| *key)
     }
 
-    pub fn refresh_order(&self, key: Key) -> u64 {
-        self.entry(key).map_or(0, |estimate| estimate.observed_at_ns.max(estimate.last_attempt_ns))
+    pub fn refresh_order(&self, key: Key) -> (bool, u64) {
+        self.entry(key).map_or((false, 0), |estimate| {
+            let stale_at = estimate.observed_at_ns.saturating_add(self.ttl_ns);
+            if estimate.last_attempt_ns >= stale_at {
+                (true, estimate.last_attempt_ns)
+            } else {
+                (false, 0)
+            }
+        })
     }
 
     pub fn record_attempt(&mut self, key: Key) {
@@ -379,5 +395,70 @@ mod tests {
         reversed.set_measured(&step_for(5, 6, 39), 18_000_000);
         assert_eq!(reversed.packed_round_duration(16, 4), Some(18_000_000));
         assert_eq!(reversed.packed_round_duration(16, 6), Some(18_000_000));
+    }
+
+    #[test]
+    fn compute_refresh_duration_excludes_readiness_wait_and_refresh_order_partitions_tiers() {
+        use crate::execution::{ExecutionTiming, ReadinessIntervals, SamplingMode};
+        let timestamps = [1_000u64, 256_000, 256_100]
+            .into_iter()
+            .flat_map(u64::to_ne_bytes)
+            .collect::<Vec<_>>();
+        let readiness = ReadinessIntervals::decode(&timestamps).unwrap();
+        assert_eq!(readiness.wait_ns(), 255_000);
+        let mut gpu_ns = [None; 16];
+        gpu_ns[0] = Some(400_000);
+        let timing = ExecutionTiming { gpu_ns, readiness: Some(readiness), wall_ns: 410_000, queued: false };
+        assert_eq!(super::observed_compute_duration_ns(timing), Some(155_000));
+        assert_eq!(super::timing_refresh_duration_ns(timing), 155_000);
+        let queued = ExecutionTiming { queued: true, ..timing };
+        assert_eq!(super::observed_compute_duration_ns(queued), Some(145_000));
+        assert_eq!(super::timing_refresh_duration_ns(queued), 145_000);
+        let invalid = ExecutionTiming { readiness: Some(readiness), wall_ns: 100_000, ..Default::default() };
+        assert_eq!(super::observed_compute_duration_ns(invalid), None);
+        assert_eq!(super::timing_refresh_duration_ns(invalid), 100_000);
+
+        let graph = GraphDescriptor {
+            name: "p512".into(),
+            kind: GraphKind::Prefill,
+            sampling_mode: SamplingMode::General,
+            confidence_width: 0,
+            draft_tokens: 0,
+            handle: 1,
+            batch_capacity: 1,
+            token_capacity: 512,
+            packed_token_capacity: 0,
+            prefill_capacity: 0,
+            estimated_duration_ns: 0,
+            input_bindings: vec![],
+            tuned_bindings: vec![],
+        };
+        let step = ScheduledStep {
+            draft_tokens: 0,
+            kind: GraphKind::Prefill,
+            batch_capacity: 1,
+            token_capacity: 512,
+            packed_token_capacity: 0,
+            mixed: None,
+            lanes: vec![],
+            requires_feedback: false,
+        };
+        let key = super::Key::from_step(&step);
+        let mut costs = ActionCosts::prepared(&[graph], 8).unwrap();
+        let ttl = 30_000_000_000;
+        costs.advance_to(10_000, ttl);
+        costs.record_attempt(key);
+        costs.observe(&step, ExecutionTiming { gpu_ns, ..Default::default() });
+        // Becoming stale without a stale-period attempt places the key in Tier 0.
+        costs.advance_to(10_000 + ttl, ttl);
+        assert_eq!(costs.refresh_order(key), (false, 0));
+        // An attempt while stale that yields no valid observation moves it to Tier 1.
+        costs.record_attempt(key);
+        assert_eq!(costs.refresh_order(key), (true, 10_000 + ttl));
+        // A later valid observation restores freshness; the next staleness returns to Tier 0.
+        costs.advance_to(20_000 + ttl, ttl);
+        costs.observe(&step, ExecutionTiming { gpu_ns, ..Default::default() });
+        costs.advance_to(20_000 + 2 * ttl, ttl);
+        assert_eq!(costs.refresh_order(key), (false, 0));
     }
 }
