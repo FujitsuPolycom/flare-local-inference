@@ -603,7 +603,14 @@ impl Core {
         let first_page =
             (checkpoint.key.consumed_tokens / self.layout.page_tokens).saturating_sub(tail.len() as u64);
         let mut captures = Vec::new();
-        if self.codec_enabled && !self.async_host_codec {
+        if self.codec_enabled
+            && !self.async_host_codec
+            && crate::shared::packed::fits_units(
+                tail.len(),
+                record.row.is_some(),
+                self.layout.ranks.len(),
+            )
+        {
             debug_assert!(self.pool.rank_parts().is_none());
             let page_addrs = self.pool.addresses(&record.pages);
             let row_addrs = record
@@ -1588,14 +1595,20 @@ impl Core {
         } else {
             match pending.error {
                 None => {
-                    if self.async_host_codec {
+                    let row_addrs = self.index[&key]
+                        .location
+                        .row
+                        .as_ref()
+                        .map(|slots| self.pool.addresses(slots));
+                    if self.async_host_codec
+                        && crate::shared::packed::fits_units(
+                            tail_pages,
+                            row_addrs.is_some(),
+                            self.layout.ranks.len(),
+                        )
+                    {
                         let page_addrs = self.pool.addresses(&self.index[&key].location.pages);
                         zero_raw_page_gaps(&self.layout, &page_addrs);
-                        let row_addrs = self.index[&key]
-                            .location
-                            .row
-                            .as_ref()
-                            .map(|slots| self.pool.addresses(slots));
                         self.compressing.insert(key);
                         self.pending_compress.push_back(CompressTask {
                             checkpoint,
@@ -2532,28 +2545,55 @@ impl MemoryStore {
         payload: &[u8],
         row: bool,
     ) -> Result<()> {
-        let units = layout
-            .units(0, layout.page_count(), row)
-            .ok_or_else(|| invalid("packed layout disagrees with requested record"))?;
-        let mut page_slices = Vec::new();
-        let mut row_slices = Vec::new();
-        let mut cursor = 0usize;
-        for unit in units {
-            let len = usize::try_from(unit.stored_length)
-                .map_err(|_| invalid("packed unit length overflow"))?;
-            let slice = payload
-                .get(cursor..cursor + len)
-                .ok_or_else(|| invalid("packed record payload truncated"))?;
-            cursor += len;
-            if unit.kind == crate::shared::wire::packed_unit::Kind::Page as i32 {
-                page_slices.push((unit, slice));
-            } else {
-                row_slices.push((unit, slice));
+        let page_units = layout
+            .units(0, layout.page_count(), false)
+            .ok_or_else(|| invalid("packed layout disagrees with requested page count"))?;
+        fn slice_units<'a>(
+            units: &'a [crate::shared::wire::PackedUnit],
+            buf: &'a [u8],
+        ) -> Result<Vec<(&'a crate::shared::wire::PackedUnit, &'a [u8])>> {
+            let mut slices = Vec::with_capacity(units.len());
+            let mut cursor = 0usize;
+            for unit in units {
+                let len = usize::try_from(unit.stored_length)
+                    .map_err(|_| invalid("packed unit length overflow"))?;
+                let slice = buf
+                    .get(cursor..cursor + len)
+                    .ok_or_else(|| invalid("packed record payload truncated"))?;
+                cursor += len;
+                slices.push((unit, slice));
             }
+            if cursor != buf.len() {
+                return Err(invalid("packed record payload has trailing bytes"));
+            }
+            Ok(slices)
         }
-        if cursor != payload.len() {
-            return Err(invalid("packed record payload has trailing bytes"));
-        }
+        let page_bytes: usize = page_units
+            .iter()
+            .try_fold(0usize, |acc, u| {
+                acc.checked_add(usize::try_from(u.stored_length).ok()?)
+            })
+            .ok_or_else(|| invalid("packed page unit length overflow"))?;
+        let (page_payload, row_payload) = payload
+            .split_at_checked(page_bytes)
+            .ok_or_else(|| invalid("packed record payload truncated"))?;
+        // Verify page units separately from row units so callers can quarantine damaged
+        // ancestor disk pages (`is_record_read() == true`) without conflating row-only errors.
+        crate::shared::packed::verify_units(page_units, page_payload)
+            .map_err(|e| e.with_record_read())?;
+        let page_slices = slice_units(page_units, page_payload)?;
+        let row_slices = if row {
+            let row_units = layout
+                .units(layout.page_count(), 0, true)
+                .ok_or_else(|| invalid("packed layout missing requested row"))?;
+            crate::shared::packed::verify_units(row_units, row_payload)?;
+            slice_units(row_units, row_payload)?
+        } else {
+            if !row_payload.is_empty() {
+                return Err(invalid("packed record payload has trailing bytes"));
+            }
+            Vec::new()
+        };
         let node = self
             .core
             .index

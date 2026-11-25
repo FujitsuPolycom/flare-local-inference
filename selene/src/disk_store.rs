@@ -1059,6 +1059,17 @@ struct InboundRecord {
     error: Option<Error>,
 }
 
+fn is_packed_content_error(error: &Error) -> bool {
+    error.carried().is_some_and(|cause| {
+        cause
+            .downcast_ref::<crate::shared::packed::Checksum>()
+            .is_some()
+            || cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::InvalidData)
+    })
+}
+
 impl InboundRecord {
     fn new(segments: Vec<Segment>, destination: Destination, plans: Vec<WindowPlan>) -> Self {
         Self {
@@ -1165,7 +1176,7 @@ impl InboundRecord {
         };
         window.referenced = window.referenced.saturating_sub(1);
         if let Err(error) = reply.result {
-            let error = if window.packed_buf.is_some() {
+            let error = if window.packed_buf.is_some() && is_packed_content_error(&error) {
                 error.with_record_read()
             } else {
                 error
@@ -1720,9 +1731,8 @@ impl Staged {
         let packed = match &source {
             Source::HostPacked { .. } => true,
             Source::Device { pages, .. } => {
-                let ranks = header.ranks.len();
-                let units = pages.len().saturating_add(1).saturating_mul(ranks);
-                self.resources.codec_enabled() && units <= crate::shared::packed::MAX_UNITS
+                self.resources.codec_enabled()
+                    && crate::shared::packed::fits_units(pages.len(), true, header.ranks.len())
             }
             Source::Host { .. } => false,
         };
@@ -2495,9 +2505,12 @@ impl DiskStore {
     }
 
     fn needs_row(&self, checkpoint: &PublishedCheckpoint) -> bool {
-        !self.covered_endpoint(checkpoint, |n| {
-            n.ready || self.outbound.values().any(|write| write.key == n.key)
-        })
+        self.index
+            .node(&checkpoint.key)
+            .is_some_and(|n| n.location.failed)
+            || !self.covered_endpoint(checkpoint, |n| {
+                n.ready || self.outbound.values().any(|write| write.key == n.key)
+            })
     }
 
     pub fn store_status(&self, checkpoint: &PublishedCheckpoint) -> Result<Option<StoreOutcome>> {
@@ -2519,7 +2532,9 @@ impl DiskStore {
             {
                 return Ok(Some(StoreOutcome::Present));
             }
-            if !node.ready
+            let writing = self.outbound.values().any(|write| write.key == checkpoint.key);
+            if (!node.ready && !node.location.failed)
+                || writing
                 || (node.row && covers)
                 || node.pinned()
                 || self
@@ -2581,16 +2596,21 @@ impl DiskStore {
         reserve: bool,
         capture_role: crate::CaptureRole,
     ) -> Result<Option<(Header, PathBuf, PathBuf)>> {
-        let parked = self.index.node(&key).is_some_and(|n| n.location.bytes == 0);
+        let parked = self
+            .index
+            .node(&key)
+            .is_some_and(|n| n.location.bytes == 0 && !n.location.failed);
         let capture_role = self.index.node(&key).map_or(capture_role, |node| {
             node.location.header.capture_role().merge(capture_role)
         });
         let replacement = if let Some(node) = self.index.node(&key).filter(|_| !parked) {
             let stored = node.location.header.capture_role();
-            if node.row && stored == capture_role {
+            if node.ready && node.row && stored == capture_role {
                 return Err(invalid("host record key is already indexed"));
             }
-            if !node.ready
+            let writing = self.outbound.values().any(|write| write.key == key);
+            if (!node.ready && !node.location.failed)
+                || writing
                 || node.pinned()
                 || self.maintenance.values().any(|job| job.key == Some(key))
             {
@@ -2732,11 +2752,18 @@ impl DiskStore {
                 true
             } else {
                 self.stats.store_failed += 1;
-                if prior_readable {
+                if prior_readable && !old.failed {
                     self.used -= node.location.bytes;
                     node.row = old.header.row_present(old.bytes);
                     node.location = old;
                     true
+                } else if prior_readable {
+                    // Replacement failed before overwriting the corrupt file; restore the
+                    // failed record's accounting without making it readable again.
+                    self.used -= node.location.bytes;
+                    node.location = old;
+                    node.row = false;
+                    false
                 } else {
                     // A failed cleanup can leave a complete replacement on one rank.
                     self.used -= old.bytes;
@@ -3059,6 +3086,22 @@ impl DiskStore {
             return Err(error);
         }
         Ok(())
+    }
+
+    pub(crate) fn is_failed(&self, key: &PrefixKey) -> bool {
+        self.index.node(key).is_some_and(|n| n.location.failed)
+    }
+
+    /// Quarantine a corrupt disk record whose pages failed checksum verification.
+    /// Drops readiness and lookup eligibility so descendants cannot re-select it,
+    /// while marking it `failed` so a subsequent capture can replace it in place
+    /// once outstanding pins drain (instead of spinning in `Retry(Inflight)`).
+    pub(crate) fn quarantine_corrupt(&mut self, key: &PrefixKey) {
+        let _ = self.index.set_ready(key, false);
+        self.index.drop_row(key);
+        if let Some(node) = self.index.node_mut(key) {
+            node.location.failed = true;
+        }
     }
 
     /// Drop a record whose write failed. It leaves the index unless children
@@ -3441,6 +3484,35 @@ impl crate::store::TierStore for DiskStore {
     }
     fn take_retiring(&mut self) -> Vec<Retiring> {
         std::mem::take(&mut self.retiring)
+    }
+    fn retirement_predecessor(&self, key: PrefixKey, candidates: bool) -> Option<Retiring> {
+        let node = self.index.node(&key)?;
+        if !node.ready {
+            return None;
+        }
+        Some(Retiring {
+            descendant_row: false,
+            tier: PoolTier::Nvme,
+            capture_role: node.location.header.capture_role(),
+            child_paths: node.children(),
+            key,
+            parent: node.parent,
+            ancestor_keys: if candidates {
+                self.index.ancestor_keys(&key)
+            } else {
+                Vec::new()
+            },
+            bucket: node.bucket,
+            tail_pages: node.tail_pages,
+            row: node.row
+                && !self.index.covered_endpoint(
+                    key,
+                    node.parent,
+                    node.location.header.capture_role(),
+                    node.children(),
+                    |n| n.ready,
+                ),
+        })
     }
     fn retired(&mut self, key: PrefixKey, tier: PoolTier, how: Retirement) {
         if tier == PoolTier::Nvme {
@@ -7917,5 +7989,25 @@ mod tests {
             err.carried().and_then(|e| e.downcast_ref::<Checksum>()),
             Some(&Checksum::Stored)
         );
+    }
+
+    #[test]
+    fn packed_transfer_error_preserves_lookup_row_for_transient_errors_only() {
+        let transient = Error::new("CUDA stream upload error");
+        let io_other = Error::carrying(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "device busy",
+        ));
+        let stored_bad = Error::carrying(crate::shared::packed::Checksum::Stored);
+        let orig_bad = Error::carrying(crate::shared::packed::Checksum::Original);
+        let corrupt_pkt = Error::carrying(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "truncated GKV1 packet",
+        ));
+        assert!(!is_packed_content_error(&transient));
+        assert!(!is_packed_content_error(&io_other));
+        assert!(is_packed_content_error(&stored_bad));
+        assert!(is_packed_content_error(&orig_bad));
+        assert!(is_packed_content_error(&corrupt_pkt));
     }
 }

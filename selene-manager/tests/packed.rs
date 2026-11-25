@@ -1527,3 +1527,73 @@ async fn all_literal_and_literal_only_suffix_offers_retire_and_restore_as_v4() {
     drop((writer, pool));
     host.stop();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_accepted_put_with_fence_reclaims_granted_window_for_next_put() {
+    // Storage budget of 32 KiB fits one 2-page + 1-row raw record (20 KiB) at a time;
+    // a leaked grant from a cancelled put would block a second put while connected.
+    let mut host = Host::with_storage(32 * 1024, 32 * 1024);
+    host.run();
+    let mut pool = Pool::connect(&host.config.socket).await;
+    let mut writer = open(&mut pool, "cancel-fence-writer", true).await;
+
+    // 1. Begin a put that the manager accepts and grants a shared-memory window for.
+    writer
+        .send(v2::client_message::M::PutBegin(v2::PutBegin {
+            ancestor_keys: Vec::new(),
+            put_id: 1,
+            key: Some(selene_manager::pool::key_to(key(128))),
+            chain_pages: 2,
+            capture_role: v2::CaptureRole::Endpoint as i32,
+            child_paths: 0,
+            descendant_row: false,
+            next_child: None,
+            row: true,
+            has_published_parent: false,
+            published_parent: None,
+            bucket: vec![4; 16],
+            published_tail_pages: 2,
+            mode: v2::CopyMode::SharedWindows as i32,
+            packed: None,
+        }))
+        .await;
+    let _accept = writer
+        .take(|m| match m {
+            v2::server_message::M::PutAccept(a) if a.put_id == 1 => Some(a.clone()),
+            _ => None,
+        })
+        .await;
+    let _grant = writer
+        .take(|m| match m {
+            v2::server_message::M::PutGrant(g) if g.put_id == 1 => Some(g.clone()),
+            _ => None,
+        })
+        .await;
+    host.wait(|h| h.gauge("memory_allocated_bytes") + h.gauge("staging_allocated_bytes") > 0);
+
+    // 2. Cancel and immediately emit FenceAck(Drained) as Engine::on_put_accept does for
+    //    an incompatible forced mixed-root accept, without disconnecting the writer.
+    writer
+        .send(v2::client_message::M::PutCancel(v2::PutCancel { put_id: 1 }))
+        .await;
+    support::put::fence(&writer, 1).await;
+    host.wait(|h| h.gauge("memory_allocated_bytes") + h.gauge("staging_allocated_bytes") == 0);
+
+    // 3. A second full put on the same connected session must reuse the reclaimed capacity.
+    let res = support::put::put_record(
+        &mut writer,
+        None,
+        2,
+        key(128),
+        None,
+        support::pool::Damage::default(),
+    )
+    .await;
+    assert!(
+        matches!(res, support::pool::PutResult::Stored(bytes) if bytes > 0),
+        "second put must reuse capacity reclaimed by PutCancel + FenceAck(Drained), got {res:?}"
+    );
+
+    drop((writer, pool));
+    host.stop();
+}

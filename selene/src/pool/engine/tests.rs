@@ -2052,3 +2052,69 @@ fn pool_names_salt_scope_and_instance_ids_and_cannot_change_on_reconnect() {
     assert!(a.bind_pool("two").is_err());
     assert_eq!((a.scope_id, a.instance_id), bound);
 }
+
+#[test]
+fn put_accept_below_homogeneous_suffix_boundary_cancels_as_permanent_refusal() {
+    struct SuffixOnlyBytes {
+        inner: Box<dyn crate::pool::PutBytes>,
+        min_first: u64,
+    }
+    impl crate::pool::PutBytes for SuffixOnlyBytes {
+        fn min_first_page(&self) -> u64 {
+            self.min_first
+        }
+        fn fill(
+            &mut self,
+            first_page: u64,
+            page_count: u32,
+            row: bool,
+            dst: &mut [u8],
+        ) -> crate::Result<crate::pool::Checksums> {
+            self.inner.fill(first_page, page_count, row, dst)
+        }
+    }
+
+    let mut rig = Rig::new();
+    rig.open();
+    let mut req = host_put(None);
+    let crate::pool::PutSource::Host(inner) = req.source;
+    req.source = crate::pool::PutSource::Host(Box::new(SuffixOnlyBytes {
+        inner,
+        min_first: 2,
+    }));
+    rig.engine.start_put(rig.now, 1, req);
+    let _ = rig.engine.take_out();
+    // Manager forces a new root at page 0 (e.g., REROOT_DEPTH) across a mixed boundary.
+    let out = rig.send(accept(1, 0, record_len(3)));
+    let cancel_pos = out
+        .iter()
+        .position(|m| matches!(m.m, Some(Out::PutCancel(wire::PutCancel { put_id: 1 }))))
+        .expect("client must cancel the incompatible forced-root put");
+    let fence_pos = out
+        .iter()
+        .position(|m| {
+            matches!(
+                &m.m,
+                Some(Out::FenceAck(wire::FenceAck {
+                    subject: Some(wire::fence_ack::Subject::PutId(1)),
+                    outcome,
+                })) if *outcome == wire::FenceOutcome::Drained as i32
+            )
+        })
+        .expect("client must emit FenceAck(Drained) for the accepted put");
+    assert!(
+        cancel_pos < fence_pos,
+        "PutCancel must precede FenceAck(Drained)"
+    );
+    let events = rig.events();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            PoolEvent::Put {
+                id: 1,
+                outcome: crate::pool::PutOutcome::Refused(crate::pool::PutRefusal::Invalid),
+            }
+        )),
+        "forced mixed root must surface as permanent Refused(Invalid), got {events:?}"
+    );
+}

@@ -122,6 +122,10 @@ impl HostPin for MemoryPin {
         &self.chain
     }
 
+    fn is_packed(&self, record: usize) -> bool {
+        self.spans.get(record).is_some_and(|s| s.packed.is_some())
+    }
+
     fn packed_offer_for(&self, record: usize) -> Option<crate::shared::wire::PackedOffer> {
         let rec = self.chain.records.get(record)?;
         let packed = self.spans.get(record)?.packed.as_ref()?;
@@ -285,6 +289,12 @@ pub struct FilePin {
 impl HostPin for FilePin {
     fn chain(&self) -> &HostChain {
         &self.chain
+    }
+
+    fn is_packed(&self, record: usize) -> bool {
+        self.spans
+            .get(record)
+            .is_some_and(|s| s.header.packed.is_some())
     }
 
     fn packed_offer_for(&self, record: usize) -> Option<crate::shared::wire::PackedOffer> {

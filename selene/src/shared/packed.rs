@@ -18,6 +18,14 @@ pub const MAX_DIRECTORY: usize = 2 * 1024 * 1024;
 pub const MAX_UNITS: usize = 16384;
 pub const MAX_RANKS: usize = 64;
 
+/// Whether a record tail with `pages`, optional `row`, and `ranks` fits within `MAX_UNITS`.
+pub(crate) fn fits_units(pages: usize, row: bool, ranks: usize) -> bool {
+    pages
+        .saturating_add(usize::from(row))
+        .saturating_mul(ranks)
+        <= MAX_UNITS
+}
+
 pub fn raw_reader() -> CodecCaps {
     CodecCaps {
         envelope_revision: REVISION,
@@ -439,5 +447,15 @@ mod tests {
         assert!(permits_offer(Some(&negotiated_caps), &literal));
         caps.receive_profiles[1].pop();
         assert!(canonical_caps(Some(&caps)).is_err());
+    }
+
+    #[test]
+    fn fits_units_enforces_max_units_boundary() {
+        // TP4: 4,095 pages + 1 row = 4,096 * 4 = 16,384 (fits); 4,096 pages + 1 row = 16,388 (exceeds).
+        assert!(fits_units(4095, true, 4));
+        assert!(!fits_units(4096, true, 4));
+        assert!(fits_units(4096, false, 4));
+        assert!(!fits_units(4097, false, 4));
+        assert!(!fits_units(usize::MAX, true, 4));
     }
 }

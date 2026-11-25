@@ -259,12 +259,11 @@ impl CompositeStore {
 
     pub fn retains_chain(&self, chain: &Match) -> bool {
         let layout = self.memory.layout();
-        let mut slots = self.memory.held_slots() + layout.row_slots();
+        let mut slots = self.memory.held_slots();
         for (position, key) in chain.nodes.iter().enumerate() {
             let Some(node) = self.disk.index().node(key) else {
                 return false;
             };
-            slots += node.tail_pages;
             let row = position + 1 == chain.nodes.len();
             if let Some(memory) = self.memory.index().node(key) {
                 if memory.pinned()
@@ -274,12 +273,28 @@ impl CompositeStore {
                 {
                     return false;
                 }
+                let resident = !self.stale.contains(key)
+                    && memory.ready
+                    && memory.location.page_count() == node.tail_pages
+                    && (!row || memory.location.row.is_some());
+                let need = if resident {
+                    // Ready resident records (including compacted packed records) stay in their
+                    // existing physical slabs instead of re-allocating uncompressed tail slots.
+                    memory.location.slots()
+                } else {
+                    node.tail_pages
+                        + if row {
+                            layout.row_slots()
+                        } else {
+                            memory.location.row.as_ref().map_or(0, Vec::len)
+                        }
+                };
+                slots += need;
                 if memory.pinned() || !memory.ready || !memory.location.durable {
                     slots -= memory.location.slots();
                 }
-                if !row {
-                    slots += memory.location.row.as_ref().map_or(0, Vec::len);
-                }
+            } else {
+                slots += node.tail_pages + if row { layout.row_slots() } else { 0 };
             }
         }
         self.memory.fits(slots)
@@ -1072,6 +1087,20 @@ impl CompositeStore {
                     Ok(()) => self.memory.pin_record(&node),
                     Err(error) => {
                         let _ = self.memory.complete_record(&node, false);
+                        if error.carried().is_some_and(|cause| {
+                            cause
+                                .downcast_ref::<crate::shared::packed::Checksum>()
+                                .is_some()
+                        }) {
+                            if error.is_record_read() {
+                                // Page unit checksum failed: quarantine damaged disk pages so
+                                // healthy children cannot re-select this corrupt ancestor, while
+                                // marking the node failed so recapture can replace it cleanly.
+                                self.disk.quarantine_corrupt(&node);
+                            } else {
+                                self.disk.index_mut().drop_row(&node);
+                            }
+                        }
                         Err(error)
                     }
                 };
@@ -1176,9 +1205,10 @@ impl HostStore for CompositeStore {
             )));
         }
         let key = checkpoint.key;
-        let covered = self.disk.covered_endpoint(checkpoint, |n| {
-            n.ready || self.resident(&n.key, n.tail_pages, true)
-        });
+        let covered = !self.disk.is_failed(&key)
+            && self.disk.covered_endpoint(checkpoint, |n| {
+                n.ready || self.resident(&n.key, n.tail_pages, true)
+            });
         if let Some(outbound) = self.outbound.get(&key) {
             self.stats.store_skipped += 1;
             if self.parked.contains_key(&key) && self.resident(&key, outbound.tail_pages, !covered)
@@ -1717,6 +1747,9 @@ impl crate::store::TierStore for CompositeStore {
     }
     fn take_retiring(&mut self) -> Vec<Retiring> {
         self.disk.take_retiring()
+    }
+    fn retirement_predecessor(&self, key: PrefixKey, candidates: bool) -> Option<Retiring> {
+        self.disk.retirement_predecessor(key, candidates)
     }
     fn retired(&mut self, key: PrefixKey, tier: PoolTier, how: Retirement) {
         self.disk.retired(key, tier, how);
@@ -5609,6 +5642,350 @@ mod tests {
             assert_eq!(gpu.pages.lock().unwrap()[&(100 + i as u32)], expected_pages[i]);
         }
         assert_eq!(gpu.rows.lock().unwrap()[&9], expected_row);
+        store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "codec")]
+    #[test]
+    fn retains_chain_serves_resident_compressed_chain_without_disk_reads() {
+        use crate::shared::codec::Plan;
+        use crate::testing::{CodecCopier, GpuMemory};
+
+        let Some(directory) = test_directory("packed-retains", "1") else {
+            return;
+        };
+        let geometry = vec![rank(PAGE_TOKENS, &[("kv", 4096)], 4096)];
+        let layout = Layout::new(&geometry).unwrap();
+        let gpu = GpuMemory::default();
+        let plan = Arc::new(Plan::new(4096, &[]).unwrap());
+        let h = history(10 * PAGE_TOKENS + 2);
+        let expected_pages: Vec<Vec<u8>> = (0..10usize)
+            .map(|p| (0..4096).map(|j| ((j / 64 + p) % 3) as u8).collect())
+            .collect();
+        for (p, data) in expected_pages.iter().enumerate() {
+            gpu.pages.lock().unwrap().insert(p as u32, data.clone());
+        }
+        let expected_row: Vec<u8> = (0..4096).map(|j| ((j / 64) % 2) as u8).collect();
+        gpu.rows.lock().unwrap().insert(0, expected_row.clone());
+        gpu.rows.lock().unwrap().insert(1, expected_row.clone());
+
+        // Pool capacity of 9 slots: smaller than raw 10-page + 1-row chain (11 slots),
+        // but comfortably holds both compressed records in DRAM simultaneously.
+        let pool = SlabPool::new(layout.page_record_bytes, 9, 0).unwrap();
+        let mem_copier = CodecCopier::new(
+            layout.clone(),
+            [13; 32],
+            plan.clone(),
+            plan.clone(),
+            gpu.clone(),
+        )
+        .shared();
+        let disk_copier = CodecCopier::new(
+            layout.clone(),
+            [13; 32],
+            plan.clone(),
+            plan,
+            gpu.clone(),
+        )
+        .shared();
+        let memory = MemoryStore::new_flat(IDENTITY, pool.clone(), mem_copier).unwrap();
+        let guard = crate::testing::directory_lock(&directory).unwrap();
+        let disk = DiskStore::new(
+            guard,
+            IDENTITY,
+            FINGERPRINT,
+            1 << 30,
+            geometry,
+            Vec::new(),
+            Box::new(Staged::new(
+                Some(pool),
+                disk_copier,
+                DiskThread::start("packed-retains").unwrap(),
+            )),
+        )
+        .unwrap();
+        let mut store = CompositeStore::new(memory, disk).unwrap();
+
+        let mut ids = Ids::new();
+        let c1 = checkpoint(
+            &mut ids,
+            &h,
+            5 * PAGE_TOKENS + 1,
+            None,
+            (0..5).map(crate::PageId).collect(),
+            5,
+            crate::StateSlotId(0),
+        );
+        let c2 = checkpoint(
+            &mut ids,
+            &h,
+            10 * PAGE_TOKENS + 2,
+            Some(c1.key.consumed_tokens),
+            (0..10).map(crate::PageId).collect(),
+            5,
+            crate::StateSlotId(1),
+        );
+
+        for c in [&c1, &c2] {
+            assert_eq!(store.store(c).unwrap(), StoreOutcome::Queued);
+            poll_until(&mut store, &mut Vec::new(), |s| s.memory.record(&c.key).is_some());
+            store.spill(c.key);
+            poll_until(&mut store, &mut Vec::new(), |s| {
+                s.disk.index().node(&c.key).is_some_and(|n| n.ready)
+            });
+        }
+        let hit = store.lookup(&h, 0, u64::MAX).unwrap();
+        assert_eq!(hit.key, c2.key);
+        assert!(
+            store.retains_chain(&hit.chain),
+            "resident compressed chain must satisfy retains_chain by physical slabs"
+        );
+        // Remove the backing disk files so any disk fallback or promotion would fail I/O.
+        let p1 = store.disk.record(&c1.key).unwrap().path.clone();
+        let p2 = store.disk.record(&c2.key).unwrap().path.clone();
+        fs::remove_file(&p1).unwrap();
+        fs::remove_file(&p2).unwrap();
+
+        store
+            .fetch(
+                hit,
+                InboundTicket {
+                    key: c2.key,
+                    pages: (100..110).map(crate::PageId).collect(),
+                    slot: crate::StateSlotId(8),
+                },
+            )
+            .unwrap();
+        let mut events = Vec::new();
+        poll_until(&mut store, &mut events, |s| s.inbound.is_empty());
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StoreEvent::Fetched { result: Ok(_), .. })),
+            "resident compressed chain must restore purely from DRAM with backing files absent"
+        );
+        for (i, expected) in expected_pages.iter().enumerate() {
+            assert_eq!(&gpu.pages.lock().unwrap()[&(100 + i as u32)], expected);
+        }
+        assert_eq!(gpu.rows.lock().unwrap()[&8], expected_row);
+        store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "codec")]
+    #[test]
+    fn corrupt_ancestor_packed_page_is_quarantined_and_row_only_keeps_ancestor_pages() {
+        use crate::shared::codec::Plan;
+        use crate::testing::{CodecCopier, GpuMemory};
+
+        let Some(directory) = test_directory("packed-quarantine", "1") else {
+            return;
+        };
+        let geometry = vec![rank(PAGE_TOKENS, &[("kv", 4096)], 4096)];
+        let layout = Layout::new(&geometry).unwrap();
+        let gpu = GpuMemory::default();
+        let plan = Arc::new(Plan::new(4096, &[]).unwrap());
+        let h = history(10 * PAGE_TOKENS + 2);
+        for p in 0..10u32 {
+            let data: Vec<u8> = (0..4096).map(|j| ((j / 64 + p as usize) % 3) as u8).collect();
+            gpu.pages.lock().unwrap().insert(p, data);
+        }
+        let row_bytes: Vec<u8> = (0..4096).map(|j| ((j / 64) % 2) as u8).collect();
+        gpu.rows.lock().unwrap().insert(0, row_bytes.clone());
+        gpu.rows.lock().unwrap().insert(1, row_bytes);
+
+        let open_store = || {
+            let pool = SlabPool::new(layout.page_record_bytes, 32, 0).unwrap();
+            let mem_copier = CodecCopier::new(
+                layout.clone(),
+                [14; 32],
+                plan.clone(),
+                plan.clone(),
+                gpu.clone(),
+            )
+            .shared();
+            let disk_copier = CodecCopier::new(
+                layout.clone(),
+                [14; 32],
+                plan.clone(),
+                plan.clone(),
+                gpu.clone(),
+            )
+            .shared();
+            let memory = MemoryStore::new_flat(IDENTITY, pool.clone(), mem_copier).unwrap();
+            let guard = crate::testing::directory_lock(&directory).unwrap();
+            let scanned = record::scan(
+                &guard,
+                &IDENTITY,
+                &FINGERPRINT,
+                PAGE_TOKENS,
+                &record::rank_sizes(&geometry),
+            )
+            .unwrap();
+            let disk = DiskStore::new(
+                guard,
+                IDENTITY,
+                FINGERPRINT,
+                1 << 30,
+                geometry.clone(),
+                scanned,
+                Box::new(Staged::new(
+                    Some(pool),
+                    disk_copier,
+                    DiskThread::start("packed-quarantine").unwrap(),
+                )),
+            )
+            .unwrap();
+            CompositeStore::new(memory, disk).unwrap()
+        };
+
+        let mut ids = Ids::new();
+        let c1 = checkpoint(
+            &mut ids,
+            &h,
+            5 * PAGE_TOKENS + 1,
+            None,
+            (0..5).map(crate::PageId).collect(),
+            5,
+            crate::StateSlotId(0),
+        );
+        let c2 = checkpoint(
+            &mut ids,
+            &h,
+            10 * PAGE_TOKENS + 2,
+            Some(c1.key.consumed_tokens),
+            (0..10).map(crate::PageId).collect(),
+            5,
+            crate::StateSlotId(1),
+        );
+
+        let mut store = open_store();
+        for c in [&c1, &c2] {
+            assert_eq!(store.store(c).unwrap(), StoreOutcome::Queued);
+            poll_until(&mut store, &mut Vec::new(), |s| s.memory.record(&c.key).is_some());
+            store.spill(c.key);
+            poll_until(&mut store, &mut Vec::new(), |s| {
+                s.disk.index().node(&c.key).is_some_and(|n| n.ready)
+            });
+        }
+        let c1_rec = store.disk.record(&c1.key).unwrap().clone();
+        let c2_rec = store.disk.record(&c2.key).unwrap().clone();
+        store.close().unwrap();
+        drop(store);
+
+        // 1. Corrupt ONLY c2's row (last byte of c2 file): c2's row is dropped, while
+        //    healthy parent c1 remains selectable on the next lookup.
+        let mut c2_bytes = fs::read(&c2_rec.path).unwrap();
+        let c2_orig = c2_bytes.clone();
+        *c2_bytes.last_mut().unwrap() ^= 0xFF;
+        fs::write(&c2_rec.path, &c2_bytes).unwrap();
+
+        let mut store = open_store();
+        let hit = store.lookup(&h, 0, u64::MAX).unwrap();
+        assert_eq!(hit.key, c2.key);
+        store
+            .fetch(
+                hit,
+                InboundTicket {
+                    key: c2.key,
+                    pages: (200..210).map(crate::PageId).collect(),
+                    slot: crate::StateSlotId(7),
+                },
+            )
+            .unwrap();
+        let mut events = Vec::new();
+        poll_until(&mut store, &mut events, |s| s.inbound.is_empty());
+        assert!(events.iter().any(|e| matches!(e, StoreEvent::Fetched { result: Err(_), .. })));
+        let next_hit = store.lookup(&h, 0, u64::MAX).unwrap();
+        assert_eq!(next_hit.key, c1.key, "row-only failure on c2 must keep healthy parent c1");
+        store.close().unwrap();
+        drop(store);
+
+        // 2. Restore c2 cleanly, then corrupt a PAGE byte inside parent c1's file:
+        //    fetching child c2 must fail and quarantine c1's damaged pages so a second
+        //    lookup cannot select [c1, c2] again.
+        fs::write(&c2_rec.path, &c2_orig).unwrap();
+        let mut c1_bytes = fs::read(&c1_rec.path).unwrap();
+        let page_off = c1_rec.header.page_segment as usize;
+        c1_bytes[page_off + 4] ^= 0xFF;
+        fs::write(&c1_rec.path, &c1_bytes).unwrap();
+
+        let mut store = open_store();
+        let hit = store.lookup(&h, 0, u64::MAX).unwrap();
+        assert_eq!(hit.key, c2.key);
+        store
+            .fetch(
+                hit,
+                InboundTicket {
+                    key: c2.key,
+                    pages: (300..310).map(crate::PageId).collect(),
+                    slot: crate::StateSlotId(6),
+                },
+            )
+            .unwrap();
+        let mut events = Vec::new();
+        poll_until(&mut store, &mut events, |s| s.inbound.is_empty());
+        assert!(events.iter().any(|e| matches!(e, StoreEvent::Fetched { result: Err(_), .. })));
+        assert!(store.memory.record(&c1.key).is_none());
+        assert!(
+            store.lookup(&h, 0, u64::MAX).is_none(),
+            "corrupt ancestor c1 pages must be quarantined from subsequent child lookups"
+        );
+
+        // 3. Recomputing and recapturing c1 must replace the quarantined disk copy cleanly
+        //    (not spin in Retry(Inflight)) so both c1 and intact child c2 become restorable
+        //    byte-for-byte again.
+        let c1_repair = checkpoint(
+            &mut ids,
+            &h,
+            5 * PAGE_TOKENS + 1,
+            None,
+            (0..5).map(crate::PageId).collect(),
+            5,
+            crate::StateSlotId(0),
+        );
+        assert_eq!(
+            store.store(&c1_repair).unwrap(),
+            StoreOutcome::Queued,
+            "recapturing quarantined ancestor c1 must be admitted for replacement"
+        );
+        poll_until(&mut store, &mut Vec::new(), |s| {
+            s.disk.index().node(&c1.key).is_some_and(|n| n.ready)
+        });
+
+        let repaired_hit = store
+            .lookup(&h, 0, u64::MAX)
+            .expect("child c2 must be selectable again once ancestor c1 is repaired");
+        assert_eq!(repaired_hit.key, c2.key);
+        store
+            .fetch(
+                repaired_hit,
+                InboundTicket {
+                    key: c2.key,
+                    pages: (400..410).map(crate::PageId).collect(),
+                    slot: crate::StateSlotId(5),
+                },
+            )
+            .unwrap();
+        let mut events = Vec::new();
+        poll_until(&mut store, &mut events, |s| s.inbound.is_empty());
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StoreEvent::Fetched { result: Ok(_), .. })),
+            "child c2 must restore cleanly after ancestor c1 replacement"
+        );
+        for p in 0..10u32 {
+            let expected: Vec<u8> = (0..4096)
+                .map(|j| ((j / 64 + p as usize) % 3) as u8)
+                .collect();
+            assert_eq!(gpu.pages.lock().unwrap()[&(400 + p)], expected);
+        }
+        let expected_row: Vec<u8> = (0..4096).map(|j| ((j / 64) % 2) as u8).collect();
+        assert_eq!(gpu.rows.lock().unwrap()[&5], expected_row);
         store.close().unwrap();
         drop(store);
         fs::remove_dir_all(directory).unwrap();

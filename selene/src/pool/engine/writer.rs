@@ -57,6 +57,7 @@ struct Put {
     row: bool,
     packed_offer: Option<wire::PackedOffer>,
     packed_accepted: bool,
+    min_first_page: u64,
     source: Arc<Mutex<Box<dyn PutBytes>>>,
     phase: Phase,
     first_page: u64,
@@ -206,6 +207,9 @@ impl Engine {
             } as i32,
             packed: request.packed.clone(),
         }));
+        let (min_first_page, source) = match request.source {
+            PutSource::Host(bytes) => (bytes.min_first_page(), Arc::new(Mutex::new(bytes))),
+        };
         self.writer.puts.insert(
             id,
             Put {
@@ -217,9 +221,8 @@ impl Engine {
                 row: request.row,
                 packed_offer: request.packed,
                 packed_accepted: false,
-                source: match request.source {
-                    PutSource::Host(bytes) => Arc::new(Mutex::new(bytes)),
-                },
+                min_first_page,
+                source,
                 phase: Phase::Begun,
                 first_page: 0,
                 parent: None,
@@ -337,6 +340,17 @@ impl Engine {
             && role == crate::CaptureRole::Endpoint
             && put.child_paths < 2;
         let put = self.writer.puts.get_mut(&id).expect("present");
+        if accept.first_page < put.min_first_page {
+            // The manager forced a root/suffix that crosses a mixed raw/packed boundary on
+            // this host chain. Because the manager has already accepted (and may have
+            // pipelined a shared-window grant), transition out of Begun so drive_put emits
+            // FenceAck(Drained) after PutCancel and the manager releases any leased window.
+            put.phase = Phase::Accepted;
+            put.refused = Some(PutOutcome::Refused(PutRefusal::Invalid));
+            self.send_cancel(id);
+            self.drive_put(id);
+            return;
+        }
         if put.packed_offer.is_some() && !accept.packed {
             return self.fail_put(
                 id,
