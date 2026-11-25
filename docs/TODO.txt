@@ -327,3 +327,8 @@
 [ ] Qualify --row-shard-prefill on SM103 GPUs and remove the SM103 planning
     refusal in ignition/planning.py once tensor-parallel export and native
     serving pass on SM103.
+
+[ ] Qualify --row-shard-attention on SM121 and multi-host RoCE topologies, and
+    on SM103 GPUs alongside --row-shard-prefill. Close each target when
+    tensor-parallel export with replicated attention weights and native flare
+    run serving pass on that hardware and transport.

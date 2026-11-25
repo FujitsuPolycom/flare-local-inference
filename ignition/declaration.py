@@ -12,8 +12,15 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, fields, replace
 import math
 from types import MappingProxyType
+from typing import Protocol
 
 from ignition.components.capacity import request_capacity
+
+
+class ReplicatedAttentionBytes(Protocol):
+    """Per-rank replicated attention weight bytes added under `--row-shard-attention`."""
+
+    def __call__(self, world_size: int, *, prompt_logprobs: bool = False, mtp_only: bool = False) -> int: ...
 
 @dataclass(frozen=True)
 class SamplingRange:
@@ -240,6 +247,10 @@ class Recipe:
     `row_shard_prefill_world_sizes` lists the tensor-parallel world sizes (at least two ranks)
     that support reducing prefill branch outputs into contiguous per-rank row shards; empty
     leaves `--row-shard-prefill` unsupported.
+    `replicated_attention_bytes(world_size, *, prompt_logprobs=False, mtp_only=False)` gives
+    the per-rank device weight bytes a row-sharded attention plan loads beside its decode
+    partition, which `weights_bytes` validates and adds when `row_shard_attention=True`; `None`
+    leaves `--row-shard-attention` unsupported.
     """
 
     name: str
@@ -298,6 +309,8 @@ class Recipe:
     vocabulary_parallel_world_sizes: tuple[int, ...] = ()
     # Tensor-parallel world sizes that support row-sharded prefill reductions and gathers.
     row_shard_prefill_world_sizes: tuple[int, ...] = ()
+    # Per-rank device weight bytes added by replicated attention projections under --row-shard-attention.
+    replicated_attention_bytes: ReplicatedAttentionBytes | None = None
 
     def mixed_shapes(self, concurrency, chunk, speculation):
         from ignition.components.capacity import mixed_shapes, serving_modes
@@ -324,6 +337,8 @@ class Recipe:
         if any(type(size) is not int or size < 2 or size not in self.ranks
                for size in self.row_shard_prefill_world_sizes):
             raise ValueError("row_shard_prefill_world_sizes must name tensor-parallel sizes >= 2 declared in ranks")
+        if self.replicated_attention_bytes is not None and not callable(self.replicated_attention_bytes):
+            raise ValueError("replicated_attention_bytes must be callable when provided")
         for name, method in self.speculative_methods.items():
             if name not in ("mtp", "dspark", "dflash2") or set(method.ranks) != set(self.ranks):
                 raise ValueError("speculative methods require known names and every declared tensor-parallel size")
@@ -358,8 +373,13 @@ class Recipe:
         return ranks[world_size] if method is None else method.ranks[world_size]
 
     def weights_bytes(self, checkpoint: Checkpoint, world_size: int, speculation: Speculation | None,
-                      expert_scale_compression: str | None = None) -> int:
-        """Estimate one rank's device weights from the checkpoint's stored tensors and their expansion."""
+                      expert_scale_compression: str | None = None, *, row_shard_attention: bool = False,
+                      prompt_logprobs: bool = False) -> int:
+        """Estimate one rank's device weights from the checkpoint's stored tensors and their expansion.
+
+        When `row_shard_attention` is true, validates and adds the recipe's
+        `replicated_attention_bytes` charge (deriving `mtp_only` from `speculation`).
+        """
         learned = speculation is not None
         device_bytes = (checkpoint.device_bytes if expert_scale_compression is None else
                         checkpoint.scale_compressed_device_bytes[expert_scale_compression])
@@ -367,8 +387,18 @@ class Recipe:
         method = None if speculation is None else self.speculative_methods.get(speculation.method)
         if method is not None and method.draft_bytes is not None:
             draft_bytes = method.draft_bytes
+        replicated = 0
+        if row_shard_attention:
+            if self.replicated_attention_bytes is None:
+                raise ValueError("row_shard_attention requires a recipe declaring replicated_attention_bytes")
+            mtp_only = speculation is not None and speculation.mtp_only
+            replicated = self.replicated_attention_bytes(
+                world_size, prompt_logprobs=prompt_logprobs, mtp_only=mtp_only
+            )
+            if type(replicated) is not int or replicated < 0:
+                raise ValueError("replicated_attention_bytes must return a non-negative integer")
         return -(-(device_bytes + checkpoint.expansion_bytes - checkpoint.draft_bytes
-                   + (draft_bytes if learned else 0)) // world_size)
+                   + (draft_bytes if learned else 0)) // world_size) + replicated
 
     def live_rows(self, concurrency: int, speculation: Speculation | None) -> int:
         """Permanently backed null, live, and speculative execution rows."""
