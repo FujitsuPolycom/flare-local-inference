@@ -377,7 +377,13 @@ fn build_packed_write(
             sync: false,
         });
     }
-    // All units fell back to Literal: emit a canonical raw v3 record file.
+    // All units fell back to Literal: verify each captured literal checksum before
+    // emitting fresh whole-page/row raw v3 checksums so in-DRAM corruption cannot pass.
+    for slot in &slots {
+        if record::checksum(&slot.bytes) != slot.unit.raw_xxh3 {
+            return Err(Error::carrying(crate::shared::packed::Checksum::Stored));
+        }
+    }
     let mut raw_header = header;
     raw_header.set_replication(Default::default())?;
     let ranks = raw_header.ranks.len();
@@ -7808,5 +7814,108 @@ mod tests {
         store.close().unwrap();
         drop(store);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn all_literal_disk_conversion_rejects_corrupted_literal_bytes() {
+        use crate::shared::{
+            packed::Checksum,
+            wire::{
+                PackedUnit,
+                packed_unit::{Kind, Representation},
+            },
+        };
+        let geometry = vec![rank(PAGE_TOKENS, &[("kv", 4096)], 4096)];
+        let key = PrefixKey {
+            digest: [7u8; 16],
+            consumed_tokens: PAGE_TOKENS,
+        };
+        let header = record::Header::new(
+            &geometry,
+            IDENTITY,
+            FINGERPRINT,
+            key,
+            None,
+            [0u8; 16],
+            1,
+            SystemTime::now(),
+        )
+        .unwrap();
+        let page_bytes = vec![0x3Cu8; 4096];
+        let row_bytes = vec![0xA5u8; 4096];
+        let make_slots = |p: Vec<u8>, r: Vec<u8>| {
+            vec![
+                crate::codec_copy::CaptureSlot {
+                    unit: PackedUnit {
+                        kind: Kind::Page as i32,
+                        logical_index: 0,
+                        stored_rank: 0,
+                        representation: Representation::Literal as i32,
+                        original_length: 4096,
+                        stored_length: 4096,
+                        raw_xxh3: record::checksum(&page_bytes),
+                        ..Default::default()
+                    },
+                    bytes: p,
+                },
+                crate::codec_copy::CaptureSlot {
+                    unit: PackedUnit {
+                        kind: Kind::Row as i32,
+                        logical_index: 0,
+                        stored_rank: 0,
+                        representation: Representation::Literal as i32,
+                        original_length: 4096,
+                        stored_length: 4096,
+                        raw_xxh3: record::checksum(&row_bytes),
+                        ..Default::default()
+                    },
+                    bytes: r,
+                },
+            ]
+        };
+        // Intact literal slots convert cleanly to canonical raw v3.
+        let ok = build_packed_write(
+            JobId(1),
+            PathBuf::from("/tmp/ok.tmp"),
+            PathBuf::from("/tmp/ok.rec"),
+            header.clone(),
+            make_slots(page_bytes.clone(), row_bytes.clone()),
+            true,
+        );
+        assert!(ok.is_ok(), "intact all-literal record must succeed: {ok:?}");
+
+        // Flipping a byte in a literal page must fail with Checksum::Stored.
+        let mut bad_p = page_bytes.clone();
+        bad_p[123] ^= 0x01;
+        let err = build_packed_write(
+            JobId(2),
+            PathBuf::from("/tmp/bad-page.tmp"),
+            PathBuf::from("/tmp/bad-page.rec"),
+            header.clone(),
+            make_slots(bad_p, row_bytes.clone()),
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.carried().and_then(|e| e.downcast_ref::<Checksum>()),
+            Some(&Checksum::Stored)
+        );
+
+        // Flipping a byte in a literal row must also fail with Checksum::Stored.
+        let mut bad_r = row_bytes.clone();
+        bad_r[77] ^= 0x80;
+        let err = build_packed_write(
+            JobId(3),
+            PathBuf::from("/tmp/bad-row.tmp"),
+            PathBuf::from("/tmp/bad-row.rec"),
+            header,
+            make_slots(page_bytes.clone(), bad_r),
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.carried().and_then(|e| e.downcast_ref::<Checksum>()),
+            Some(&Checksum::Stored)
+        );
     }
 }

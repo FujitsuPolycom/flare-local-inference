@@ -4968,10 +4968,10 @@ fn apply_packed_offer(
         })
         .cloned()
         .collect();
-    // If every unit in the accepted suffix is a raw literal, fall back to a standard v3 record.
-    if !units.iter().any(|u| {
-        u.representation == flare_selene::shared::wire::packed_unit::Representation::Packet as i32
-    }) {
+    // Keep a non-empty packed offer in v4 form even when every unit in the accepted
+    // suffix fell back to Literal: the client streams packed units directly and v4
+    // preserves per-unit raw_xxh3 checks with an empty required_profiles set.
+    if units.is_empty() {
         return Ok(header);
     }
     let sliced = flare_selene::shared::wire::PackedOffer { first_page, units };

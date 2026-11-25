@@ -280,9 +280,6 @@ impl Header {
             .parent
             .map_or(0, |p| p.consumed_tokens / self.page_tokens);
         let layout = packed::Layout::new(offer, &self.ranks, first, self.tail_pages)?;
-        if !layout.offer().units.iter().any(|u| u.representation == 1) {
-            return Err(invalid("a literal-only record uses the raw envelope"));
-        }
         let size = self.directory_bytes(&layout).len();
         if size > packed::MAX_DIRECTORY {
             return Err(invalid("oversized v4 directory"));

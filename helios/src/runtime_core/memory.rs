@@ -680,7 +680,7 @@ impl NativeModel {
         let codec_instances =
             (u64::from(has_pool) + u64::from(has_memory) + u64::from(has_disk)).max(1);
         let restore_host = if compression_active {
-            geometry
+            let per_tier = geometry
                 .iter()
                 .try_fold(0u64, |total, g| {
                     let [page, row] = flare_selene::shared::codec_layout::plans(g)
@@ -704,7 +704,28 @@ impl NativeModel {
                         .checked_add(share)
                         .ok_or_else(|| invalid("codec restore host scratch overflows memory"))
                 })?
-                .saturating_mul(codec_instances)
+                .saturating_mul(codec_instances);
+            // Bounded async CPU host-compression wave scratch (pages) + one-rank row staging.
+            let async_cpu_scratch = if has_memory && cfg.compression == crate::offload::KvCompression::Cpu {
+                let mut page_max_all_ranks = 0u64;
+                let mut row_staging_max = 0u64;
+                let mut row_encoded_all_ranks = 0u64;
+                for g in &geometry {
+                    let [page, row] = flare_selene::shared::codec_layout::plans(g)
+                        .map_err(|e| invalid(format!("invalid codec layout: {e}")))?;
+                    page_max_all_ranks = page_max_all_ranks.saturating_add(page.max_packet() as u64);
+                    row_staging_max = row_staging_max
+                        .max((row.original_bytes() as u64).saturating_add(row.max_packet() as u64));
+                    row_encoded_all_ranks =
+                        row_encoded_all_ranks.saturating_add(row.original_bytes() as u64);
+                }
+                let page_wave =
+                    (flare_selene::memory::CPU_COMPRESS_PAGE_SCRATCH_BYTES as u64).max(page_max_all_ranks);
+                page_wave.max(row_staging_max.saturating_add(row_encoded_all_ranks))
+            } else {
+                0
+            };
+            per_tier.saturating_add(async_cpu_scratch)
         } else {
             0
         };

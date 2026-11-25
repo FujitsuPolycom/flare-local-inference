@@ -1327,3 +1327,203 @@ async fn packed_peer_dram_export_relays_over_shm_and_tcp_and_isolates_raw_peers(
     ));
     host.stop();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_literal_and_literal_only_suffix_offers_retire_and_restore_as_v4() {
+    let mut host = Host::with_storage(64 << 20, 64 << 20);
+    host.run();
+    let mut pool = Pool::connect(&host.config.socket).await;
+    let mut writer = open(&mut pool, "literal-writer", true).await;
+
+    let lit_p0 = vec![0x5Au8; 4096];
+    let lit_p1 = vec![0xA5u8; 4096];
+    let lit_row = vec![0x3Cu8; 4096];
+    let make_lit = |kind: i32, logical_index: u64, data: &[u8]| v2::PackedUnit {
+        kind,
+        logical_index,
+        stored_rank: 0,
+        representation: v2::packed_unit::Representation::Literal as i32,
+        original_length: data.len() as u64,
+        stored_length: data.len() as u64,
+        raw_xxh3: flare_selene::record::checksum(data),
+        ..Default::default()
+    };
+
+    // 1. All-literal root checkpoint must be accepted as packed v4 (not rejected as raw).
+    let all_lit_offer = v2::PackedOffer {
+        first_page: 0,
+        units: vec![
+            make_lit(0, 0, &lit_p0),
+            make_lit(0, 1, &lit_p1),
+            make_lit(1, 0, &lit_row),
+        ],
+    };
+    let all_lit_payload = [lit_p0.as_slice(), lit_p1.as_slice(), lit_row.as_slice()].concat();
+    put_packed(
+        &mut writer,
+        1,
+        128,
+        None,
+        2,
+        2,
+        all_lit_offer,
+        &all_lit_payload,
+        4096,
+    )
+    .await;
+
+    // 2. Mixed parent (compressed page 0 + row) followed by a child whose full offer has
+    //    compressed page 0 + literal suffix (page 1 + row): manager accepts suffix at first_page=1
+    //    as packed v4 so the client's packed-mode stream succeeds.
+    let parent_offer = v2::PackedOffer {
+        first_page: 0,
+        units: vec![offer().units[0].clone(), offer().units[2].clone()],
+    };
+    let parent_payload = [page0(), row()].concat();
+    put_packed(&mut writer, 2, 64, None, 1, 1, parent_offer, &parent_payload, 4096).await;
+
+    let child_full_offer = v2::PackedOffer {
+        first_page: 0,
+        units: vec![
+            offer().units[0].clone(),
+            make_lit(0, 1, &lit_p1),
+            make_lit(1, 0, &lit_row),
+        ],
+    };
+    let child_suffix_offer = v2::PackedOffer {
+        first_page: 1,
+        units: vec![make_lit(0, 1, &lit_p1), make_lit(1, 0, &lit_row)],
+    };
+    let child_suffix_payload = [lit_p1.as_slice(), lit_row.as_slice()].concat();
+    writer
+        .send(v2::client_message::M::PutBegin(v2::PutBegin {
+            ancestor_keys: vec![v2::PrefixKey {
+                consumed_tokens: 64,
+                digest: key(64).digest.to_vec(),
+            }],
+            put_id: 3,
+            key: Some(v2::PrefixKey {
+                consumed_tokens: 129,
+                digest: key(129).digest.to_vec(),
+            }),
+            chain_pages: 2,
+            capture_role: flare_selene::CaptureRole::Endpoint as i32,
+            child_paths: 0,
+            descendant_row: false,
+            next_child: None,
+            row: true,
+            has_published_parent: true,
+            published_parent: Some(v2::PrefixKey {
+                consumed_tokens: 64,
+                digest: key(64).digest.to_vec(),
+            }),
+            bucket: vec![4; 16],
+            published_tail_pages: 1,
+            mode: v2::CopyMode::SharedWindows as i32,
+            packed: Some(child_full_offer),
+        }))
+        .await;
+    let accept = writer
+        .take(|m| match m {
+            v2::server_message::M::PutAccept(a) if a.put_id == 3 => Some(a.clone()),
+            _ => None,
+        })
+        .await;
+    assert!(accept.packed, "literal-only suffix must be accepted as packed v4");
+    assert_eq!(accept.first_page, 1);
+    let descriptor = support::descriptor();
+    let header = selene_manager::record::new_header(
+        &descriptor,
+        key(129),
+        Some(key(64)),
+        [4; 16],
+        1,
+    )
+    .unwrap()
+    .with_capture_role(flare_selene::CaptureRole::Endpoint)
+    .with_packed(child_suffix_offer)
+    .unwrap();
+    let metadata = header.packed_metadata().unwrap();
+    assert_eq!(accept.record_bytes, header.length(true));
+    let mut filled = 0usize;
+    while filled < child_suffix_payload.len() {
+        let grant = writer
+            .take(|m| match m {
+                v2::server_message::M::PutGrant(g) if g.put_id == 3 => Some(g.clone()),
+                _ => None,
+            })
+            .await;
+        let window = grant.window.unwrap();
+        let end = filled + window.length as usize;
+        writer
+            .shm
+            .as_ref()
+            .unwrap()
+            .write(&window, &child_suffix_payload[filled..end]);
+        writer
+            .send(v2::client_message::M::PutFilled(v2::PutFilled {
+                put_id: 3,
+                index: window.index,
+                row_xxh3: 0,
+                page_xxh3: Vec::new(),
+                has_row: false,
+                rank_sums: Vec::new(),
+            }))
+            .await;
+        filled = end;
+    }
+    writer
+        .send(v2::client_message::M::PutCommit(v2::PutCommit {
+            put_id: 3,
+            metadata_offset: 0,
+            metadata,
+        }))
+        .await;
+    let stored = writer
+        .take(|m| match m {
+            v2::server_message::M::Stored(s) if s.put_id == 3 => Some(s.bytes),
+            _ => None,
+        })
+        .await;
+    assert_eq!(stored, header.length(true));
+    support::put::fence(&mut writer, 3).await;
+
+    // Verify both records can be looked up and claimed back cleanly with checksum verification.
+    let cand = writer.manager_candidate(4, 128).await;
+    writer.claim(writer.claim_for(10, &cand, 0, true)).await;
+    let _granted = writer.claim_granted(10).await;
+    let mut got = Vec::new();
+    while got.len() < all_lit_payload.len() {
+        let w = writer.window_ready(10).await.window.unwrap();
+        let data = writer.shm.as_ref().unwrap().read(&w);
+        packed::verify_units(&w.packed.as_ref().unwrap().units, &data).unwrap();
+        got.extend_from_slice(&data);
+        writer.released(10, w.index).await;
+    }
+    assert_eq!(got, all_lit_payload);
+    writer.copy_result(10, v2::CopyOutcome::CopyOk).await;
+    writer.claim_terminal(10).await;
+    writer.fence(10, v2::FenceOutcome::Drained).await;
+
+    // Also claim and restore the 129-token child endpoint to verify full chain reconstruction:
+    // parent compressed page 0 + child literal page 1 + child literal row.
+    let child_cand = writer.manager_candidate(4, 129).await;
+    writer.claim(writer.claim_for(11, &child_cand, 0, true)).await;
+    let _child_granted = writer.claim_granted(11).await;
+    let expected_chain = [page0(), lit_p1.as_slice(), lit_row.as_slice()].concat();
+    let mut got_child = Vec::new();
+    while got_child.len() < expected_chain.len() {
+        let w = writer.window_ready(11).await.window.unwrap();
+        let data = writer.shm.as_ref().unwrap().read(&w);
+        packed::verify_units(&w.packed.as_ref().unwrap().units, &data).unwrap();
+        got_child.extend_from_slice(&data);
+        writer.released(11, w.index).await;
+    }
+    assert_eq!(got_child, expected_chain);
+    writer.copy_result(11, v2::CopyOutcome::CopyOk).await;
+    writer.claim_terminal(11).await;
+    writer.fence(11, v2::FenceOutcome::Drained).await;
+
+    drop((writer, pool));
+    host.stop();
+}

@@ -1902,12 +1902,15 @@ fn zero_raw_page_gaps(layout: &Layout, page_addrs: &[usize]) {
     }
 }
 
+/// Upper bound on page scratch retained during one background CPU compression wave.
+/// Every encoded page share is at most its raw share, so compacting wave-by-wave into
+/// the record's own slabs never overtakes unread pages and avoids checkpoint-sized scratch.
+pub const CPU_COMPRESS_PAGE_SCRATCH_BYTES: usize = 16 << 20;
+
 #[cfg(feature = "codec")]
 #[derive(Default)]
 struct CompressScratch {
     page_out: Vec<Vec<u8>>,
-    row_raw: Vec<Vec<u8>>,
-    row_out: Vec<Vec<u8>>,
 }
 
 #[cfg_attr(not(feature = "codec"), allow(dead_code))]
@@ -2051,120 +2054,124 @@ fn encode_host_task(
     let encode_result = (|| -> std::result::Result<PackedDirs, String> {
         let (page_dir, page_keep) = if page_jobs > 0 {
             let max_pkt = encoder.page.max_packet();
-            if scratch.page_out.len() < page_jobs {
-                scratch.page_out.resize_with(page_jobs, || vec![0u8; max_pkt]);
+            let wave_pages = (CPU_COMPRESS_PAGE_SCRATCH_BYTES / (ranks * max_pkt).max(1))
+                .clamp(1, 32)
+                .min(task.page_addrs.len());
+            let wave_jobs = wave_pages * ranks;
+            if scratch.page_out.len() < wave_jobs {
+                scratch.page_out.resize_with(wave_jobs, || vec![0u8; max_pkt]);
             }
-            for buf in &mut scratch.page_out[..page_jobs] {
+            for buf in &mut scratch.page_out[..wave_jobs] {
                 if buf.len() < max_pkt {
                     buf.resize(max_pkt, 0);
                 }
             }
-            let results: Vec<std::result::Result<(PackedUnit, usize), String>> = scratch.page_out
-                [..page_jobs]
-                .par_iter_mut()
-                .enumerate()
-                .map(|(idx, out)| {
-                    let p = idx / ranks;
-                    let r = idx % ranks;
-                    let share = layout.page_share(r) as usize;
-                    let ptr = (task.page_addrs[p] + layout.ranks[r].page_offset as usize)
-                        as *const u8;
-                    // SAFETY: unpublished pinned record exclusively owned by this task.
-                    let raw = unsafe { std::slice::from_raw_parts(ptr, share) };
-                    let base = PackedUnit {
-                        kind: Kind::Page as i32,
-                        logical_index: task.first_page + p as u64,
-                        stored_rank: r as u32,
-                        ..Default::default()
-                    };
-                    encoder
-                        .page
-                        .encode_capture(base, &encoder.profile, raw, out, None)
-                        .map_err(|e| e.to_string())
-                })
-                .collect();
-            let mut order: Vec<(usize, PackedUnit, usize)> = Vec::with_capacity(page_jobs);
-            for (idx, res) in results.into_iter().enumerate() {
-                let (unit, used) = res?;
-                stored_bytes += unit.stored_length;
-                order.push((idx, unit, used));
+            let mut page_dir = Vec::with_capacity(page_jobs);
+            let mut out_offset = 0usize;
+            for wave_start in (0..task.page_addrs.len()).step_by(wave_pages) {
+                let wave_end = (wave_start + wave_pages).min(task.page_addrs.len());
+                let cur_jobs = (wave_end - wave_start) * ranks;
+                let results: Vec<std::result::Result<(PackedUnit, usize), String>> = scratch
+                    .page_out[..cur_jobs]
+                    .par_iter_mut()
+                    .enumerate()
+                    .map(|(idx, out)| {
+                        let p = wave_start + idx / ranks;
+                        let r = idx % ranks;
+                        let share = layout.page_share(r) as usize;
+                        let ptr = (task.page_addrs[p] + layout.ranks[r].page_offset as usize)
+                            as *const u8;
+                        // SAFETY: unpublished pinned record exclusively owned by this task;
+                        // prior waves wrote strictly within `[0..wave_start * slab_bytes)`.
+                        let raw = unsafe { std::slice::from_raw_parts(ptr, share) };
+                        let base = PackedUnit {
+                            kind: Kind::Page as i32,
+                            logical_index: task.first_page + p as u64,
+                            stored_rank: r as u32,
+                            ..Default::default()
+                        };
+                        encoder
+                            .page
+                            .encode_capture(base, &encoder.profile, raw, out, None)
+                            .map_err(|e| e.to_string())
+                    })
+                    .collect();
+                let mut writes: Vec<(usize, usize, usize)> = Vec::with_capacity(cur_jobs);
+                for (idx, res) in results.into_iter().enumerate() {
+                    let (unit, used) = res?;
+                    stored_bytes += unit.stored_length;
+                    page_dir.push((unit, out_offset));
+                    writes.push((idx, out_offset, used));
+                    out_offset += used;
+                }
+                debug_assert!(out_offset <= wave_end * slab_bytes);
+                writes.par_iter().for_each(|&(idx, start, used)| {
+                    // SAFETY: reads for `wave_start..wave_end` finished above and every
+                    // wave entry writes a disjoint range inside `task.page_addrs[..wave_end]`.
+                    unsafe {
+                        crate::codec_copy::write_to_slabs(
+                            &task.page_addrs,
+                            slab_bytes,
+                            start,
+                            &scratch.page_out[idx][..used],
+                        );
+                    }
+                });
             }
-            order.sort_by_key(|(_, u, _)| (u.kind, u.logical_index, u.stored_rank));
-            let slices: Vec<(&PackedUnit, &[u8])> = order
-                .iter()
-                .map(|(idx, unit, used)| (unit, &scratch.page_out[*idx][..*used]))
-                .collect();
-            // SAFETY: all raw page reads have finished; we now compact into `task.page_addrs`.
-            unsafe { write_packed_into_slabs(&task.page_addrs, slab_bytes, &slices, true) }
+            (page_dir, out_offset.div_ceil(slab_bytes))
         } else {
             (Vec::new(), 0)
         };
 
         let row_dir = if let Some(row_addrs) = &task.row_addrs {
+            // Release page-wave buffers before row allocation so page and row scratch never
+            // overlap in peak memory (matching `helios::runtime_core::memory` budgeting).
+            scratch.page_out.clear();
+            scratch.page_out.shrink_to_fit();
+            // Encode one rank at a time using one shared raw+packet staging pair (each
+            // rank already parallelizes internally across `pool`) and drop the transient
+            // buffers once compacted so row scratch is never retained across checkpoints.
             let max_pkt = encoder.row.max_packet();
             let row_orig = encoder.row.original_bytes();
-            if scratch.row_raw.len() < ranks {
-                scratch.row_raw.resize_with(ranks, || vec![0u8; row_orig]);
-            }
-            if scratch.row_out.len() < ranks {
-                scratch.row_out.resize_with(ranks, || vec![0u8; max_pkt]);
-            }
-            for buf in &mut scratch.row_raw[..ranks] {
-                if buf.len() != row_orig {
-                    buf.resize(row_orig, 0);
-                }
-            }
-            for buf in &mut scratch.row_out[..ranks] {
-                if buf.len() < max_pkt {
-                    buf.resize(max_pkt, 0);
-                }
-            }
-            let results: Vec<std::result::Result<(PackedUnit, usize), String>> = scratch.row_raw
-                [..ranks]
-                .par_iter_mut()
-                .zip(scratch.row_out[..ranks].par_iter_mut())
-                .enumerate()
-                .map(|(r, (raw, out))| {
-                    let share = layout.page_share(r) as usize;
-                    let row_bytes = layout.ranks[r].row_bytes as usize;
-                    let mut off = 0usize;
-                    for &slot_addr in row_addrs {
-                        if off >= row_bytes {
-                            break;
-                        }
-                        let take = (row_bytes - off).min(share);
-                        let src =
-                            (slot_addr + layout.ranks[r].page_offset as usize) as *const u8;
-                        // SAFETY: unpublished pinned row slabs exclusively owned by this task.
-                        let slice = unsafe { std::slice::from_raw_parts(src, take) };
-                        raw[off..off + take].copy_from_slice(slice);
-                        off += take;
+            let mut row_raw = vec![0u8; row_orig];
+            let mut row_buf = vec![0u8; max_pkt];
+            let mut encoded_rows: Vec<(PackedUnit, Vec<u8>)> = Vec::with_capacity(ranks);
+            for r in 0..ranks {
+                let share = layout.page_share(r) as usize;
+                let row_bytes = layout.ranks[r].row_bytes as usize;
+                let mut off = 0usize;
+                for &slot_addr in row_addrs {
+                    if off >= row_bytes {
+                        break;
                     }
-                    if row_orig > row_bytes {
-                        raw[row_bytes..row_orig].fill(0);
-                    }
-                    let base = PackedUnit {
-                        kind: Kind::Row as i32,
-                        logical_index: 0,
-                        stored_rank: r as u32,
-                        ..Default::default()
-                    };
-                    encoder
-                        .row
-                        .encode_capture(base, &encoder.profile, raw, out, Some(pool))
-                        .map_err(|e| e.to_string())
-                })
-                .collect();
-            let mut order: Vec<(usize, PackedUnit, usize)> = Vec::with_capacity(ranks);
-            for (r, res) in results.into_iter().enumerate() {
-                let (unit, used) = res?;
+                    let take = (row_bytes - off).min(share);
+                    let src = (slot_addr + layout.ranks[r].page_offset as usize) as *const u8;
+                    // SAFETY: unpublished pinned row slabs exclusively owned by this task.
+                    let slice = unsafe { std::slice::from_raw_parts(src, take) };
+                    row_raw[off..off + take].copy_from_slice(slice);
+                    off += take;
+                }
+                if row_orig > row_bytes {
+                    row_raw[row_bytes..row_orig].fill(0);
+                }
+                let base = PackedUnit {
+                    kind: Kind::Row as i32,
+                    logical_index: 0,
+                    stored_rank: r as u32,
+                    ..Default::default()
+                };
+                let (unit, used) = encoder
+                    .row
+                    .encode_capture(base, &encoder.profile, &row_raw, &mut row_buf, Some(pool))
+                    .map_err(|e| e.to_string())?;
                 stored_bytes += unit.stored_length;
-                order.push((r, unit, used));
+                encoded_rows.push((unit, row_buf[..used].to_vec()));
             }
-            order.sort_by_key(|(_, u, _)| (u.kind, u.logical_index, u.stored_rank));
-            let slices: Vec<(&PackedUnit, &[u8])> = order
+            drop(row_raw);
+            drop(row_buf);
+            let slices: Vec<(&PackedUnit, &[u8])> = encoded_rows
                 .iter()
-                .map(|(r, unit, used)| (unit, &scratch.row_out[*r][..*used]))
+                .map(|(unit, bytes)| (unit, bytes.as_slice()))
                 .collect();
             // SAFETY: all raw row reads have finished; we now compact into `row_addrs`.
             Some(unsafe { write_packed_into_slabs(row_addrs, slab_bytes, &slices, true) })
@@ -2316,7 +2323,12 @@ impl MemoryStore {
         for mut rec in completed {
             let scratch = std::mem::take(&mut rec.scratch);
             if let Some(compressor) = self.compressor.as_mut() {
-                compressor.scratch = Some(scratch);
+                // Release wave scratch once the queue drains so idle replicas retain 0 B.
+                compressor.scratch = Some(if compressor.queue.is_empty() {
+                    CompressScratch::default()
+                } else {
+                    scratch
+                });
             }
             let key = rec.key;
             let refill = rec.refill;
@@ -6123,6 +6135,89 @@ mod tests {
         assert_eq!(store.stats().stored, 0);
         assert_eq!(store.stats().store_failed, 1);
         assert_clean_slots(&store.core);
+        store.close().unwrap();
+    }
+
+    #[cfg(feature = "codec")]
+    #[test]
+    fn async_host_codec_multi_wave_endpoint_with_incompressible_row_releases_idle_scratch() {
+        use crate::shared::codec::Plan;
+        use crate::store::TierStore;
+        use crate::testing::{CodecCopier, GpuMemory};
+
+        const PAGES: usize = 40; // Exceeds max 32-page wave so compression spans 2 waves.
+        let geometry = vec![geometry(PT, &[("kv", PAGE)], PAGE)];
+        let layout = Layout::new(&geometry).unwrap();
+        let gpu = GpuMemory::default();
+        let plan = Arc::new(Plan::new(PAGE as usize, &[]).unwrap());
+        let copier = CodecCopier::new(layout.clone(), [9; 32], plan.clone(), plan, gpu.clone())
+            .with_async_host_codec(true)
+            .shared();
+        let pool = SlabPool::new(layout.page_record_bytes, PAGES + 8, 0).unwrap();
+        let mut store = MemoryStore::new(IDENTITY, pool, copier).unwrap();
+
+        let h = history(PAGES as u64 * PT + 3, 1);
+        let c = published(&h, PAGES as u64 * PT + 3, None, 0, 1);
+        let mut rng = 0x1234_5678_9abc_def0u64;
+        let mut next_byte = || -> u8 {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng as u8
+        };
+        let expected_pages: Vec<Vec<u8>> = (0..PAGES)
+            .map(|p| {
+                if p % 5 == 0 {
+                    // Incompressible literal page interleaved with compressible pages.
+                    (0..PAGE as usize).map(|_| next_byte()).collect()
+                } else {
+                    (0..PAGE as usize)
+                        .map(|j| ((j / 16 + p) % 4) as u8)
+                        .collect()
+                }
+            })
+            .collect();
+        for (p, data) in expected_pages.iter().enumerate() {
+            gpu.pages.lock().unwrap().insert(p as u32, data.clone());
+        }
+        // Incompressible pseudo-random row exercises literal row fallback after page waves.
+        let expected_row: Vec<u8> = (0..PAGE as usize).map(|_| next_byte()).collect();
+        gpu.rows.lock().unwrap().insert(1, expected_row.clone());
+
+        assert_eq!(store.store(&c).unwrap(), StoreOutcome::Queued);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        poll_until(&mut store, deadline, |e| {
+            matches!(e, StoreEvent::Stored { result: Ok(_), .. })
+        });
+        // Once the queue drains, idle scratch holds 0 bytes.
+        let scratch = store
+            .compressor
+            .as_ref()
+            .unwrap()
+            .scratch
+            .as_ref()
+            .unwrap();
+        assert_eq!(scratch.page_out.capacity(), 0);
+        assert_clean_slots(&store.core);
+
+        let hit = store.lookup(&h, 0, u64::MAX).unwrap();
+        store
+            .fetch(
+                hit,
+                InboundTicket {
+                    key: c.key,
+                    pages: (200..200 + PAGES as u32).map(PageId).collect(),
+                    slot: StateSlotId(12),
+                },
+            )
+            .unwrap();
+        poll_until(&mut store, deadline, |e| {
+            matches!(e, StoreEvent::Fetched { result: Ok(_), .. })
+        });
+        for (p, expected) in expected_pages.iter().enumerate() {
+            assert_eq!(&gpu.pages.lock().unwrap()[&(200 + p as u32)], expected);
+        }
+        assert_eq!(gpu.rows.lock().unwrap()[&12], expected_row);
         store.close().unwrap();
     }
 }
