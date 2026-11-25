@@ -50,6 +50,10 @@ def _materialize_selected_cubin(result):
 
 def _install(tuner, encoded):
     result = pickle.loads(encoded)
+    unchanged = (len(tuner.launchers) == 1 and len(tuner.compile_results) == 1
+                 and tuner.inductor_meta.get('dynamic_scale_rblock') is False
+                 and vars(tuner.compile_results[0].config) == result._flare_config_state
+                 and tuner.compile_results[0].kernel.cubin_raw == result.kernel.cubin_raw)
     result.config.__dict__.clear()
     result.config.__dict__.update(result._flare_config_state)
     result.compile_meta = dict(result.compile_meta, device=tuner.triton_meta['device'])
@@ -60,6 +64,7 @@ def _install(tuner, encoded):
     tuner.inductor_meta = {**tuner.inductor_meta, 'dynamic_scale_rblock': False}
     tuner.__dict__.pop('_could_rblock_scale', None)
     tuner._make_launchers()
+    return not unchanged
 
 
 def _snapshot(entry, tuner):
@@ -117,6 +122,8 @@ class InductorSelections:
         self.winners = {}
         self.instances = {}
         self.forwards = {}
+        self._updated_forwards = set()
+        self._tuner_forwards = {}
 
     def _gather(self, value):
         if self.coordinator is None:
@@ -161,11 +168,12 @@ class InductorSelections:
                     f'bundled={cache_key in entries}, static_entries={len(entries)}')
             identity = CompiledTritonKernels.key(_device_source(source, original, 0))
             bindings[cache_key] = identity, entries[cache_key], tuner
+            self._tuner_forwards.setdefault(id(tuner), set()).add(id(bound))
             instances = self.instances.setdefault(identity, {})
             if id(tuner) not in instances:
                 instances[id(tuner)] = tuner
-                if identity in self.winners:
-                    _install(tuner, self.winners[identity])
+                if identity in self.winners and _install(tuner, self.winners[identity]):
+                    self._updated_forwards.add(id(bound))
         # Epilogue-fusion benchmarking bundles template candidates that final code never names.
         if any(entries[key].kernel_name in graph.source_code for key in set(entries) - set(bindings)):
             raise ValueError("compiled forward has unbound static Inductor kernels")
@@ -307,7 +315,8 @@ class InductorSelections:
         try:
             for identity in set(local) | set(owners):
                 for tuner in self.instances.get(identity, {}).values():
-                    _install(tuner, self.winners[identity])
+                    if _install(tuner, self.winners[identity]):
+                        self._updated_forwards.update(self._tuner_forwards.get(id(tuner), ()))
         except Exception as error:
             failure = f"{type(error).__name__}: {error}"
         self._check(failure)
@@ -340,7 +349,20 @@ class InductorSelections:
                 ((identity, vars(result.config), result.kernel.cubin_raw) for identity, result in selected),
                 description)
 
+    def needs_save(self, bound, path):
+        return needs_save(self, bound, path)
+
     def release(self, bound):
         self.forwards.pop(id(bound))
+        self._updated_forwards.discard(id(bound))
         if not self.forwards:
             self.instances.clear()
+            self._tuner_forwards.clear()
+            self._updated_forwards.clear()
+
+
+def needs_save(selections, bound, path):
+    return (not bound.cache_hit
+            or not getattr(bound.backend, "_loaded_frozen", False)
+            or id(bound) in getattr(selections, "_updated_forwards", ())
+            or not Path(path).is_file())

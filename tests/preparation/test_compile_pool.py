@@ -556,3 +556,29 @@ def test_compiler_does_not_serialize_preparation_session_resources(recorded):
         assert session.resource is token
     finally:
         context.reset(token)
+
+
+def test_describe_workers_reports_host_ram_gpu_and_cpu_clamping():
+    from ignition.preparation.compile_pool import CompilerResources, allocate_workers, describe_workers
+
+    ram_limited = [CompilerResources(16, 72 << 30, 16, 32 << 30, 8 << 30)] * 4
+    workers = allocate_workers(ram_limited, [10] * 4, ["host"] * 4)
+    assert describe_workers(ram_limited, [10] * 4, workers, ["host"] * 4, requested=12) == (
+        "2 compiler workers (requested 12; host RAM limit, 72 GiB avail); per rank [1, 1, 0, 0]"
+    )
+
+    gpu_limited = [CompilerResources(2, 512 << 30, 16, 32 << 30, 8 << 30)]
+    workers = allocate_workers(gpu_limited, [8], ["host"])
+    assert describe_workers(gpu_limited, [8], workers, ["host"], requested=8) == (
+        "2 compiler workers (requested 8; GPU memory limit)"
+    )
+
+    cpu_limited = [CompilerResources(16, 512 << 30, 3, 32 << 30, 8 << 30)]
+    workers = allocate_workers(cpu_limited, [8], ["host"])
+    assert describe_workers(cpu_limited, [8], workers, ["host"], requested=8) == (
+        "3 compiler workers (requested 8; CPU limit 3)"
+    )
+
+    unclamped = [CompilerResources(16, 512 << 30, 16, 32 << 30, 8 << 30)]
+    workers = allocate_workers(unclamped, [2], ["host"])
+    assert describe_workers(unclamped, [2], workers, ["host"], requested=12) == "2 compiler workers"

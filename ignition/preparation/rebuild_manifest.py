@@ -454,6 +454,40 @@ def from_plan(model, plan, *, compiled_forwards, multi_host=False):
     }
 
 
+def validate_preparation_manifest(manifest):
+    """Validate `manifest` against Python and native `PreparationManifest` schemas."""
+    import json
+    from google.protobuf import json_format
+
+    if not isinstance(manifest, Mapping):
+        raise ValueError('preparation manifest must be a mapping')
+    reproduction = manifest.get('reproduction_args')
+    if not isinstance(reproduction, (list, tuple)) or not reproduction or any(
+            not isinstance(arg, str) or not arg for arg in reproduction):
+        raise ValueError('reproduction_args entries must be non-empty')
+    try:
+        parsed = json_format.ParseDict(dict(manifest), proto.PreparationManifest())
+    except json_format.ParseError as error:
+        raise ValueError(f'invalid preparation manifest: {error}') from error
+    if parsed.version != 1:
+        raise ValueError(f'unsupported preparation manifest version {parsed.version}')
+    keys = [parameter.key for parameter in parsed.parameters]
+    if keys != sorted(set(keys)):
+        raise ValueError('preparation parameters must have unique keys in strictly ascending order')
+    if 'speculation.history_drafts' in keys:
+        raise ValueError('history_drafts is a runtime option and cannot be exported')
+    try:
+        import flare_heliopause
+    except ImportError:
+        return
+    validator = getattr(flare_heliopause, 'export_validate_preparation_manifest', None)
+    if validator is None:
+        raise ValueError(
+            'installed flare_heliopause lacks export_validate_preparation_manifest; rebuild ./heliopause'
+        )
+    validator(json.dumps(dict(manifest)))
+
+
 def weight_views(roots):
     """Walk named weight owners without evaluating properties, closures, or module code.
 

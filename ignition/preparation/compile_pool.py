@@ -93,6 +93,39 @@ def allocate_workers(resources, counts, hosts):
     return workers
 
 
+def describe_workers(resources, counts, workers, hosts, *, requested=None) -> str:
+    """Format admitted forward compiler workers and any resource cap that reduced `--compile-workers`."""
+    total = sum(workers)
+    text = f"{total} compiler worker{'s' if total != 1 else ''}"
+    if requested is not None and any(counts):
+        reasons = []
+        for host in dict.fromkeys(hosts):
+            members = [rank for rank, name in enumerate(hosts) if name == host]
+            jobs = sum(counts[rank] for rank in members)
+            admitted = sum(workers[rank] for rank in members)
+            target = min(requested, jobs)
+            if not jobs or admitted >= target:
+                continue
+            cpu_cap = min(resources[rank].limit for rank in members)
+            gpu_cap = sum(resources[rank].capacity for rank in members)
+            available = min(resources[rank].available for rank in members)
+            ram_cap = max(0, (available - max(resources[rank].headroom for rank in members))
+                          // max(resources[rank].worker_bytes for rank in members))
+            if admitted >= gpu_cap and gpu_cap <= ram_cap and gpu_cap < target:
+                reason = f"requested {requested}; GPU memory limit"
+            elif admitted >= cpu_cap and cpu_cap < target:
+                reason = f"requested {requested}; CPU limit {cpu_cap}"
+            else:
+                reason = f"requested {requested}; host RAM limit, {available >> 30} GiB avail"
+            if reason not in reasons:
+                reasons.append(reason)
+        if reasons:
+            text += f" ({'; '.join(reasons)})"
+    if len(workers) > 1:
+        text += f"; per rank {list(workers)}"
+    return text
+
+
 @_defer_full_collection()
 def _compile_forward(payload, device, options, path, num_threads, grad_enabled):
     runtime_patches.apply()
@@ -123,11 +156,12 @@ class CompilePool:
         """Use admitted workers, or size one rank's pool from its host and device resources."""
         self.device = torch.device(device)
         self.pool = None
+        self.resources = None
         options = _compile_options(options)
         if workers is None:
-            resources = compiler_resources(self.device, headroom_bytes=headroom_bytes, options=options,
-                                           compile_workers=compile_workers)
-            workers = allocate_workers([resources], [resources.limit], ["local"])[0]
+            self.resources = compiler_resources(self.device, headroom_bytes=headroom_bytes, options=options,
+                                                compile_workers=compile_workers)
+            workers = allocate_workers([self.resources], [self.resources.limit], ["local"])[0]
         if type(workers) is not int or workers < 1:
             raise ValueError("forward compiler pool requires a positive admitted worker count")
         self.workers = workers

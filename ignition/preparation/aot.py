@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from threading import RLock
+from time import monotonic
 from types import MappingProxyType
 
 import torch
@@ -426,6 +427,7 @@ class StorageBackend(SerializableCallable):
         self._serialized_artifact = None
         self._cuda_allocation_sizes = None
         self._tuning_frozen = False
+        self._loaded_frozen = False
         self._bound = None
 
     def __call__(self, *args):
@@ -471,6 +473,7 @@ class StorageBackend(SerializableCallable):
     def deserialize_compile_artifacts(cls, data):
         fn = cls.__new__(cls)
         artifact, fn.inputs, calls, fn.signature, fn._tuning_frozen, fn._cuda_allocation_sizes = pickle.loads(data)
+        fn._loaded_frozen = bool(fn._tuning_frozen)
         devices = {item[4] for item in fn.signature if isinstance(item, tuple) and item[4].type == "cuda"}
         if len(devices) != 1:
             raise ValueError("compiled forwards require exactly one CUDA device")
@@ -615,13 +618,19 @@ class BoundForward:
             release_unused()
 
 
-def _completed(pending):
+def _completed(pending, *, poll_seconds=10.0, on_wait=None):
     while True:
         for index, item in enumerate(pending):
             future = item[-2].pending
             if future is None or future.done():
                 return pending.pop(index)
-        wait([item[-2].pending for item in pending], return_when=FIRST_COMPLETED)
+        done, _ = wait([item[-2].pending for item in pending], timeout=poll_seconds, return_when=FIRST_COMPLETED)
+        if not done and on_wait is not None:
+            on_wait()
+
+
+def _format_inflight(items):
+    return ", ".join(items[:2]) + (f" +{len(items) - 2}" if len(items) > 2 else "")
 
 
 def allocation_order(names, sizes, coordinator=None):
@@ -869,19 +878,38 @@ class ForwardCache:
     def _prepare_many(self, functions, signatures, *, progress, coordinator, materialize, warmup,
                       before_run):
         from ignition.progress import phase
-        from .compile_pool import CompilePool
-        from .inductor_tuning import InductorSelections
+        from .compile_pool import CompilePool, describe_workers
+        from .inductor_tuning import InductorSelections, needs_save
 
         if coordinator is not None:
             return self._prepare_ranks(functions, signatures, coordinator, progress=progress,
                                        materialize=materialize, warmup=warmup, before_run=before_run)
         selections = InductorSelections(self.device, lock_gpu_clocks=self.lock_gpu_clocks,
                                         source_identity=self.root.name)
-        compiled, loaded, paths, pending = {}, {}, {}, []
+        compiled, loaded, paths, pending, fresh = {}, {}, {}, [], set()
+        cached_count = compiled_count = 0
+        compile_elapsed = 0.0
         with phase(progress, "Compile model forwards", total=len(functions)) as stage, CompilePool(self.device,
                 headroom_bytes=self.headroom_bytes, options=self.options, compile_workers=self.compile_workers) as compiler:
+            resources = getattr(compiler, "resources", None)
+            worker_summary = (describe_workers([resources], [len(functions)], [compiler.workers], ["local"],
+                                               requested=self.compile_workers)
+                              if resources is not None
+                              else f"{compiler.workers} compiler worker{'s' if compiler.workers != 1 else ''}")
+            if functions:
+                stage.update(worker_summary, milestone=True)
+
+            def on_wait():
+                inflight = [f"{item[0]} ({monotonic() - item[1]:.0f}s)"
+                            for item in pending if item[-2].pending is not None]
+                if inflight:
+                    stage.update(f"{worker_summary} · compiling {_format_inflight(inflight)} "
+                                 f"({compiled_count} compiled, {cached_count} cached)")
+
             def finish():
-                name, bound, path = _completed(pending)
+                nonlocal cached_count, compiled_count, compile_elapsed
+                name, submitted_at, bound, path = _completed(pending, on_wait=on_wait)
+                was_compiled = bound.pending is not None or not bound.cache_hit
                 try:
                     with _guard_code_cache(self.root / 'guards'):
                         if bound.pending is not None:
@@ -891,18 +919,30 @@ class ForwardCache:
                         paths[name] = path
                 except Exception as error:
                     raise RuntimeError(f"failed to prepare compiled forward {name}") from error
-                stage.update(advance=1)
+                if was_compiled:
+                    fresh.add(name)
+                    item_elapsed = monotonic() - submitted_at
+                    compiled_count += 1
+                    compile_elapsed += item_elapsed
+                    stage.update(f"{name} ({item_elapsed:.1f}s) · {compiled_count} compiled, "
+                                 f"{cached_count} cached · {compile_elapsed / compiled_count:.1f}s/fwd", advance=1)
+                else:
+                    cached_count += 1
+                    stage.update(f"{name} (cached) · {compiled_count} compiled, {cached_count} cached", advance=1)
 
             for name, forward in functions.items():
                 with _guard_code_cache(self.root / 'guards'):
                     bound, path = self._prepare(forward, name=name, signature=signatures[name], compiler=compiler,
                                                 deferred=materialize is not None,
                                                 before_run=None if before_run is None else lambda name=name: before_run(name))
-                pending.append((name, bound, path))
+                pending.append((name, monotonic(), bound, path))
                 if len(pending) >= compiler.workers:
                     finish()
             while pending:
                 finish()
+            stage.update(f"0 compiled, {cached_count}/{len(functions)} cached" if compiled_count == 0
+                         else f"{worker_summary} · {compiled_count} compiled "
+                              f"({compile_elapsed / compiled_count:.1f}s/fwd), {cached_count} cached")
         release_unused()
         if materialize is not None:
             materialize()
@@ -915,9 +955,13 @@ class ForwardCache:
             ordered_names = allocation_order(functions, sizes)
         else:
             ordered_names = tuple(functions)
+        released = warm_cached = warm_compiled = warm_saved = 0
         with phase(progress, "Warm compiled forwards", total=len(functions)) as stage:
-            for name in ordered_names:
+            warm_started = monotonic()
+            for index, name in enumerate(ordered_names, 1):
                 forward = functions[name]
+                stage.update(f"warming {name} ({index}/{len(functions)})")
+                t0 = monotonic()
                 try:
                     with _guard_code_cache(self.root / 'guards'):
                         if name in loaded:
@@ -931,19 +975,33 @@ class ForwardCache:
                                     raise
                                 bound = BoundForward(aot_forward(forward, options=self.options), forward, False)
                             else:
-                                if materialize is None:
+                                if name in fresh or materialize is None:
                                     bound.cache_hit = False
+                        t1 = monotonic()
+                        saving = needs_save(selections, bound, paths[name])
                         compiled[name] = self._warm(bound, paths[name], name=name, progress=None,
                                                    selections=selections, warmup=warmup,
                                                    before_run=None if before_run is None else lambda name=name: before_run(name))
-                        compiled[name].prepare_capture()
+                        if saving or needs_save(selections, compiled[name], paths[name]):
+                            warm_saved += 1
+                        released += compiled[name].prepare_capture()
                         selections.release(compiled[name])
                         release_unused(generation=0)
                 except Exception as error:
                     if materialize is None:
                         raise RuntimeError(f"failed to prepare compiled forward {name}") from error
                     raise
-                stage.update(advance=1)
+                t2 = monotonic()
+                if compiled[name].cache_hit:
+                    warm_cached += 1
+                    origin = "cached"
+                else:
+                    warm_compiled += 1
+                    origin = "compiled"
+                stage.update(f"{name} ({origin}, {t2 - t0:.1f}s: load {t1 - t0:.1f}s, warm {t2 - t1:.1f}s) · "
+                             f"{(t2 - warm_started) / index:.1f}s/fwd", advance=1)
+            stage.update(f"{warm_cached} cached, {warm_compiled} compiled ({warm_saved} saved); "
+                         f"{released >> 20} MiB portable state released; guards and kernel owners retained")
         release_unused()
         return compiled
 
@@ -961,8 +1019,8 @@ class ForwardCache:
         """
         import torch.distributed as dist
         from ignition.progress import phase
-        from .compile_pool import CompilePool, allocate_workers, compiler_resources
-        from .inductor_tuning import InductorSelections
+        from .compile_pool import CompilePool, allocate_workers, compiler_resources, describe_workers
+        from .inductor_tuning import InductorSelections, needs_save
 
         group, ranks = coordinator.group, coordinator.ranks
         share = ranks.index(dist.get_rank())
@@ -982,7 +1040,7 @@ class ForwardCache:
             # the catalog. Ranks on one host share its cache, so a rank lends forwards it cannot restore, whether
             # missing or bound differently by another launch, to ranks whose compilers would otherwise finish
             # first; the borrower compiles the owner's metadata.
-            restored, missing = {}, []
+            restored, missing, restore_started = {}, [], monotonic()
             try:
                 for index, (name, variant, forward) in enumerate(work):
                     with _guard_code_cache(self.root / 'guards'):
@@ -993,6 +1051,10 @@ class ForwardCache:
                         missing.append(index)
                     else:
                         restored[index] = bound, path
+                    if monotonic() - restore_started >= 2.0:
+                        stage.update(f"checking forward cache ({index + 1}/{len(work)}: "
+                                     f"{len(restored)} cached, {len(missing)} missing)")
+                        restore_started = monotonic()
             except Exception as failure:
                 error = error or f"{type(failure).__name__}: {failure}"
             resources = None
@@ -1009,13 +1071,16 @@ class ForwardCache:
                 error = error or f"{type(failure).__name__}: {failure}"
             demand = [None] * len(ranks)
             dist.all_gather_object(demand, (len(missing), resources, error), group=group)
+            counts, workers, worker_summary = [0] * len(ranks), [0] * len(ranks), "0 compiler workers"
             try:
                 failures = [(rank, failure) for rank, (_, _, failure) in zip(ranks, demand) if failure is not None]
                 if failures:
                     raise RuntimeError(f"forward compiler resource collection failed: {failures}")
                 counts = [count for count, _, _ in demand]
-                workers = allocate_workers([resources for _, resources, _ in demand], counts, coordinator.hosts)
-                stage.update(f"{sum(workers)} compiler workers; per rank {workers}")
+                all_resources = [item for _, item, _ in demand]
+                workers = allocate_workers(all_resources, counts, coordinator.hosts)
+                worker_summary = describe_workers(all_resources, counts, workers, coordinator.hosts,
+                                                  requested=self.compile_workers)
                 assigned = [[] for _ in ranks]
                 for host in dict.fromkeys(coordinator.hosts):
                     members = [index for index, name in enumerate(coordinator.hosts) if name == host]
@@ -1038,6 +1103,7 @@ class ForwardCache:
                     jobs.mkdir(parents=True, exist_ok=True)
                     for borrower, index in loans:
                         name, variant, forward = work[index]
+                        label = name if variant == "shared" else f"{name}.{variant}"
                         path = self._path(forward, name=f"{name}.{variant}", signature=signatures[name])
                         job = jobs / f"{path.stem}.forward"
                         with tempfile.NamedTemporaryFile(dir=jobs, suffix='.tmp', delete=False) as file:
@@ -1048,48 +1114,75 @@ class ForwardCache:
                                 os.replace(temporary, job)
                             finally:
                                 temporary.unlink(missing_ok=True)
-                        sent.append((borrower, str(job)))
+                        sent.append((borrower, label, str(job)))
                         # The borrower compiles it before every rank gathers the outcome below.
                         paths[name, variant] = str(path), True
             except Exception as failure:
                 error = error or f"{type(failure).__name__}: {failure}"
             mailed = [None] * len(ranks)
             dist.all_gather_object(mailed, sent, group=group)
-            borrowed = [job for jobs in mailed for borrower, job in jobs if borrower == share]
+            borrowed = [(label, job) for jobs in mailed for borrower, label, job in jobs if borrower == share]
+            cached_count, lent_count, borrowed_count = len(restored), len(lent), len(borrowed)
+            local_total = len(work) - cached_count - lent_count + borrowed_count
+            compiled_done, compile_elapsed = 0, 0.0
             try:
                 if error is not None:
                     raise RuntimeError(error)
+                stage.total = len(work) + borrowed_count
+                for index, (bound, path) in restored.items():
+                    name, variant, _ = work[index]
+                    if materialize is None:
+                        selected[name] = bound
+                    paths[name, variant] = str(path), False
+                if not any(counts):
+                    stage.update(f"0 compiler workers; {cached_count}/{len(work)} cached",
+                                 advance=cached_count, milestone=True)
+                else:
+                    parts = [f"{cached_count} cached", f"{len(work) - cached_count - lent_count} local",
+                             *([f"{borrowed_count} borrowed"] if borrowed_count else []),
+                             *([f"{lent_count} lent"] if lent_count else [])]
+                    stage.update(f"{worker_summary} · {', '.join(parts)}", advance=cached_count, milestone=True)
                 pending = []
+                lent_suffix = f", {lent_count} lent" if lent_count else ""
+
+                def on_wait():
+                    inflight = [f"{item[2] if item[0] is not None else 'borrowed ' + item[2]} "
+                                f"({monotonic() - item[3]:.0f}s)" for item in pending]
+                    if inflight:
+                        stage.update(f"compiling {_format_inflight(inflight)} · "
+                                     f"{compiled_done}/{local_total} local compiled, {cached_count} cached{lent_suffix}")
 
                 def finish():
-                    name, variant, bound, path = _completed(pending)
-                    if bound.pending is not None:
-                        bound.pending.result()
-                    elif materialize is None:
-                        # Restored and bound to this rank's own forward already.
-                        selected[name] = bound
+                    nonlocal compiled_done, compile_elapsed
+                    name, variant, label, submitted_at, bound, path = _completed(pending, on_wait=on_wait)
+                    bound.pending.result()
+                    item_elapsed = monotonic() - submitted_at
+                    compiled_done += 1
+                    compile_elapsed += item_elapsed
                     if name is not None:
-                        # Each forward's path, and whether this launch compiled it rather than restoring it.
-                        paths[name, variant] = str(path), bound.pending is not None
-                        stage.update(advance=1)
+                        paths[name, variant] = str(path), True
+                        display_name = label
+                    else:
+                        display_name = f"borrowed {label}"
+                    stage.update(f"{display_name} ({item_elapsed:.1f}s) · {compiled_done}/{local_total} "
+                                 f"local compiled, {cached_count} cached{lent_suffix} · "
+                                 f"{compile_elapsed / compiled_done:.1f}s/fwd", advance=1)
 
                 for index, (name, variant, forward) in enumerate(work):
-                    if (name, variant) in lent:
+                    if (name, variant) in lent or index in restored:
                         continue
-                    if index in restored:
-                        bound, path = restored[index]
-                    else:
-                        path = self._path(forward, name=f"{name}.{variant}", signature=signatures[name])
-                        bound = BoundForward(None, forward, False, compiler.submit(forward, path))
-                    pending.append((name, variant, bound, path))
+                    label = name if variant == "shared" else f"{name}.{variant}"
+                    path = self._path(forward, name=f"{name}.{variant}", signature=signatures[name])
+                    bound = BoundForward(None, forward, False, compiler.submit(forward, path))
+                    pending.append((name, variant, label, monotonic(), bound, path))
                     if compiler is not None and len(pending) >= compiler.workers:
                         finish()
-                for job in borrowed:
+                for label, job in borrowed:
                     with open(job, 'rb') as file:
                         payload, path = pickle.load(file)
                     os.unlink(job)
                     future = compiler.submit_payload(payload, Path(path))
-                    pending.append((None, None, BoundForward(None, None, False, future), path))
+                    pending.append((None, None, label, monotonic(), BoundForward(None, None, False, future), path))
                     if len(pending) >= compiler.workers:
                         finish()
                 while pending:
@@ -1101,9 +1194,13 @@ class ForwardCache:
                 compiler_scope.close()
             except Exception as failure:
                 outcome = None, outcome[1] or f"{type(failure).__name__}: {failure}"
+            if outcome[1] is None and (lent_count or sum(counts) > local_total):
+                wait_note = f" ({lent_count} lent)" if lent_count else ""
+                stage.update(f"local {compiled_done}/{local_total} compiled, {cached_count} cached; "
+                             f"waiting on peer ranks{wait_note}", milestone=lent_count > 0)
             outcomes = [None] * len(ranks)
             dist.all_gather_object(outcomes, outcome, group=group)
-            for _, job in sent:
+            for _, _, job in sent:
                 Path(job).unlink(missing_ok=True)
             # Raise inside the phase so it ends as failed rather than complete. Every rank holds the same
             # outcomes, so every rank raises here and none skips a collective.
@@ -1111,7 +1208,15 @@ class ForwardCache:
             if failures:
                 raise RuntimeError(f"forward compilation failed: {failures}")
             # Forwards lent to other ranks are complete once every rank reports.
-            stage.update(advance=len(lent))
+            if not any(counts):
+                final_detail = f"0 compiler workers; {cached_count}/{len(work)} cached"
+            else:
+                rate = f" ({compile_elapsed / compiled_done:.1f}s/fwd)" if compiled_done else ""
+                parts = [f"{cached_count} cached", f"{compiled_done} local compiled{rate}",
+                         *([f"incl. {borrowed_count} borrowed"] if borrowed_count else []),
+                         *([f"{lent_count} lent"] if lent_count else [])]
+                final_detail = f"{worker_summary} · {', '.join(parts)}"
+            stage.update(final_detail, advance=lent_count)
         restored.clear()
         bound = None
         paths = {key: value for compiled, _ in outcomes for key, value in compiled.items()}
@@ -1139,9 +1244,13 @@ class ForwardCache:
         selections = InductorSelections(self.device, coordinator=coordinator,
                                         lock_gpu_clocks=self.lock_gpu_clocks, source_identity=self.root.name)
         published, released = [], 0
+        warm_cached = warm_compiled = warm_saved = 0
         with phase(progress, "Load and warm compiled forwards", total=len(functions)) as stage:
-            for name in ordered_names:
+            warm_started = monotonic()
+            for index, name in enumerate(ordered_names, 1):
                 forward = functions[name]
+                stage.update(f"warming {name} ({index}/{len(functions)})")
+                t0 = monotonic()
                 failure = None
                 try:
                     if name not in selected:
@@ -1158,6 +1267,7 @@ class ForwardCache:
                     traceback.print_exc(limit=-40)
                     failure = f"{name}: {type(error).__name__}: {error}"
                 selections._check(failure)
+                t1 = monotonic()
                 coordinator.barrier(f"compiled warmup {name}", ranks)
                 try:
                     selections.warm(bound, warmup,
@@ -1165,22 +1275,36 @@ class ForwardCache:
                 except Exception as error:
                     error.add_note(f"Warming compiled forward {name!r}")
                     raise
-                failure = None
+                t2 = monotonic()
+                failure, saved = None, False
                 try:
                     selections.freeze(bound)
                     variant = getattr(forward, 'compilation_variant', 'shared')
                     if compilers[name, variant] == share:
                         path, _ = paths[name, variant]
-                        bound.artifact.save_compiled_function(path)
-                        published.append(path)
+                        if needs_save(selections, bound, path):
+                            bound.artifact.save_compiled_function(path)
+                            published.append(path)
+                            saved = True
+                            warm_saved += 1
                     released += bound.prepare_capture()
                     selections.release(bound)
                     release_unused(generation=0)
                 except Exception as error:
                     failure = f"{name}: {type(error).__name__}: {error}"
                 selections._check(failure)
-                stage.update(advance=1)
-            stage.update(f"{released >> 20} MiB portable state released; guards and kernel owners retained")
+                t3 = monotonic()
+                if bound.cache_hit:
+                    warm_cached += 1
+                    origin = "cached"
+                else:
+                    warm_compiled += 1
+                    origin = "compiled"
+                stage.update(f"{name} ({origin}, {t3 - t0:.1f}s: load {t1 - t0:.1f}s, warm {t2 - t1:.1f}s, "
+                             f"{'save' if saved else 'freeze'} {t3 - t2:.1f}s) · "
+                             f"{(t3 - warm_started) / index:.1f}s/fwd", advance=1)
+            stage.update(f"{warm_cached} cached, {warm_compiled} compiled ({warm_saved} saved); "
+                         f"{released >> 20} MiB portable state released; guards and kernel owners retained")
         release_unused()
         if coordinator.spans_hosts:
             _share_artifacts(selections._gather(published), group, ranks)
@@ -1267,7 +1391,7 @@ class ForwardCache:
             if progress is not None:
                 progress.update(f"{name} · {operation}")
 
-        from .inductor_tuning import InductorSelections
+        from .inductor_tuning import InductorSelections, needs_save
 
         if selections is None:
             selections = InductorSelections(self.device, lock_gpu_clocks=self.lock_gpu_clocks,
@@ -1282,6 +1406,7 @@ class ForwardCache:
         selections.register(bound)
         selections.warm(bound, warmup, before_run=before_run)
         selections.freeze(bound)
-        report("saving compiled forward")
-        bound.artifact.save_compiled_function(str(path))
+        if needs_save(selections, bound, path):
+            report("saving compiled forward")
+            bound.artifact.save_compiled_function(str(path))
         return bound

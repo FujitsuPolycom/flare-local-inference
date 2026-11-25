@@ -7,6 +7,8 @@ from contextlib import contextmanager
 import sys
 from time import monotonic
 
+_NONTERMINAL_INTERVAL_SECONDS = 10.0
+
 
 class StartupProgress:
     def __init__(self, *, stream=None):
@@ -76,13 +78,28 @@ class _Phase:
         self.detail = ""
         self.live = None
         self.failed = False
+        self._nonterminal_live = False
+        self._last_emit = self.started
+        self._last_emitted_state = (0, "")
 
-    def update(self, detail=None, *, advance=0):
+    def update(self, detail=None, *, advance=0, milestone=False):
         if detail is not None:
             self.detail = str(detail)
         self.completed += advance
         if self.progress is not None and not isinstance(self.progress, StartupProgress) and detail is not None:
             self.progress(f"{self.label}: {self.detail}")
+            return
+        if not self._nonterminal_live or self.finished or self.failed:
+            return
+        state = (self.completed, self.detail)
+        if state == self._last_emitted_state:
+            return
+        now = monotonic()
+        if (milestone and (self.total is None or self.completed < self.total)
+                or now - self._last_emit >= _NONTERMINAL_INTERVAL_SECONDS):
+            self._last_emit = now
+            self._last_emitted_state = state
+            self.console.print(self)
 
     def __rich__(self):
         from rich.progress_bar import ProgressBar
@@ -94,6 +111,8 @@ class _Phase:
             status = Text("  FAILED  ", style="bold red")
         elif self.finished:
             status = Text("    OK    ", style="bold green")
+        elif self.console is not None and not self.console.is_terminal:
+            status = Text(" PROGRESS ", style="cyan")
         else:
             status = ProgressBar(total=self.total, completed=self.completed, width=10,
                                  pulse=self.total is None, complete_style="cyan",
@@ -128,6 +147,7 @@ def phase(progress, label, *, total=None, live=True):
                               redirect_stdout=False, redirect_stderr=False)
             stage.live.start()
         elif live:
+            stage._nonterminal_live = True
             display.console.print(f"[ STARTED  ] {label}.", markup=False)
     elif progress is not None:
         progress(f"{label} started")

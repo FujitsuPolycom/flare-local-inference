@@ -85,19 +85,20 @@ def _exhausted(error, plan) -> CapacityError | None:
         f"{', '.join(relief[:-1]).capitalize()}, or {relief[-1]} need less memory.")
 
 
-def _publisher(configuration, args, model=None, hub_cache=None):
+def _publisher(configuration, args, model=None, hub_cache=None, *, signer=None):
     """The signing publisher; with `model`, carrying the license its cached model card declares."""
-    from ignition.preparation.protection import Publisher
-    values = configuration.values.get("publishing", {})
-    try:
-        if not any(key in values for key in ("signing_key", "namespace", "official_source")) and not args.official_source:
-            from ignition.development import publisher
-            signer = publisher(configuration)
-        else:
-            signer = Publisher.load(values["signing_key"], values["namespace"],
-                                    args.official_source or values["official_source"])
-    except (KeyError, ValueError, OSError) as error:
-        raise UsageError(f"publishing requires an Ed25519 signing_key, namespace, and official_source: {error}") from error
+    if signer is None:
+        from ignition.preparation.protection import Publisher
+        values = configuration.values.get("publishing", {})
+        try:
+            if not any(key in values for key in ("signing_key", "namespace", "official_source")) and not args.official_source:
+                from ignition.development import publisher
+                signer = publisher(configuration)
+            else:
+                signer = Publisher.load(values["signing_key"], values["namespace"],
+                                        args.official_source or values["official_source"])
+        except (KeyError, ValueError, OSError) as error:
+            raise UsageError(f"publishing requires an Ed25519 signing_key, namespace, and official_source: {error}") from error
     if model is None:
         return signer
     from ignition.preparation.model_card import model_license
@@ -110,6 +111,31 @@ def _publisher(configuration, args, model=None, hub_cache=None):
     except ValueError as error:
         raise UsageError(str(error)) from error
     return replace(signer, license=license)
+
+
+def _preflight_export(configuration, args, model, plan, *, hub_cache, signer, multi_host=False):
+    """Validate signing, preparation metadata, and staging writability before GPU preparation."""
+    import flare_heliopause
+    from ignition.preparation.rebuild_manifest import from_plan, validate_preparation_manifest
+
+    publisher = _publisher(configuration, args, model, hub_cache, signer=signer)
+    options = _server_options(configuration, model, plan)
+    options.pop("api_key", None)
+    try:
+        manifest = from_plan(model, plan, compiled_forwards=not args.no_compile, multi_host=multi_host)
+        validate_preparation_manifest(manifest)
+    except ValueError as error:
+        raise PreparationError(f"invalid export preparation manifest: {error}") from error
+    staging = configuration.directory("export_staging")
+    cache = configuration.directory("core_cache")
+    try:
+        flare_heliopause.NativeExportStage(None, staging, cache).close()
+        if staging != cache:
+            flare_heliopause.NativeExportStage(None, None, cache).close()
+    except (OSError, RuntimeError, ValueError) as error:
+        raise UsageError(f"export staging or core cache is not writable: {error}") from error
+    options["preparation_manifest"] = manifest
+    return publisher, options
 
 
 def _check_host_shape(args) -> None:
@@ -171,6 +197,7 @@ def _export_hosts(args):
         raise UsageError("--ranks greater than one requires --rendezvous ADDRESS:PORT for the peer hosts")
     progress = _serving_progress(args.verbose)
     configuration = Configuration.load(args.config)
+    signer = _publisher(configuration, args)
     hub_cache = configuration.directory("hub_cache")
     model = resolve_model(configuration, args.model)
     if not model.cached(hub_cache):
@@ -208,9 +235,9 @@ def _export_hosts(args):
                    lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
                    force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", args.force_moe_decode_a16).value,
                    shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning)
+    publisher, options = _preflight_export(configuration, args, model, plan, hub_cache=hub_cache,
+                                           signer=signer, multi_host=True)
     environment.apply(configuration, local, plan.recipe.b12x_environment)
-    options = _server_options(configuration, model, plan)
-    options.pop("api_key")
     print(json.dumps({"plan": plan.to_dict()}), file=sys.stderr, flush=True)
     import flare_heliopause
 
@@ -233,12 +260,8 @@ def _export_hosts(args):
                     retain_graphs=True, core_storage=storage, ranks=rendezvous)
         with prepared:
             with phase(progress, "Export native cores", live=False) as stage:
-                from ignition.preparation.rebuild_manifest import from_plan
-
-                options['preparation_manifest'] = from_plan(
-                    model, plan, compiled_forwards=not args.no_compile, multi_host=True)
                 result = prepared.export(None, options=options, export_id=uuid.uuid4().hex, images=recorder,
-                                storage=storage, publisher=_publisher(configuration, args, model, hub_cache),
+                                storage=storage, publisher=publisher,
                                 staging=configuration.directory("export_staging"),
                                 progress=progress)
                 stage.update(f"{result.entry_path} ({plan.world_size} ranks)")
@@ -260,7 +283,7 @@ def _prepare(args):
 
     progress = Progress()
     configuration = Configuration.load(args.config)
-    _publisher(configuration, args)
+    signer = _publisher(configuration, args)
     hub_cache = configuration.directory("hub_cache")
     with phase(progress, "Resolve checkpoint") as stage:
         model = resolve_model(configuration, args.model)
@@ -322,6 +345,7 @@ def _prepare(args):
             fetch(model, hub_cache, progress_bars=False)
             model.verify(hub_cache)
 
+    publisher, options = _preflight_export(configuration, args, model, plan, hub_cache=hub_cache, signer=signer)
     environment.apply(configuration, plan.gpus, plan.recipe.b12x_environment)
     import flare_heliopause
 
@@ -359,16 +383,10 @@ def _prepare(args):
         with prepared:
             usage = model.recipe.usage(prepared)
             _keep_reserve(plan, usage)
-            options = _server_options(configuration, model, plan)
             from ignition.preparation.model_core import export_core
 
-            publisher = _publisher(configuration, args, model, hub_cache)
             with phase(progress, "Export native core", live=False) as stage:
                 try:
-                    options.pop("api_key")
-                    from ignition.preparation.rebuild_manifest import from_plan
-
-                    options['preparation_manifest'] = from_plan(model, plan, compiled_forwards=not args.no_compile)
                     result = export_core(prepared, recorder, storage, None, options=options, publisher=publisher,
                                  progress=progress, console=progress.console,
                                  staging=configuration.directory("export_staging"))

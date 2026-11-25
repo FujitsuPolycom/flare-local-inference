@@ -456,3 +456,73 @@ def test_cached_catalog_releases_restoration_owners_before_rebinding(tmp_path, d
         process.join(timeout=60)
         assert process.exitcode == 0
     assert results == {rank: list("abcd") for rank in range(3)}
+
+
+def _metrics_and_save_skip_rank(rank, world, store, root, already_frozen, outcome):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    import torch.distributed as dist
+    from ignition.preparation import aot, compile_pool
+
+    messages, saves = [], []
+    try:
+        compile_pool.CompilePool = _Pool
+        _replace_gpu_preparation()
+
+        def load(self, forward, path, required=False, before_run=None):
+            artifact = _Artifact(lambda owner: None)
+            artifact._artifacts.compiled_fn._tuning_frozen = already_frozen
+            artifact._artifacts.compiled_fn._loaded_frozen = already_frozen
+            artifact.save_compiled_function = lambda target: saves.append(str(target))
+            return aot.BoundForward(artifact, forward, True)
+
+        aot.ForwardCache._load = load
+        aot.ForwardCache._allocation_sizes = lambda self, path: ()
+        dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world)
+        cache = aot.ForwardCache.__new__(aot.ForwardCache)
+        cache.root, cache.device, cache.headroom_bytes, cache.options = root, "cpu", 0, aot.MappingProxyType({})
+        cache.compile_workers = 8
+        cache.lock_gpu_clocks = False
+        functions = {name: _Forward("shared") for name in "abcd"}
+        signatures = {name: name for name in functions}
+        for name, forward in functions.items():
+            cache._path(forward, name=f"{name}.shared", signature=name).write_text("cached")
+        dist.barrier()
+        coordinator = SimpleNamespace(group=dist.group.WORLD, ranks=tuple(range(world)), spans_hosts=False,
+            hosts=("host",) * world,
+            local_ranks=world, barrier=lambda key, ranks: dist.monitored_barrier(group=dist.group.WORLD))
+        cache._prepare_ranks(functions, signatures, coordinator, progress=messages.append,
+                             materialize=lambda: None, warmup=nullcontext, before_run=None)
+        outcome.put((rank, (len(saves), messages)))
+    except Exception:
+        import traceback
+
+        outcome.put((rank, traceback.format_exc()))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("already_frozen", [True, False])
+def test_warm_progress_reports_forwards_and_skips_resaving_unchanged_frozen_hits(tmp_path, already_frozen):
+    context = multiprocessing.get_context("fork")
+    root = tmp_path / "forwards"
+    root.mkdir()
+    outcome = context.Queue()
+    processes = [context.Process(target=_metrics_and_save_skip_rank,
+        args=(rank, 2, tmp_path / "store", root, already_frozen, outcome)) for rank in range(2)]
+    for process in processes:
+        process.start()
+    results = dict(outcome.get(timeout=90) for _ in processes)
+    for process in processes:
+        process.join(timeout=30)
+        assert process.exitcode == 0
+    for rank, value in results.items():
+        assert isinstance(value, tuple), value
+        save_count, messages = value
+        assert save_count == (0 if already_frozen else 2)
+        assert any("Compile model forwards: 0 compiler workers; 2/2 cached" in m for m in messages)
+        for name in "abcd":
+            assert any(f"Load and warm compiled forwards: {name} (cached," in m for m in messages)
+        expected_saved = "0 saved" if already_frozen else "2 saved"
+        assert any(f"4 cached, 0 compiled ({expected_saved})" in m for m in messages)

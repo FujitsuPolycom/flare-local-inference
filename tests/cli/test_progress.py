@@ -148,3 +148,50 @@ def test_nonlive_export_only_prints_its_terminal_result(fail):
     assert len(lines) == 1
     assert lines[0].startswith('[  FAILED  ]' if fail else '[    OK    ]')
     assert progress.active is None
+
+
+def test_nonterminal_live_phase_emits_milestones_and_throttled_heartbeats_without_bar_blocks(monkeypatch):
+    import ignition.progress as progress_mod
+
+    clock = [100.0]
+    monkeypatch.setattr(progress_mod, "monotonic", lambda: clock[0])
+    stream = io.StringIO()
+    progress = StartupProgress(stream=stream)
+    progress.console = Console(file=stream, width=140, color_system=None)
+
+    with phase(progress, "Compile model forwards", total=4) as stage:
+        stage.update("2 compiler workers (requested 12; host RAM limit, 72 GiB avail) · 1 cached, 3 local",
+                     advance=1, milestone=True)
+        clock[0] += 3.0
+        stage.update("decode_b1 (3.0s) · 1/3 local compiled, 1 cached · 3.0s/fwd", advance=1)
+        clock[0] += 4.0
+        stage.update("compiling prefill_4096 (4s) · 1/3 local compiled, 1 cached")
+        clock[0] += 4.0
+        stage.update("prefill_4096 (8.0s) · 2/3 local compiled, 1 cached · 5.5s/fwd", advance=1)
+        clock[0] += 1.0
+        stage.update("local 2/2 compiled, 1 cached; waiting on peer ranks (1 lent)", milestone=True)
+        clock[0] += 2.0
+        stage.update("2 compiler workers · 1 cached, 2 local compiled (5.5s/fwd), 1 lent", advance=1)
+
+    lines = stream.getvalue().splitlines()
+    assert lines[0] == "[ STARTED  ] Compile model forwards."
+    progress_lines = [line for line in lines if line.startswith("[ PROGRESS ]")]
+    assert len(progress_lines) == 3
+    assert "requested 12; host RAM limit" in progress_lines[0] and "1/4" in progress_lines[0]
+    assert "prefill_4096 (8.0s)" in progress_lines[1] and "3/4" in progress_lines[1]
+    assert "waiting on peer ranks (1 lent)" in progress_lines[2] and "3/4" in progress_lines[2]
+    assert lines[-1].startswith("[    OK    ] Compile model forwards.")
+    assert "4/4  14.0s" in lines[-1]
+    assert all("█" not in line for line in lines)
+
+
+def test_completed_milestone_does_not_duplicate_terminal_ok_row():
+    stream = io.StringIO()
+    progress = StartupProgress(stream=stream)
+    progress.console = Console(file=stream, width=120, color_system=None)
+    with phase(progress, "Compile model forwards", total=4) as stage:
+        stage.update("0 compiler workers; 4/4 cached", advance=4, milestone=True)
+    lines = stream.getvalue().splitlines()
+    assert len(lines) == 2
+    assert lines[0] == "[ STARTED  ] Compile model forwards."
+    assert lines[1].startswith("[    OK    ] Compile model forwards.  0 compiler workers; 4/4 cached  4/4")

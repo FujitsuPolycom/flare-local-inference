@@ -106,6 +106,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(export_synchronize, module)?)?;
     module.add_function(wrap_pyfunction!(export_reset_peer_storage, module)?)?;
     module.add_function(wrap_pyfunction!(export_serving, module)?)?;
+    module.add_function(wrap_pyfunction!(export_validate_preparation_manifest, module)?)?;
     module.add_class::<NativeExportStage>()?;
     module.add_class::<NativeRankOutput>()?;
     super::recorder::register(module)?;
@@ -1005,19 +1006,7 @@ pub(crate) fn serving_metadata(
         ));
     }
     if let Some(preparation) = preparation {
-        let manifest: super::wire::PreparationManifest =
-            message("PreparationManifest", &preparation)?;
-        if manifest
-            .parameters
-            .iter()
-            .any(|parameter| parameter.key == "speculation.history_drafts")
-        {
-            return Err(super::invalid(
-                "history_drafts is a runtime option and cannot be exported",
-            ));
-        }
-        helios_core::runtime_core::validate_preparation_manifest(&manifest)?;
-        index.preparation = Some(manifest);
+        index.preparation = Some(validate_preparation_manifest_value(&preparation)?);
     }
     if let Some(rebuild) = rebuild {
         #[allow(deprecated)]
@@ -1043,6 +1032,33 @@ pub(crate) fn serving_metadata(
         .or_insert("mtp".into());
     index.contract = Some(message("ServingContract", &server.into())?);
     Ok(assets.clone())
+}
+
+pub(crate) fn validate_preparation_manifest_value(
+    preparation: &serde_json::Value,
+) -> super::Result<super::wire::PreparationManifest> {
+    let manifest: super::wire::PreparationManifest =
+        message("PreparationManifest", preparation)?;
+    if manifest
+        .parameters
+        .iter()
+        .any(|parameter| parameter.key == "speculation.history_drafts")
+    {
+        return Err(super::invalid(
+            "history_drafts is a runtime option and cannot be exported",
+        ));
+    }
+    helios_core::runtime_core::validate_preparation_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+#[pyfunction]
+fn export_validate_preparation_manifest(py: Python<'_>, manifest: &str) -> PyResult<()> {
+    let preparation: serde_json::Value =
+        serde_json::from_str(manifest).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    py.detach(|| validate_preparation_manifest_value(&preparation))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(())
 }
 
 #[pyfunction]
@@ -1560,6 +1576,49 @@ mod asset_tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn preparation_manifest_validator_accepts_valid_manifest_and_rejects_invalid_fields() {
+        let valid = serde_json::json!({
+            "version": 1,
+            "recipe": "fixture_tp",
+            "source_identity": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "checkpoint_repository": "example/Fixture-TP-Model",
+            "checkpoint_revision": "0123456789abcdef0123456789abcdef01234567",
+            "local_checkpoint": false,
+            "reproduction_args": ["ignition", "export", "example/Fixture-TP-Model", "--gpus", "0-3"],
+            "parameters": [
+                {"key": "row_shard_prefill", "scope": "PREPARATION_PARAMETER_SCOPE_DEPLOYMENT", "value": {"bool_value": true}},
+                {"key": "tensor_parallel", "scope": "PREPARATION_PARAMETER_SCOPE_DEPLOYMENT", "value": {"uint_value": 4}}
+            ]
+        });
+        let decoded = super::validate_preparation_manifest_value(&valid).unwrap();
+        assert_eq!(decoded.version, 1);
+        assert_eq!(decoded.parameters.len(), 2);
+
+        let mut unknown = valid.clone();
+        unknown["row_shard_attention"] = serde_json::json!(true);
+        let err = super::validate_preparation_manifest_value(&unknown)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("row_shard_attention"), "unexpected error: {err}");
+
+        let mut runtime_drafts = valid.clone();
+        runtime_drafts["parameters"] = serde_json::json!([
+            {"key": "speculation.history_drafts", "scope": "PREPARATION_PARAMETER_SCOPE_DEPLOYMENT", "value": {"bool_value": true}}
+        ]);
+        assert!(super::validate_preparation_manifest_value(&runtime_drafts)
+            .unwrap_err()
+            .to_string()
+            .contains("history_drafts"));
+
+        let mut empty_repro = valid;
+        empty_repro["reproduction_args"] = serde_json::json!(["ignition", ""]);
+        assert!(super::validate_preparation_manifest_value(&empty_repro)
+            .unwrap_err()
+            .to_string()
+            .contains("reproduction_args"));
     }
 }
 
