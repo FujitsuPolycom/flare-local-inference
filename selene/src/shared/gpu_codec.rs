@@ -12,6 +12,7 @@ use super::codec::{
     crc32_par, page_split_decode, unpack_restore_f32_128,
 };
 use rayon::prelude::*;
+use std::cell::RefCell;
 use std::io::{Error, ErrorKind, Result};
 
 pub const MAGIC: u32 = u32::from_le_bytes(*b"GKV1");
@@ -470,116 +471,223 @@ impl GpuPlan {
         if crc32_chunks_par(chunks, pool) != stored_crc {
             return Err(Error::new(ErrorKind::InvalidData, Checksum::Stored));
         }
-        let total: usize = chunks.iter().map(|c| c.len()).sum();
-        let owned;
-        let pkt: &[u8] = if chunks.len() == 1 {
-            chunks[0]
-        } else {
-            let mut buf = Vec::with_capacity(total);
-            for c in chunks {
-                buf.extend_from_slice(c);
-            }
-            owned = buf;
-            &owned
-        };
 
-        let hdr = self.parse_packet_header(pkt)?;
-        let nc = self.num_chunks();
-
-        // 1. Decode all rANS32 / raw chunks into `ans_buf` (parallelized when `pool` is provided).
-        let mut ans_buf = vec![0u8; self.ans_total_bytes];
-        if nc > 0 {
-            let mut slices: Vec<&mut [u8]> = Vec::with_capacity(nc);
-            let mut rest = ans_buf.as_mut_slice();
-            for &sz in &self.chunk_sizes {
-                let (head, tail) = rest.split_at_mut(sz);
-                slices.push(head);
-                rest = tail;
-            }
-            let decode_one = |(dst, (&off, &entry)): (&mut [u8], (&u32, &u32))| {
-                let is_raw = (entry & RAW_FLAG) != 0;
-                let len = (entry & !RAW_FLAG) as usize;
-                let src = &pkt[off as usize..off as usize + len];
-                if is_raw {
-                    dst.copy_from_slice(src);
-                    Ok(())
-                } else {
-                    rans32_decode_chunk(src, dst)
+        // Reuse per-thread scratch buffers up to `MAX_RETAINED_DECODE_SCRATCH` to avoid
+        // per-page allocation churn while releasing oversized row buffers immediately on exit.
+        CPU_DECODE_SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            struct TrimGuard<'a>(&'a mut CpuDecodeScratch);
+            impl Drop for TrimGuard<'_> {
+                fn drop(&mut self) {
+                    self.0.trim();
                 }
-            };
-            if let Some(p) = pool.filter(|p| p.current_num_threads() > 1 && nc > 1) {
-                p.install(|| {
-                    slices
-                        .into_par_iter()
-                        .zip(hdr.chunk_pkt_offs.par_iter().zip(hdr.chunk_words.par_iter()))
-                        .try_for_each(decode_one)
-                })?;
+            }
+            let guard = TrimGuard(&mut *scratch);
+            let scratch = &mut *guard.0;
+            let pkt: &[u8] = if chunks.len() == 1 {
+                chunks[0]
             } else {
-                for pair in slices
-                    .into_iter()
-                    .zip(hdr.chunk_pkt_offs.iter().zip(hdr.chunk_words.iter()))
-                {
-                    decode_one(pair)?;
+                let total: usize = chunks.iter().map(|c| c.len()).sum();
+                scratch.pkt_buf.clear();
+                scratch.pkt_buf.reserve(total);
+                for c in chunks {
+                    scratch.pkt_buf.extend_from_slice(c);
                 }
-            }
-        }
+                &scratch.pkt_buf
+            };
 
-        // 2. Reconstruct 128x128 float32 matrices via existing SIMD/scalar CPU inverse predictor.
-        if self.num_mats > 0 {
-            let widths = &ans_buf[..self.num_mats * MATRIX_ELEMS];
-            let low_all = &pkt[hdr.low_offset..hdr.low_offset + hdr.low_bytes];
-            for (m, &mat_off) in self.matrix_offsets.iter().enumerate() {
-                let off = mat_off as usize;
-                let mat_lanes = [
-                    hdr.lane_u32s[m * 4],
-                    hdr.lane_u32s[m * 4 + 1],
-                    hdr.lane_u32s[m * 4 + 2],
-                    hdr.lane_u32s[m * 4 + 3],
-                ];
-                let lb: usize = mat_lanes.iter().map(|&w| usize::from(w) * 4).sum();
-                let lstart = hdr.lane_offs[m * 4] as usize;
-                unpack_restore_f32_128(
-                    &mut out[off..off + MATRIX_BYTES],
-                    &widths[m * MATRIX_ELEMS..(m + 1) * MATRIX_ELEMS],
-                    &low_all[lstart..lstart + lb],
-                    &mat_lanes,
-                )?;
-            }
-        }
+            let hdr = self.parse_packet_header(pkt)?;
+            let nc = self.num_chunks();
 
-        // 3. Uncoalesce & invert non-matrix transforms.
-        if !self.transforms.is_empty() {
-            let mut trans_buf = vec![0u8; self.original_bytes];
-            for c in &self.coalesce {
-                trans_buf[c.trans_offset..c.trans_offset + c.length]
-                    .copy_from_slice(&ans_buf[c.ans_offset..c.ans_offset + c.length]);
+            // 1. Decode all rANS32 / raw chunks into reusable `ans_buf` (parallelized when `pool` is provided).
+            if scratch.ans_buf.len() < self.ans_total_bytes {
+                scratch.ans_buf.resize(self.ans_total_bytes, 0);
             }
-            let mut tmp = [0u8; 4096];
-            for op in &self.transforms {
-                let src = &trans_buf[op.offset..op.offset + op.length];
-                let dst = &mut out[op.offset..op.offset + op.length];
-                match op.encoding {
-                    Encoding::Bytes => dst.copy_from_slice(src),
-                    Encoding::Bfloat16 => byte_shuffle_decode(dst, src, 2),
-                    enc => {
-                        let spec = enc.page_spec().unwrap();
-                        page_split_decode(dst, src, spec.kind, &mut tmp)?;
+            let ans_buf = &mut scratch.ans_buf[..self.ans_total_bytes];
+            if nc > 0 {
+                let mut slices: Vec<&mut [u8]> = Vec::with_capacity(nc);
+                let mut rest = &mut *ans_buf;
+                for &sz in &self.chunk_sizes {
+                    let (head, tail) = rest.split_at_mut(sz);
+                    slices.push(head);
+                    rest = tail;
+                }
+                let decode_one = |(dst, (&off, &entry)): (&mut [u8], (&u32, &u32))| {
+                    let is_raw = (entry & RAW_FLAG) != 0;
+                    let len = (entry & !RAW_FLAG) as usize;
+                    let src = &pkt[off as usize..off as usize + len];
+                    if is_raw {
+                        dst.copy_from_slice(src);
+                        Ok(())
+                    } else {
+                        rans32_decode_chunk(src, dst)
+                    }
+                };
+                if let Some(p) = pool.filter(|p| p.current_num_threads() > 1 && nc > 1) {
+                    p.install(|| {
+                        slices
+                            .into_par_iter()
+                            .zip(hdr.chunk_pkt_offs.par_iter().zip(hdr.chunk_words.par_iter()))
+                            .try_for_each(decode_one)
+                    })?;
+                } else {
+                    for pair in slices
+                        .into_iter()
+                        .zip(hdr.chunk_pkt_offs.iter().zip(hdr.chunk_words.iter()))
+                    {
+                        decode_one(pair)?;
                     }
                 }
             }
-        }
 
-        if crc32_par(out, pool) != original_crc {
-            return Err(Error::new(ErrorKind::InvalidData, Checksum::Original));
-        }
-        Ok(())
+            // 2. Reconstruct 128x128 float32 matrices via existing SIMD/scalar CPU inverse predictor.
+            if self.num_mats > 0 {
+                let widths = &ans_buf[..self.num_mats * MATRIX_ELEMS];
+                let low_all = &pkt[hdr.low_offset..hdr.low_offset + hdr.low_bytes];
+                if let Some(p) = pool.filter(|p| p.current_num_threads() > 1 && self.num_mats > 1) {
+                    let mut mat_slices: Vec<(usize, &mut [u8])> = Vec::with_capacity(self.num_mats);
+                    let mut cursor = 0usize;
+                    let mut rest = &mut *out;
+                    for (m, &mat_off) in self.matrix_offsets.iter().enumerate() {
+                        let off = mat_off as usize;
+                        let (_, tail) = rest.split_at_mut(off - cursor);
+                        let (mat_dst, after) = tail.split_at_mut(MATRIX_BYTES);
+                        mat_slices.push((m, mat_dst));
+                        cursor = off + MATRIX_BYTES;
+                        rest = after;
+                    }
+                    p.install(|| {
+                        mat_slices.into_par_iter().try_for_each(|(m, mat_dst)| {
+                            let mat_lanes = [
+                                hdr.lane_u32s[m * 4],
+                                hdr.lane_u32s[m * 4 + 1],
+                                hdr.lane_u32s[m * 4 + 2],
+                                hdr.lane_u32s[m * 4 + 3],
+                            ];
+                            let lb: usize = mat_lanes.iter().map(|&w| usize::from(w) * 4).sum();
+                            let lstart = hdr.lane_offs[m * 4] as usize;
+                            unpack_restore_f32_128(
+                                mat_dst,
+                                &widths[m * MATRIX_ELEMS..(m + 1) * MATRIX_ELEMS],
+                                &low_all[lstart..lstart + lb],
+                                &mat_lanes,
+                            )
+                        })
+                    })?;
+                } else {
+                    for (m, &mat_off) in self.matrix_offsets.iter().enumerate() {
+                        let off = mat_off as usize;
+                        let mat_lanes = [
+                            hdr.lane_u32s[m * 4],
+                            hdr.lane_u32s[m * 4 + 1],
+                            hdr.lane_u32s[m * 4 + 2],
+                            hdr.lane_u32s[m * 4 + 3],
+                        ];
+                        let lb: usize = mat_lanes.iter().map(|&w| usize::from(w) * 4).sum();
+                        let lstart = hdr.lane_offs[m * 4] as usize;
+                        unpack_restore_f32_128(
+                            &mut out[off..off + MATRIX_BYTES],
+                            &widths[m * MATRIX_ELEMS..(m + 1) * MATRIX_ELEMS],
+                            &low_all[lstart..lstart + lb],
+                            &mat_lanes,
+                        )?;
+                    }
+                }
+            }
+
+            // 3. Uncoalesce & invert non-matrix transforms (parallelized across transforms when `pool` is provided).
+            if !self.transforms.is_empty() {
+                if scratch.trans_buf.len() < self.original_bytes {
+                    scratch.trans_buf.resize(self.original_bytes, 0);
+                }
+                let trans_buf = &mut scratch.trans_buf[..self.original_bytes];
+                for c in &self.coalesce {
+                    trans_buf[c.trans_offset..c.trans_offset + c.length]
+                        .copy_from_slice(&ans_buf[c.ans_offset..c.ans_offset + c.length]);
+                }
+                let apply_op = |op: &TransformOp, dst: &mut [u8], tmp: &mut [u8; 4096]| -> Result<()> {
+                    let src = &trans_buf[op.offset..op.offset + op.length];
+                    match op.encoding {
+                        Encoding::Bytes => {
+                            dst.copy_from_slice(src);
+                            Ok(())
+                        }
+                        Encoding::Bfloat16 => {
+                            byte_shuffle_decode(dst, src, 2);
+                            Ok(())
+                        }
+                        enc => {
+                            let spec = enc.page_spec().unwrap();
+                            page_split_decode(dst, src, spec.kind, tmp)
+                        }
+                    }
+                };
+                if let Some(p) =
+                    pool.filter(|p| p.current_num_threads() > 1 && self.transforms.len() > 1)
+                {
+                    let mut op_slices: Vec<(&TransformOp, &mut [u8])> =
+                        Vec::with_capacity(self.transforms.len());
+                    let mut cursor = 0usize;
+                    let mut rest = &mut *out;
+                    for op in &self.transforms {
+                        let (_, tail) = rest.split_at_mut(op.offset - cursor);
+                        let (dst, after) = tail.split_at_mut(op.length);
+                        op_slices.push((op, dst));
+                        cursor = op.offset + op.length;
+                        rest = after;
+                    }
+                    p.install(|| {
+                        op_slices.into_par_iter().try_for_each_init(
+                            || [0u8; 4096],
+                            |tmp, (op, dst)| apply_op(op, dst, tmp),
+                        )
+                    })?;
+                } else {
+                    let mut tmp = [0u8; 4096];
+                    for op in &self.transforms {
+                        apply_op(op, &mut out[op.offset..op.offset + op.length], &mut tmp)?;
+                    }
+                }
+            }
+
+            if crc32_par(out, pool) != original_crc {
+                return Err(Error::new(ErrorKind::InvalidData, Checksum::Original));
+            }
+            Ok(())
+        })
     }
+}
+
+/// Maximum retained capacity per thread-local CPU decode scratch buffer (2 MiB).
+/// Covers hot page restores without pinning multi-megabyte row buffers on worker threads.
+const MAX_RETAINED_DECODE_SCRATCH: usize = 2 << 20;
+
+#[derive(Default)]
+struct CpuDecodeScratch {
+    pkt_buf: Vec<u8>,
+    ans_buf: Vec<u8>,
+    trans_buf: Vec<u8>,
+}
+
+impl CpuDecodeScratch {
+    fn trim(&mut self) {
+        for buf in [&mut self.pkt_buf, &mut self.ans_buf, &mut self.trans_buf] {
+            if buf.capacity() > MAX_RETAINED_DECODE_SCRATCH {
+                *buf = Vec::new();
+            }
+        }
+    }
+}
+
+thread_local! {
+    static CPU_DECODE_SCRATCH: RefCell<CpuDecodeScratch> = RefCell::new(CpuDecodeScratch::default());
+    static RANS_LUT_SCRATCH: RefCell<Box<[u32; RANS_PROB_SCALE as usize]>> =
+        RefCell::new(Box::new([0u32; RANS_PROB_SCALE as usize]));
 }
 
 /// Pure-Rust decoder for one 32-way interleaved 12-bit static rANS (or RLE) chunk.
 /// Matches `kv_rans32_encode_gpu` / `kv_rans32_decode_gpu` bit-for-bit with strict bounds checking.
 pub(crate) fn rans32_decode_chunk(src: &[u8], dst: &mut [u8]) -> Result<()> {
-    let raw_sz = dst.len();
     if src.len() < 2 {
         return Err(invalid("truncated GKV1 rANS chunk"));
     }
@@ -657,16 +765,6 @@ pub(crate) fn rans32_decode_chunk(src: &[u8], dst: &mut [u8]) -> Result<()> {
                 return Err(invalid("GKV1 rANS frequency sum mismatch"));
             }
 
-            let mut lut = [0u32; RANS_PROB_SCALE as usize];
-            for s in 0..256 {
-                let f = freq[s];
-                if f > 0 {
-                    let c = cdf[s];
-                    let entry = (s as u32) | (f << 8) | (c << 20);
-                    lut[c as usize..(c + f) as usize].fill(entry);
-                }
-            }
-
             let mut states = [0u32; RANS_LANES];
             let mut p = tbl_len;
             for st in &mut states {
@@ -677,54 +775,78 @@ pub(crate) fn rans32_decode_chunk(src: &[u8], dst: &mut [u8]) -> Result<()> {
                 *st = v;
                 p += 4;
             }
-            let mut lane_words = [0usize; RANS_LANES];
-            let mut lane_offs = [0usize; RANS_LANES];
+            let mut lane_bytes = [0usize; RANS_LANES];
             let mut payload_bytes = 0usize;
-            for l in 0..RANS_LANES {
-                let nw = usize::from(u16::from_le_bytes([src[p], src[p + 1]]));
-                lane_words[l] = nw;
-                lane_offs[l] = payload_bytes;
-                payload_bytes += nw * 2;
+            for lb in &mut lane_bytes {
+                let nb = usize::from(u16::from_le_bytes([src[p], src[p + 1]])) * 2;
+                *lb = nb;
+                payload_bytes += nb;
                 p += 2;
             }
             if p + payload_bytes != src.len() {
                 return Err(invalid("GKV1 rANS payload length mismatch"));
             }
-            let payload = &src[p..];
+            let mut rest_payload = &src[p..];
+            let mut lanes: [&[u8]; RANS_LANES] = [&[]; RANS_LANES];
+            for (slot, &nb) in lanes.iter_mut().zip(&lane_bytes) {
+                let (head, tail) = rest_payload.split_at(nb);
+                *slot = head;
+                rest_payload = tail;
+            }
 
-            let mut wpos = [0usize; RANS_LANES];
-            let full_groups = raw_sz / RANS_LANES;
-            let rem = raw_sz % RANS_LANES;
-            for g in 0..=full_groups {
-                let lim = if g < full_groups { RANS_LANES } else { rem };
-                let base = g * RANS_LANES;
-                for l in 0..lim {
-                    let mut x = states[l];
-                    let slot = x & 4095;
-                    let entry = lut[slot as usize];
-                    dst[base + l] = (entry & 0xff) as u8;
+            RANS_LUT_SCRATCH.with(|lut_cell| {
+                let mut lut_ref = lut_cell.borrow_mut();
+                let lut: &mut [u32; RANS_PROB_SCALE as usize] = &mut lut_ref;
+                for s in 0..256 {
+                    let f = freq[s];
+                    if f > 0 {
+                        let c = cdf[s] as usize;
+                        let entry = (s as u32) | (f << 8) | ((c as u32) << 20);
+                        lut[c..c + f as usize].fill(entry);
+                    }
+                }
+
+                #[inline(always)]
+                fn step_lane(
+                    state: &mut u32,
+                    lane: &mut &[u8],
+                    lut: &[u32; RANS_PROB_SCALE as usize],
+                ) -> Result<u8> {
+                    let mut x = *state;
+                    let slot = (x & 4095) as usize;
+                    let entry = lut[slot];
+                    let sym = (entry & 0xff) as u8;
                     let f = (entry >> 8) & 0xfff;
                     let c = entry >> 20;
-                    x = f * (x >> RANS_PROB_BITS) + (slot - c);
+                    x = f * (x >> RANS_PROB_BITS) + (slot as u32 - c);
                     if x < RANS_L {
-                        let wp = wpos[l];
-                        if wp >= lane_words[l] {
+                        let Some((word, tail)) = lane.split_first_chunk::<2>() else {
                             return Err(invalid("truncated GKV1 rANS lane stream"));
-                        }
-                        let off = lane_offs[l] + wp * 2;
-                        let w = u16::from_le_bytes([payload[off], payload[off + 1]]);
-                        x = (x << 16) | u32::from(w);
-                        wpos[l] = wp + 1;
+                        };
+                        x = (x << 16) | u32::from(u16::from_le_bytes(*word));
+                        *lane = tail;
                     }
-                    states[l] = x;
+                    *state = x;
+                    Ok(sym)
                 }
-            }
-            for l in 0..RANS_LANES {
-                if states[l] != RANS_L || wpos[l] != lane_words[l] {
-                    return Err(invalid("corrupted GKV1 rANS terminal state"));
+
+                let mut iter = dst.chunks_exact_mut(RANS_LANES);
+                for group in iter.by_ref() {
+                    for l in 0..RANS_LANES {
+                        group[l] = step_lane(&mut states[l], &mut lanes[l], lut)?;
+                    }
                 }
-            }
-            Ok(())
+                let tail = iter.into_remainder();
+                for (l, byte) in tail.iter_mut().enumerate() {
+                    *byte = step_lane(&mut states[l], &mut lanes[l], lut)?;
+                }
+                for l in 0..RANS_LANES {
+                    if states[l] != RANS_L || !lanes[l].is_empty() {
+                        return Err(invalid("corrupted GKV1 rANS terminal state"));
+                    }
+                }
+                Ok(())
+            })
         }
         _ => Err(invalid("unknown GKV1 rANS chunk mode")),
     }
@@ -775,5 +897,68 @@ mod tests {
         assert!(rans32_decode_chunk(&[1u8, 0x5A, 0], &mut out).is_err());
         assert!(rans32_decode_chunk(&[9u8, 0], &mut out).is_err());
         assert!(rans32_decode_chunk(&[], &mut out).is_err());
+    }
+
+    #[test]
+    fn cpu_decode_scratch_trims_oversized_buffers_after_large_restore() {
+        // Build a synthetic valid GKV1/v2 RLE packet for a 3 MiB (> MAX_RETAINED_DECODE_SCRATCH)
+        // unit and a 64 KiB small unit to verify oversized thread-local buffers are released on exit.
+        let make_rle_pkt = |orig_bytes: usize, byte_val: u8| -> (GpuPlan, Vec<u8>, u32, u32) {
+            let plan = Plan::new(
+                orig_bytes,
+                &[Field {
+                    offset: 0,
+                    length: orig_bytes,
+                    encoding: Encoding::Bytes,
+                }],
+            )
+            .unwrap();
+            let gplan = GpuPlan::from_plan(&plan).unwrap();
+            let nc = gplan.num_chunks();
+            let mut pkt = Vec::new();
+            pkt.extend_from_slice(&MAGIC.to_le_bytes());
+            pkt.extend_from_slice(&VERSION.to_le_bytes());
+            pkt.extend_from_slice(&(orig_bytes as u32).to_le_bytes());
+            pkt.extend_from_slice(&(nc as u32).to_le_bytes());
+            pkt.extend_from_slice(&0u32.to_le_bytes());
+            pkt.extend_from_slice(&0u32.to_le_bytes());
+            for _ in 0..nc {
+                pkt.extend_from_slice(&2u32.to_le_bytes());
+            }
+            for _ in 0..nc {
+                pkt.push(1u8);
+                pkt.push(byte_val);
+            }
+            let sc = crc32_par(&pkt, None);
+            let orig = vec![byte_val; orig_bytes];
+            let oc = crc32_par(&orig, None);
+            (gplan, pkt, sc, oc)
+        };
+
+        let (big_plan, big_pkt, big_sc, big_oc) = make_rle_pkt(3 << 20, 0x3C);
+        let mut big_out = vec![0u8; 3 << 20];
+        big_plan
+            .decode_checked_cpu(&[&big_pkt], &mut big_out, big_sc, big_oc, None)
+            .unwrap();
+        assert!(big_out.iter().all(|&b| b == 0x3C));
+        CPU_DECODE_SCRATCH.with(|cell| {
+            let s = cell.borrow();
+            assert_eq!(s.ans_buf.capacity(), 0, "oversized ans_buf must be released");
+            assert_eq!(s.trans_buf.capacity(), 0, "oversized trans_buf must be released");
+            assert!(s.pkt_buf.capacity() <= MAX_RETAINED_DECODE_SCRATCH);
+        });
+
+        let (sm_plan, sm_pkt, sm_sc, sm_oc) = make_rle_pkt(64 << 10, 0x5A);
+        let mut sm_out = vec![0u8; 64 << 10];
+        sm_plan
+            .decode_checked_cpu(&[&sm_pkt], &mut sm_out, sm_sc, sm_oc, None)
+            .unwrap();
+        assert!(sm_out.iter().all(|&b| b == 0x5A));
+        CPU_DECODE_SCRATCH.with(|cell| {
+            let s = cell.borrow();
+            assert!(s.ans_buf.capacity() >= (64 << 10));
+            assert!(s.ans_buf.capacity() <= MAX_RETAINED_DECODE_SCRATCH);
+            assert!(s.trans_buf.capacity() <= MAX_RETAINED_DECODE_SCRATCH);
+        });
     }
 }
