@@ -30,7 +30,7 @@ pub const GB10_DEVICES: [u32; 5] = [0x2e02, 0x2e03, 0x2e06, 0x2e12, 0x2e2a];
 pub const GA102_DEVICES: [u32; 6] = [0x2203, 0x2204, 0x2206, 0x2208, 0x220a, 0x2216];
 
 /// GB300 device identifiers. `0x31c3` is the SM103 GPU of DGX Station GB300.
-pub const GB300_DEVICES: [u32; 1] = [0x31c3];
+pub const GB300_DEVICES: [u32; 2] = [0x31c2, 0x31c3];
 
 pub fn platform_from_pci(pci_id: u32) -> Option<&'static str> {
     if pci_id & 0xffff != 0x10de {
@@ -185,6 +185,7 @@ mod tests {
                 "{device:#06x}"
             );
         }
+        assert_eq!(platform_from_pci(0x31c2_10de), Some("gb300"));
         assert_eq!(platform_from_pci(0x31c3_10de), Some("gb300"));
         for device in GB202_DEVICES {
             assert_eq!(
@@ -203,6 +204,7 @@ mod tests {
         assert_eq!(platform_from_pci(0x2204_1af4), None);
         assert_eq!(platform_from_pci(0x2484_10de), None);
         assert_eq!(platform_from_pci(0x2bbc_1af4), None);
+        assert_eq!(platform_from_pci(0x31c2_1af4), None);
         assert_eq!(platform_from_pci(0x31c3_1af4), None);
         assert_eq!(platform_from_pci(0x2e06_1af4), None);
         assert_eq!(platform_from_pci(0x2e07_10de), None);

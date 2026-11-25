@@ -312,6 +312,7 @@ fn platform(pci_id: u32) -> Option<&'static str> {
         return None;
     }
     match pci_id >> 16 {
+        device if flare_helios::core::naming::GB300_DEVICES.contains(&device) => Some("gb300"),
         0x2e12 => Some("gb10"),
         0x2b85 | 0x2b87 | 0x2b8c | 0x2bb1 | 0x2bb2 | 0x2bb3 | 0x2bb4 | 0x2bb5 | 0x2bb9 | 0x2bbc => {
             Some("gb202")
@@ -348,6 +349,8 @@ mod tests {
 
     #[test]
     fn pci_ids_select_the_revision_before_compute_capability() {
+        assert_eq!(revision(0x31c210de, 9, 9), "gb300");
+        assert_eq!(revision(0x31c310de, 9, 9), "gb300");
         assert_eq!(revision(0x2e1210de, 12, 1), "gb10");
         assert_eq!(revision(0x2bb410de, 12, 0), "gb202");
         assert_eq!(revision(0x2b8510de, 9, 9), "gb202");
@@ -355,7 +358,8 @@ mod tests {
 
     #[test]
     fn unknown_pci_ids_fall_back_to_compute_capability() {
-        assert_eq!(revision(0x31c310de, 10, 3), "gb300");
+        assert_eq!(revision(0x31c410de, 10, 3), "gb300");
+        assert_eq!(revision(0x31c21234, 9, 0), "sm90");
         assert_eq!(revision(0x2e1310de, 12, 1), "gb10");
         assert_eq!(revision(0x2c0010de, 12, 0), "gb202");
         assert_eq!(revision(0x2bb41234, 9, 0), "sm90");
