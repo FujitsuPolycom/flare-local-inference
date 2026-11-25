@@ -16,6 +16,10 @@ use super::*;
             let mut peers = vec![zero_stream];
             join_rank_zero(None, &mut peers)
         });
-        assert!(join_peer(None, &mut peer_stream, 1, 2).unwrap().is_none());
+        assert!(
+            join_peer(None, Vec::new(), &mut peer_stream, 1, 2)
+                .unwrap()
+                .is_none()
+        );
         assert!(zero.join().unwrap().unwrap().is_none());
     }

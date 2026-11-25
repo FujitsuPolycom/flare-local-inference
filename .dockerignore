@@ -41,6 +41,8 @@ selene/**
 !selene/examples/**
 !selene/proto/
 !selene/proto/**
+!selene/native/
+!selene/native/**
 !selene/src/
 !selene/src/**
 !selene-manager/

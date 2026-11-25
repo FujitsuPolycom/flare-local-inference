@@ -36,6 +36,7 @@ fn peer_registration_budget_fails_startup() {
             enabled: true,
             identity: [3; 32],
             layout: [4; 16],
+            codec_profile: None,
             rank,
             world: 2,
             gpu_uuid: [rank as u8 + 1; 16],
@@ -140,7 +141,13 @@ fn peer_registration_budget_fails_startup() {
         let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let zero = listener.accept().unwrap().0;
         let service = thread::spawn(move || {
-            super::super::shard::join_peer(Some(&shared), &mut RankStream::Tcp(stream), 1, 2)
+            super::super::shard::join_peer(
+                Some(&shared),
+                Vec::new(),
+                &mut RankStream::Tcp(stream),
+                1,
+                2,
+            )
                 .unwrap()
                 .unwrap()
         });

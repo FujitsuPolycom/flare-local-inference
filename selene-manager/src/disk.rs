@@ -11,7 +11,7 @@ use flare_eos::direct_update_file as open;
 use flare_selene::shared::record::Header;
 use std::{
     fs::{self, File},
-    io::{self, Read},
+    io,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -74,12 +74,18 @@ pub fn recover(root: &Path, pool_name: &str) -> Result<Vec<Recovered>> {
             {
                 continue;
             }
-            let mut block = [0; 4096];
-            match File::open(entry.path())?.read_exact(&mut block) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => continue,
+            let block = match Header::read_metadata(File::open(entry.path())?) {
+                Ok(block) => block,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::UnexpectedEof | io::ErrorKind::InvalidData
+                    ) =>
+                {
+                    continue;
+                }
                 Err(e) => return Err(e),
-            }
+            };
             if let Ok(value) = Header::decode(&block) {
                 if entry.file_name().to_str().and_then(record::parse_file_name) == Some(value.key)
                     && entry.path().parent().unwrap().file_name().unwrap()

@@ -66,6 +66,7 @@ pub enum Kind {
 /// record. The window lies in one of the manager's regions.
 #[derive(Clone, Debug)]
 pub struct WindowOut {
+    pub packed: Option<flare_selene::shared::wire::PackedWindow>,
     pub shape: Shape,
     pub page_xxh3: Vec<u64>,
     pub row_xxh3: u64,
@@ -79,6 +80,7 @@ pub struct GrantOut {
     pub shape: Shape,
     pub region: Region,
     pub offset: u64,
+    pub packed: bool,
 }
 
 /// What a handler reports. `Closed` is always last.
@@ -654,6 +656,102 @@ async fn send_windows(
             let _ = timeout(GOODBYE, conn.shutdown()).await;
             return Ok(());
         };
+        if let Some(manifest) = &window.packed {
+            let rank = entry
+                .slicing
+                .as_ref()
+                .filter(|(layout, _)| layout.world() > 1)
+                .map(|(_, r)| *r as u32);
+            let parts: Vec<_> = flare_selene::shared::packed::leg_units(manifest, rank).collect();
+            let mut shape = window.shape;
+            shape.length = parts.iter().map(|(_, u)| u.stored_length).sum();
+            let units = flare_selene::shared::wire::PackedWindow {
+                units: parts.iter().map(|(_, u)| (*u).clone()).collect(),
+            };
+            if let Some(channel) = rdma.as_mut() {
+                let ToManager::Credit { offset, length } = within(
+                    IO_TIMEOUT,
+                    "the instance lent no slot",
+                    ToManager::read(conn, inner.max_pages),
+                )
+                .await?
+                else {
+                    return Err(invalid("a claim's instance sends only credits"));
+                };
+                if shape.length > length || !offset.is_multiple_of(4096) {
+                    return Err(invalid("a window does not fit the slot the instance lent"));
+                }
+                // Coalesce contiguous runs of `parts` and RDMA-write each run into the lent slot
+                // at `offset + dst_cursor` (1 write when world == 1; exact rank gather when world > 1).
+                let mut dst_cursor = 0u64;
+                let mut run: Option<(u64, u64)> = None;
+                for &(at, u) in &parts {
+                    let len = u.stored_length;
+                    if len == 0 {
+                        continue;
+                    }
+                    match run {
+                        Some((start, rlen)) if start + rlen == at => {
+                            run = Some((start, rlen + len));
+                        }
+                        Some((start, rlen)) => {
+                            channel.write(
+                                window.region,
+                                window.offset + start,
+                                rlen,
+                                offset + dst_cursor,
+                            )?;
+                            rdma_done(channel).await?;
+                            dst_cursor += rlen;
+                            run = Some((at, len));
+                        }
+                        None => {
+                            run = Some((at, len));
+                        }
+                    }
+                }
+                if let Some((start, rlen)) = run {
+                    channel.write(
+                        window.region,
+                        window.offset + start,
+                        rlen,
+                        offset + dst_cursor,
+                    )?;
+                    rdma_done(channel).await?;
+                }
+                within(IO_TIMEOUT, "the instance stopped reading", async {
+                    ToInstance::Window(Window::packed_in_slot(shape, units, offset))
+                        .write(conn)
+                        .await?;
+                    conn.flush().await
+                })
+                .await?;
+                inner.counters.add(1, shape.length);
+            } else {
+                within(IO_TIMEOUT, "the instance stopped reading", async {
+                    ToInstance::Window(Window::packed(shape, units))
+                        .write(conn)
+                        .await?;
+                    for (at, u) in parts {
+                        // The granted extent is held until this handler has fenced.
+                        let data = unsafe {
+                            inner
+                                .regions
+                                .bytes(window.region, window.offset + at, u.stored_length)?
+                        };
+                        conn.write_all(data).await?;
+                    }
+                    conn.flush().await
+                })
+                .await?;
+                inner.counters.add(0, shape.length);
+            }
+            let _ = inner.events.send(Event::Sent {
+                transfer,
+                index: shape.index,
+            });
+            continue;
+        }
         let slot = if let Some(channel) = rdma.as_mut() {
             let ToManager::Credit { offset, length } = within(
                 IO_TIMEOUT,
@@ -707,6 +805,7 @@ async fn send_windows(
             }
         };
         let frame = ToInstance::Window(Window {
+            packed: None,
             shape: window.shape,
             page_xxh3: window.page_xxh3,
             row_xxh3: window.row_xxh3,
@@ -796,14 +895,17 @@ async fn receive_windows(
             else {
                 return Err(invalid("the instance sent a frame a put does not take"));
             };
-            if index != grant.shape.index
-                || page_xxh3.len() != grant.shape.page_count as usize
-                || row_xxh3.is_some() != grant.shape.row
-            {
+            let sums_ok = if grant.packed {
+                page_xxh3.is_empty() && row_xxh3.is_none()
+            } else {
+                page_xxh3.len() == grant.shape.page_count as usize
+                    && row_xxh3.is_some() == grant.shape.row
+            };
+            if index != grant.shape.index || !sums_ok {
                 return Err(invalid("a filled window does not match its grant"));
             }
             // SAFETY: the handler owns this window until `Closed`; the store leased this window to the put.
-            match &entry.slicing {
+            match entry.slicing.as_ref().filter(|_| !grant.packed) {
                 None => {
                     let payload = unsafe {
                         inner
@@ -985,6 +1087,7 @@ mod tests {
             hub.push_window(
                 transfer,
                 WindowOut {
+                    packed: Default::default(),
                     shape: shape(0, 2, true),
                     page_xxh3: vec![11, 12],
                     row_xxh3: 13,
@@ -995,6 +1098,7 @@ mod tests {
             hub.push_window(
                 transfer,
                 WindowOut {
+                    packed: Default::default(),
                     shape: shape(1, 1, false),
                     page_xxh3: vec![21],
                     row_xxh3: 0,
@@ -1087,6 +1191,7 @@ mod tests {
                 hub.push_window(
                     transfer,
                     WindowOut {
+                        packed: Default::default(),
                         shape: Shape {
                             length: 1 << 20,
                             page_count: 256,
@@ -1130,6 +1235,7 @@ mod tests {
                 hub.push_window(
                     transfer,
                     WindowOut {
+                        packed: Default::default(),
                         shape: Shape {
                             length: 1 << 20,
                             page_count: 256,
@@ -1168,6 +1274,7 @@ mod tests {
                     shape: shape(0, 2, true),
                     region: Region::Staging,
                     offset: 4096,
+                    packed: false,
                 },
             );
             let ToInstance::Grant(granted) = ToInstance::read(&mut conn, 64).await.unwrap() else {
@@ -1208,6 +1315,7 @@ mod tests {
                     shape: shape(1, 1, false),
                     region: Region::Staging,
                     offset: 65536,
+                    packed: false,
                 },
             );
             assert!(matches!(
@@ -1260,6 +1368,7 @@ mod tests {
                 hub.push_window(
                     transfer,
                     WindowOut {
+                        packed: Default::default(),
                         shape: rank_shape(&layout, rank, 0, 2, true),
                         page_xxh3: vec![1, 2],
                         row_xxh3: 3,
@@ -1312,6 +1421,7 @@ mod tests {
                         shape: rank_shape(&layout, rank, 0, 2, true),
                         region: Region::Staging,
                         offset: 16384,
+                        packed: false,
                     },
                 );
                 let ToInstance::Grant(granted) = ToInstance::read(&mut conn, 64).await.unwrap()
@@ -1353,6 +1463,7 @@ mod tests {
                     shape: shape(0, 2, true),
                     region: Region::Staging,
                     offset: 16384,
+                    packed: false,
                 },
             );
             let ToInstance::Grant(_) = ToInstance::read(&mut conn, 64).await.unwrap() else {
@@ -1392,6 +1503,7 @@ mod tests {
                     shape: shape(0, 2, false),
                     region: Region::Staging,
                     offset: 0,
+                    packed: false,
                 },
             );
             let _ = ToInstance::read(&mut conn, 64).await.unwrap();
@@ -1451,6 +1563,7 @@ mod tests {
             hub.push_window(
                 transfer,
                 WindowOut {
+                    packed: Default::default(),
                     shape: shape(0, 1, false),
                     page_xxh3: vec![1],
                     row_xxh3: 0,
@@ -1690,6 +1803,7 @@ mod tests {
             hub.push_window(
                 transfer,
                 WindowOut {
+                    packed: Default::default(),
                     shape: shape(0, 1, false),
                     page_xxh3: vec![1],
                     row_xxh3: 0,
@@ -1706,6 +1820,72 @@ mod tests {
             assert_eq!(frame(&mut conn).await, ToInstance::End);
             assert!(matches!(next(&mut events).await, Event::Sent { .. }));
             assert!(matches!(next(&mut events).await, Event::Closed { .. }));
+        });
+    }
+
+    #[test]
+    fn packed_rdma_window_lands_in_credited_slot_with_exact_compressed_bytes() {
+        bounded(async {
+            let (hub, mut events, address, regions, _, remote) = start_fake_rdma();
+            let (transfer, token) = hub.open(Kind::Get).unwrap();
+            let mut conn = dial_rdma(&address, &token).await;
+            ToManager::Credit {
+                offset: 8192,
+                length: PAGE as u64,
+            }
+            .write(&mut conn)
+            .await
+            .unwrap();
+            let payload: Vec<u8> = (0..1377).map(|i| ((i * 31) % 251) as u8).collect();
+            fill(&regions, Region::Arena, 123, &payload);
+            let packed = flare_selene::shared::wire::PackedWindow {
+                units: vec![flare_selene::shared::wire::PackedUnit {
+                    kind: 0,
+                    logical_index: 0,
+                    original_length: PAGE as u64,
+                    stored_length: payload.len() as u64,
+                    representation: 1,
+                    stored_crc: flare_selene::shared::packed::crc32(&payload),
+                    original_crc: 42,
+                    profile: vec![1; 32],
+                    ..Default::default()
+                }],
+            };
+            hub.push_window(
+                transfer,
+                WindowOut {
+                    packed: Some(packed.clone()),
+                    shape: Shape {
+                        index: 0,
+                        record: 0,
+                        first_page: 0,
+                        page_count: 1,
+                        row: false,
+                        length: payload.len() as u64,
+                    },
+                    page_xxh3: Vec::new(),
+                    row_xxh3: 0,
+                    region: Region::Arena,
+                    offset: 123,
+                },
+            );
+            hub.finish(transfer);
+            let ToInstance::Window(window) = frame(&mut conn).await else {
+                panic!("packed RDMA window missing")
+            };
+            assert_eq!(window.slot, 8192);
+            assert_eq!(window.shape.length, payload.len() as u64);
+            assert_eq!(window.packed, Some(packed));
+            assert_eq!(
+                &remote.lock().unwrap()[8192..8192 + payload.len()],
+                &payload[..]
+            );
+            assert_eq!(frame(&mut conn).await, ToInstance::End);
+            assert!(matches!(next(&mut events).await, Event::Sent { .. }));
+            assert!(matches!(next(&mut events).await, Event::Closed { .. }));
+            let moved = hub.moved();
+            assert_eq!(moved.windows, [0, 1]);
+            assert_eq!(moved.bytes, [0, payload.len() as u64]);
         });
     }
 
@@ -1806,6 +1986,7 @@ mod tests {
                 hub.push_window(
                     transfer,
                     WindowOut {
+                        packed: None,
                         shape: shape(0, 2, false),
                         page_xxh3: vec![1, 2],
                         row_xxh3: 0,
@@ -1816,6 +1997,7 @@ mod tests {
                 hub.push_window(
                     transfer,
                     WindowOut {
+                        packed: None,
                         shape: shape(1, 1, false),
                         page_xxh3: vec![3],
                         row_xxh3: 0,
@@ -1877,6 +2059,7 @@ mod tests {
                 hub.push_window(
                     transfer,
                     WindowOut {
+                        packed: None,
                         shape: shape(0, 2, false),
                         page_xxh3: vec![1, 2],
                         row_xxh3: 0,

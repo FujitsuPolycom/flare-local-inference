@@ -11,13 +11,16 @@ name = "flare_selene"
 crate-type = ["rlib"]
 
 [features]
-default = []
+default = ["codec"]
+# CPU/GPU KV-cache codec planners, Zstd encoder/decoder, and C++17 matrix predictor.
+codec = ["dep:rayon", "dep:zstd-safe"]
 # The instance's end of the RDMA data channel (experimental).
 rdma = ["dep:ibverbs-sys"]
 # Fixtures that tests of other crates share with this crate's own tests.
-test-support = []
+test-support = ["codec"]
 
 [dependencies]
+rayon = { version = "1.12", optional = true }
 flare-eos = { path = "../eos" }
 blake2 = "0.10"
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -31,7 +34,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tonic = { version = "0.14", default-features = false, features = ["transport", "codegen"] }
 tonic-prost = "0.14"
 tower = { version = "0.5", features = ["util"] }
-twox-hash = { version = "2.1", default-features = false, features = ["xxhash3_64", "alloc"] }
+crc32fast = "1.5"
+twox-hash = { version = "2.1", default-features = false, features = ["xxhash3_64", "std"] }
+zstd-safe = { version = "7.3", default-features = false, features = ["std"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_Security", "Win32_Security_Cryptography"] }
@@ -40,6 +45,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 io-uring = "0.7"
 
 [build-dependencies]
+cc = "1.6"
 tonic-prost-build = "0.14"
 
 [dev-dependencies]

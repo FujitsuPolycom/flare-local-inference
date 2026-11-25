@@ -63,8 +63,7 @@ use std::os::{fd::AsRawFd as _, unix::fs::OpenOptionsExt as _};
 use std::{
     collections::HashSet,
     fmt::Write as _,
-    fs,
-    io::{self, Read as _},
+    fs, io,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -73,7 +72,15 @@ use crate::{Error, PrefixKey, Result};
 
 use crate::geometry::{BLOCK_BYTES, CacheGeometry, Layout, RankLayout, invalid};
 
+use super::{
+    packed,
+    wire::{PackedOffer, RankPlanes},
+};
+use prost::Message;
+use std::sync::Arc;
+
 pub const MAGIC: [u8; 8] = *b"FLARECKP";
+/// Header version byte for raw records (packed codec records use `packed::REVISION = 4`).
 pub const VERSION: u32 = 3;
 const LEGACY_VERSION: u32 = 1;
 const LEGACY_REPLICATED_VERSION: u32 = 2;
@@ -117,6 +124,7 @@ pub struct Replication {
 pub struct Header {
     /// Encoding version retained across legacy read/rewrite cycles; not semantic identity.
     version: u32,
+    pub packed: Option<Arc<packed::Layout>>,
     pub identity: [u8; 32],
     pub fingerprint: [u8; 16],
     pub flags: u32,
@@ -135,7 +143,8 @@ pub struct Header {
 
 impl PartialEq for Header {
     fn eq(&self, other: &Self) -> bool {
-        self.identity == other.identity
+        self.packed == other.packed
+            && self.identity == other.identity
             && self.fingerprint == other.fingerprint
             && self.flags == other.flags
             && self.key == other.key
@@ -212,6 +221,7 @@ impl Header {
         created: u64,
     ) -> Result<Self> {
         let mut header = Self {
+            packed: None,
             version: Self::version_for_sizes(&ranks),
             identity,
             fingerprint,
@@ -235,7 +245,9 @@ impl Header {
     }
 
     pub fn encode(&self) -> Result<[u8; HEADER_BYTES]> {
-        let version = if self.version == VERSION {
+        let version = if self.packed.is_some() {
+            packed::REVISION
+        } else if self.version == VERSION {
             VERSION
         } else if self.replicated() {
             LEGACY_REPLICATED_VERSION
@@ -243,6 +255,82 @@ impl Header {
             LEGACY_VERSION
         };
         self.encode_version(version)
+    }
+
+    fn directory_bytes(&self, layout: &packed::Layout) -> Vec<u8> {
+        packed::Directory {
+            ranks: self
+                .ranks
+                .iter()
+                .map(|r| RankPlanes {
+                    plane_bytes: r.planes.clone(),
+                    row_bytes: r.row_bytes,
+                })
+                .collect(),
+            offer: Some(layout.offer().clone()),
+        }
+        .encode_to_vec()
+    }
+
+    pub fn with_packed(mut self, offer: PackedOffer) -> Result<Self> {
+        if self.page_tokens == 0 {
+            return Err(invalid("zero page tokens"));
+        }
+        let first = self
+            .parent
+            .map_or(0, |p| p.consumed_tokens / self.page_tokens);
+        let layout = packed::Layout::new(offer, &self.ranks, first, self.tail_pages)?;
+        if !layout.offer().units.iter().any(|u| u.representation == 1) {
+            return Err(invalid("a literal-only record uses the raw envelope"));
+        }
+        let size = self.directory_bytes(&layout).len();
+        if size > packed::MAX_DIRECTORY {
+            return Err(invalid("oversized v4 directory"));
+        }
+        self.page_segment = HEADER_BYTES as u64 + size as u64;
+        self.row_segment = self
+            .page_segment
+            .checked_add(layout.page_offset(layout.page_count()))
+            .ok_or_else(|| invalid("v4 page offset overflow"))?;
+        self.row_segment
+            .checked_add(layout.row_bytes())
+            .filter(|n| *n <= isize::MAX as u64)
+            .ok_or_else(|| invalid("v4 row offset overflow"))?;
+        // v4 authenticates and names replicas per unit.
+        self.row_checksum = 0;
+        self.flags &= !(REPLICATED | REPLICATED_ROW);
+        self.version = packed::REVISION;
+        self.packed = Some(Arc::new(layout));
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn packed_metadata(&self) -> Result<Vec<u8>> {
+        let layout = self
+            .packed
+            .as_ref()
+            .ok_or_else(|| invalid("expected v4 header"))?;
+        let mut bytes = self.encode()?.to_vec();
+        bytes.extend(self.directory_bytes(layout));
+        Ok(bytes)
+    }
+
+    /// Read only metadata. A corrupt length never allocates more than the directory bound.
+    pub fn read_metadata(mut file: impl io::Read) -> io::Result<Vec<u8>> {
+        let mut bytes = vec![0; HEADER_BYTES];
+        file.read_exact(&mut bytes)?;
+        if bytes[..8] == MAGIC && bytes[8..12] == packed::REVISION.to_le_bytes() {
+            let size = u32::from_le_bytes(bytes[181..185].try_into().unwrap()) as usize;
+            if size == 0 || size > packed::MAX_DIRECTORY {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid v4 directory length",
+                ));
+            }
+            bytes.resize(HEADER_BYTES + size, 0);
+            file.read_exact(&mut bytes[HEADER_BYTES..])?;
+        }
+        Ok(bytes)
     }
 
     fn version_for_sizes(ranks: &[RankSizes]) -> u32 {
@@ -258,6 +346,9 @@ impl Header {
 
     /// Equal header fields yield equal bytes regardless of the source file version.
     pub(crate) fn canonical_encoding(&self) -> Result<[u8; HEADER_BYTES]> {
+        if self.packed.is_some() {
+            return self.encode();
+        }
         let version = Self::version_for_sizes(&self.ranks);
         self.encode_version(if version == LEGACY_VERSION && self.replicated() {
             LEGACY_REPLICATED_VERSION
@@ -291,6 +382,14 @@ impl Header {
         cursor.put(&self.row_segment.to_le_bytes());
         cursor.put(&self.row_checksum.to_le_bytes());
         cursor.put(&self.created.to_le_bytes());
+        if let Some(layout) = &self.packed {
+            let directory = self.directory_bytes(layout);
+            cursor.put(&(HEADER_BYTES as u64).to_le_bytes());
+            cursor.put(&(directory.len() as u32).to_le_bytes());
+            cursor.put(&packed::crc32(&directory).to_le_bytes());
+            cursor.put(&self.length_with_row().to_le_bytes());
+            return Ok(bytes);
+        }
         cursor.put(&(self.ranks.len() as u32).to_le_bytes());
         for rank in &self.ranks {
             cursor.put(&(rank.planes.len() as u32).to_le_bytes());
@@ -324,9 +423,16 @@ impl Header {
             return Err(invalid("record header magic is not FLARECKP"));
         }
         let version = cursor.u32("version")?;
-        if ![LEGACY_VERSION, LEGACY_REPLICATED_VERSION, VERSION].contains(&version) {
+        if ![
+            LEGACY_VERSION,
+            LEGACY_REPLICATED_VERSION,
+            VERSION,
+            packed::REVISION,
+        ]
+        .contains(&version)
+        {
             return Err(invalid(format!(
-                "record header version {version} is unsupported; expected 1, 2, or 3"
+                "record header version {version} is unsupported; expected versions 1 through 4"
             )));
         }
         let flags = cursor.u32("flags")?;
@@ -357,6 +463,59 @@ impl Header {
         let row_segment = cursor.u64("row segment offset")?;
         let row_checksum = cursor.u64("row checksum")?;
         let created = cursor.u64("creation time")?;
+        if version == packed::REVISION {
+            if cursor.u64("directory offset")? != HEADER_BYTES as u64 {
+                return Err(invalid("v4 directory offset"));
+            }
+            let length = cursor.u32("directory length")? as usize;
+            let crc = cursor.u32("directory CRC")?;
+            let full = cursor.u64("stored length")?;
+            let directory = bytes
+                .get(HEADER_BYTES..HEADER_BYTES + length.min(packed::MAX_DIRECTORY))
+                .filter(|d| d.len() == length && packed::crc32(d) == crc)
+                .ok_or_else(|| invalid("bad v4 directory"))?;
+            let value = packed::Directory::decode(directory)
+                .map_err(|_| invalid("bad v4 directory encoding"))?;
+            let ranks = value
+                .ranks
+                .into_iter()
+                .map(|r| RankSizes {
+                    planes: r.plane_bytes,
+                    row_bytes: r.row_bytes,
+                })
+                .collect();
+            let header = Self {
+                version,
+                packed: None,
+                identity,
+                fingerprint,
+                flags,
+                key,
+                parent,
+                bucket,
+                page_tokens,
+                tail_pages,
+                ranks,
+                page_segment,
+                row_segment,
+                row_checksum,
+                created,
+            };
+            if page_tokens == 0 {
+                return Err(invalid("zero page tokens"));
+            }
+            header.derive()?;
+            let header =
+                header.with_packed(value.offer.ok_or_else(|| invalid("missing v4 units"))?)?;
+            if header.page_segment != page_segment
+                || header.row_segment != row_segment
+                || header.length_with_row() != full
+                || row_checksum != 0
+            {
+                return Err(invalid("v4 physical offsets disagree with directory"));
+            }
+            return Ok(header);
+        }
         let rank_count = cursor.u32("rank count")?;
         let mut ranks = Vec::new();
         for rank in 0..rank_count {
@@ -378,6 +537,7 @@ impl Header {
             ranks.push(RankSizes { planes, row_bytes });
         }
         let header = Self {
+            packed: None,
             version,
             identity,
             fingerprint,
@@ -414,6 +574,11 @@ impl Header {
     }
 
     pub fn set_replication(&mut self, replication: Replication) -> Result<()> {
+        if self.packed.is_some() {
+            return Err(invalid(
+                "replicas of a v4 record are fixed by its directory",
+            ));
+        }
         self.flags = (self.flags & !(REPLICATED | REPLICATED_ROW))
             | (u32::from(replication.pages) * REPLICATED)
             | (u32::from(replication.row) * REPLICATED_ROW);
@@ -439,6 +604,9 @@ impl Header {
     }
 
     pub fn stored_row_bytes(&self) -> u64 {
+        if let Some(layout) = &self.packed {
+            return layout.row_bytes();
+        }
         if self.replication().row {
             self.ranks[0].row_record_bytes()
         } else {
@@ -471,7 +639,7 @@ impl Header {
             return Err(invalid("record header plane size does not fit the version 3 u32 encoding"));
         }
         let entry_bytes: usize = self.ranks.iter().map(|rank| rank.encoded_bytes(version)).sum();
-        if FIXED_FIELD_BYTES + entry_bytes > HEADER_BYTES {
+        if version != packed::REVISION && FIXED_FIELD_BYTES + entry_bytes > HEADER_BYTES {
             return Err(invalid(format!(
                 "record header for {} ranks and {} planes needs {} bytes, more than the \
                  {HEADER_BYTES}-byte header block",
@@ -526,6 +694,9 @@ impl Header {
             )));
         }
         let derived = self.derive()?;
+        if self.packed.is_some() {
+            return Ok(());
+        }
         if self.page_segment != derived.page_segment {
             return Err(invalid(format!(
                 "record header page segment offset {} is not the derived offset {}",
@@ -623,7 +794,8 @@ impl Header {
     }
 
     pub fn row_present(&self, file_length: u64) -> bool {
-        file_length >= self.length_with_row()
+        self.packed.as_ref().is_none_or(|p| p.row_bytes() != 0)
+            && file_length >= self.length_with_row()
     }
 
     /// The header's sizes equal the live geometry's.
@@ -679,11 +851,11 @@ struct Derived {
 }
 
 fn padded(bytes: u64) -> u64 {
-    bytes.div_ceil(BLOCK_BYTES) * BLOCK_BYTES
+    crate::geometry::padded_bytes(bytes).expect("padded block length overflow")
 }
 
 fn checked_padded(bytes: u64) -> Option<u64> {
-    bytes.div_ceil(BLOCK_BYTES).checked_mul(BLOCK_BYTES)
+    crate::geometry::padded_bytes(bytes)
 }
 
 struct Cursor<'a> {
@@ -971,6 +1143,10 @@ pub fn scan(
             Inspection::Unreadable(error) => return Err(error),
         }
     }
+    remove_orphans(records)
+}
+
+pub(crate) fn remove_orphans(mut records: Vec<Scanned>) -> Result<Vec<Scanned>> {
     loop {
         let keys: HashSet<PrefixKey> = records.iter().map(|record| record.header.key).collect();
         let parents: HashSet<PrefixKey> = records.iter().filter_map(|r| r.header.parent).collect();
@@ -1024,17 +1200,22 @@ fn inspect(
             ));
         }
     };
-    let mut block = [0u8; HEADER_BYTES];
-    if let Err(error) = file.read_exact(&mut block) {
-        return if error.kind() == io::ErrorKind::UnexpectedEof {
-            Inspection::Invalid
-        } else {
-            Inspection::Unreadable(io_failure(
-                format!("read record header of {}", path.display()),
-                error,
-            ))
-        };
-    }
+    let block = match Header::read_metadata(&mut file) {
+        Ok(b) => b,
+        Err(error) => {
+            return if matches!(
+                error.kind(),
+                io::ErrorKind::UnexpectedEof | io::ErrorKind::InvalidData
+            ) {
+                Inspection::Invalid
+            } else {
+                Inspection::Unreadable(io_failure(
+                    format!("read record header of {}", path.display()),
+                    error,
+                ))
+            };
+        }
+    };
     let Ok(header) = Header::decode(&block) else {
         return Inspection::Invalid;
     };
@@ -1044,7 +1225,8 @@ fn inspect(
         && header.page_tokens == page_tokens
         && header.ranks == ranks;
     let named_by_key = parse_file_name(name) == Some(header.key);
-    let covers_pages = bytes >= header.row_segment;
+    let covers_pages = bytes >= header.row_segment
+        && (header.packed.is_none() || bytes <= header.length_with_row());
     if !belongs_here || !named_by_key || !covers_pages {
         return Inspection::Invalid;
     }
@@ -1057,7 +1239,7 @@ fn inspect(
     })
 }
 
-fn remove(path: &Path) -> Result<()> {
+pub(crate) fn remove(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -1491,7 +1673,7 @@ mod tests {
             Header::decode(&bytes).unwrap_err().to_string()
         };
         assert!(corrupt(0, b'X').contains("magic"));
-        assert!(corrupt(8, 4).contains("version"));
+        assert!(corrupt(8, 5).contains("version"));
         assert!(corrupt(88, 2).contains("parent presence"));
         assert!(corrupt(142, 0).contains("page segment"));
         assert!(corrupt(150, 0).contains("row segment"));

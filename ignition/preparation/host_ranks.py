@@ -465,7 +465,8 @@ class HostRankGroup:
                      for rank in range(self.rendezvous.world)]
             for control in self.controls:
                 send_object(control, ("export", options, settings))
-            with export_options(settings.cache, no_weights=settings.no_weights, reuse_weights=settings.reuse_weights):
+            with export_options(settings.cache, no_weights=settings.no_weights, reuse_weights=settings.reuse_weights,
+                                kernel_cache=settings.kernel_cache):
                 core = export_model(self.model, images, storage, roots[0], options=options,
                                        progress=progress, sources=True)
                 channels = [[self.checkpoint_fabric.readers[rank, stream].channel

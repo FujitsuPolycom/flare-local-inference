@@ -5,7 +5,7 @@
 
 use super::{
     channel::{self, Security},
-    content_for, descriptor,
+    content_with_payload, descriptor,
     pool::{Damage, PutResult, Session},
     store_client::{BUCKET, CancelAt, PutOptions},
 };
@@ -20,7 +20,7 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
 pub enum Outcome {
-    Stored { payload: Vec<u8>, bytes: u64 },
+    Stored { payload: Vec<u8>, bytes: u64, first_window: Option<v2::WindowSpec> },
     Refused(v2::PutRefused),
     Cancelled,
     Abandoned,
@@ -41,7 +41,7 @@ pub async fn put_record(
         keep_windows: true,
         ..Default::default()
     };
-    match put(session, &descriptor(), id, key, parent, options, security).await {
+    match put(session, &descriptor(), id, key, parent, options, security, None).await {
         Outcome::Stored { bytes, .. } => PutResult::Stored(bytes),
         Outcome::Refused(refused) => PutResult::Refused(refused),
         Outcome::Cancelled => PutResult::Refused(v2::PutRefused {
@@ -53,7 +53,7 @@ pub async fn put_record(
     }
 }
 
-async fn fence(session: &Session, id: u64) {
+pub async fn fence(session: &Session, id: u64) {
     session
         .send(c::M::FenceAck(v2::FenceAck {
             subject: Some(v2::fence_ack::Subject::PutId(id)),
@@ -80,6 +80,7 @@ pub async fn put(
     parent: Option<Key>,
     options: PutOptions,
     security: Option<&Security>,
+    payload: Option<&[u8]>,
 ) -> Outcome {
     let chain_pages = key.consumed_tokens / descriptor.page_tokens;
     session
@@ -103,6 +104,7 @@ pub async fn put(
             } else {
                 v2::CopyMode::SharedWindows
             } as i32,
+            packed: None,
         }))
         .await;
     enum Next {
@@ -113,7 +115,7 @@ pub async fn put(
     }
     let mut pick = |m: &M| match m {
         M::PutAccept(a) if a.put_id == id => Some(Next::Accept(a.clone())),
-        M::PutGrant(g) if g.put_id == id => Some(Next::Grant(g.window.unwrap())),
+        M::PutGrant(g) if g.put_id == id => Some(Next::Grant(g.window.clone().unwrap())),
         M::Stored(s) if s.put_id == id => Some(Next::Stored(s.bytes)),
         M::PutRefused(r) if r.put_id == id => Some(Next::Refused(r.clone())),
         _ => None,
@@ -142,7 +144,7 @@ pub async fn put(
             digest: p.digest.as_slice().try_into().unwrap(),
         }
     });
-    let (header, mut bytes, _) = content_for(descriptor, key, parent, first);
+    let (header, mut bytes, _) = content_with_payload(descriptor, key, parent, first, payload);
     let mut header =
         header.with_capture_role(flare_selene::CaptureRole::try_from(accept.capture_role).unwrap());
     let row = accept.record_bytes == header.length_with_row();
@@ -154,6 +156,7 @@ pub async fn put(
     bytes[..4096].copy_from_slice(&header.encode().unwrap());
     let payload = accept.record_bytes - header.page_segment;
     let page_bytes = header.page_record_bytes() as usize;
+    let mut first_window = None;
     let mut covered = 0;
     let mut grants = 0;
     let mut committed = false;
@@ -189,6 +192,7 @@ pub async fn put(
                 return Outcome::Stored {
                     payload: bytes[header.page_segment as usize..].to_vec(),
                     bytes: stored,
+                    first_window,
                 };
             }
             Next::Refused(r) => {
@@ -200,6 +204,7 @@ pub async fn put(
             Next::Grant(window) => window,
             Next::Accept(_) => panic!("duplicate accept"),
         };
+        first_window.get_or_insert_with(|| window.clone());
         grants += 1;
         if options.cancel == Some(CancelAt::Grant) {
             return cancel(session, id, options.keep_windows).await;

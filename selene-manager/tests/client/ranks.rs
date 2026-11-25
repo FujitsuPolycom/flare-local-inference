@@ -157,6 +157,7 @@ fn put_and_wait(
             child_paths,
             descendant_row: child_paths == 1,
             next_child: None,
+            packed: None,
             source: PutSource::Host(Box::new(RecordBytes {
                 data,
                 sums,
@@ -489,6 +490,8 @@ fn offer(source: &Source, history: &TestHistory, world: usize, pages: usize) -> 
         row: true,
         tier: Tier::Dram,
         bytes: (pages * page + row) as u64,
+        packed: false,
+        required_profiles: Vec::new(),
     });
     key
 }
@@ -912,6 +915,8 @@ fn publish(source: &Instance, history: &TestHistory, world: usize, pages: usize)
         row: true,
         tier: Tier::Gpu,
         bytes: (pages * page + row) as u64,
+        packed: false,
+        required_profiles: Vec::new(),
     });
     key
 }
@@ -1548,6 +1553,8 @@ fn host_export(
         row: true,
         tier: Tier::Dram,
         bytes: (pages * page + row) as u64,
+        packed: false,
+        required_profiles: Vec::new(),
     });
     wait_offered(&requester.client, &history);
     let scratch = [300, 301, 302, 303];
@@ -1664,6 +1671,7 @@ fn host_put(manager: &Manager, world: usize, reach: &[Reach]) {
             descendant_row: false,
             next_child: None,
             row: true,
+            packed: None,
             source: PutSource::Host(Box::new(ZeroBytes(RankFiles {
                 world,
                 rank: 0,

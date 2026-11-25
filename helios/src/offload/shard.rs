@@ -36,6 +36,7 @@ pub fn join_rank_zero(store: Option<&Shared>, peers: &mut [RankStream]) -> Resul
 
 pub fn join_peer(
     store: Option<&Shared>,
+    gpu_cubins: Vec<std::sync::Arc<Vec<u8>>>,
     stream: &mut RankStream,
     rank: usize,
     world: usize,
@@ -43,7 +44,7 @@ pub fn join_peer(
     Ok(flare_selene::offload::sharded::join_peer(
         store,
         rank,
-        &super::transfer::Copiers,
+        &super::transfer::Copiers::new(gpu_cubins),
         |record| Ok(rendezvous::exchange_record(stream, record, world)?),
     )?)
 }

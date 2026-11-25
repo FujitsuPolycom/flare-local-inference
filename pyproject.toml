@@ -50,7 +50,7 @@ flashinfer-python = { git = "https://github.com/local-inference-lab/flashinfer.g
 include = ["ignition*"]
 
 [tool.setuptools.package-data]
-"ignition.preparation" = ["ladders/*.json"]
+"ignition.preparation" = ["ladders/*.json", "kv_codec_gpu.cu"]
 
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib"

@@ -132,6 +132,7 @@ use std::net::TcpListener;
                 results: vec![Some(Ok(8192)), None],
                 path: Some(third.clone()),
                 cleanup: None,
+                header: None,
                 started: Instant::now(),
             },
         );
@@ -159,6 +160,7 @@ use std::net::TcpListener;
                 results: vec![Some(Err(invalid("short write"))), None],
                 path: Some(fourth.clone()),
                 cleanup: None,
+                header: None,
                 started: Instant::now(),
             },
         );
@@ -194,6 +196,7 @@ use std::net::TcpListener;
                 results: vec![Some(Err(invalid("no space"))), None],
                 path: Some(sixth.clone()),
                 cleanup: None,
+                header: None,
                 started: Instant::now(),
             },
         );
@@ -232,6 +235,7 @@ use std::net::TcpListener;
                 results: vec![Some(Err(invalid("write failed"))), None],
                 path: Some(seventh.clone()),
                 cleanup: None,
+                header: None,
                 started: Instant::now(),
             },
         );
@@ -439,6 +443,7 @@ use std::net::TcpListener;
                 results: vec![Some(Ok(0)), None],
                 path: None,
                 cleanup: None,
+                header: None,
                 started: Instant::now() - JOB_TIMEOUT - Duration::from_secs(1),
             },
         );
@@ -659,6 +664,7 @@ fn record_read_failure_survives_rank_events_and_aggregation() {
             results,
             path: None,
             cleanup: None,
+            header: None,
             started: Instant::now(),
         },
     );
@@ -688,6 +694,7 @@ fn space_pressure_survives_rank_events_and_aggregation() {
                 results: vec![Some(result)],
                 path: None,
                 cleanup: None,
+                header: None,
                 started: Instant::now(),
             },
         );

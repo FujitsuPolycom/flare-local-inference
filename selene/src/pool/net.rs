@@ -351,6 +351,9 @@ pub(crate) struct Open {
 
 /// Opens transfers. The engine owns one per session; tests substitute their own.
 pub(crate) trait Dial: Send + Sync {
+    fn may_use_rdma(&self) -> bool {
+        false
+    }
     fn open(&self, request: Open) -> io::Result<Channel>;
 }
 
@@ -368,7 +371,14 @@ pub(crate) struct Tcp {
     pub rdma_broken: Arc<AtomicBool>,
 }
 
+pub(crate) fn can_negotiate_rdma(offered: bool, tls: bool) -> bool {
+    cfg!(feature = "rdma") && offered && !tls
+}
 impl Dial for Tcp {
+    fn may_use_rdma(&self) -> bool {
+        can_negotiate_rdma(self.rdma_offered, self.tls.is_some())
+            && !self.rdma_broken.load(Ordering::Relaxed)
+    }
     fn open(&self, request: Open) -> io::Result<Channel> {
         let token: [u8; TOKEN_BYTES] = request
             .reference
@@ -391,9 +401,7 @@ impl Dial for Tcp {
             token,
             staging: self.staging.clone(),
             events: self.events.clone(),
-            rdma: transport == wire::DataTransport::Rdma as i32
-                && self.rdma_offered
-                && !self.rdma_broken.load(Ordering::Relaxed),
+            rdma: transport == wire::DataTransport::Rdma as i32 && self.may_use_rdma(),
             rdma_broken: self.rdma_broken.clone(),
         };
         let (events, id) = (self.events.clone(), request.id);
@@ -656,8 +664,11 @@ fn note_failure(target: &Target, link_was_rdma: bool, result: &io::Result<()>) {
 }
 
 /// The length of a window must fit a slot and the page grid.
+fn fits_slot(target: &Target, length: u64) -> bool {
+    length != 0 && length <= target.staging.slot_bytes()
+}
 fn usable_length(target: &Target, length: u64) -> bool {
-    length != 0 && length.is_multiple_of(ALIGN) && length <= target.staging.slot_bytes()
+    length.is_multiple_of(ALIGN) && fits_slot(target, length)
 }
 
 /// A claim: windows arrive until the manager ends the transfer.
@@ -759,7 +770,12 @@ async fn receive_windows(
         match frame {
             ToInstance::Window(window) => {
                 let length = window.shape.length;
-                if !usable_length(target, length) {
+                let usable = if window.packed.is_some() {
+                    fits_slot(target, length)
+                } else {
+                    usable_length(target, length)
+                };
+                if !usable {
                     return Err(invalid(format!(
                         "window {} has an unusable length ({length})",
                         window.shape.index
@@ -835,7 +851,7 @@ async fn fill(target: &Target, id: Id, filled: mpsc::UnboundedReceiver<Filled>) 
             match frame {
                 ToInstance::Grant(shape) => {
                     let length = shape.length;
-                    if !usable_length(target, length) {
+                    if !fits_slot(target, length) {
                         return Err(invalid(format!(
                             "window {} has an unusable length ({length})",
                             shape.index
@@ -1055,6 +1071,7 @@ mod tests {
 
     fn window_frame(shape: Shape, bytes: &[u8]) -> Window {
         Window {
+            packed: None,
             shape,
             page_xxh3: (0..shape.page_count as usize)
                 .map(|i| checksum(&bytes[i * PAGE..(i + 1) * PAGE]))
@@ -1229,6 +1246,7 @@ mod tests {
                 .await
                 .unwrap();
             ToInstance::Window(Window {
+                packed: None,
                 shape: shape(0, 1, false),
                 page_xxh3: vec![0],
                 row_xxh3: 0,
@@ -1334,6 +1352,7 @@ mod tests {
             let mut odd = shape(0, 1, false);
             odd.length = length;
             ToInstance::Window(Window {
+                packed: None,
                 shape: odd,
                 page_xxh3: vec![0],
                 row_xxh3: 0,

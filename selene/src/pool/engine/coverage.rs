@@ -15,6 +15,8 @@ use super::{super::wire, requester::ExpectedRecord};
 /// pages.
 pub(crate) struct Coverage {
     pub(crate) expected: Vec<ExpectedRecord>,
+    packed: Vec<Option<crate::shared::packed::Layout>>,
+    pub(crate) channel_rank: Option<u32>,
     taken: Vec<u32>,
     cursor: usize,
     windows: u32,
@@ -23,11 +25,69 @@ pub(crate) struct Coverage {
 impl Coverage {
     pub(crate) fn new(expected: Vec<ExpectedRecord>) -> Self {
         Self {
+            packed: vec![None; expected.len()],
+            channel_rank: None,
             taken: vec![0; expected.len()],
             expected,
             cursor: 0,
             windows: 0,
         }
+    }
+
+    pub(crate) fn select_packed(
+        &mut self,
+        records: &[wire::Record],
+        caps: Option<&wire::CodecCaps>,
+        page_tokens: u64,
+        ranks: impl FnOnce() -> Vec<crate::record::RankSizes>,
+    ) -> Result<(), &'static str> {
+        if records.iter().all(|r| r.packed.is_none()) {
+            return Ok(());
+        }
+        let caps = caps.ok_or("packed selection requires a negotiated profile")?;
+        let ranks = ranks();
+        for (i, r) in records.iter().enumerate() {
+            let Some(offer) = &r.packed else { continue };
+            let first = (self.expected[i].key.consumed_tokens / page_tokens)
+                .checked_sub(r.pages.into())
+                .ok_or("invalid packed first page")?;
+            let layout = crate::shared::packed::Layout::new(offer.clone(), &ranks, first, r.pages)
+                .map_err(|_| "invalid packed selection")?;
+            if !crate::shared::packed::permits(Some(caps), &layout.required_profiles(r.row))
+                || r.row != (layout.row_bytes() != 0)
+            {
+                return Err("incompatible packed selection");
+            }
+            self.packed[i] = Some(layout);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_packed_layout(&mut self, record: usize, layout: crate::shared::packed::Layout) {
+        if let Some(slot) = self.packed.get_mut(record) {
+            *slot = Some(layout);
+        }
+    }
+
+    pub(crate) fn pinned_units(&self, spec: &wire::WindowSpec) -> Option<Vec<wire::PackedUnit>> {
+        let r = spec.record as usize;
+        let layout = self.packed.get(r)?.as_ref()?;
+        let first = if spec.page_count == 0 && spec.row {
+            layout.page_count()
+        } else {
+            spec.first_page.checked_sub(self.expected[r].first_page)? as usize
+        };
+        Some(
+            layout
+                .units(first, spec.page_count as usize, spec.row)?
+                .iter()
+                .filter(|u| {
+                    self.channel_rank
+                        .is_none_or(|r| r == u.stored_rank || u.replicas.contains(&r))
+                })
+                .cloned()
+                .collect(),
+        )
     }
 
     /// Every record, page and the row has been covered once.
@@ -74,7 +134,20 @@ impl Coverage {
             return Err(format!("window {} carries the row wrongly", spec.index));
         }
         let row = if spec.row { row_bytes } else { 0 };
-        if spec.length != u64::from(spec.page_count) * page_bytes + row {
+        let length = match (&self.packed[record], &spec.packed) {
+            (None, None) => u64::from(spec.page_count) * page_bytes + row,
+            (Some(_), Some(window)) => {
+                let units = self
+                    .pinned_units(spec)
+                    .ok_or("window outside packed selection")?;
+                if units != window.units {
+                    return Err("window differs from pinned selection".into());
+                }
+                units.iter().map(|u| u.stored_length).sum()
+            }
+            _ => return Err("window representation differs from pinned selection".into()),
+        };
+        if spec.length != length {
             return Err(format!("window {} has the wrong length", spec.index));
         }
         let before: u64 = self.expected[..record]

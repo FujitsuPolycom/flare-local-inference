@@ -83,12 +83,14 @@ fn check_window(
         .records
         .get(window.record as usize)
         .ok_or_else(|| Error::new("window names no record"))?;
-    let end = record.first_page + record.pages;
+    let end = u64::from(record.first_page) + u64::from(record.pages);
     if window.first_page < record.first_page
-        || window.first_page + window.page_count > end
+        || u64::from(window.first_page) + u64::from(window.page_count) > end
         || (window.row && !record.row)
-        || dst.len() as u64
-            != u64::from(window.page_count) * page + if window.row { row } else { 0 }
+        || u64::from(window.page_count)
+            .checked_mul(page)
+            .and_then(|n| n.checked_add(if window.row { row } else { 0 }))
+            != Some(dst.len() as u64)
     {
         return Err(Error::new("window does not fit the pinned record"));
     }
@@ -97,10 +99,12 @@ fn check_window(
 
 /// One pinned record in memory.
 pub(crate) struct MemorySpan {
-    /// Addresses of every tail page of the record.
+    /// Addresses of every tail page slab of the record.
     pub pages: Vec<usize>,
     pub row: Option<Vec<usize>>,
     pub sums: Arc<RecordSums>,
+    pub packed: Option<Arc<crate::memory::PackedMemory>>,
+    pub slab_bytes: usize,
 }
 
 /// A chain of records in registered host memory, held in place by pins that
@@ -118,6 +122,72 @@ impl HostPin for MemoryPin {
         &self.chain
     }
 
+    fn packed_offer_for(&self, record: usize) -> Option<crate::shared::wire::PackedOffer> {
+        let rec = self.chain.records.get(record)?;
+        let packed = self.spans.get(record)?.packed.as_ref()?;
+        let start = packed.first_page + u64::from(rec.first_page);
+        let end = start + u64::from(rec.pages);
+        let mut units = Vec::new();
+        for (u, _) in &packed.pages {
+            if u.logical_index >= start && u.logical_index < end {
+                units.push(u.clone());
+            }
+        }
+        if rec.row {
+            let row_units = packed.row.as_ref()?;
+            for (u, _) in row_units {
+                units.push(u.clone());
+            }
+        }
+        Some(crate::shared::wire::PackedOffer {
+            first_page: start,
+            units,
+        })
+    }
+
+    fn read_packed(&mut self, window: &HostWindow, dst: &mut [u8]) -> Result<usize> {
+        let span = self
+            .spans
+            .get(window.record as usize)
+            .ok_or_else(|| Error::new("window names no record"))?;
+        let packed = span
+            .packed
+            .as_ref()
+            .ok_or_else(|| Error::new("record is not stored packed"))?;
+        let start = packed.first_page + u64::from(window.first_page);
+        let end = start + u64::from(window.page_count);
+        let mut written = 0usize;
+        for (u, byte_off) in &packed.pages {
+            if u.logical_index >= start && u.logical_index < end {
+                let len = u.stored_length as usize;
+                let out = dst
+                    .get_mut(written..written + len)
+                    .ok_or_else(|| Error::new("packed put window buffer too small"))?;
+                crate::memory::read_from_slabs(&span.pages, span.slab_bytes, *byte_off, out);
+                written += len;
+            }
+        }
+        if window.row {
+            let row_slots = span
+                .row
+                .as_ref()
+                .ok_or_else(|| Error::new("the record has no row"))?;
+            let row_units = packed
+                .row
+                .as_ref()
+                .ok_or_else(|| Error::new("the record has no packed row"))?;
+            for (u, byte_off) in row_units {
+                let len = u.stored_length as usize;
+                let out = dst
+                    .get_mut(written..written + len)
+                    .ok_or_else(|| Error::new("packed put window buffer too small"))?;
+                crate::memory::read_from_slabs(row_slots, span.slab_bytes, *byte_off, out);
+                written += len;
+            }
+        }
+        Ok(written)
+    }
+
     fn read(&mut self, window: &HostWindow, dst: &mut [u8]) -> Result<Checksums> {
         check_window(
             &self.chain,
@@ -128,6 +198,9 @@ impl HostPin for MemoryPin {
         )?;
         let page_bytes = self.layout.page_record_bytes as usize;
         let span = &self.spans[window.record as usize];
+        if span.packed.is_some() {
+            return Err(Error::new("cannot raw-read a packed host record"));
+        }
         let mut offset = 0;
         let mut pages = Vec::with_capacity(window.page_count as usize);
         for page in window.first_page..window.first_page + window.page_count {
@@ -214,7 +287,88 @@ impl HostPin for FilePin {
         &self.chain
     }
 
+    fn packed_offer_for(&self, record: usize) -> Option<crate::shared::wire::PackedOffer> {
+        let rec = self.chain.records.get(record)?;
+        let layout = self.spans.get(record)?.header.packed.as_ref()?;
+        let start = layout.offer().first_page + u64::from(rec.first_page);
+        let units = layout
+            .units(rec.first_page as usize, rec.pages as usize, rec.row)?
+            .to_vec();
+        Some(crate::shared::wire::PackedOffer {
+            first_page: start,
+            units,
+        })
+    }
+
+    fn read_packed(&mut self, window: &HostWindow, dst: &mut [u8]) -> Result<usize> {
+        let span = self
+            .spans
+            .get_mut(window.record as usize)
+            .ok_or_else(|| Error::new("window names no record"))?;
+        let layout = span
+            .header
+            .packed
+            .as_ref()
+            .ok_or_else(|| Error::new("record file is not stored packed"))?
+            .clone();
+        let path = span.path.clone();
+        let io = |what: &str, e: std::io::Error| {
+            Error::caused_by(format!("{what} {}", path.display()), e)
+        };
+        if span.open.is_none() {
+            let file = File::open(&span.path).map_err(|e| io("cannot open", e))?;
+            span.open = Some(OpenSpan { file, ahead: None });
+        }
+        let open = span.open.as_mut().expect("opened");
+        let first = window.first_page as usize;
+        let count = window.page_count as usize;
+        if first.checked_add(count).is_none_or(|end| end > layout.page_count()) {
+            return Err(Error::new("packed put window exceeds record pages"));
+        }
+        let start_rel = if count == 0 && window.row {
+            layout.page_offset(layout.page_count())
+        } else {
+            layout.page_offset(first)
+        };
+        let end_rel = if window.row {
+            layout.physical_bytes()
+        } else {
+            layout.page_offset(first + count)
+        };
+        let len = end_rel
+            .checked_sub(start_rel)
+            .ok_or_else(|| Error::new("packed put window range is inverted"))?
+            as usize;
+        let out = dst
+            .get_mut(..len)
+            .ok_or_else(|| Error::new("packed put window buffer too small"))?;
+        if len > 0 {
+            open.file
+                .read_exact_at(out, span.header.page_segment + start_rel)
+                .map_err(|e| io("cannot read packed window of", e))?;
+        }
+        let (record_first, record_pages, record_has_row) = {
+            let record = &self.chain.records[window.record as usize];
+            (record.first_page, record.pages, record.row)
+        };
+        if window.first_page + window.page_count >= record_first + record_pages
+            && (window.row || !record_has_row)
+        {
+            self.spans[window.record as usize].open = None;
+        }
+        Ok(len)
+    }
+
     fn read(&mut self, window: &HostWindow, dst: &mut [u8]) -> Result<Checksums> {
+        if self
+            .spans
+            .get(window.record as usize)
+            .is_some_and(|s| s.header.packed.is_some())
+        {
+            return Err(Error::new(
+                "cannot serve a raw export window from a v4 packed record file",
+            ));
+        }
         check_window(&self.chain, window, dst, self.page_bytes, self.row_bytes)?;
         let (record_first, record_pages) = {
             let record = &self.chain.records[window.record as usize];
@@ -393,6 +547,8 @@ mod tests {
                 pages: vec![base, base + page, base + 2 * page],
                 row: Some(vec![base + 3 * page]),
                 sums,
+                packed: None,
+                slab_bytes: page,
             }],
             layout: Arc::new(crate::Layout {
                 page_tokens: 16,

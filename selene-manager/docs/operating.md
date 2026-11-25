@@ -342,6 +342,7 @@ does not answer within 1 s the previous store text is served.
 | `selene_put_shapes_total{shape="row"\|"page_only"\|"empty"}` | Accepted puts that carry a row, accepted puts that carry pages only, including later failures or cancellation, and puts with no new pages and no row, which are answered `PRESENT` and also count under `present`. | A rising `page_only` share shows writers sending pages without rows. |
 | `selene_put_bytes_total{part="pages"\|"rows"}` | Padded page and row payload bytes accepted per put, excluding headers and checksum tables. Counts the accepted shape once, including puts that later fail or are cancelled. | Page bytes per accepted put rising without a similar increase in conversation length. |
 | `selene_gets_total{outcome}` | `ok`, `error` for the store's reads. | Any `error`. |
+| `selene_pool_codec_incompatible_total{action}` | Lookups (`action="lookup"`) and claims (`action="claim"`) skipped because the reader does not advertise the record's codec profile. | Any sustained increase; a reader not advertising the record's profile misses packed records. |
 | `selene_nvme_errors_total` | NVMe read and write failures. | Any increase. |
 | `selene_nvme_bytes_total`, `selene_nvme_read_bytes_total`, `selene_nvme_seconds_total` | Durable bytes written, bytes read for restores, and disk time for both directions. | Disk time growing faster than the sum of written and read bytes. |
 | `selene_memory_allocated_bytes`, `selene_staging_allocated_bytes` | Arena and staging in use. | Near `--memory` / `--staging`. |
@@ -409,3 +410,17 @@ requesting an export, and the instance falls back to an equivalent local
 copy or recomputes after draining. An occasional warning during restarts is
 expected; repeated warnings on a quiet pool warrant checking source sessions
 and record retention.
+
+### Checkpoint roots with codec envelopes
+
+A manager reads and serves raw v1–v3 and packed v4 files verbatim without
+re-encoding them. Every manager sharing a record root with codec-enabled
+writers must support v4 envelopes; a manager without v4 support deletes
+unrecognized v4 files during recovery and can prune dependent entries. A Flare
+instance with `--lossless-kv-compression cpu` or `gpu` advertises its receive
+profiles (`ZKV1` and `GKV1`) to the manager over shared memory, TCP, or RDMA.
+
+For a cold restore, staging must fit the largest indivisible stored row. The
+file's physical length includes the header, directory, and stored payload.
+Incompatible pool lookups and claims increment
+`selene_pool_codec_incompatible_total`.

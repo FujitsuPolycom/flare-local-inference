@@ -274,6 +274,8 @@ fn source(args: &Args) {
         row: true,
         tier: Tier::Dram,
         bytes: (PAGES * page + row) as u64,
+        packed: false,
+        required_profiles: Vec::new(),
     });
     say("ready");
     let commands = commands();

@@ -107,6 +107,85 @@ fn a_pool_with_shards_keeps_one_local_rank_and_refuses_memory_retention() {
     }
 }
 
+fn qualified_rank() -> CacheGeometry {
+    let mut g = crate::testing::geometry(64, &[("kv", 4096)], 4096);
+    for name in ["kv", "state"] {
+        g.codec_fields.push(crate::geometry::CodecField {
+            buffer: name.into(),
+            offset: 0,
+            length: 4096,
+            encoding: 0,
+        });
+    }
+    g
+}
+
+#[test]
+fn restore_placement_preserves_warm_capacity() {
+    let memory = 4 << 20;
+    let g = qualified_rank();
+    for placement in [KvCompression::Off, KvCompression::Cpu] {
+        let options = PrefixCacheOffload {
+            memory_bytes: Some(memory),
+            compression: placement,
+            pool: Some(pool("unix:/run/selene.sock")),
+            ..Default::default()
+        };
+        let Preparation::Store(p) = prepare(
+            &options,
+            std::path::Path::new("model"),
+            [0; 32],
+            vec![g.clone()],
+            vec![(0, 0)],
+        )
+        .unwrap() else {
+            panic!("missing store")
+        };
+        let pool = p.memory_pool.unwrap();
+        assert_eq!(p.warm_bytes, memory);
+        let warm_slots = (memory / 4096) as usize;
+        let warm = pool.allocate(warm_slots).unwrap();
+        assert_eq!(pool.free_slots(), pool.intake_slots());
+        assert_eq!(pool.bytes(), memory + pool.intake_slots() as u64 * 4096);
+        pool.release(warm);
+    }
+}
+
+#[test]
+fn disk_only_restore_preserves_minimum_staging() {
+    let directory = test_directory();
+    let options = PrefixCacheOffload {
+        memory_bytes: Some(0),
+        disk: Some(directory.clone()),
+        disk_limit: Some(4 << 20),
+        ..Default::default()
+    };
+    for max_active in [1, 9] {
+        let Preparation::Store(p) = super::prepare_with_inputs(
+            &options,
+            std::path::Path::new("model"),
+            [0; 32],
+            vec![qualified_rank()],
+            vec![(0, 0)],
+            max_active,
+            0,
+            None,
+            &crate::testing::IdentityRegistrar,
+        )
+        .unwrap() else {
+            panic!("missing disk store")
+        };
+        let (_, budget) = options
+            .headroom_with_inputs(1, &p.layout, max_active, false, None)
+            .unwrap();
+        let pool = p.memory_pool.as_ref().unwrap();
+        assert_eq!(pool.bytes(), budget);
+        assert!(pool.intake_slots() >= intake_slots(&p.layout, 1));
+        assert_eq!(pool.free_slots(), pool.intake_slots());
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 #[test]
 fn without_a_pool_nothing_for_it_is_budgeted_or_built() {
     let layout = Layout::new(&[crate::testing::geometry(64, &[("kv", 4096)], 4096)]).unwrap();

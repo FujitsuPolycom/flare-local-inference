@@ -472,7 +472,9 @@ async fn establish(engine: &mut Engine, link: &Link) -> std::result::Result<Esta
     };
     let st = engine.st.clone();
     let (tx, rx) = mpsc::channel::<wire::ClientMessage>(OUTBOUND);
+    let caps = engine.codec_caps();
     let open = wire::OpenSession {
+        codec: (!caps.receive_profiles.is_empty()).then_some(caps),
         manager_incarnation: hello.manager_incarnation,
         instance_id: st.instance_id.to_vec(),
         scope: Some(super::codec::scope_to(&st.scope)),

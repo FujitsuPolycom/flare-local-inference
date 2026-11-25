@@ -108,7 +108,7 @@ impl Outbound {
                     rank,
                     super::super::rank::Window {
                         xfer,
-                        spec: Some(spec),
+                        spec: Some(spec.clone()),
                         sums: None,
                     },
                 )

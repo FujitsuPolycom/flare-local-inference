@@ -54,6 +54,8 @@ pub(crate) fn entry_to(entry: &IndexEntry) -> wire::IndexEntry {
         row: entry.row,
         tier: tier_to(entry.tier) as i32,
         bytes: entry.bytes,
+        packed: entry.packed,
+        required_profiles: entry.required_profiles.clone(),
     }
 }
 

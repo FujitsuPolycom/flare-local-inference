@@ -159,6 +159,8 @@ pub fn geometry(page_tokens: u64, planes: &[(&str, u64)], row_bytes: u64) -> Cac
         })
         .collect();
     CacheGeometry {
+        placement: Default::default(),
+        codec_fields: Vec::new(),
         snapshot_pages: Vec::new(),
         page_tokens,
         page_capacity: 4096,
@@ -538,5 +540,239 @@ impl crate::pool::HostPin for BytesPin {
             window.row,
             dst,
         )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Packet {
+    pub unit: crate::shared::wire::PackedUnit,
+    pub data: std::sync::Arc<[u8]>,
+}
+
+/// Shared test double for compressed [`PageCopier`] paths (synchronous packed
+/// capture/restore, cross-profile receive sets, and asynchronous host-codec
+/// slab capture).
+#[cfg(feature = "codec")]
+pub struct CodecCopier {
+    layout: Layout,
+    profile: [u8; 32],
+    receive: Vec<[u8; 32]>,
+    page_plan: std::sync::Arc<crate::shared::codec::Plan>,
+    row_plan: std::sync::Arc<crate::shared::codec::Plan>,
+    gpu: GpuMemory,
+    async_host: bool,
+    raw_out_noop: bool,
+    replies: Vec<Reply>,
+}
+
+#[cfg(feature = "codec")]
+impl CodecCopier {
+    pub fn new(
+        layout: Layout,
+        profile: [u8; 32],
+        page_plan: std::sync::Arc<crate::shared::codec::Plan>,
+        row_plan: std::sync::Arc<crate::shared::codec::Plan>,
+        gpu: GpuMemory,
+    ) -> Self {
+        Self {
+            layout,
+            profile,
+            receive: vec![profile],
+            page_plan,
+            row_plan,
+            gpu,
+            async_host: false,
+            raw_out_noop: false,
+            replies: Vec::new(),
+        }
+    }
+
+    pub fn with_receive(mut self, receive: Vec<[u8; 32]>) -> Self {
+        self.receive = receive;
+        self
+    }
+
+    pub fn with_async_host_codec(mut self, enabled: bool) -> Self {
+        self.async_host = enabled;
+        self
+    }
+
+    pub fn with_raw_out_noop(mut self, noop: bool) -> Self {
+        self.raw_out_noop = noop;
+        self
+    }
+
+    pub fn shared(self) -> crate::SharedCopier {
+        std::sync::Arc::new(std::sync::Mutex::new(self))
+    }
+}
+
+#[cfg(feature = "codec")]
+impl PageCopier for CodecCopier {
+    fn layout(&self) -> &Layout {
+        &self.layout
+    }
+
+    fn codec_profile(&self) -> Option<[u8; 32]> {
+        Some(self.profile)
+    }
+
+    fn codec_receive_profiles(&self) -> Vec<[u8; 32]> {
+        self.receive.clone()
+    }
+
+    fn async_host_codec(&self) -> Option<crate::codec_copy::HostEncoder> {
+        self.async_host.then(|| crate::codec_copy::HostEncoder {
+            profile: self.profile,
+            page: self.page_plan.clone(),
+            row: self.row_plan.clone(),
+            counters: None,
+        })
+    }
+
+    fn submit(&mut self, job: Job) -> Result<()> {
+        use crate::shared::wire::{
+            PackedUnit,
+            packed_unit::{Kind, Representation},
+        };
+        let mut bytes = 0u64;
+        match job.direction {
+            crate::Direction::Out if self.async_host => {
+                assert!(job.codec.is_none(), "async host codec captures raw slabs");
+                if self.raw_out_noop {
+                    bytes = self.layout.page_record_bytes;
+                } else {
+                    let pages = self.gpu.pages.lock().unwrap();
+                    let rows = self.gpu.rows.lock().unwrap();
+                    for (pid, addr) in &job.pages {
+                        let src = &pages[&pid.0];
+                        // SAFETY: pinned DRAM slab owned by the test store.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(src.as_ptr(), *addr as *mut u8, src.len());
+                        }
+                        bytes += src.len() as u64;
+                    }
+                    if let Some((slot, addrs)) = &job.row {
+                        let src = &rows[&slot.0];
+                        // SAFETY: pinned DRAM row slab owned by the test store.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                src.as_ptr(),
+                                addrs[0] as *mut u8,
+                                src.len(),
+                            );
+                        }
+                        bytes += src.len() as u64;
+                    }
+                }
+            }
+            crate::Direction::Out => {
+                let win = job.codec.as_ref().expect("packed capture job uses codec window");
+                let cap = win.capture.as_ref().expect("capture slot");
+                let pages = self.gpu.pages.lock().unwrap();
+                let rows = self.gpu.rows.lock().unwrap();
+                let mut buf = vec![0u8; self.page_plan.max_packet().max(self.row_plan.max_packet())];
+                for (i, (page, _)) in job.pages.iter().enumerate() {
+                    let raw = &pages[&page.0];
+                    let base = PackedUnit {
+                        kind: Kind::Page as i32,
+                        logical_index: win.first + i as u64,
+                        stored_rank: 0,
+                        original_length: raw.len() as u64,
+                        ..Default::default()
+                    };
+                    let (unit, n) = self
+                        .page_plan
+                        .encode_capture(base, &self.profile, raw, &mut buf, None)
+                        .unwrap();
+                    cap.push(unit, buf[..n].to_vec());
+                    bytes += n as u64;
+                }
+                if let Some((slot, _)) = &job.row {
+                    let raw = &rows[&slot.0];
+                    let base = PackedUnit {
+                        kind: Kind::Row as i32,
+                        logical_index: 0,
+                        stored_rank: 0,
+                        original_length: raw.len() as u64,
+                        ..Default::default()
+                    };
+                    let (unit, n) = self
+                        .row_plan
+                        .encode_capture(base, &self.profile, raw, &mut buf, None)
+                        .unwrap();
+                    cap.push(unit, buf[..n].to_vec());
+                    bytes += n as u64;
+                }
+            }
+            crate::Direction::In => {
+                let win = job.codec.as_ref().expect("packed restore job uses codec window");
+                let mut pages = self.gpu.pages.lock().unwrap();
+                let mut rows = self.gpu.rows.lock().unwrap();
+                for pkt in &win.packets {
+                    assert!(
+                        pkt.unit.representation == Representation::Literal as i32
+                            || self
+                                .receive
+                                .iter()
+                                .any(|r| r.as_slice() == pkt.unit.profile.as_slice()),
+                        "unexpected codec profile in restore packet"
+                    );
+                    // SAFETY: test slabs stay pinned until poll completes.
+                    let chunks = unsafe { pkt.chunks() };
+                    let is_page = pkt.unit.kind == Kind::Page as i32;
+                    let plan = if is_page {
+                        &self.page_plan
+                    } else {
+                        &self.row_plan
+                    };
+                    let mut raw = vec![0u8; pkt.unit.original_length as usize];
+                    if pkt.unit.representation == Representation::Literal as i32 {
+                        let mut off = 0;
+                        for c in &chunks {
+                            raw[off..off + c.len()].copy_from_slice(c);
+                            off += c.len();
+                        }
+                    } else {
+                        plan.decode_checked(
+                            &chunks,
+                            &mut raw,
+                            pkt.unit.stored_crc,
+                            pkt.unit.original_crc,
+                            None,
+                        )
+                        .unwrap();
+                    }
+                    bytes += pkt.unit.stored_length;
+                    if is_page {
+                        let local = (pkt.unit.logical_index - win.first) as usize;
+                        pages.insert(job.pages[local].0.0, raw);
+                    } else if let Some((slot, _)) = &job.row {
+                        rows.insert(slot.0, raw);
+                    }
+                }
+            }
+        }
+        self.replies.push(Reply {
+            id: job.id,
+            window: job.window,
+            direction: job.direction,
+            result: Ok(()),
+            bytes,
+            elapsed: std::time::Duration::from_micros(1),
+        });
+        Ok(())
+    }
+
+    fn poll(&mut self, out: &mut Vec<Reply>) {
+        out.append(&mut self.replies);
+    }
+
+    fn in_flight(&self) -> usize {
+        self.replies.len()
+    }
+
+    fn close(&mut self) -> Result<()> {
+        Ok(())
     }
 }

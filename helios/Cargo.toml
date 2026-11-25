@@ -24,12 +24,13 @@ images = ["frontend", "dep:png", "dep:turbojpeg", "dep:image-webp", "dep:gif"]
 grammar = ["frontend", "dep:llguidance"]
 server = ["dep:serde", "images", "grammar", "dep:axum", "dep:tokio", "dep:async-stream", "dep:base64", "dep:ratatui", "dep:crossterm", "dep:futures-util", "dep:flate2", "dep:zstd", "dep:brotli", "dep:httpdate", "dep:deepseek-recipe"]
 # RoCEnante's RDMA proxy for ranks on separate hosts; links libibverbs.
-roce = ["dep:cc", "runtime-core"]
+roce = ["runtime-core", "dep:cc"]
 # Lets the prefix cache pool's data channel use RDMA when its manager offers it (experimental);
 # links libibverbs.
 rdma = ["flare-selene/rdma"]
 
 [dependencies]
+rayon = "1.12"
 flare-eos = { path = "../eos" }
 deepseek-recipe = { git = "https://github.com/local-inference-lab/deepseek-recipe", rev = "6d09e9be68dbf4ae488f6b22ee9114dcf9ea6270", optional = true }
 deepseek-recipe-core = { git = "https://github.com/local-inference-lab/deepseek-recipe", rev = "6d09e9be68dbf4ae488f6b22ee9114dcf9ea6270", optional = true }

@@ -67,6 +67,10 @@ impl LoadOptions {
     }
 
     pub(super) fn select(&self, cores: &mut [Core], config: &mut Value) -> Result<usize> {
+        self.prefix_cache
+            .validate_compression()
+            .and_then(|()| self.prefix_cache.validate_topology(self.cluster_rank.is_some()))
+            .map_err(|error| invalid(error.to_string()))?;
         if self.mtp_verification_token_budget.is_some()
             && self.mtp_max_verification_token_budget.is_some()
         {
@@ -352,7 +356,11 @@ impl LoadOptions {
                 .chain(execution.persistent_workers.iter().map(|w| w.graph.as_str()))
                 .collect();
             core.graphs.retain(|g| selected.contains(g.name.as_str()));
-            prune_kernels(core)?;
+            let keep_codec_module = (self.prefix_cache.compression
+                == crate::offload::KvCompression::Gpu)
+                .then(|| codec_gpu_module(config))
+                .flatten();
+            prune_kernels(core, keep_codec_module)?;
         }
         let object = config
             .as_object_mut()
@@ -375,7 +383,13 @@ impl LoadOptions {
     }
 }
 
-fn prune_kernels(core: &mut Core) -> Result<()> {
+pub(super) fn codec_gpu_module(config: &Value) -> Option<&str> {
+    config
+        .pointer("/model_contract/cache/codec_layout/gpu_module")
+        .and_then(|v| v.as_str())
+}
+
+fn prune_kernels(core: &mut Core, keep_module: Option<&str>) -> Result<()> {
     let used: HashSet<_> = core
         .graphs
         .iter()
@@ -387,10 +401,13 @@ fn prune_kernels(core: &mut Core) -> Result<()> {
         .iter()
         .map(|f| f.module.as_str())
         .collect();
-    // Module globals can own persistent data referenced through opaque kernel arguments.
-    core
-        .modules
-        .retain(|module| modules.contains(module.name.as_str()) || !module.globals.is_empty());
+    // Module globals can own persistent data referenced through opaque kernel arguments;
+    // keep_module preserves a standalone GPU codec cubin when GPU compression is active.
+    core.modules.retain(|module| {
+        modules.contains(module.name.as_str())
+            || !module.globals.is_empty()
+            || keep_module == Some(module.name.as_str())
+    });
     Ok(())
 }
 
@@ -1829,4 +1846,24 @@ mod tests {
         }
     }
 
+}
+
+
+#[cfg(test)]
+mod codec_configuration_tests {
+    use super::*;
+    use crate::offload::KvCompression;
+
+    #[test]
+    fn decode_requires_an_offload_tier() {
+        for mode in [KvCompression::Cpu, KvCompression::Gpu] {
+            let mut options = LoadOptions::default();
+            options.prefix_cache.compression = mode;
+            let error = options.select(&mut [], &mut Value::Null).unwrap_err();
+            assert!(
+                error.to_string().contains("requires an offload tier"),
+                "{mode}: {error}"
+            );
+        }
+    }
 }

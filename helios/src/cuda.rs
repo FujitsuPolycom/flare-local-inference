@@ -57,6 +57,30 @@ type MemcpyBatch = unsafe extern "C" fn(
     usize,
     Handle,
 ) -> c_int;
+type ModuleLoadData = unsafe extern "C" fn(*mut Handle, *const c_void) -> c_int;
+type ModuleUnload = unsafe extern "C" fn(Handle) -> c_int;
+type ModuleGetFunction = unsafe extern "C" fn(*mut Handle, Handle, *const c_char) -> c_int;
+type FuncSetAttribute = unsafe extern "C" fn(Handle, c_int, c_int) -> c_int;
+type LaunchKernel = unsafe extern "C" fn(
+    Handle,
+    c_uint,
+    c_uint,
+    c_uint,
+    c_uint,
+    c_uint,
+    c_uint,
+    c_uint,
+    Handle,
+    *mut *mut c_void,
+    *mut *mut c_void,
+) -> c_int;
+type MemAlloc = unsafe extern "C" fn(*mut u64, usize) -> c_int;
+type MemFree = unsafe extern "C" fn(u64) -> c_int;
+type MemsetD8 = unsafe extern "C" fn(u64, u8, usize, Handle) -> c_int;
+type CopyDtoD = unsafe extern "C" fn(u64, u64, usize, Handle) -> c_int;
+
+/// `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`.
+const FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: c_int = 8;
 
 /// `CUmemcpyAttributes`: source access order, source and destination location
 /// hints as `CUmemLocation {type, id}`, and flags.
@@ -185,6 +209,15 @@ struct Driver {
     memory_unmap: MemoryUnmap,
     memory_access: MemoryAccess,
     granularity: Granularity,
+    module_load_data: ModuleLoadData,
+    module_unload: ModuleUnload,
+    module_get_function: ModuleGetFunction,
+    func_set_attribute: FuncSetAttribute,
+    launch_kernel: LaunchKernel,
+    mem_alloc: MemAlloc,
+    mem_free: MemFree,
+    memset_d8: MemsetD8,
+    copy_dtod: CopyDtoD,
 }
 
 impl Driver {
@@ -250,6 +283,15 @@ impl Driver {
                 memory_unmap: symbol!("cuMemUnmap"),
                 memory_access: symbol!("cuMemSetAccess"),
                 granularity: symbol!("cuMemGetAllocationGranularity"),
+                module_load_data: symbol!("cuModuleLoadData"),
+                module_unload: symbol!("cuModuleUnload"),
+                module_get_function: symbol!("cuModuleGetFunction"),
+                func_set_attribute: symbol!("cuFuncSetAttribute"),
+                launch_kernel: symbol!("cuLaunchKernel"),
+                mem_alloc: symbol!("cuMemAlloc_v2"),
+                mem_free: symbol!("cuMemFree_v2"),
+                memset_d8: symbol!("cuMemsetD8Async"),
+                copy_dtod: symbol!("cuMemcpyDtoDAsync_v2"),
                 _library: library,
             }))
         }
@@ -958,6 +1000,211 @@ impl Stream {
         self.driver.check("cuStreamDestroy_v2", unsafe {
             (self.driver.stream_destroy)(handle as Handle)
         })
+    }
+
+    pub(crate) fn alloc_device(&self, bytes: usize) -> Result<DeviceBuffer> {
+        let mut ctx: Handle = std::ptr::null_mut();
+        self.driver
+            .check("cuCtxGetCurrent", unsafe { (self.driver.get_context)(&mut ctx) })?;
+        if ctx.is_null() {
+            return Err(Error::execution(
+                ExecutionError::State,
+                "device buffer allocation requires a current CUDA context",
+            ));
+        }
+        let size = bytes.max(64);
+        let mut ptr = 0u64;
+        self.driver
+            .check("cuMemAlloc_v2", unsafe { (self.driver.mem_alloc)(&mut ptr, size) })?;
+        Ok(DeviceBuffer {
+            driver: Arc::clone(&self.driver),
+            context: ctx as usize,
+            ptr,
+            bytes: size,
+        })
+    }
+
+    pub(crate) fn load_module(&self, image: &[u8]) -> Result<LoadedModule> {
+        let mut ctx: Handle = std::ptr::null_mut();
+        self.driver
+            .check("cuCtxGetCurrent", unsafe { (self.driver.get_context)(&mut ctx) })?;
+        if ctx.is_null() {
+            return Err(Error::execution(
+                ExecutionError::State,
+                "module load requires a current CUDA context",
+            ));
+        }
+        let mut handle: Handle = std::ptr::null_mut();
+        self.driver.check("cuModuleLoadData", unsafe {
+            (self.driver.module_load_data)(&mut handle, image.as_ptr().cast())
+        })?;
+        Ok(LoadedModule {
+            driver: Arc::clone(&self.driver),
+            context: ctx as usize,
+            handle,
+        })
+    }
+
+    pub(crate) unsafe fn launch_1d(
+        &self,
+        func: usize,
+        grid: u32,
+        block: u32,
+        shared_bytes: u32,
+        args: &mut [*mut c_void],
+        label: &str,
+    ) -> Result<()> {
+        self.driver.check(label, unsafe {
+            (self.driver.launch_kernel)(
+                func as Handle,
+                grid,
+                1,
+                1,
+                block,
+                1,
+                1,
+                shared_bytes,
+                self.handle as Handle,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })
+    }
+
+    pub(crate) unsafe fn memset_d8_async(&self, dst: u64, value: u8, nbytes: usize) -> Result<()> {
+        self.driver.check("cuMemsetD8Async", unsafe {
+            (self.driver.memset_d8)(dst, value, nbytes, self.handle as Handle)
+        })
+    }
+
+    pub(crate) unsafe fn copy_dtod_async(&self, dst: u64, src: u64, nbytes: usize) -> Result<()> {
+        self.driver.check("cuMemcpyDtoDAsync_v2", unsafe {
+            (self.driver.copy_dtod)(dst, src, nbytes, self.handle as Handle)
+        })
+    }
+
+    pub(crate) unsafe fn copy_htod_async(
+        &self,
+        dst: u64,
+        src: *const c_void,
+        nbytes: usize,
+    ) -> Result<()> {
+        self.driver.check("cuMemcpyHtoDAsync_v2", unsafe {
+            (self.driver.upload)(dst, src, nbytes, self.handle as Handle)
+        })
+    }
+
+    pub(crate) unsafe fn copy_dtoh_async(
+        &self,
+        dst: *mut c_void,
+        src: u64,
+        nbytes: usize,
+    ) -> Result<()> {
+        self.driver.check("cuMemcpyDtoHAsync_v2", unsafe {
+            (self.driver.download)(dst, src, nbytes, self.handle as Handle)
+        })
+    }
+}
+
+pub(crate) struct DeviceBuffer {
+    driver: Arc<Driver>,
+    context: usize,
+    ptr: u64,
+    #[cfg_attr(not(test), allow(dead_code))]
+    bytes: usize,
+}
+
+impl DeviceBuffer {
+    pub(crate) fn ptr(&self) -> u64 {
+        self.ptr
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for DeviceBuffer {
+    fn drop(&mut self) {
+        if self.ptr == 0 {
+            return;
+        }
+        let result = unsafe {
+            let mut previous: Handle = std::ptr::null_mut();
+            let had_previous = (self.driver.get_context)(&mut previous) == 0;
+            let outcome = self
+                .driver
+                .check("cuCtxSetCurrent", (self.driver.set_context)(self.context as Handle))
+                .and_then(|()| {
+                    self.driver
+                        .check("cuMemFree_v2", (self.driver.mem_free)(self.ptr))
+                });
+            if had_previous && previous != self.context as Handle {
+                let _ = (self.driver.set_context)(previous);
+            }
+            outcome
+        };
+        if let Err(error) = result {
+            eprintln!(
+                "warning: cannot free device buffer at {:#x}: {error}",
+                self.ptr
+            );
+        }
+    }
+}
+
+pub(crate) struct LoadedModule {
+    driver: Arc<Driver>,
+    context: usize,
+    handle: Handle,
+}
+
+unsafe impl Send for LoadedModule {}
+
+impl LoadedModule {
+    pub(crate) fn function(&self, name: &CStr) -> Result<usize> {
+        let mut func: Handle = std::ptr::null_mut();
+        self.driver.check("cuModuleGetFunction", unsafe {
+            (self.driver.module_get_function)(&mut func, self.handle, name.as_ptr())
+        })?;
+        Ok(func as usize)
+    }
+
+    pub(crate) fn set_max_dynamic_shared_bytes(&self, func: usize, bytes: i32) -> Result<()> {
+        self.driver.check("cuFuncSetAttribute", unsafe {
+            (self.driver.func_set_attribute)(
+                func as Handle,
+                FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                bytes,
+            )
+        })
+    }
+}
+
+impl Drop for LoadedModule {
+    fn drop(&mut self) {
+        if self.handle.is_null() {
+            return;
+        }
+        let result = unsafe {
+            let mut previous: Handle = std::ptr::null_mut();
+            let had_previous = (self.driver.get_context)(&mut previous) == 0;
+            let outcome = self
+                .driver
+                .check("cuCtxSetCurrent", (self.driver.set_context)(self.context as Handle))
+                .and_then(|()| {
+                    self.driver
+                        .check("cuModuleUnload", (self.driver.module_unload)(self.handle))
+                });
+            if had_previous && previous != self.context as Handle {
+                let _ = (self.driver.set_context)(previous);
+            }
+            outcome
+        };
+        if let Err(error) = result {
+            eprintln!("warning: cannot unload CUDA module: {error}");
+        }
     }
 }
 

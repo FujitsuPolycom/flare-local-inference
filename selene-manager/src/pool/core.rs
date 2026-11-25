@@ -289,6 +289,8 @@ pub struct PoolHandle {
 }
 
 pub(super) struct Session {
+    pub(super) codec: Option<v2::CodecCaps>,
+    pub(super) offered_codec: Option<v2::CodecCaps>,
     pub sid: u64,
     pub instance: InstanceId,
     pub nonce: Nonce,
@@ -611,6 +613,14 @@ impl Core {
         if self.shutting_down.is_some() || self.state == v2::ReadinessState::Draining {
             return refuse(v2::OpenStatus::ShuttingDown, self);
         }
+        let Ok(offered_codec) = flare_selene::shared::packed::canonical_caps(open.codec.as_ref())
+        else {
+            return refuse(v2::OpenStatus::InvalidScope, self);
+        };
+        let codec = offered_codec
+            .as_ref()
+            .filter(|caps| caps.envelope_revision == flare_selene::shared::packed::REVISION)
+            .cloned();
         if open.manager_incarnation != self.incarnation {
             return refuse(v2::OpenStatus::StaleManager, self);
         }
@@ -645,8 +655,9 @@ impl Core {
         let claim_slots = open.claim_slots.min(limits.max_claims_in_flight);
 
         if let Some(old) = self.instances.get(&instance).and_then(|i| i.current) {
-            // The same process reconnecting keeps its agents; another process does not.
-            self.reconnecting = Some((instance, nonce));
+            // Retain live ranks only when their capabilities still match.
+            self.reconnecting =
+                (self.sessions[&old].offered_codec == offered_codec).then_some((instance, nonce));
             self.close_session(
                 old,
                 v2::ClosingReason::ClosingSuperseded,
@@ -695,6 +706,8 @@ impl Core {
         self.sessions.insert(
             sid,
             Session {
+                offered_codec,
+                codec: codec.clone(),
                 sid,
                 instance,
                 nonce,
@@ -717,6 +730,7 @@ impl Core {
         self.send(
             sid,
             M::Opened(v2::SessionOpened {
+                codec,
                 status: v2::OpenStatus::OpenOk as i32,
                 session_incarnation: sid,
                 scope_id,

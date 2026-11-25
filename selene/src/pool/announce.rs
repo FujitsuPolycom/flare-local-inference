@@ -37,6 +37,8 @@ pub struct IndexEntry {
     pub row: bool,
     pub tier: Tier,
     pub bytes: u64,
+    pub packed: bool,
+    pub required_profiles: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -255,6 +257,8 @@ mod tests {
             row: true,
             tier,
             bytes: 4096,
+            packed: false,
+            required_profiles: Vec::new(),
         }
     }
 

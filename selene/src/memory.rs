@@ -33,6 +33,8 @@
 //! supplies chains, and `fetch_chain` reads page counts from the slots. Such a
 //! store answers no lookups of its own.
 
+#[cfg(feature = "codec")]
+use std::sync::{Condvar, Mutex, mpsc};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::{Arc, PoisonError},
@@ -63,6 +65,145 @@ use super::{
 /// Windows of one record submitted to the transfer threads at a time.
 pub const IN_FLIGHT_WINDOWS: usize = crate::shared::WINDOW_CREDITS as usize;
 
+/// Compact packed unit directory stored tightly inside a [`MemoryRecord`]'s slabs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackedMemory {
+    pub first_page: u64,
+    pub page_count: usize,
+    pub pages: Vec<(crate::shared::wire::PackedUnit, usize)>,
+    pub row: Option<Vec<(crate::shared::wire::PackedUnit, usize)>>,
+}
+
+impl PackedMemory {
+    pub fn stored_bytes(&self, row: bool) -> u64 {
+        let pages: u64 = self.pages.iter().map(|(u, _)| u.stored_length).sum();
+        let row_bytes: u64 = if row {
+            self.row
+                .as_ref()
+                .map_or(0, |r| r.iter().map(|(u, _)| u.stored_length).sum())
+        } else {
+            0
+        };
+        pages + row_bytes
+    }
+
+    pub fn required_profiles(&self, row: bool) -> Vec<Vec<u8>> {
+        let row_units = if row {
+            self.row.as_deref().unwrap_or(&[])
+        } else {
+            &[]
+        };
+        let mut profiles: Vec<Vec<u8>> = self
+            .pages
+            .iter()
+            .chain(row_units)
+            .filter(|(u, _)| {
+                u.representation
+                    == crate::shared::wire::packed_unit::Representation::Packet as i32
+            })
+            .map(|(u, _)| u.profile.clone())
+            .collect();
+        profiles.sort_unstable();
+        profiles.dedup();
+        profiles
+    }
+}
+
+/// Map byte range `[offset..offset + len)` across `slab_addrs` into contiguous `(addr, len)` spans.
+pub(crate) fn slab_spans(
+    slab_addrs: &[usize],
+    slab_bytes: usize,
+    mut offset: usize,
+    mut len: usize,
+) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    while len > 0 {
+        let idx = offset / slab_bytes;
+        let within = offset % slab_bytes;
+        let take = len.min(slab_bytes - within);
+        out.push((slab_addrs[idx] + within, take));
+        offset += take;
+        len -= take;
+    }
+    out
+}
+
+/// Copy `dst.len()` bytes starting at `offset` out of pinned slabs.
+pub(crate) fn read_from_slabs(
+    slab_addrs: &[usize],
+    slab_bytes: usize,
+    offset: usize,
+    dst: &mut [u8],
+) {
+    let mut pos = 0usize;
+    for (addr, len) in slab_spans(slab_addrs, slab_bytes, offset, dst.len()) {
+        // SAFETY: the caller holds a pin on the record's slabs.
+        let src = unsafe { std::slice::from_raw_parts(addr as *const u8, len) };
+        dst[pos..pos + len].copy_from_slice(src);
+        pos += len;
+    }
+}
+
+/// Write packed units sequentially from offset 0 into `slab_addrs`, returning
+/// `(directory, slabs_kept)`. Callers pass `parallel = false` while holding the
+/// pool handle on the store thread and `parallel = true` on the background host-codec
+/// worker thread.
+///
+/// # Safety
+/// The caller must hold exclusive ownership of `slab_addrs` (an unpublished, pinned
+/// record) and have finished any reads from those slabs.
+unsafe fn write_packed_into_slabs(
+    slab_addrs: &[usize],
+    slab_bytes: usize,
+    items: &[(&crate::shared::wire::PackedUnit, &[u8])],
+    parallel: bool,
+) -> (Vec<(crate::shared::wire::PackedUnit, usize)>, usize) {
+    let mut dir = Vec::with_capacity(items.len());
+    let mut writes = Vec::with_capacity(items.len());
+    let mut offset = 0usize;
+    for &(unit, bytes) in items {
+        dir.push((unit.clone(), offset));
+        writes.push((offset, bytes));
+        offset += bytes.len();
+    }
+    #[cfg(feature = "codec")]
+    if parallel {
+        use rayon::prelude::*;
+        writes.par_iter().for_each(|&(start, bytes)| {
+            // SAFETY: exclusive ownership guaranteed by caller; each unit writes
+            // a strictly disjoint byte range inside `slab_addrs[..keep]`.
+            unsafe {
+                crate::codec_copy::write_to_slabs(slab_addrs, slab_bytes, start, bytes);
+            }
+        });
+        return (dir, offset.div_ceil(slab_bytes));
+    }
+    #[cfg(not(feature = "codec"))]
+    let _ = parallel;
+    for &(start, bytes) in &writes {
+        // SAFETY: exclusive ownership guaranteed by caller.
+        unsafe {
+            crate::codec_copy::write_to_slabs(slab_addrs, slab_bytes, start, bytes);
+        }
+    }
+    let keep = offset.div_ceil(slab_bytes);
+    (dir, keep)
+}
+
+fn pack_slices_into_slabs(
+    pool: &SlabPool,
+    slots: &mut Vec<Slot>,
+    items: &[(&crate::shared::wire::PackedUnit, &[u8])],
+) -> Vec<(crate::shared::wire::PackedUnit, usize)> {
+    let addrs: Vec<usize> = slots.iter().map(|&s| pool.slot_address(s)).collect();
+    // SAFETY: this unpublished record exclusively owns these slots.
+    let (dir, keep) = unsafe { write_packed_into_slabs(&addrs, pool.page_bytes(), items, false) };
+    if keep < slots.len() {
+        pool.release(slots.drain(keep..));
+    }
+    dir
+}
+
 /// Slabs holding one record. `durable` is set by the composite once the disk
 /// copy is complete; a standalone memory store treats every record as durable.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,9 +213,16 @@ pub struct MemoryRecord {
     pub row: Option<Vec<Slot>>,
     pub durable: bool,
     pub replication: crate::record::Replication,
+    pub packed: Option<Arc<PackedMemory>>,
 }
 
 impl MemoryRecord {
+    pub(crate) fn page_count(&self) -> usize {
+        self.packed
+            .as_ref()
+            .map_or(self.pages.len(), |p| p.page_count)
+    }
+
     pub(crate) fn slots(&self) -> usize {
         self.pages.chunk_by(|a, b| a == b).count() + self.row.as_ref().map_or(0, Vec::len)
     }
@@ -159,6 +307,9 @@ struct Outbound {
     refill: bool,
     checkpoint: CheckpointId,
     key: PrefixKey,
+    first_page: u64,
+    tail_pages: usize,
+    captures: Vec<Arc<crate::codec_copy::CaptureWindow>>,
     pending: Pending,
 }
 
@@ -185,6 +336,10 @@ struct Core {
     /// Every node is a root; the composite's disk index owns the tree.
     flat: bool,
     pack_shares: bool,
+    codec_enabled: bool,
+    async_host_codec: bool,
+    compressing: HashSet<PrefixKey>,
+    pending_compress: VecDeque<CompressTask>,
     outbound: BTreeMap<JobId, Outbound>,
     inbound: BTreeMap<JobId, Inbound>,
     /// Publications waiting for the copy-out of the named parent key.
@@ -237,6 +392,10 @@ impl Core {
             identity,
             flat,
             pack_shares,
+            codec_enabled: false,
+            async_host_codec: false,
+            compressing: HashSet::new(),
+            pending_compress: VecDeque::new(),
             outbound: BTreeMap::new(),
             inbound: BTreeMap::new(),
             deferred: Vec::new(),
@@ -440,13 +599,41 @@ impl Core {
             .row
             .as_ref()
             .map(|slots| (checkpoint.slot, self.pool.addresses(slots)));
-        let queued = windows(id, Direction::Out, pages, row);
+        let mut queued = windows(id, Direction::Out, pages, row);
+        let first_page =
+            (checkpoint.key.consumed_tokens / self.layout.page_tokens).saturating_sub(tail.len() as u64);
+        let mut captures = Vec::new();
+        if self.codec_enabled && !self.async_host_codec {
+            debug_assert!(self.pool.rank_parts().is_none());
+            let page_addrs = self.pool.addresses(&record.pages);
+            let row_addrs = record
+                .row
+                .as_ref()
+                .map(|slots| self.pool.addresses(slots))
+                .unwrap_or_default();
+            let direct_capture = Arc::new(crate::codec_copy::CaptureWindow::with_slabs(
+                page_addrs,
+                row_addrs,
+                self.pool.page_bytes(),
+            ));
+            let mut page_cursor = first_page;
+            for job in &mut queued {
+                let win =
+                    crate::codec_copy::Window::capture_shared(page_cursor, direct_capture.clone());
+                page_cursor += job.pages.len() as u64;
+                job.codec = Some(win);
+            }
+            captures.push(direct_capture);
+        }
         self.outbound.insert(
             id,
             Outbound {
                 refill: false,
                 checkpoint: checkpoint.id,
                 key: checkpoint.key,
+                first_page,
+                tail_pages: tail.len(),
+                captures,
                 pending: Pending::new(queued),
             },
         );
@@ -476,6 +663,7 @@ impl Core {
             row: row.then_some(row_slots),
             durable,
             replication: Default::default(),
+            packed: None,
         };
         // The index requires a root's tail to cover its whole chain; a flat
         // store's roots hold only their checkpoint's tail, so their count is
@@ -550,17 +738,39 @@ impl Core {
         let addresses = self.pool.addresses(&slots);
         self.index[&key].location.row = Some(slots);
         let id = self.next_job();
-        let queued = windows(
+        let mut queued = windows(
             id,
             Direction::Out,
             std::iter::empty(),
-            Some((checkpoint.slot, addresses)),
+            Some((checkpoint.slot, addresses.clone())),
         );
+        let mut captures = Vec::new();
+        if self.codec_enabled
+            && !self.async_host_codec
+            && self.index[&key].location.packed.is_some()
+        {
+            debug_assert!(self.pool.rank_parts().is_none());
+            let direct_capture = Arc::new(crate::codec_copy::CaptureWindow::with_slabs(
+                Vec::new(),
+                addresses,
+                self.pool.page_bytes(),
+            ));
+            for job in &mut queued {
+                job.codec = Some(crate::codec_copy::Window::capture_shared(
+                    0,
+                    direct_capture.clone(),
+                ));
+            }
+            captures.push(direct_capture);
+        }
         self.outbound.insert(
             id,
             Outbound {
                 checkpoint: checkpoint.id,
                 key,
+                first_page: 0,
+                tail_pages: 0,
+                captures,
                 refill: true,
                 pending: Pending::new(queued),
             },
@@ -758,7 +968,7 @@ impl Core {
 
     fn complete_record(&mut self, key: &PrefixKey, success: bool) -> Result<()> {
         if success && self.index.node(key).is_some_and(|node| !node.ready) {
-            if self.pack_shares {
+            if self.pack_shares && self.index[key].location.packed.is_none() {
                 self.pack_shares(key);
             }
             let r = self.index[key].location.replication;
@@ -842,6 +1052,9 @@ impl Core {
         let record = &mut self.index.node_mut(key).unwrap().location;
         let row = record.row.take();
         record.replication.row = false;
+        if let Some(packed) = record.packed.as_mut() {
+            Arc::make_mut(packed).row = None;
+        }
         self.clean_slots -= clean;
         self.clean_slots += self.clean_slots(&self.index[key]);
         if let Some(row) = row {
@@ -969,6 +1182,14 @@ impl Core {
         {
             return Err(invalid("an inbound transfer for this key is in flight"));
         }
+        let any_packed = chain.nodes.iter().any(|key| {
+            self.index
+                .node(key)
+                .is_some_and(|n| n.ready && n.location.packed.is_some())
+        });
+        if any_packed {
+            return self.fetch_mixed_chain(chain, ticket);
+        }
         let mut slots = Vec::with_capacity(chain.pages);
         let id = self.next_job();
         let mut groups: Vec<(bool, Vec<(PageId, usize)>)> = Vec::new();
@@ -1061,6 +1282,159 @@ impl Core {
         Ok(())
     }
 
+    fn fetch_mixed_chain(&mut self, chain: &Match, ticket: InboundTicket) -> Result<()> {
+        let Some((last, _)) = chain.nodes.split_last() else {
+            return Err(invalid("host chain names no records"));
+        };
+        let slab_bytes = self.pool.page_bytes();
+        let mut total_pages = 0usize;
+        for (position, key) in chain.nodes.iter().enumerate() {
+            let node = self
+                .index
+                .node(key)
+                .filter(|n| n.ready)
+                .ok_or_else(|| invalid("host chain names an unready record"))?;
+            let skip = if position == 0 { chain.skip_pages } else { 0 };
+            let page_count = node.location.page_count();
+            if skip > page_count {
+                return Err(invalid("host chain skips beyond record pages"));
+            }
+            if key == last && node.location.row.is_none() {
+                return Err(invalid("host chain endpoint has no row"));
+            }
+            total_pages += page_count - skip;
+        }
+        if total_pages != ticket.pages.len() || total_pages != chain.pages {
+            return Err(invalid("mixed host chain disagrees with ticket pages"));
+        }
+        for (pinned, key) in chain.nodes.iter().enumerate() {
+            if let Err(error) = self.pin_record(key) {
+                for key in &chain.nodes[..pinned] {
+                    let _ = self.unpin_record(key);
+                }
+                return Err(error);
+            }
+        }
+        let id = self.next_job();
+        let mut queued = VecDeque::new();
+        let mut page_offset = 0usize;
+        for (position, key) in chain.nodes.iter().enumerate() {
+            let node = self.index.node(key).unwrap();
+            let record = &node.location;
+            let skip = if position == 0 { chain.skip_pages } else { 0 };
+            let count = record.page_count() - skip;
+            let is_last = key == last;
+            let ids = &ticket.pages[page_offset..page_offset + count];
+            page_offset += count;
+            if let Some(packed) = &record.packed {
+                let page_addrs = self.pool.addresses(&record.pages);
+                let start = packed.first_page + skip as u64;
+                let end = packed.first_page + packed.page_count as u64;
+                let page_packets: Vec<_> = packed
+                    .pages
+                    .iter()
+                    .filter(|(u, _)| u.logical_index >= start && u.logical_index < end)
+                    .map(|(u, off)| crate::codec_copy::PinnedPacket {
+                        unit: u.clone(),
+                        spans: slab_spans(&page_addrs, slab_bytes, *off, u.stored_length as usize),
+                    })
+                    .collect();
+                let row_packets: Vec<_> = if is_last {
+                    let row_addrs = self.pool.addresses(record.row.as_ref().unwrap());
+                    packed
+                        .row
+                        .as_ref()
+                        .unwrap()
+                        .iter()
+                        .map(|(u, off)| crate::codec_copy::PinnedPacket {
+                            unit: u.clone(),
+                            spans: slab_spans(&row_addrs, slab_bytes, *off, u.stored_length as usize),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                if ids.is_empty() && is_last {
+                    queued.push_back(Job {
+                        codec: Some(crate::codec_copy::Window::restore_pinned(0, row_packets)),
+                        replication: Default::default(),
+                        id,
+                        window: queued.len() as u32,
+                        direction: Direction::In,
+                        pages: Vec::new(),
+                        row: Some((ticket.slot, vec![0])),
+                    });
+                } else {
+                    let chunks: Vec<_> = ids.chunks(WINDOW_PAGES).collect();
+                    let mut logical_cursor = start;
+                    for (idx, chunk) in chunks.iter().enumerate() {
+                        let win_end = logical_cursor + chunk.len() as u64;
+                        let mut packets: Vec<_> = page_packets
+                            .iter()
+                            .filter(|p| {
+                                p.unit.logical_index >= logical_cursor
+                                    && p.unit.logical_index < win_end
+                            })
+                            .cloned()
+                            .collect();
+                        let row = if is_last && idx + 1 == chunks.len() {
+                            packets.extend(row_packets.iter().cloned());
+                            Some((ticket.slot, vec![0]))
+                        } else {
+                            None
+                        };
+                        queued.push_back(Job {
+                            codec: Some(crate::codec_copy::Window::restore_pinned(
+                                logical_cursor,
+                                packets,
+                            )),
+                            replication: Default::default(),
+                            id,
+                            window: queued.len() as u32,
+                            direction: Direction::In,
+                            pages: chunk.iter().map(|&p| (p, 0)).collect(),
+                            row,
+                        });
+                        logical_cursor = win_end;
+                    }
+                }
+            } else {
+                let addresses = record.page_addresses(&self.pool, &self.layout, skip);
+                let row = is_last.then(|| {
+                    (
+                        ticket.slot,
+                        self.pool.addresses(record.row.as_ref().unwrap()),
+                    )
+                });
+                let mut group = windows(
+                    id,
+                    Direction::In,
+                    ids.iter().copied().zip(addresses),
+                    row,
+                );
+                for job in &mut group {
+                    job.replication = crate::record::Replication {
+                        pages: record.replication.pages,
+                        row: record.replication.row && job.row.is_some(),
+                    };
+                    job.window += queued.len() as u32;
+                }
+                queued.extend(group);
+            }
+        }
+        self.inbound_rate.started();
+        self.inbound.insert(
+            id,
+            Inbound {
+                key: ticket.key,
+                nodes: chain.nodes.clone(),
+                tokens: chain.consumed_tokens.saturating_sub(chain.resident_tokens),
+                pending: Pending::new(queued),
+            },
+        );
+        Ok(())
+    }
+
     /// Account for one completed window; a reply for a job this store did not
     /// submit is ignored.
     fn absorb(&mut self, reply: Reply) {
@@ -1138,12 +1512,62 @@ impl Core {
         let Outbound {
             checkpoint,
             key,
+            first_page,
+            tail_pages,
+            captures,
             pending,
             refill,
         } = outbound;
         let result = if refill {
             let result = match pending.error {
                 None => {
+                    if self.async_host_codec && self.index[&key].location.packed.is_some() {
+                        let row_addrs = self.index[&key]
+                            .location
+                            .row
+                            .as_ref()
+                            .map(|slots| self.pool.addresses(slots));
+                        self.compressing.insert(key);
+                        self.pending_compress.push_back(CompressTask {
+                            checkpoint,
+                            key,
+                            refill: true,
+                            raw_bytes: pending.bytes,
+                            first_page: 0,
+                            tail_pages: 0,
+                            page_addrs: Vec::new(),
+                            row_addrs,
+                        });
+                        return;
+                    } else if let Some(direct) = captures.first().and_then(|c| c.take_direct()) {
+                        match direct {
+                            Ok((_, _, row_dir, row_keep)) => {
+                                let row_slots = self.index[&key].location.row.as_mut().unwrap();
+                                if row_keep < row_slots.len() {
+                                    self.pool.release(row_slots.drain(row_keep..));
+                                }
+                                if let Some(packed) = self.index[&key].location.packed.as_mut() {
+                                    Arc::make_mut(packed).row = Some(row_dir);
+                                }
+                            }
+                            Err(msg) => {
+                                self.pool
+                                    .release(self.index[&key].location.row.take().unwrap());
+                                self.stats.store_failed += 1;
+                                self.index
+                                    .set_ready(&key, true)
+                                    .expect("refill holds the indexed record");
+                                self.unpin_record(&key).expect("refill owns a pin");
+                                events.push(StoreEvent::Stored {
+                                    checkpoint,
+                                    key,
+                                    result: Err(invalid(msg)),
+                                });
+                                self.start_deferred(&key, events);
+                                return;
+                            }
+                        }
+                    }
                     self.index[&key].row = true;
                     self.stats.row_refills += 1;
                     self.stats.bytes_out += pending.bytes;
@@ -1163,14 +1587,75 @@ impl Core {
             result
         } else {
             match pending.error {
-                None => match self.complete_record(&key, true) {
-                    Ok(()) => {
-                        self.stats.stored += 1;
-                        self.stats.bytes_out += pending.bytes;
-                        Ok(pending.bytes)
+                None => {
+                    if self.async_host_codec {
+                        let page_addrs = self.pool.addresses(&self.index[&key].location.pages);
+                        zero_raw_page_gaps(&self.layout, &page_addrs);
+                        let row_addrs = self.index[&key]
+                            .location
+                            .row
+                            .as_ref()
+                            .map(|slots| self.pool.addresses(slots));
+                        self.compressing.insert(key);
+                        self.pending_compress.push_back(CompressTask {
+                            checkpoint,
+                            key,
+                            refill: false,
+                            raw_bytes: pending.bytes,
+                            first_page,
+                            tail_pages,
+                            page_addrs,
+                            row_addrs,
+                        });
+                        return;
+                    } else {
+                        let mut direct_err = None;
+                        if let Some(direct) = captures.first().and_then(|c| c.take_direct()) {
+                            let node = self.index.node_mut(&key).unwrap();
+                            let page_count = tail_pages;
+                            let record = &mut node.location;
+                            match direct {
+                                Ok((page_dir, page_keep, row_dir, row_keep)) => {
+                                    if page_keep < record.pages.len() {
+                                        self.pool.release(record.pages.drain(page_keep..));
+                                    }
+                                    let row_dir = record.row.as_mut().map(|row_slots| {
+                                        if row_keep < row_slots.len() {
+                                            self.pool.release(row_slots.drain(row_keep..));
+                                        }
+                                        row_dir
+                                    });
+                                    record.packed = Some(Arc::new(PackedMemory {
+                                        first_page,
+                                        page_count,
+                                        pages: page_dir,
+                                        row: row_dir,
+                                    }));
+                                }
+                                Err(msg) => {
+                                    direct_err = Some(invalid(msg));
+                                }
+                            }
+                        }
+                        if let Some(error) = direct_err {
+                            self.stats.store_failed += 1;
+                            if let Err(removal) = self.complete_record(&key, false) {
+                                Err(invalid(format!("{error}; {removal}")))
+                            } else {
+                                Err(error)
+                            }
+                        } else {
+                            match self.complete_record(&key, true) {
+                                Ok(()) => {
+                                    self.stats.stored += 1;
+                                    self.stats.bytes_out += pending.bytes;
+                                    Ok(pending.bytes)
+                                }
+                                Err(error) => Err(error),
+                            }
+                        }
                     }
-                    Err(error) => Err(error),
-                },
+                }
                 Some(error) => {
                     self.stats.store_failed += 1;
                     if let Err(removal) = self.complete_record(&key, false) {
@@ -1345,6 +1830,7 @@ fn windows(
     while let Some(chunk) = chunks.next() {
         let last = chunks.peek().is_none();
         queued.push_back(Job {
+            codec: None,
             replication: Default::default(),
             id,
             window: queued.len() as u32,
@@ -1355,6 +1841,7 @@ fn windows(
     }
     if queued.is_empty() && row.is_some() {
         queued.push_back(Job {
+            codec: None,
             replication: Default::default(),
             id,
             window: 0,
@@ -1383,10 +1870,351 @@ impl Drop for Announce {
     }
 }
 
+#[cfg(feature = "codec")]
+fn host_compress_pool() -> Result<&'static rayon::ThreadPool> {
+    crate::shared::codec::cpu_pool().map_err(|e| invalid(e.to_string()))
+}
+
+fn zero_raw_page_gaps(layout: &Layout, page_addrs: &[usize]) {
+    for &slab in page_addrs {
+        for (r, rank) in layout.ranks.iter().enumerate() {
+            let share = layout.page_share(r) as usize;
+            let base = slab + rank.page_offset as usize;
+            let mut cursor = 0usize;
+            for (&off, &len) in rank.plane_offsets.iter().zip(&rank.plane_bytes) {
+                let start = off as usize;
+                let end = start + len as usize;
+                if start > cursor {
+                    // SAFETY: outbound owns these pinned, unpublished raw slabs.
+                    unsafe {
+                        std::ptr::write_bytes((base + cursor) as *mut u8, 0, start - cursor);
+                    }
+                }
+                cursor = end;
+            }
+            if share > cursor {
+                // SAFETY: outbound owns these pinned, unpublished raw slabs.
+                unsafe {
+                    std::ptr::write_bytes((base + cursor) as *mut u8, 0, share - cursor);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "codec")]
+#[derive(Default)]
+struct CompressScratch {
+    page_out: Vec<Vec<u8>>,
+    row_raw: Vec<Vec<u8>>,
+    row_out: Vec<Vec<u8>>,
+}
+
+#[cfg_attr(not(feature = "codec"), allow(dead_code))]
+struct CompressTask {
+    checkpoint: CheckpointId,
+    key: PrefixKey,
+    refill: bool,
+    raw_bytes: u64,
+    first_page: u64,
+    tail_pages: usize,
+    page_addrs: Vec<usize>,
+    row_addrs: Option<Vec<usize>>,
+}
+
+#[cfg(feature = "codec")]
+struct PackedDirs {
+    page_dir: Vec<(crate::shared::wire::PackedUnit, usize)>,
+    page_keep: usize,
+    row_dir: Option<(Vec<(crate::shared::wire::PackedUnit, usize)>, usize)>,
+}
+
+#[cfg(feature = "codec")]
+struct CompressedRecord {
+    checkpoint: CheckpointId,
+    key: PrefixKey,
+    refill: bool,
+    raw_bytes: u64,
+    first_page: u64,
+    tail_pages: usize,
+    scratch: CompressScratch,
+    result: std::result::Result<PackedDirs, String>,
+}
+
+#[cfg(feature = "codec")]
+struct AsyncCompressor {
+    encoder: crate::codec_copy::HostEncoder,
+    layout: Arc<Layout>,
+    slab_bytes: usize,
+    tx: mpsc::Sender<CompressedRecord>,
+    rx: mpsc::Receiver<CompressedRecord>,
+    active: Arc<(Mutex<usize>, Condvar)>,
+    scratch: Option<CompressScratch>,
+    queue: VecDeque<CompressTask>,
+}
+
+#[cfg(feature = "codec")]
+impl AsyncCompressor {
+    fn new(encoder: crate::codec_copy::HostEncoder, layout: Arc<Layout>, slab_bytes: usize) -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self {
+            encoder,
+            layout,
+            slab_bytes,
+            tx,
+            rx,
+            active: Arc::new((Mutex::new(0), Condvar::new())),
+            scratch: Some(CompressScratch::default()),
+            queue: VecDeque::new(),
+        }
+    }
+
+    fn is_idle(&self) -> bool {
+        self.queue.is_empty()
+            && *self.active.0.lock().unwrap_or_else(PoisonError::into_inner) == 0
+    }
+
+    fn pump_spawns(&mut self) {
+        let Some(scratch) = self.scratch.take() else {
+            return;
+        };
+        let Some(task) = self.queue.pop_front() else {
+            self.scratch = Some(scratch);
+            return;
+        };
+        let Ok(pool) = host_compress_pool() else {
+            self.scratch = Some(scratch);
+            let _ = self.tx.send(CompressedRecord {
+                checkpoint: task.checkpoint,
+                key: task.key,
+                refill: task.refill,
+                raw_bytes: task.raw_bytes,
+                first_page: task.first_page,
+                tail_pages: task.tail_pages,
+                scratch: CompressScratch::default(),
+                result: Err("host KV compression pool unavailable".into()),
+            });
+            return;
+        };
+        {
+            let mut active = self.active.0.lock().unwrap_or_else(PoisonError::into_inner);
+            *active += 1;
+        }
+        let encoder = self.encoder.clone();
+        let layout = self.layout.clone();
+        let slab_bytes = self.slab_bytes;
+        let tx = self.tx.clone();
+        let active = self.active.clone();
+        pool.spawn(move || {
+            let record = encode_host_task(pool, &encoder, &layout, slab_bytes, scratch, task);
+            let _ = tx.send(record);
+            let mut count = active.0.lock().unwrap_or_else(PoisonError::into_inner);
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                active.1.notify_all();
+            }
+        });
+    }
+}
+
+#[cfg(feature = "codec")]
+impl Drop for AsyncCompressor {
+    fn drop(&mut self) {
+        let mut count = self.active.0.lock().unwrap_or_else(PoisonError::into_inner);
+        while *count > 0 {
+            count = self
+                .active
+                .1
+                .wait(count)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+#[cfg(feature = "codec")]
+fn encode_host_task(
+    pool: &rayon::ThreadPool,
+    encoder: &crate::codec_copy::HostEncoder,
+    layout: &Layout,
+    slab_bytes: usize,
+    mut scratch: CompressScratch,
+    task: CompressTask,
+) -> CompressedRecord {
+    use crate::shared::wire::{PackedUnit, packed_unit::Kind};
+    use rayon::prelude::*;
+
+    let start = Instant::now();
+    let ranks = layout.ranks.len();
+    let page_jobs = task.page_addrs.len() * ranks;
+
+    let mut stored_bytes = 0u64;
+    let encode_result = (|| -> std::result::Result<PackedDirs, String> {
+        let (page_dir, page_keep) = if page_jobs > 0 {
+            let max_pkt = encoder.page.max_packet();
+            if scratch.page_out.len() < page_jobs {
+                scratch.page_out.resize_with(page_jobs, || vec![0u8; max_pkt]);
+            }
+            for buf in &mut scratch.page_out[..page_jobs] {
+                if buf.len() < max_pkt {
+                    buf.resize(max_pkt, 0);
+                }
+            }
+            let results: Vec<std::result::Result<(PackedUnit, usize), String>> = scratch.page_out
+                [..page_jobs]
+                .par_iter_mut()
+                .enumerate()
+                .map(|(idx, out)| {
+                    let p = idx / ranks;
+                    let r = idx % ranks;
+                    let share = layout.page_share(r) as usize;
+                    let ptr = (task.page_addrs[p] + layout.ranks[r].page_offset as usize)
+                        as *const u8;
+                    // SAFETY: unpublished pinned record exclusively owned by this task.
+                    let raw = unsafe { std::slice::from_raw_parts(ptr, share) };
+                    let base = PackedUnit {
+                        kind: Kind::Page as i32,
+                        logical_index: task.first_page + p as u64,
+                        stored_rank: r as u32,
+                        ..Default::default()
+                    };
+                    encoder
+                        .page
+                        .encode_capture(base, &encoder.profile, raw, out, None)
+                        .map_err(|e| e.to_string())
+                })
+                .collect();
+            let mut order: Vec<(usize, PackedUnit, usize)> = Vec::with_capacity(page_jobs);
+            for (idx, res) in results.into_iter().enumerate() {
+                let (unit, used) = res?;
+                stored_bytes += unit.stored_length;
+                order.push((idx, unit, used));
+            }
+            order.sort_by_key(|(_, u, _)| (u.kind, u.logical_index, u.stored_rank));
+            let slices: Vec<(&PackedUnit, &[u8])> = order
+                .iter()
+                .map(|(idx, unit, used)| (unit, &scratch.page_out[*idx][..*used]))
+                .collect();
+            // SAFETY: all raw page reads have finished; we now compact into `task.page_addrs`.
+            unsafe { write_packed_into_slabs(&task.page_addrs, slab_bytes, &slices, true) }
+        } else {
+            (Vec::new(), 0)
+        };
+
+        let row_dir = if let Some(row_addrs) = &task.row_addrs {
+            let max_pkt = encoder.row.max_packet();
+            let row_orig = encoder.row.original_bytes();
+            if scratch.row_raw.len() < ranks {
+                scratch.row_raw.resize_with(ranks, || vec![0u8; row_orig]);
+            }
+            if scratch.row_out.len() < ranks {
+                scratch.row_out.resize_with(ranks, || vec![0u8; max_pkt]);
+            }
+            for buf in &mut scratch.row_raw[..ranks] {
+                if buf.len() != row_orig {
+                    buf.resize(row_orig, 0);
+                }
+            }
+            for buf in &mut scratch.row_out[..ranks] {
+                if buf.len() < max_pkt {
+                    buf.resize(max_pkt, 0);
+                }
+            }
+            let results: Vec<std::result::Result<(PackedUnit, usize), String>> = scratch.row_raw
+                [..ranks]
+                .par_iter_mut()
+                .zip(scratch.row_out[..ranks].par_iter_mut())
+                .enumerate()
+                .map(|(r, (raw, out))| {
+                    let share = layout.page_share(r) as usize;
+                    let row_bytes = layout.ranks[r].row_bytes as usize;
+                    let mut off = 0usize;
+                    for &slot_addr in row_addrs {
+                        if off >= row_bytes {
+                            break;
+                        }
+                        let take = (row_bytes - off).min(share);
+                        let src =
+                            (slot_addr + layout.ranks[r].page_offset as usize) as *const u8;
+                        // SAFETY: unpublished pinned row slabs exclusively owned by this task.
+                        let slice = unsafe { std::slice::from_raw_parts(src, take) };
+                        raw[off..off + take].copy_from_slice(slice);
+                        off += take;
+                    }
+                    if row_orig > row_bytes {
+                        raw[row_bytes..row_orig].fill(0);
+                    }
+                    let base = PackedUnit {
+                        kind: Kind::Row as i32,
+                        logical_index: 0,
+                        stored_rank: r as u32,
+                        ..Default::default()
+                    };
+                    encoder
+                        .row
+                        .encode_capture(base, &encoder.profile, raw, out, Some(pool))
+                        .map_err(|e| e.to_string())
+                })
+                .collect();
+            let mut order: Vec<(usize, PackedUnit, usize)> = Vec::with_capacity(ranks);
+            for (r, res) in results.into_iter().enumerate() {
+                let (unit, used) = res?;
+                stored_bytes += unit.stored_length;
+                order.push((r, unit, used));
+            }
+            order.sort_by_key(|(_, u, _)| (u.kind, u.logical_index, u.stored_rank));
+            let slices: Vec<(&PackedUnit, &[u8])> = order
+                .iter()
+                .map(|(r, unit, used)| (unit, &scratch.row_out[*r][..*used]))
+                .collect();
+            // SAFETY: all raw row reads have finished; we now compact into `row_addrs`.
+            Some(unsafe { write_packed_into_slabs(row_addrs, slab_bytes, &slices, true) })
+        } else {
+            None
+        };
+
+        Ok(PackedDirs {
+            page_dir,
+            page_keep,
+            row_dir,
+        })
+    })();
+
+    if let Some(counters) = &encoder.counters {
+        let mut totals = counters.lock().unwrap_or_else(PoisonError::into_inner);
+        totals.transform_ns += start.elapsed().as_nanos() as u64;
+        match &encode_result {
+            Ok(_) => {
+                totals.original_bytes +=
+                    (task.page_addrs.len() * ranks) as u64 * encoder.page.original_bytes() as u64;
+                if task.row_addrs.is_some() {
+                    totals.original_bytes += ranks as u64 * encoder.row.original_bytes() as u64;
+                }
+                totals.stored_bytes += stored_bytes;
+            }
+            Err(_) => {
+                totals.failed_windows += 1;
+            }
+        }
+    }
+
+    CompressedRecord {
+        checkpoint: task.checkpoint,
+        key: task.key,
+        refill: task.refill,
+        raw_bytes: task.raw_bytes,
+        first_page: task.first_page,
+        tail_pages: task.tail_pages,
+        scratch,
+        result: encode_result,
+    }
+}
+
 pub struct MemoryStore {
     pass_through: bool,
-    // Dropped first: the checksum thread reads slots the core frees.
+    // Dropped first: checksum and async compression threads read slots the core frees.
     announce: Option<Announce>,
+    #[cfg(feature = "codec")]
+    compressor: Option<AsyncCompressor>,
     core: Core,
     transfers: SharedCopier,
     /// Reply scratch reused across polls.
@@ -1414,22 +2242,185 @@ impl MemoryStore {
         flat: bool,
         pass_through: bool,
     ) -> Result<Self> {
-        let layout = transfers
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .layout()
-            .clone();
+        #[cfg(feature = "codec")]
+        let (layout, codec_enabled, async_encoder) = {
+            let guard = transfers.lock().unwrap_or_else(PoisonError::into_inner);
+            let async_encoder = if pool.rank_parts().is_none() {
+                guard.async_host_codec()
+            } else {
+                None
+            };
+            (
+                guard.layout().clone(),
+                guard.codec_profile().is_some(),
+                async_encoder,
+            )
+        };
+        #[cfg(not(feature = "codec"))]
+        let (layout, codec_enabled) = {
+            let guard = transfers.lock().unwrap_or_else(PoisonError::into_inner);
+            (guard.layout().clone(), guard.codec_profile().is_some())
+        };
         if pool.page_bytes() as u64 != layout.page_record_bytes {
             return Err(invalid("slot size disagrees with the record layout"));
         }
+        let mut core = Core::new(identity, pool, layout, flat);
+        core.codec_enabled = codec_enabled;
+        #[cfg(feature = "codec")]
+        let compressor = {
+            let slab_bytes = core.pool.page_bytes();
+            async_encoder.map(|enc| {
+                core.async_host_codec = true;
+                core.pack_shares = false;
+                AsyncCompressor::new(enc, core.layout.clone(), slab_bytes)
+            })
+        };
         Ok(Self {
             pass_through,
-            core: Core::new(identity, pool, layout, flat),
+            core,
             announce: None,
+            #[cfg(feature = "codec")]
+            compressor,
             transfers,
             replies: Vec::new(),
             events: Vec::new(),
         })
+    }
+
+    pub(crate) fn compressing_slots(&self) -> usize {
+        self.core
+            .compressing
+            .iter()
+            .filter_map(|key| self.core.index.node(key))
+            .map(|node| node.location.slots())
+            .sum()
+    }
+
+    #[cfg(not(feature = "codec"))]
+    fn drain_compressed(&mut self, _events: &mut Vec<StoreEvent>) {}
+
+    #[cfg(feature = "codec")]
+    fn drain_compressed(&mut self, events: &mut Vec<StoreEvent>) {
+        let mut completed = Vec::new();
+        {
+            let Some(compressor) = self.compressor.as_mut() else {
+                return;
+            };
+            while let Some(task) = self.core.pending_compress.pop_front() {
+                compressor.queue.push_back(task);
+            }
+            while let Ok(done) = compressor.rx.try_recv() {
+                completed.push(done);
+            }
+        }
+        for mut rec in completed {
+            let scratch = std::mem::take(&mut rec.scratch);
+            if let Some(compressor) = self.compressor.as_mut() {
+                compressor.scratch = Some(scratch);
+            }
+            let key = rec.key;
+            let refill = rec.refill;
+            self.apply_compressed(rec, events);
+            if !refill {
+                self.core.start_deferred(&key, events);
+            }
+        }
+        if let Some(compressor) = self.compressor.as_mut() {
+            compressor.pump_spawns();
+        }
+    }
+
+    #[cfg(feature = "codec")]
+    fn apply_compressed(&mut self, rec: CompressedRecord, events: &mut Vec<StoreEvent>) {
+        self.core.compressing.remove(&rec.key);
+        self.core.stats.progress += 1;
+        if self.core.index.node(&rec.key).is_none() {
+            return;
+        }
+        if rec.refill {
+            let result = match rec.result {
+                Ok(dirs) => {
+                    if let (Some(row_slots), Some((row_dir, row_keep))) = (
+                        self.core.index[&rec.key].location.row.as_mut(),
+                        dirs.row_dir,
+                    ) {
+                        if row_keep < row_slots.len() {
+                            self.core.pool.release(row_slots.drain(row_keep..));
+                        }
+                        if let Some(packed) = self.core.index[&rec.key].location.packed.as_mut() {
+                            Arc::make_mut(packed).row = Some(row_dir);
+                        }
+                    }
+                    self.core.index[&rec.key].row = true;
+                    self.core.stats.row_refills += 1;
+                    self.core.stats.bytes_out += rec.raw_bytes;
+                    Ok(rec.raw_bytes)
+                }
+                Err(msg) => {
+                    if let Some(row_slots) = self.core.index[&rec.key].location.row.take() {
+                        self.core.pool.release(row_slots);
+                    }
+                    self.core.stats.store_failed += 1;
+                    Err(invalid(msg))
+                }
+            };
+            let _ = self.core.index.set_ready(&rec.key, true);
+            let _ = self.core.unpin_record(&rec.key);
+            events.push(StoreEvent::Stored {
+                checkpoint: rec.checkpoint,
+                key: rec.key,
+                result,
+            });
+            return;
+        }
+
+        let result = match rec.result {
+            Ok(dirs) => {
+                {
+                    let node = self.core.index.node_mut(&rec.key).unwrap();
+                    let record = &mut node.location;
+                    if dirs.page_keep < record.pages.len() {
+                        self.core.pool.release(record.pages.drain(dirs.page_keep..));
+                    }
+                    let row_dir = match (record.row.as_mut(), dirs.row_dir) {
+                        (Some(row_slots), Some((dir, keep))) => {
+                            if keep < row_slots.len() {
+                                self.core.pool.release(row_slots.drain(keep..));
+                            }
+                            Some(dir)
+                        }
+                        _ => None,
+                    };
+                    record.packed = Some(Arc::new(PackedMemory {
+                        first_page: rec.first_page,
+                        page_count: rec.tail_pages,
+                        pages: dirs.page_dir,
+                        row: row_dir,
+                    }));
+                }
+                match self.core.complete_record(&rec.key, true) {
+                    Ok(()) => {
+                        self.core.stats.stored += 1;
+                        self.core.stats.bytes_out += rec.raw_bytes;
+                        Ok(rec.raw_bytes)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Err(msg) => {
+                self.core.stats.store_failed += 1;
+                if let Err(removal) = self.core.complete_record(&rec.key, false) {
+                    Err(invalid(format!("{msg}; {removal}")))
+                } else {
+                    Err(invalid(msg))
+                }
+            }
+        };
+        events.push(StoreEvent::Stored {
+            checkpoint: rec.checkpoint,
+            key: rec.key,
+            result,
+        });
     }
 
     pub fn flat(&self) -> bool {
@@ -1519,6 +2510,61 @@ impl MemoryStore {
     /// unpinned; on failure it is unpinned, removed, and its slots released.
     pub fn complete_record(&mut self, key: &PrefixKey, success: bool) -> Result<()> {
         self.core.complete_record(key, success)
+    }
+
+    /// Pack a v4 record payload read from disk into an allocated record's slabs and complete it.
+    pub fn complete_packed_record(
+        &mut self,
+        key: &PrefixKey,
+        layout: &crate::shared::packed::Layout,
+        payload: &[u8],
+        row: bool,
+    ) -> Result<()> {
+        let units = layout
+            .units(0, layout.page_count(), row)
+            .ok_or_else(|| invalid("packed layout disagrees with requested record"))?;
+        let mut page_slices = Vec::new();
+        let mut row_slices = Vec::new();
+        let mut cursor = 0usize;
+        for unit in units {
+            let len = usize::try_from(unit.stored_length)
+                .map_err(|_| invalid("packed unit length overflow"))?;
+            let slice = payload
+                .get(cursor..cursor + len)
+                .ok_or_else(|| invalid("packed record payload truncated"))?;
+            cursor += len;
+            if unit.kind == crate::shared::wire::packed_unit::Kind::Page as i32 {
+                page_slices.push((unit, slice));
+            } else {
+                row_slices.push((unit, slice));
+            }
+        }
+        if cursor != payload.len() {
+            return Err(invalid("packed record payload has trailing bytes"));
+        }
+        let node = self
+            .core
+            .index
+            .node_mut(key)
+            .ok_or_else(|| invalid("cannot complete an unindexed packed host record"))?;
+        let record = &mut node.location;
+        let page_dir = pack_slices_into_slabs(&self.core.pool, &mut record.pages, &page_slices);
+        let row_dir = if row {
+            let row_slots = record
+                .row
+                .as_mut()
+                .ok_or_else(|| invalid("packed host record has no row slabs"))?;
+            Some(pack_slices_into_slabs(&self.core.pool, row_slots, &row_slices))
+        } else {
+            None
+        };
+        record.packed = Some(Arc::new(PackedMemory {
+            first_page: layout.offer().first_page,
+            page_count: layout.page_count(),
+            pages: page_dir,
+            row: row_dir,
+        }));
+        self.core.complete_record(key, true)
     }
 
     pub fn mark_durable(&mut self, key: &PrefixKey) -> Result<()> {
@@ -1667,6 +2713,37 @@ impl MemoryStore {
                     let Some(node) = self.core.index.node(&key).filter(|n| n.ready) else {
                         continue;
                     };
+                    if let Some(packed) = node.location.packed.as_ref() {
+                        // Packed records already carry per-unit CRC32 integrity fields.
+                        // Announce them with their packed metadata and required profiles so
+                        // codec-compatible peers can claim directly from DRAM while
+                        // incompatible readers skip them and Cascade retires them packed.
+                        let mut updated = notice;
+                        updated.row = node.row;
+                        let meta = (
+                            packed.stored_bytes(node.row),
+                            packed.required_profiles(node.row),
+                        );
+                        a.view.announce_packed(
+                            &updated,
+                            parent_of(&updated.key, updated.parent),
+                            Some(meta),
+                        );
+                        if !self.core.announced.contains(&key) {
+                            let before = self.core.clean_slots(node);
+                            a.sums.insert(
+                                key,
+                                Arc::new(RecordSums {
+                                    pages: Vec::new(),
+                                    row: None,
+                                }),
+                            );
+                            self.core.announced.insert(key);
+                            let after = self.core.clean_slots(&self.core.index[&key]);
+                            self.core.clean_slots = self.core.clean_slots - before + after;
+                        }
+                        continue;
+                    }
                     debug_assert!(
                         !node.location.replication.row && !node.location.replication.pages
                     );
@@ -1703,8 +2780,15 @@ impl MemoryStore {
                     }
                 }
                 NodeEvent::RowDropped => {
-                    if a.sums.contains_key(&key) {
-                        a.view.announce(&notice, parent_of(&key, notice.parent));
+                    if a.view.contains(&key) && a.sums.contains_key(&key) {
+                        let packed = self
+                            .core
+                            .index
+                            .node(&key)
+                            .and_then(|n| n.location.packed.as_ref())
+                            .map(|p| (p.stored_bytes(false), p.required_profiles(false)));
+                        a.view
+                            .announce_packed(&notice, parent_of(&key, notice.parent), packed);
                     }
                 }
             }
@@ -1742,7 +2826,12 @@ impl MemoryStore {
             if want_row && position + 1 == keys.len() && node.location.row.is_none() {
                 return Err(ExportRefusal::ChainGap);
             }
-            nodes.push((*key, node.location.pages.len()));
+            let page_count = node
+                .location
+                .packed
+                .as_ref()
+                .map_or(node.location.pages.len(), |p| p.page_count);
+            nodes.push((*key, page_count));
             spans.push(MemorySpan {
                 pages: pool.addresses(&node.location.pages),
                 row: node
@@ -1751,6 +2840,8 @@ impl MemoryStore {
                     .as_ref()
                     .map(|slots| pool.addresses(slots)),
                 sums: sums.clone(),
+                packed: node.location.packed.clone(),
+                slab_bytes: pool.page_bytes(),
             });
         }
         let page_tokens = self.core.layout.page_tokens;
@@ -1876,6 +2967,7 @@ impl HostStore for MemoryStore {
 
     fn poll(&mut self, events: &mut Vec<StoreEvent>) -> Result<()> {
         events.append(&mut self.events);
+        self.drain_compressed(events);
         self.transfers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1884,6 +2976,7 @@ impl HostStore for MemoryStore {
             self.core.absorb(reply);
         }
         self.core.settle(events);
+        self.drain_compressed(events);
         self.pump();
         events.append(&mut self.events);
         // Inside a composite the disk index supplies parents, so it flushes.
@@ -1898,7 +2991,7 @@ impl HostStore for MemoryStore {
                 let target = if self.pass_through {
                     self.pool().slot_count()
                 } else {
-                    2 * self.pool().intake_slots()
+                    2 * self.pool().intake_slots() + self.compressing_slots()
                 };
                 self.core.retire_for(self.reserve(target));
             }
@@ -1907,7 +3000,16 @@ impl HostStore for MemoryStore {
     }
 
     fn stats(&self) -> StoreStats {
-        self.core.stats()
+        let mut stats = self.core.stats();
+        if let Some(counters) = self
+            .transfers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .decode_counters()
+        {
+            stats.decode = *counters.lock().unwrap();
+        }
+        stats
     }
 
     /// Wait up to [`CLOSE_TIMEOUT`] for records in transfer to finish, so
@@ -1917,12 +3019,21 @@ impl HostStore for MemoryStore {
     fn close(&mut self) -> Result<()> {
         let deadline = Instant::now() + CLOSE_TIMEOUT;
         let mut events = Vec::new();
-        while !(self.core.outbound.is_empty() && self.core.inbound.is_empty())
-            && Instant::now() < deadline
-        {
+        let busy = |store: &Self| {
+            #[cfg(feature = "codec")]
+            let compressor_idle = store.compressor.as_ref().is_none_or(|c| c.is_idle());
+            #[cfg(not(feature = "codec"))]
+            let compressor_idle = true;
+            !(store.core.outbound.is_empty()
+                && store.core.inbound.is_empty()
+                && store.core.compressing.is_empty()
+                && store.core.pending_compress.is_empty()
+                && compressor_idle)
+        };
+        while busy(self) && Instant::now() < deadline {
             let _ = self.poll(&mut events);
             events.clear();
-            if !(self.core.outbound.is_empty() && self.core.inbound.is_empty()) {
+            if busy(self) {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
@@ -1944,7 +3055,17 @@ impl crate::store::TierStore for MemoryStore {
         let record_bytes = |pages: usize, row: bool| {
             pages as u64 * core.layout.page_record_bytes + u64::from(row) * core.layout.row_record_bytes
         };
-        let resident: u64 = core.index.nodes().map(|node| record_bytes(node.tail_pages, node.row)).sum();
+        let resident: u64 = core
+            .index
+            .nodes()
+            .map(|node| {
+                if let Some(packed) = &node.location.packed {
+                    packed.stored_bytes(node.row)
+                } else {
+                    record_bytes(node.tail_pages, node.row)
+                }
+            })
+            .sum();
         let deferred: u64 = core.deferred.iter().map(|(_, copy)| record_bytes(copy.tail_pages, true)).sum();
         Some((core.index.len() + core.deferred.len(), resident + deferred))
     }
@@ -4723,6 +5844,285 @@ mod tests {
         assert_eq!(gpu.pages.lock().unwrap()[&100], first);
         assert_eq!(gpu.pages.lock().unwrap()[&101], second);
         assert_eq!(gpu.rows.lock().unwrap()[&9], row);
+        store.close().unwrap();
+    }
+
+    #[cfg(feature = "codec")]
+    #[test]
+    fn packed_memory_capture_releases_trailing_slabs_and_restores_exact_bytes() {
+        use crate::shared::codec::Plan;
+
+        let geometry = vec![geometry(PT, &[("kv", PAGE)], PAGE)];
+        let layout = Layout::new(&geometry).unwrap();
+        let gpu = crate::testing::GpuMemory::default();
+        let plan = Arc::new(Plan::new(PAGE as usize, &[]).unwrap());
+        let copier = crate::testing::CodecCopier::new(
+            layout.clone(),
+            [7; 32],
+            plan.clone(),
+            plan,
+            gpu.clone(),
+        )
+        .shared();
+        let pool = SlabPool::new(layout.page_record_bytes, 16, 0).unwrap();
+        let mut store = MemoryStore::new(IDENTITY, pool.clone(), copier).unwrap();
+        let h = history(6 * PT + 3, 1);
+        let checkpoint = published(&h, 6 * PT + 3, None, 0, 1);
+        let expected_pages: Vec<Vec<u8>> = (0..6u32)
+            .map(|p| {
+                (0..PAGE as usize)
+                    .map(|j| ((j / 16 + p as usize) % 4) as u8)
+                    .collect()
+            })
+            .collect();
+        for (p, data) in expected_pages.iter().enumerate() {
+            gpu.pages.lock().unwrap().insert(p as u32, data.clone());
+        }
+        let expected_row: Vec<u8> = (0..PAGE as usize).map(|j| ((j / 32) % 3) as u8).collect();
+        gpu.rows.lock().unwrap().insert(1, expected_row.clone());
+
+        assert_eq!(store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        poll_until(&mut store, deadline, |e| {
+            matches!(e, StoreEvent::Stored { result: Ok(_), .. })
+        });
+        let record = store.record(&checkpoint.key).unwrap();
+        assert!(record.packed.is_some());
+        // 6 compressible pages + 1 compressible row compact well below 7 raw slabs.
+        assert!(
+            record.slots() < 7,
+            "expected trailing slabs to be released, got {} slots",
+            record.slots()
+        );
+        assert_eq!(store.stats().slots_used, record.slots());
+
+        let hit = store.lookup(&h, 0, u64::MAX).unwrap();
+        store
+            .fetch(
+                hit,
+                InboundTicket {
+                    key: checkpoint.key,
+                    pages: (100..106).map(PageId).collect(),
+                    slot: StateSlotId(9),
+                },
+            )
+            .unwrap();
+        poll_until(&mut store, deadline, |e| {
+            matches!(e, StoreEvent::Fetched { result: Ok(_), .. })
+        });
+        for (p, expected) in expected_pages.iter().enumerate() {
+            assert_eq!(&gpu.pages.lock().unwrap()[&(100 + p as u32)], expected);
+        }
+        assert_eq!(gpu.rows.lock().unwrap()[&9], expected_row);
+
+        store.remove_record(&checkpoint.key).unwrap();
+        assert_eq!(pool.free_slots(), pool.slot_count());
+        store.close().unwrap();
+    }
+
+    #[cfg(feature = "codec")]
+    #[test]
+    fn packed_memory_cascades_without_announcing_raw_host_export() {
+        use crate::pool::HostWindow;
+        use crate::shared::codec::Plan;
+        use crate::store::TierStore;
+        use crate::testing::{CodecCopier, GpuMemory};
+
+        let geometry = vec![geometry(PT, &[("kv", PAGE)], PAGE)];
+        let layout = Layout::new(&geometry).unwrap();
+        let gpu = GpuMemory::default();
+        let plan = Arc::new(Plan::new(PAGE as usize, &[]).unwrap());
+        let copier = CodecCopier::new(layout.clone(), [7; 32], plan.clone(), plan, gpu.clone()).shared();
+        let pool = SlabPool::new(layout.page_record_bytes, 6, 0).unwrap();
+        let mut store = MemoryStore::new(IDENTITY, pool, copier).unwrap();
+
+        let announcer = Announcer::new(Arc::new(tokio::sync::Notify::new()));
+        store.announce_to(announcer);
+        store.set_spill(true);
+
+        let h1 = history(2 * PT + 3, 1);
+        let c1 = published(&h1, 2 * PT + 3, None, 0, 1);
+        for p in 0..2u32 {
+            gpu.pages
+                .lock()
+                .unwrap()
+                .insert(p, vec![(p + 1) as u8; PAGE as usize]);
+        }
+        gpu.rows
+            .lock()
+            .unwrap()
+            .insert(1, vec![9u8; PAGE as usize]);
+
+        assert_eq!(store.store(&c1).unwrap(), StoreOutcome::Queued);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        poll_until(&mut store, deadline, |e| {
+            matches!(e, StoreEvent::Stored { result: Ok(_), .. })
+        });
+        assert_clean_slots(&store.core);
+        assert!(store.core.announced.contains(&c1.key));
+        // Packed DRAM records are announced with packed metadata and required profiles so
+        // codec-compatible peers can claim them directly while raw-only peers skip them.
+        assert!(store.announce.as_ref().unwrap().view.contains(&c1.key));
+
+        // Pinning for Cascade succeeds with a packed offer, and raw `read` refuses cleanly.
+        let mut pin = store
+            .pin_export(PoolTier::Dram, c1.key, 0, true)
+            .expect("cascade must be able to pin packed DRAM record");
+        assert!(pin.packed_offer().is_some());
+        let mut raw_buf = vec![0u8; PAGE as usize];
+        assert!(
+            pin.read(
+                &HostWindow {
+                    record: 0,
+                    first_page: 0,
+                    page_count: 1,
+                    row: false,
+                },
+                &mut raw_buf,
+            )
+            .is_err()
+        );
+        drop(pin);
+
+        let mut events = Vec::new();
+        store.poll(&mut events).unwrap();
+        assert_clean_slots(&store.core);
+
+        // Pressure on DRAM must retire the packed record via Cascade (not drop it in place).
+        assert!(store.core.retire_for(1));
+        let retiring = store.take_retiring();
+        assert_eq!(retiring.len(), 1);
+        assert_eq!(retiring[0].key, c1.key);
+        store.retired(c1.key, PoolTier::Dram, Retirement::Moved);
+        store.poll(&mut events).unwrap();
+        assert_clean_slots(&store.core);
+        store.close().unwrap();
+    }
+
+    #[cfg(feature = "codec")]
+    #[test]
+    fn async_host_codec_encodes_off_transfer_thread_and_cascades_packed() {
+        use crate::shared::codec::Plan;
+        use crate::store::TierStore;
+        use crate::testing::{CodecCopier, GpuMemory};
+
+        let geometry = vec![geometry(PT, &[("kv", PAGE)], PAGE)];
+        let layout = Layout::new(&geometry).unwrap();
+        let gpu = GpuMemory::default();
+        let plan = Arc::new(Plan::new(PAGE as usize, &[]).unwrap());
+        let copier = CodecCopier::new(layout.clone(), [9; 32], plan.clone(), plan, gpu.clone())
+            .with_async_host_codec(true)
+            .shared();
+        let pool = SlabPool::new(layout.page_record_bytes, 16, 0).unwrap();
+        let mut store = MemoryStore::new(IDENTITY, pool, copier).unwrap();
+
+        let announcer = Announcer::new(Arc::new(tokio::sync::Notify::new()));
+        store.announce_to(announcer);
+        store.set_spill(true);
+
+        let h = history(6 * PT + 3, 1);
+        let c = published(&h, 6 * PT + 3, None, 0, 1);
+        let expected_pages: Vec<Vec<u8>> = (0..6u32)
+            .map(|p| {
+                (0..PAGE as usize)
+                    .map(|j| ((j / 16 + p as usize) % 4) as u8)
+                    .collect()
+            })
+            .collect();
+        for (p, data) in expected_pages.iter().enumerate() {
+            gpu.pages.lock().unwrap().insert(p as u32, data.clone());
+        }
+        let expected_row: Vec<u8> = (0..PAGE as usize).map(|j| ((j / 32) % 3) as u8).collect();
+        gpu.rows.lock().unwrap().insert(1, expected_row.clone());
+
+        assert_eq!(store.store(&c).unwrap(), StoreOutcome::Queued);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        poll_until(&mut store, deadline, |e| {
+            matches!(e, StoreEvent::Stored { result: Ok(_), .. })
+        });
+        assert_eq!(store.stats().stored, 1);
+        assert_eq!(store.stats().per_rank_records[0], 1);
+        let rec = store.record(&c.key).unwrap();
+        assert!(rec.packed.is_some());
+        assert!(rec.slots() < 7, "expected compacted slabs, got {}", rec.slots());
+        assert_clean_slots(&store.core);
+        assert!(store.core.announced.contains(&c.key));
+        assert!(store.announce.as_ref().unwrap().view.contains(&c.key));
+
+        // Packed DRAM record restores bit-identically and cascades cleanly.
+        let hit = store.lookup(&h, 0, u64::MAX).unwrap();
+        store
+            .fetch(
+                hit,
+                InboundTicket {
+                    key: c.key,
+                    pages: (100..106).map(PageId).collect(),
+                    slot: StateSlotId(9),
+                },
+            )
+            .unwrap();
+        poll_until(&mut store, deadline, |e| {
+            matches!(e, StoreEvent::Fetched { result: Ok(_), .. })
+        });
+        for (p, expected) in expected_pages.iter().enumerate() {
+            assert_eq!(&gpu.pages.lock().unwrap()[&(100 + p as u32)], expected);
+        }
+        assert_eq!(gpu.rows.lock().unwrap()[&9], expected_row);
+
+        assert!(store.core.retire_for(1));
+        let retiring = store.take_retiring();
+        assert_eq!(retiring.len(), 1);
+        assert_eq!(retiring[0].key, c.key);
+        let pin = store.pin_export(PoolTier::Dram, c.key, 0, true).unwrap();
+        assert!(pin.packed_offer().is_some());
+        drop(pin);
+        store.retired(c.key, PoolTier::Dram, Retirement::Moved);
+        store.poll(&mut Vec::new()).unwrap();
+        assert_clean_slots(&store.core);
+        store.close().unwrap();
+    }
+
+    #[cfg(feature = "codec")]
+    #[test]
+    fn async_host_codec_failure_reports_stored_error_without_publishing() {
+        use crate::shared::codec::Plan;
+        use crate::testing::{CodecCopier, GpuMemory};
+
+        let geometry = vec![geometry(PT, &[("kv", PAGE)], PAGE)];
+        let layout = Layout::new(&geometry).unwrap();
+        // Deliberately mismatched original_bytes so encode_capture returns Err.
+        let bad_plan = Arc::new(Plan::new((PAGE / 2) as usize, &[]).unwrap());
+        let copier = CodecCopier::new(
+            layout.clone(),
+            [9; 32],
+            bad_plan.clone(),
+            bad_plan,
+            GpuMemory::default(),
+        )
+        .with_async_host_codec(true)
+        .with_raw_out_noop(true)
+        .shared();
+        let pool = SlabPool::new(layout.page_record_bytes, 8, 0).unwrap();
+        let mut store = MemoryStore::new(IDENTITY, pool, copier).unwrap();
+
+        let h = history(2 * PT + 3, 1);
+        let c = published(&h, 2 * PT + 3, None, 0, 1);
+        assert_eq!(store.store(&c).unwrap(), StoreOutcome::Queued);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        poll_until(&mut store, deadline, |e| {
+            matches!(
+                e,
+                StoreEvent::Stored {
+                    checkpoint,
+                    key,
+                    result: Err(_),
+                } if *checkpoint == c.id && *key == c.key
+            )
+        });
+        assert!(store.record(&c.key).is_none());
+        assert_eq!(store.stats().stored, 0);
+        assert_eq!(store.stats().store_failed, 1);
+        assert_clean_slots(&store.core);
         store.close().unwrap();
     }
 }

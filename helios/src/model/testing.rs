@@ -216,6 +216,7 @@ pub fn metadata() -> PreparedContract {
         input_vocabulary: 248320,
         vision: VisionCapabilities::disabled(),
         cache: CacheContract {
+            codec_layout: None,
             page_tokens: 64,
             regions: vec![],
             page_tables: vec![PageTableView {

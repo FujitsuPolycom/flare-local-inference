@@ -24,6 +24,7 @@ pub struct NativeModel {
     pub(super) server_config: serde_json::Value,
     engram: Vec<(std::sync::Arc<crate::engram::Shared>, usize)>,
     pub(super) offload: flare_selene::offload::Startup,
+    gpu_codec_cubins: Vec<std::sync::Arc<Vec<u8>>>,
     cluster: Option<ClusterRank>,
     roce: Vec<Option<RoceSpec>>,
 }
@@ -621,12 +622,44 @@ impl NativeModel {
         // Keep every shard's write/delete exclusion through unbuffered guards;
         // the buffered startup readers close when loading returns.
         let core_files = files.retained_files()?;
+        let codec_gpu_module = super::selection::codec_gpu_module(&server_config).map(str::to_owned);
+        let gpu_codec_cubins = if options.prefix_cache.compression == crate::offload::KvCompression::Gpu
+        {
+            let name = codec_gpu_module.as_deref().ok_or_else(|| {
+                invalid(
+                    "GPU checkpoint compression requested, but this core was exported without embedded GPU codec kernels; use --lossless-kv-compression cpu or re-export the core",
+                )
+            })?;
+            let mut cubins = Vec::with_capacity(cores.len());
+            for (rank_idx, core) in cores.iter().enumerate() {
+                let module = core
+                    .modules
+                    .iter()
+                    .find(|m| m.name == name)
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "rank {rank_idx} core is missing embedded GPU codec module {name:?}"
+                        ))
+                    })?;
+                let image = files.read(core, &module.file)?;
+                if !image.starts_with(b"\x7fELF") {
+                    return Err(invalid(format!(
+                        "rank {rank_idx} GPU codec module {name:?} is not a compiled cubin"
+                    )));
+                }
+                cubins.push(std::sync::Arc::new(image));
+            }
+            cubins
+        } else {
+            Vec::new()
+        };
         let mut model = Self {
             _core_files: core_files,
             ranks: Vec::new(),
             server_config,
             engram: Vec::new(),
             offload: Default::default(),
+            gpu_codec_cubins,
             cluster,
             roce,
         };
@@ -765,7 +798,7 @@ impl NativeModel {
             let modules = cores.iter().map(|p| p.modules.len() as u64).sum::<u64>();
             let phase = progress.phase("Prepare kernels", Some(kernels + modules));
             model.parallel(&cores, &files, |rank, core, path| {
-                rank.prepare_kernels(path, core, &phase)
+                rank.prepare_kernels(path, core, &phase, codec_gpu_module.as_deref())
             })?;
             phase.finish(format!("{kernels} kernels"));
             let nodes = cores
@@ -917,9 +950,13 @@ impl NativeModel {
             staging,
             shard,
         )?;
-        let summary = self.offload.attach(prepared, &crate::offload::transfer::Copiers)?;
-        phase.finish(summary);
+        phase.finish(self.attach_offload(prepared)?);
         Ok(())
+    }
+
+    fn attach_offload(&mut self, prepared: crate::offload::Preparation) -> Result<String> {
+        let copiers = crate::offload::transfer::Copiers::new(self.gpu_codec_cubins.clone());
+        Ok(self.offload.attach(prepared, &copiers)?)
     }
 
     fn parallel<F: super::payload::Files>(
@@ -961,7 +998,10 @@ impl NativeModel {
             .enumerate()
             .map(|(index, rank)| {
                 let mut manifest = rank.execution_manifest()?;
-                manifest.offload = self.offload.binding(index);
+                manifest.offload = self
+                    .offload
+                    .binding(index)
+                    .map(|b| crate::offload::Binding::new(b, self.gpu_codec_cubins.clone()));
                 if let Some((shared, delivery_rank)) = self.engram.get(index) {
                     let events = shared
                         .index
@@ -997,6 +1037,11 @@ impl NativeModel {
     /// The host prefix store this process prepared, before the model worker opens it.
     pub fn offload(&self) -> Option<&crate::offload::Shared> {
         self.offload.shared()
+    }
+
+    /// Embedded per-rank GPU KV codec cubins loaded when `--lossless-kv-compression gpu` is active.
+    pub fn gpu_codec_cubins(&self) -> &[std::sync::Arc<Vec<u8>>] {
+        &self.gpu_codec_cubins
     }
 
     /// The RoCE transport local rank `rank` launches, if any.
@@ -1229,10 +1274,12 @@ mod tests {
             offload: Default::default(),
             cluster: None,
             roce: Vec::new(),
+            gpu_codec_cubins: Vec::new(),
         };
         for prefix_cache in [
             crate::offload::PrefixCacheOffload::default(),
             crate::offload::PrefixCacheOffload {
+                compression: Default::default(),
                 memory_bytes: Some(0),
                 disk: Some("unopened-prefix-cache".into()),
                 disk_limit: Some(0),

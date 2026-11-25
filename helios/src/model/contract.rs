@@ -117,7 +117,37 @@ pub struct PreparedContract {
     any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
+pub struct CodecField {
+    pub buffer: String,
+    pub offset: u64,
+    pub length: u64,
+    pub encoding: u32,
+}
+
+#[derive(Clone, Debug)]
+#[cfg_attr(
+    any(feature = "frontend", feature = "runtime-core"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
+pub struct CodecLayout {
+    pub revision: u32,
+    pub fields: Vec<CodecField>,
+    #[cfg_attr(
+        any(feature = "frontend", feature = "runtime-core"),
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub gpu_module: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+#[cfg_attr(
+    any(feature = "frontend", feature = "runtime-core"),
+    derive(serde::Serialize, serde::Deserialize),
+    serde(deny_unknown_fields)
+)]
 pub struct CacheContract {
+    #[cfg_attr(any(feature = "frontend", feature = "runtime-core"), serde(default))]
+    pub codec_layout: Option<CodecLayout>,
     pub page_tokens: usize,
     pub regions: Vec<HistoryRegion>,
     pub page_tables: Vec<PageTableView>,

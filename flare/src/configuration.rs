@@ -1,5 +1,7 @@
 //! Typed host configuration independent of frontend argument parsing.
-use flare_helios::offload::{parse_drain_on_shutdown, parse_max_age, parse_size};
+use flare_helios::offload::{
+    KvCompression, parse_drain_on_shutdown, parse_max_age, parse_size,
+};
 use serde::Deserialize;
 use std::{
     collections::HashMap,
@@ -50,6 +52,7 @@ pub struct PrefixCache {
     pub disk_limit: Option<String>,
     pub drain_on_shutdown: Option<String>,
     pub max_age: Option<String>,
+    pub compression: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -94,6 +97,11 @@ impl Configuration {
         }
         if let Some(value) = nonempty(configuration.prefix_cache.max_age.as_deref()) {
             parse_max_age(value).map_err(|error| format!("prefix_cache.max_age: {error}"))?;
+        }
+        if let Some(value) = nonempty(configuration.prefix_cache.compression.as_deref()) {
+            value
+                .parse::<KvCompression>()
+                .map_err(|error| format!("prefix_cache.compression: {error}"))?;
         }
         Ok(configuration)
     }

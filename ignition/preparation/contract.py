@@ -107,10 +107,32 @@ def prefix_boundary(roles, *, append_role=None, minimum_messages=1, required_sta
 
 
 def model_contract(*, vocabulary, input_vocabulary=None, vision=None, page_tokens, page_tables, graphs, frontend,
-                   regions):
+                   regions, codec_layout=None):
     return dict(version=3, vocabulary=vocabulary, input_vocabulary=input_vocabulary or vocabulary,
         vision={"feature_slots": 0, **(vision or dict(features_per_request=0, max_images=0, patches_per_feature=0, patch_capacities=[]))},
-        cache=dict(page_tokens=page_tokens, page_tables=page_tables, regions=regions), graphs=graphs, frontend=frontend)
+        cache=dict(page_tokens=page_tokens, page_tables=page_tables, regions=regions,
+                   **({"codec_layout": codec_layout} if codec_layout else {})), graphs=graphs, frontend=frontend)
+
+
+def codec_layout(pool, regions, buffers, *, field_encoding=None):
+    """Serialize the recipe's encoding for each contiguous checkpoint field."""
+    row_regions = getattr(pool.layout, "regions", ())
+    if field_encoding is None or not row_regions:
+        return None
+    fields = [dict(buffer="state_pool", offset=r.offset, length=r.nbytes,
+                   encoding=field_encoding(r.name, r.dtype, r.shape)) for r in row_regions]
+    for region in regions:
+        view = region["storage"]
+        name = view["buffer"]
+        tensor = buffers[name]
+        if view["offset"] or not tensor[0].is_contiguous():
+            return None
+        length = tensor[0].numel() * tensor.element_size()
+        if length > view["stride"] or view["nbytes"] != view["stride"]:
+            return None
+        fields.append(dict(buffer=name, offset=0, length=length,
+                           encoding=field_encoding(name, tensor.dtype, tensor.shape[1:])))
+    return dict(revision=1, fields=fields)
 
 
 def vision_inputs(fields):

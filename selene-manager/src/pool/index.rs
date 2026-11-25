@@ -27,6 +27,8 @@ pub enum SourceId {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
+    pub packed: bool,
+    pub required_profiles: Vec<Vec<u8>>,
     pub key: Key,
     pub parent: Option<Key>,
     pub bucket: Bucket,
@@ -136,6 +138,8 @@ impl ScopeIndex {
 /// One node of a chain a lookup walked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChainStep {
+    pub packed: bool,
+    pub required_profiles: Vec<Vec<u8>>,
     pub key: Key,
     pub tail_pages: u32,
     pub row: bool,
@@ -169,6 +173,8 @@ pub fn walk_chain(
     }
     let end_of = |key: Key| key.consumed_tokens / page_tokens;
     let mut nodes = vec![ChainStep {
+        packed: endpoint.packed,
+        required_profiles: endpoint.required_profiles.clone(),
         key: endpoint.key,
         tail_pages: endpoint.tail_pages,
         row: endpoint.row,
@@ -202,6 +208,8 @@ pub fn walk_chain(
         // own, and a record with no page and no row is not part of a claim.
         if parent.tail_pages > 0 {
             nodes.push(ChainStep {
+                packed: parent.packed,
+                required_profiles: parent.required_profiles.clone(),
                 key: parent.key,
                 tail_pages: parent.tail_pages,
                 row: parent.row,
@@ -239,6 +247,8 @@ mod tests {
 
     fn entry(tokens: u64, tag: u8, parent: Option<(u64, u8)>, tail: u32, tier: Tier) -> Entry {
         Entry {
+            packed: false,
+            required_profiles: Default::default(),
             key: key(tokens, tag),
             parent: parent.map(|(tokens, tag)| key(tokens, tag)),
             bucket: [9; 16],

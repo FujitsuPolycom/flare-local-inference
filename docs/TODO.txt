@@ -211,6 +211,20 @@
     single-process instance of the same TP width: restore a record written by
     one into the other.
 
+[ ] Qualify two Flare instances sharing a compressed pool namespace across
+    heterogeneous `cpu` and `gpu` modes. Put a packed checkpoint from one
+    instance and restore it through the other after arena release, comparing
+    with a raw restore.
+
+[ ] Qualify multi-host `--rank` local-disk compression (`--prefix-cache-disk`
+    + `--lossless-kv-compression cpu|gpu`) on a multi-host cluster; unit tests
+    cover sharded v4 store/fetch/truncate/agreement and mismatch rejection.
+
+[ ] Support `--lossless-kv-compression cpu|gpu` with multi-host `--rank` +
+    `--prefix-cache-pool` by building world-wide packed offers and teaching
+    `selene/src/pool/records.rs` v4 headers, directories, and packed slicing
+    (currently rejected at startup in `selene/src/offload.rs`).
+
 [ ] Resolve pool-only host retention for ranks on separate hosts.
     prefix-cache-offload.md section 1 allows it, while ModelRuntime::start in
     helios/src/server/runtime.rs requires shard links that

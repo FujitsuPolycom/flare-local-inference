@@ -414,6 +414,7 @@ mod tests {
                 kind: wire::rank_fence::Kind::Put as i32,
                 fence_id: 12,
                 records: vec![wire::Record {
+                    packed: None,
                     key: Some(wire::PrefixKey {
                         consumed_tokens: 64,
                         digest: vec![13; 16],
@@ -440,6 +441,7 @@ mod tests {
             Msg::Window(Window {
                 xfer: 19,
                 spec: Some(wire::WindowSpec {
+                    packed: None,
                     index: 20,
                     region: wire::Region::Staging as i32,
                     offset: 21,

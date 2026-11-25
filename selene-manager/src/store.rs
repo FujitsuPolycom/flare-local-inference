@@ -145,6 +145,15 @@ struct PlannedGrant {
 }
 
 impl PlannedGrant {
+    fn read_prefix(self) -> usize {
+        (self.record_offset % 4096) as usize
+    }
+    fn read_length(self) -> usize {
+        usize::try_from(self.length)
+            .unwrap_or(usize::MAX)
+            .saturating_add(self.read_prefix())
+    }
+
     fn window(
         self,
         transfer: u64,
@@ -152,8 +161,19 @@ impl PlannedGrant {
         region: Region,
         offset: u64,
         hold: Arc<Extent>,
+        header: &Header,
     ) -> WindowGrant {
+        let packed = header.packed.as_ref().map(|p| {
+            let first = self.page_first.saturating_sub(p.offer().first_page) as usize;
+            flare_selene::shared::wire::PackedWindow {
+                units: p
+                    .units(first, self.pages as usize, self.row)
+                    .expect("planned range")
+                    .to_vec(),
+            }
+        });
         WindowGrant {
+            packed,
             transfer,
             index,
             record: self.record,
@@ -493,6 +513,8 @@ pub struct Metrics {
 
 #[derive(Clone, Debug)]
 pub struct EntryData {
+    pub packed: bool,
+    pub required_profiles: Vec<Vec<u8>>,
     pub key: Key,
     pub parent: Option<Key>,
     pub bucket: [u8; 16],
@@ -533,6 +555,7 @@ pub struct PutRequest {
     pub descendant_row: bool,
     pub next_child: Option<Key>,
     pub row: bool,
+    pub packed: Option<flare_selene::shared::wire::PackedOffer>,
 }
 
 pub struct GetRequest {
@@ -952,7 +975,13 @@ impl Store {
 
     fn entry(namespace: &Namespace, key: Key) -> EntryData {
         let node = &namespace.tree[&key];
+        let header = &node.location.header;
         EntryData {
+            packed: header.packed.is_some(),
+            required_profiles: header
+                .packed
+                .as_ref()
+                .map_or_else(Vec::new, |p| p.required_profiles(node.row)),
             key,
             parent: node.parent,
             bucket: node.bucket,
@@ -1475,8 +1504,18 @@ impl Store {
             initial_parent,
             initial_bucket,
             initial_tail,
-        ) {
-            Ok(header) => header.with_capture_role(wire_role),
+        )
+        .and_then(|header| {
+            let header = header.with_capture_role(wire_role);
+            apply_packed_offer(
+                header,
+                request.packed.as_ref(),
+                initial_first,
+                initial_tail,
+                row,
+            )
+        }) {
+            Ok(header) => header,
             Err(_) => {
                 self.reject_put(&pending.events, proto::Reason::Invalid as u8);
                 return;
@@ -1488,8 +1527,19 @@ impl Store {
             None,
             initial_bucket,
             request.chain_pages,
-        ) {
-            Ok(header) => header.with_capture_role(wire_role),
+        )
+        .and_then(|header| {
+            let header = header.with_capture_role(wire_role);
+            let root_packed = request.packed.as_ref().filter(|o| o.first_page == 0);
+            apply_packed_offer(
+                header,
+                root_packed,
+                0,
+                request.chain_pages,
+                request.row,
+            )
+        }) {
+            Ok(header) => header,
             Err(_) => {
                 self.reject_put(&pending.events, proto::Reason::Invalid as u8);
                 return;
@@ -1752,6 +1802,7 @@ impl Store {
             parent,
             record_bytes: length,
             windows: put.grants.len(),
+            packed: header.packed.is_some(),
         })));
         self.sessions.get_mut(&connection).unwrap().ops.insert(
             transfer,
@@ -1867,16 +1918,21 @@ impl Store {
             return false;
         }
         if node.location.disk.is_some() {
-            let old = node.location.bytes;
-            node.location.memory = None;
-            node.location.bytes = node.location.header.length(node.row);
-            self.charged = self.charged - old + node.location.bytes;
-            self.delta(id, CatalogKind::Changed, key);
+            self.release_arena(id, key);
             return true;
         }
         let removed = self.evict_accounted(id, key);
         self.metrics.evictions += removed;
         removed != 0
+    }
+
+    fn release_arena(&mut self, id: NamespaceId, key: Key) {
+        let node = &mut self.namespaces.get_mut(&id).unwrap().tree[&key];
+        let bytes = node.location.header.length(node.row);
+        node.location.memory = None;
+        self.charged = self.charged - node.location.bytes + bytes;
+        node.location.bytes = bytes;
+        self.delta(id, CatalogKind::Changed, key);
     }
 
     /// The physical requirement for this Put shape. A record whose
@@ -2071,9 +2127,10 @@ impl Store {
             } else {
                 put.hold_slots.iter().position(Option::is_none)
             };
-            (index, plan, memory, hold, hold_unit, slot)
+            let packed = put.header.packed.is_some();
+            (index, plan, memory, hold, hold_unit, slot, packed)
         };
-        let (index, plan, memory, hold, hold_unit, slot) = prepared;
+        let (index, plan, memory, hold, hold_unit, slot, packed) = prepared;
         if memory.is_none() && slot.is_none() {
             // Both hold slots are still live; retry once one is released.
             return false;
@@ -2093,7 +2150,7 @@ impl Store {
                 (Region::Staging, hold, slot.unwrap() * hold_unit)
             }
         };
-        let result = self.local.offset(region, &extent, within, plan.length);
+        let result = self.local.offset(region, &extent, within, plan.length, packed);
         match result {
             Ok(offset) => {
                 if let Some((put, progress)) = put_mut(&mut self.sessions, connection, transfer) {
@@ -2103,9 +2160,14 @@ impl Store {
                         put.hold_slots[slot] = Some(HoldSlot { index, job: None });
                     }
                     put.windows.granted.insert(index, plan);
-                    put.outbox.push_back(Ok(PutAnswer::Grant(
-                        plan.window(transfer, index, region, offset, extent),
-                    )));
+                    put.outbox.push_back(Ok(PutAnswer::Grant(plan.window(
+                        transfer,
+                        index,
+                        region,
+                        offset,
+                        extent,
+                        &put.header,
+                    ))));
                     *progress = Instant::now();
                 }
                 true
@@ -2177,7 +2239,12 @@ impl Store {
                     return progressed;
                 }
             };
-            let Some(table) = metadata.get(4096..4096 + header.tail_pages as usize * 8) else {
+            let sum_count = if header.packed.is_some() {
+                0
+            } else {
+                header.tail_pages as usize
+            };
+            let Some(table) = metadata.get(4096..4096 + sum_count * 8) else {
                 self.fail_get(
                     connection,
                     transfer,
@@ -2219,7 +2286,7 @@ impl Store {
         enum Next {
             Stop,
             Fail(proto::Reason, io::Error),
-            Lease { memory: Arc<Extent> },
+            Lease { memory: Arc<Extent>, packed: bool },
             Read { file: Arc<File> },
         }
         let action = {
@@ -2245,6 +2312,7 @@ impl Store {
                     } else {
                         Next::Lease {
                             memory: memory.clone(),
+                            packed: record.header.packed.is_some(),
                         }
                     }
                 } else if let Some(file) = &record.file {
@@ -2260,12 +2328,13 @@ impl Store {
                 self.fail_get(connection, transfer, reason as u8, error);
                 return false;
             }
-            Next::Lease { memory } => {
+            Next::Lease { memory, packed } => {
                 let offset = match self.local.offset(
                     Region::Arena,
                     &memory,
                     plan.record_offset as usize,
                     plan.length,
+                    packed,
                 ) {
                     Ok(offset) => offset,
                     Err(error) => {
@@ -2285,12 +2354,13 @@ impl Store {
                     Region::Arena,
                     offset,
                     memory,
+                    &get.records[plan.record as usize].header,
                 ))));
                 *progress = Instant::now();
                 return true;
             }
             Next::Read { file } => {
-                let length = usize::try_from(plan.length).unwrap_or(usize::MAX);
+                let length = plan.read_length();
                 // Restore windows are transient staging traffic: reads do not
                 // grow the durable set, so they are bounded by the staging
                 // region alone and never by the NVMe budget.
@@ -2330,7 +2400,7 @@ impl Store {
             file,
             span: Span {
                 address: extent.bytes().as_ptr() as usize,
-                offset: plan.record_offset,
+                offset: plan.record_offset - plan.read_prefix() as u64,
                 length: extent.bytes().len(),
             },
         };
@@ -2471,11 +2541,16 @@ impl Store {
             return Ok(());
         };
         let plan = prepared.plan;
-        if page_xxh3.len() != plan.pages as usize
-            || (plan.row && row_xxh3.is_none())
-            || (!plan.row && row_xxh3.is_some())
-            || plan.pages > 64
-        {
+        let is_packed = prepared.header.packed.is_some();
+        let bad_shape = if is_packed {
+            !page_xxh3.is_empty() || row_xxh3.is_some() || plan.pages > 64
+        } else {
+            page_xxh3.len() != plan.pages as usize
+                || (plan.row && row_xxh3.is_none())
+                || (!plan.row && row_xxh3.is_some())
+                || plan.pages > 64
+        };
+        if bad_shape {
             self.abort_put_window(connection, transfer, index);
             self.fail_put(
                 connection,
@@ -2506,34 +2581,56 @@ impl Store {
             return Ok(());
         };
         let bytes = data.bytes();
-        let page_bytes = prepared.header.page_record_bytes() as usize;
         let mut verified = Vec::with_capacity(page_xxh3.len());
-        for (position, hash) in page_xxh3.iter().enumerate() {
-            let start = position * page_bytes;
-            if flare_selene::shared::record::checksum(&bytes[start..start + page_bytes]) != *hash {
+        if let Some(packed) = &prepared.header.packed {
+            let first = if plan.pages == 0 {
+                packed.page_count()
+            } else {
+                plan.page_first.saturating_sub(packed.offer().first_page) as usize
+            };
+            let ok = packed
+                .units(first, plan.pages as usize, plan.row)
+                .is_some_and(|units| flare_selene::shared::packed::verify_units(units, bytes).is_ok());
+            if !ok {
                 self.abort_put_window(connection, transfer, index);
                 self.fail_put(
                     connection,
                     transfer,
                     proto::Reason::Invalid as u8,
-                    invalid("page checksum"),
+                    invalid("packed window checksum"),
                 );
                 return Ok(());
             }
-            verified.push(*hash);
-        }
-        if plan.row {
-            let row_bytes = prepared.header.row_record_bytes() as usize;
-            let start = bytes.len() - row_bytes;
-            if flare_selene::shared::record::checksum(&bytes[start..]) != row_xxh3.unwrap() {
-                self.abort_put_window(connection, transfer, index);
-                self.fail_put(
-                    connection,
-                    transfer,
-                    proto::Reason::Invalid as u8,
-                    invalid("row checksum"),
-                );
-                return Ok(());
+        } else {
+            let page_bytes = prepared.header.page_record_bytes() as usize;
+            for (position, hash) in page_xxh3.iter().enumerate() {
+                let start = position * page_bytes;
+                if flare_selene::shared::record::checksum(&bytes[start..start + page_bytes]) != *hash
+                {
+                    self.abort_put_window(connection, transfer, index);
+                    self.fail_put(
+                        connection,
+                        transfer,
+                        proto::Reason::Invalid as u8,
+                        invalid("page checksum"),
+                    );
+                    return Ok(());
+                }
+                verified.push(*hash);
+            }
+            if plan.row {
+                let row_bytes = prepared.header.row_record_bytes() as usize;
+                let start = bytes.len() - row_bytes;
+                if flare_selene::shared::record::checksum(&bytes[start..]) != row_xxh3.unwrap() {
+                    self.abort_put_window(connection, transfer, index);
+                    self.fail_put(
+                        connection,
+                        transfer,
+                        proto::Reason::Invalid as u8,
+                        invalid("row checksum"),
+                    );
+                    return Ok(());
+                }
             }
         }
         {
@@ -2542,15 +2639,22 @@ impl Store {
             };
             put.windows.granted.remove(&index);
             // The slot stays occupied until the chunk write drains.
-            for (position, hash) in verified.iter().enumerate() {
-                let relative =
-                    (plan.page_first - u64::from(prepared.first_page)) as usize + position;
-                put.windows.pages[relative] = Some(*hash);
-                put.windows.pages_filled += 1;
-            }
-            if plan.row {
-                put.windows.row = row_xxh3;
-                put.windows.row_filled = true;
+            if is_packed {
+                put.windows.pages_filled += plan.pages;
+                if plan.row {
+                    put.windows.row_filled = true;
+                }
+            } else {
+                for (position, hash) in verified.iter().enumerate() {
+                    let relative =
+                        (plan.page_first - u64::from(prepared.first_page)) as usize + position;
+                    put.windows.pages[relative] = Some(*hash);
+                    put.windows.pages_filled += 1;
+                }
+                if plan.row {
+                    put.windows.row = row_xxh3;
+                    put.windows.row_filled = true;
+                }
             }
             *progress = Instant::now();
         }
@@ -2658,10 +2762,13 @@ impl Store {
                 )
             } else {
                 let header_page_segment = put.header.page_segment as usize;
+                let end = put.commit_bytes.len().saturating_add(metadata.len());
+                let align_ok = metadata.len().is_multiple_of(4096)
+                    || (put.header.packed.is_some() && end == header_page_segment);
                 if metadata_offset as usize != put.commit_bytes.len()
                     || metadata.is_empty()
-                    || !metadata.len().is_multiple_of(4096)
-                    || put.commit_bytes.len() + metadata.len() > header_page_segment
+                    || !align_ok
+                    || end > header_page_segment
                     || !(metadata_offset as usize).is_multiple_of(4096)
                 {
                     Action::Fail(proto::Reason::Invalid, invalid("commit offset or length"))
@@ -2673,18 +2780,17 @@ impl Store {
                         Action::Fail(proto::Reason::Invalid, error)
                     } else {
                         if let Some(memory) = &mut put.memory {
-                            let checksum_segment =
-                                put.commit_bytes[4096..header_page_segment].to_vec();
                             let bytes = Arc::get_mut(memory).unwrap().bytes_mut();
-                            bytes[..4096].copy_from_slice(&put.commit_bytes[..4096]);
-                            bytes[4096..header_page_segment].copy_from_slice(&checksum_segment);
+                            bytes[..header_page_segment]
+                                .copy_from_slice(&put.commit_bytes[..header_page_segment]);
                             put.committed = true;
                             Action::Publish
                         } else {
                             match Arena::new(header_page_segment.next_power_of_two()) {
                                 Ok(arena) => {
                                     let mut metadata = arena.allocate(header_page_segment).unwrap();
-                                    metadata.bytes_mut().copy_from_slice(&put.commit_bytes);
+                                    metadata.bytes_mut()[..header_page_segment]
+                                        .copy_from_slice(&put.commit_bytes[..header_page_segment]);
                                     put.metadata = Some(Arc::new(metadata));
                                     put.commit_bytes = Vec::new();
                                     put.committed = true;
@@ -2959,7 +3065,7 @@ impl Store {
                 )
         }) || grants.iter().any(|grant| {
             records[grant.record as usize].memory.is_none()
-                && !self.staging_can_ever_hold(usize::try_from(grant.length).unwrap_or(usize::MAX))
+                && !self.staging_can_ever_hold(grant.read_length())
         });
         if unservable {
             self.metrics.gets_error += 1;
@@ -3012,6 +3118,25 @@ impl Store {
         };
         let mut get = get;
         get.outbox.push_back(Ok(GetAnswer::Leased {
+            packed: get
+                .records
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    r.header.packed.as_ref().map(|p| {
+                        let skip = if i == 0 {
+                            request.skip_pages as usize
+                        } else {
+                            0
+                        };
+                        let row = i + 1 == get.records.len() && request.row;
+                        flare_selene::shared::wire::PackedOffer {
+                            first_page: p.offer().first_page + skip as u64,
+                            units: p.units(skip, p.page_count() - skip, row).unwrap().to_vec(),
+                        }
+                    })
+                })
+                .collect(),
             transfer,
             windows: get.grants.len(),
         }));
@@ -3246,7 +3371,7 @@ impl Store {
                 }
             }
             ReadKind::Window { grant } => {
-                let plan = {
+                let (plan, packed) = {
                     let Some((get, _)) = get_mut(&mut self.sessions, connection, transfer) else {
                         return;
                     };
@@ -3255,10 +3380,16 @@ impl Store {
                     let Some(plan) = get.grants.get(grant as usize) else {
                         return;
                     };
-                    *plan
+                    (*plan, get.records[plan.record as usize].header.packed.is_some())
                 };
                 let extent = Arc::new(extent);
-                let offset = match self.local.offset(Region::Staging, &extent, 0, plan.length) {
+                let offset = match self.local.offset(
+                    Region::Staging,
+                    &extent,
+                    plan.read_prefix(),
+                    plan.length,
+                    packed,
+                ) {
                     Ok(offset) => offset,
                     Err(error) => {
                         self.fail_get(connection, transfer, proto::Reason::Invalid as u8, error);
@@ -3272,6 +3403,7 @@ impl Store {
                         Region::Staging,
                         offset,
                         extent,
+                        &get.records[plan.record as usize].header,
                     ))));
                     *progress = Instant::now();
                 }
@@ -3679,11 +3811,7 @@ impl Store {
                     node.location.job = None;
                     node.location.writing = false;
                     if !failed {
-                        let bytes = node.location.bytes - node.location.header.row_segment;
-                        node.location.bytes -= bytes;
-                        self.charged -= bytes;
-                        node.location.memory = None;
-                        self.delta(namespace, CatalogKind::Changed, key);
+                        self.release_arena(namespace, key);
                     } else {
                         node.row = true;
                         self.delta(namespace, CatalogKind::Changed, key);
@@ -3900,7 +4028,7 @@ impl Store {
             return;
         };
         let node = &namespace.tree[&key];
-        let Some(worker) = self.writers.iter().find(|worker| worker.is_idle()) else {
+        let Some(writer) = self.writers.iter().find(|w| w.is_idle()) else {
             return;
         };
         let Some(memory) = node.location.memory.clone() else {
@@ -3911,31 +4039,33 @@ impl Store {
             return;
         };
         let length = node.location.header.length(node.row);
+        let path = namespace.path(key).unwrap();
         let task = DiskJob::write_record(
             JobId(job),
             temporary.path.clone(),
             0,
             &memory.bytes()[..length as usize],
-            Some((namespace.path(key).unwrap(), length)),
+            Some((path, length)),
         );
-        if worker.submit(task).is_ok() {
-            self.job_counter = job;
-            self.jobs.insert(
-                job,
-                Job::Write {
-                    namespace: id,
-                    key,
-                    reason: if key == target { reason } else { "dependency" },
-                    _memory: memory,
-                    _temporary: temporary,
-                },
-            );
-            let tree = &mut self.namespaces.get_mut(&id).unwrap().tree;
-            tree.pin(&key).expect("writeback holds a resident record");
-            let location = &mut tree[&key].location;
-            location.writing = true;
-            location.job = Some(job);
+        if writer.submit(task).is_err() {
+            return;
         }
+        self.job_counter = job;
+        self.jobs.insert(
+            job,
+            Job::Write {
+                namespace: id,
+                key,
+                reason: if key == target { reason } else { "dependency" },
+                _memory: memory,
+                _temporary: temporary,
+            },
+        );
+        let tree = &mut self.namespaces.get_mut(&id).unwrap().tree;
+        tree.pin(&key).expect("writeback holds a resident record");
+        let location = &mut tree[&key].location;
+        location.writing = true;
+        location.job = Some(job);
     }
 
     fn schedule(&mut self) {
@@ -4110,7 +4240,7 @@ impl Store {
             }
             for queue in &mut targets {
                 for _ in 0..queue.len() {
-                    if !self.writers.iter().any(DiskThread::is_idle) {
+                    if !self.writers.iter().any(|w| w.is_idle()) {
                         break;
                     }
                     let (id, key) = queue.pop_front().unwrap();
@@ -4429,6 +4559,7 @@ pub struct PutAccept {
     pub parent: Option<Key>,
     pub record_bytes: u64,
     pub windows: usize,
+    pub packed: bool,
 }
 
 pub struct WindowGrant {
@@ -4436,6 +4567,7 @@ pub struct WindowGrant {
     pub transfer: u64,
     pub index: u32,
     pub record: u32,
+    pub packed: Option<flare_selene::shared::wire::PackedWindow>,
     pub record_offset: u64,
     pub length: u64,
     pub region: i32,
@@ -4465,6 +4597,7 @@ pub enum PutAnswer {
 
 pub enum GetAnswer {
     Leased {
+        packed: Vec<Option<flare_selene::shared::wire::PackedOffer>>,
         transfer: u64,
         windows: usize,
     },
@@ -4511,6 +4644,7 @@ pub enum StoreCommand {
         descendant_row: bool,
         next_child: Option<Key>,
         row: bool,
+        packed: Option<flare_selene::shared::wire::PackedOffer>,
         events: tokio::sync::mpsc::Sender<Result<PutAnswer>>,
         reply: Reply<Result<()>>,
     },
@@ -4573,6 +4707,24 @@ fn record_grants(
     max_window: u64,
     record: u32,
 ) -> Vec<PlannedGrant> {
+    if let Some(packed) = &header.packed {
+        return packed
+            .windows(skip, include_row, max_window)
+            .into_iter()
+            .map(|w| PlannedGrant {
+                record,
+                record_offset: header.page_segment + w.offset,
+                length: w.length,
+                pages: w.pages,
+                row: w.row,
+                page_first: if w.pages == 0 {
+                    0
+                } else {
+                    u64::from(first_page) + u64::from(w.first)
+                },
+            })
+            .collect();
+    }
     use crate::pool::windows::{self, RecordShape};
     let shape = RecordShape {
         first_page: skip,
@@ -4645,6 +4797,7 @@ impl Store {
                 descendant_row,
                 next_child,
                 row,
+                packed,
                 events,
                 reply,
             } => {
@@ -4685,6 +4838,7 @@ impl Store {
                         descendant_row,
                         next_child,
                         row,
+                        packed,
                     },
                     events,
                 );
@@ -4789,12 +4943,59 @@ impl Store {
     }
 }
 
+fn apply_packed_offer(
+    header: Header,
+    offer: Option<&flare_selene::shared::wire::PackedOffer>,
+    first_page: u64,
+    tail_pages: u32,
+    include_row: bool,
+) -> Result<Header> {
+    let Some(offer) = offer else {
+        return Ok(header);
+    };
+    let end_page = first_page
+        .checked_add(u64::from(tail_pages))
+        .ok_or_else(|| invalid("packed put page range overflow"))?;
+    let units: Vec<_> = offer
+        .units
+        .iter()
+        .filter(|u| match flare_selene::shared::wire::packed_unit::Kind::try_from(u.kind) {
+            Ok(flare_selene::shared::wire::packed_unit::Kind::Page) => {
+                u.logical_index >= first_page && u.logical_index < end_page
+            }
+            Ok(flare_selene::shared::wire::packed_unit::Kind::Row) => include_row,
+            Err(_) => false,
+        })
+        .cloned()
+        .collect();
+    // If every unit in the accepted suffix is a raw literal, fall back to a standard v3 record.
+    if !units.iter().any(|u| {
+        u.representation == flare_selene::shared::wire::packed_unit::Representation::Packet as i32
+    }) {
+        return Ok(header);
+    }
+    let sliced = flare_selene::shared::wire::PackedOffer { first_page, units };
+    header
+        .with_packed(sliced)
+        .map_err(|e| invalid(e.to_string()))
+}
+
 fn validate_commit(put: &mut Put, descriptor: &Descriptor) -> Result<()> {
-    let header = Header::decode(&put.commit_bytes[..4096]).map_err(|e| invalid(e.to_string()))?;
     let planned = &put.header;
-    let row_ok = match put.windows.row {
-        Some(hash) => header.row_checksum == hash,
-        None => header.row_checksum == planned.row_checksum,
+    let page_segment = planned.page_segment as usize;
+    let header = Header::decode(if planned.packed.is_some() {
+        &put.commit_bytes[..page_segment]
+    } else {
+        &put.commit_bytes[..4096]
+    })
+    .map_err(|e| invalid(e.to_string()))?;
+    let row_ok = if planned.packed.is_some() {
+        header.row_checksum == 0 && header.packed == planned.packed
+    } else {
+        match put.windows.row {
+            Some(hash) => header.row_checksum == hash,
+            None => header.row_checksum == planned.row_checksum,
+        }
     };
     if header.key != planned.key
         || header.parent != planned.parent
@@ -4808,14 +5009,15 @@ fn validate_commit(put: &mut Put, descriptor: &Descriptor) -> Result<()> {
     {
         return Err(invalid("commit header disagrees with accept"));
     }
-    let page_segment = planned.page_segment as usize;
-    let checksum_segment = &put.commit_bytes[4096..page_segment];
-    for (index, hash) in put.windows.pages.iter().enumerate() {
-        let Some(hash) = hash else {
-            return Err(invalid("missing page hash"));
-        };
-        if checksum_segment[index * 8..index * 8 + 8] != hash.to_le_bytes() {
-            return Err(invalid("commit checksum table"));
+    if planned.packed.is_none() {
+        let checksum_segment = &put.commit_bytes[4096..page_segment];
+        for (index, hash) in put.windows.pages.iter().enumerate() {
+            let Some(hash) = hash else {
+                return Err(invalid("missing page hash"));
+            };
+            if checksum_segment[index * 8..index * 8 + 8] != hash.to_le_bytes() {
+                return Err(invalid("commit checksum table"));
+            }
         }
     }
     if header.capture_role() == put.stored_role {
@@ -5042,6 +5244,7 @@ mod tests {
                         descendant_row: false,
                         next_child: None,
                         row: true,
+                packed: None,
                     },
                     events: events.clone(),
                 });
@@ -6260,6 +6463,7 @@ mod tests {
             descendant_row: false,
             next_child: None,
             row: true,
+                packed: None,
             events,
             reply,
         });
@@ -6312,6 +6516,7 @@ mod tests {
             descendant_row: false,
             next_child: None,
             row: true,
+                packed: None,
             events,
             reply,
         });
@@ -6409,6 +6614,7 @@ mod tests {
                 descendant_row: false,
                 next_child: None,
                 row,
+                packed: None,
             },
             events,
         });
@@ -6632,6 +6838,7 @@ mod tests {
                     descendant_row: children == 1,
                     next_child: None,
                     row: true,
+                packed: None,
                 },
                 events,
             });
@@ -6713,6 +6920,7 @@ mod tests {
                     descendant_row: children == 1,
                     next_child: None,
                     row: true,
+                packed: None,
                 },
                 events,
             });
@@ -6961,6 +7169,7 @@ mod tests {
                 descendant_row: false,
                 next_child: None,
                 row: true,
+                packed: None,
             },
             events,
         );
@@ -7265,6 +7474,7 @@ mod tests {
                 descendant_row: false,
                 next_child: None,
                 row: true,
+                packed: None,
                 events: put_events.clone(),
                 reply,
             });
@@ -7463,6 +7673,7 @@ mod tests {
                 descendant_row: false,
                 next_child: None,
                 row: true,
+                packed: None,
             },
             events,
         );
@@ -7509,6 +7720,7 @@ mod tests {
                 descendant_row: false,
                 next_child: None,
                 row: true,
+                packed: None,
             },
             events,
         );
@@ -7568,6 +7780,7 @@ mod tests {
                 descendant_row: false,
                 next_child: None,
                 row: true,
+                packed: None,
             },
             events,
         );
@@ -7657,6 +7870,7 @@ mod tests {
                 descendant_row: false,
                 next_child: None,
                 row: true,
+                packed: None,
             },
             put_events,
         );
@@ -7728,6 +7942,7 @@ mod tests {
                 descendant_row: false,
                 next_child: None,
                 row: true,
+                packed: None,
             },
             put_events,
         );
@@ -7767,6 +7982,7 @@ mod tests {
                 descendant_row: false,
                 next_child: None,
                 row: true,
+                packed: None,
             },
             events,
         );
@@ -7863,6 +8079,7 @@ mod tests {
                 descendant_row: false,
                 next_child: None,
                 row: true,
+                packed: None,
             },
             events,
         );
@@ -7933,6 +8150,7 @@ mod tests {
                     descendant_row: false,
                     next_child: None,
                     row: true,
+                packed: None,
                 },
                 put_events.clone(),
             );
@@ -7990,6 +8208,7 @@ mod tests {
                 descendant_row: false,
                 next_child: None,
                 row: true,
+                packed: None,
             },
             events,
         );
@@ -8350,6 +8569,7 @@ mod tests {
                 descendant_row: false,
                 next_child: None,
                 row: true,
+                packed: None,
             },
             events,
         );
@@ -8403,6 +8623,7 @@ mod tests {
                 descendant_row: false,
                 next_child: None,
                 row: true,
+                packed: None,
             },
             put_events,
         );
@@ -8490,6 +8711,7 @@ mod tests {
                 descendant_row: false,
                 next_child: None,
                 row: true,
+                packed: None,
             },
             events.clone(),
         );
@@ -8516,6 +8738,7 @@ mod tests {
                 descendant_row: false,
                 next_child: None,
                 row: true,
+                packed: None,
             },
             events,
         );
@@ -8628,6 +8851,7 @@ mod tests {
                 descendant_row: false,
                 next_child: None,
                 row: true,
+                packed: None,
             },
             events,
         );

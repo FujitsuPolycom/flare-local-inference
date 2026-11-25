@@ -61,6 +61,8 @@ pub(super) struct PutRec {
     pub chain_pages: u64,
     /// The record carries the state row.
     pub row: bool,
+    /// True when the manager accepted a packed v4 record layout for this put.
+    pub packed: bool,
     /// What the store accepted: the parent it will link to and the first page it needs.
     pub accepted: Option<(Option<Key>, u32)>,
     /// Set when the writer's bytes arrive on the data channel.
@@ -165,6 +167,8 @@ impl Core {
                 _ => Tier::Nvme,
             };
             Entry {
+                packed: entry.packed,
+                required_profiles: entry.required_profiles.clone(),
                 key: entry.key,
                 parent: entry.parent,
                 bucket: entry.bucket,
@@ -412,6 +416,12 @@ impl Core {
                 return Ok(());
             }
         };
+        let capture_role = m.capture_role();
+        let child_paths = m.child_paths;
+        let descendant_row = m.descendant_row;
+        let row = m.row;
+        let packed = m.packed;
+        let raw_chain_pages = m.chain_pages;
         let (events, mut answers) = mpsc::channel::<io::Result<PutAnswer>>(32);
         let begun = self.store_call(|reply| StoreCommand::PutBegin {
             connection: link.connection,
@@ -424,11 +434,12 @@ impl Core {
             bucket,
             chain_pages,
             published_tail_pages: tail_pages,
-            capture_role: m.capture_role(),
-            child_paths: m.child_paths,
-            descendant_row: m.descendant_row,
+            capture_role,
+            child_paths,
+            descendant_row,
             next_child,
-            row: m.row,
+            row,
+            packed,
             events,
             reply,
         });
@@ -525,8 +536,9 @@ impl Core {
                 parties,
                 refused: false,
                 key: record_key,
-                chain_pages: m.chain_pages,
-                row: m.row,
+                chain_pages: raw_chain_pages,
+                row,
+                packed: false,
                 accepted: None,
                 legs,
                 deferred_commit: None,
@@ -572,6 +584,7 @@ impl Core {
         match answer {
             Ok(PutAnswer::Accept(accept)) => {
                 rec.accepted = Some((accept.parent, accept.first_page));
+                rec.packed = accept.packed;
                 rec.remaining = accept.windows;
                 let channel = rec
                     .channel()
@@ -598,6 +611,7 @@ impl Core {
                         capture_role: accept.capture_role as i32,
                         channel,
                         rank_channels,
+                        packed: accept.packed,
                     }),
                 );
             }
@@ -638,6 +652,7 @@ impl Core {
                 }
                 let legs = rec.legs.iter().map(|l| (l.ch.transfer, l.rank)).collect();
                 let spec = v2::WindowSpec {
+                    packed: grant.packed,
                     index: grant.index,
                     region: grant.region,
                     offset: grant.offset,
@@ -656,7 +671,7 @@ impl Core {
                 };
                 let message = M::PutGrant(v2::PutGrant {
                     put_id,
-                    window: Some(spec),
+                    window: Some(spec.clone()),
                 });
                 self.grant_windows(sid, message, legs, &layout, &[spec]);
             }
@@ -1464,6 +1479,7 @@ mod tests {
                 key: Key::default(),
                 chain_pages: 0,
                 row: true,
+                packed: false,
                 accepted: None,
                 legs: Vec::new(),
                 deferred_commit: None,
@@ -1514,6 +1530,8 @@ mod tests {
                     unit_bytes: 4096,
                 })
                 .collect(),
+            placement: Default::default(),
+            codec_fields: Vec::new(),
             snapshot_pages: Vec::new(),
         };
         let geometry = vec![rank; 2];

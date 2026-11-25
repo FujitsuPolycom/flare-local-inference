@@ -53,3 +53,17 @@ sum in nanoseconds as `flare_host_cache_retirement_nanoseconds_total`.
 by pool refusal reason. `flare_host_cache_reoffer_calls_total` counts store
 calls for reoffered GPU publications. `flare_host_cache_reoffer_present_total`
 counts those calls answered PRESENT.
+
+When `--lossless-kv-compression` (or `[prefix_cache] compression`) is `cpu` or
+`gpu`, Flare also exports:
+
+- `flare_kv_codec_active{placement="cpu"|"gpu"}` (gauge, `1` while active)
+- `flare_kv_codec_original_bytes_total{placement}` and
+  `flare_kv_codec_stored_bytes_total{placement}` (uncompressed and compressed
+  bytes processed across capture and restore)
+- `flare_kv_codec_transform_nanoseconds_total{placement}` (cumulative codec
+  transform duration)
+- `flare_kv_codec_failed_windows_total{placement}` (transfer windows that
+  failed encode or decode)
+- `flare_kv_codec_verification_failures_total{stage="stored"|"original"}`
+  (CRC-32/IEEE verification failures on compressed or decoded payloads)

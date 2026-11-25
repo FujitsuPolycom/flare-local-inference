@@ -35,11 +35,92 @@ starts the pool at load time (`pool.rs`).
 Host offload requires explicit configuration: `flare run` retains no host
 records unless a memory size, disk directory, or pool is configured. Derived
 default sizes and a default record directory are designed, not implemented
-(section 2.11). Host offload does not change the contracts of preparation,
-captured graphs, or the runtime core format. The
+(section 2.11). Preparation can include an optional codec layout for qualified
+recipes. Captured graphs continue to use the raw checkpoint layout. The
 [core design](core-design.md#4-prefix-checkpoints-and-complete-model-state)
 defines checkpoint contents and ownership; the [CLI design](cli-design.md)
 defines configuration precedence.
+
+## 0. Lossless KV compression
+
+Flare supports two lossless checkpoint compression modes selected at serving
+time with `--lossless-kv-compression` (requiring at least one configured offload
+tier: `--prefix-cache-memory`, `--prefix-cache-disk`, or `--prefix-cache-pool`):
+
+- `cpu` (profile revision `ZKV1/v1/64-pivots`): copies raw pages and
+  continuation rows from VRAM into pinned staging on capture, encodes each unit
+  with the 64-pivot matrix predictor and 64 KiB Zstd frames on a bounded CPU
+  worker pool (half the host CPUs, clamped to `[1, 24]`), and decodes both
+  `ZKV1` and `GKV1` restores on the same worker pool before host-to-device copy.
+- `gpu` (profile revision `GKV1/v2/64-pivots-rans32`): runs the 64-pivot
+  predictor, 4-lane bit packing, 32-way warp-interleaved 12-bit static rANS,
+  on-GPU packet assembly, and parallel GPU CRC32 directly on each rank's
+  lowest-priority CUDA transfer stream using a compact 3-buffer aliased
+  per-rank GPU workspace budgeted before KV cache sizing. Only compressed bytes
+  cross PCIe during capture and GPU-decoded restores, while small non-matrix
+  restores (< 256 KiB) or mutex-contended restores decode on the bounded CPU
+  worker pool over async HtoD DMA, with zero external runtime libraries beyond
+  `libcuda.so.1`.
+
+Both modes compress at the VRAM-to-DRAM boundary and keep compressed bytes
+across local DRAM (`MemoryStore`), local disk (`DiskStore`, standalone or
+composite `--prefix-cache-memory` + `--prefix-cache-disk`), manager DRAM
+(`selene-manager` arena), NVMe record files, shared-memory windows, TCP
+streams, and RDMA claims. After capturing a packed record into local DRAM
+slabs, `MemoryStore` compacts the compressed payloads and releases unused
+trailing slabs; `CompositeStore` spills those compressed units verbatim into v4
+`.ckpt` files on `--prefix-cache-disk` and promotes v4 `.ckpt` files back into
+packed DRAM slabs without re-encoding. Standalone `--prefix-cache-disk`
+captures compressed units from VRAM directly into v4 `.ckpt` files and restores
+v4 `GKV1`, v4 `ZKV1`, and raw v1–v3 `.ckpt` files across restarts. When
+retiring packed records from local memory or local disk to `selene-manager`,
+Flare sends `PutBegin.packed`; the manager sizes the arena allocation to the
+compressed v4 extent, verifies unit checksums on ingest, and flushes the v4
+record verbatim to NVMe without re-encoding. Incompressible units fall back to
+`Literal` storage with an xxh3 checksum (and all-literal local disk captures
+emit a standard raw v3 file). Shared-memory, TCP, and RDMA readers advertising
+a matching profile can claim packed records from both manager DRAM and NVMe.
+
+Both `cpu` and `gpu` modes advertise `[ZKV1, GKV1]` receive profiles across
+single-process local tiers, single-process `selene-manager` pools, and
+standalone multi-host `--rank` local disk (the profile handshake rejects
+mismatched rank modes at startup, and multi-host `--rank` +
+`--prefix-cache-pool` rejects active compression at startup):
+
+- In `gpu` mode, new captures encode on GPU as `GKV1`, matrix-predictor and
+  large-page (>= 256 KiB) `GKV1` restores decode on GPU (falling back to the
+  bounded CPU pool if a background capture holds the GPU codec), and smaller
+  non-matrix `GKV1` and `ZKV1` restores decode on the bounded CPU worker pool
+  over async HtoD DMA so critical-path restores do not stall behind foreground
+  GPU saturation. All active offload tiers (`memory`, `disk`, `pool`) share one
+  3-buffer aliased per-rank `GpuRankCodec` workspace (~130 MiB per GPU on
+  GLM-5.3-Flash TP4, ~32 MiB per GPU on DeepSeek-V4.1-Flash TP4, ~440 MiB on
+  Qwen3.8-Flash-Next TP1) with no secondary CUDA primary context. Because `gpu`
+  capture runs on a lowest-priority CUDA transfer stream, `cpu` mode remains a
+  zero-VRAM option on unified-memory GPUs such as DGX Spark GB10.
+- In `cpu` mode, Flare reserves **0 GPU VRAM**, never loads GPU codec modules,
+  encodes new captures as `ZKV1`, and natively decodes both `ZKV1` and `GKV1`
+  checkpoints on CPU.
+
+Readers running with compression `off` miss packed pool records and incur zero
+runtime overhead; starting with `off` against an exclusive local
+`--prefix-cache-disk` directory prunes v4 `.ckpt` files during its startup
+scan. Any `selene-manager` serving a codec-enabled writer must support v4
+envelopes; a manager without v4 support deletes unrecognized v4 `.ckpt` files
+during its startup scan.
+
+In `gpu` mode, the pure-CUDA C++ kernels in `ignition/preparation/kv_codec_gpu.cu`
+are compiled during Ignition core export into one cubin for the export device's
+SM architecture and embedded inside the signed core archive as an optional
+`Module` referenced by `CodecLayout.gpu_module`. Helios skips loading that
+module when compression is `off` or `cpu`, and loads it lazily via
+`cuModuleLoadData` (using only `libcuda.so.1`) when
+`--lossless-kv-compression gpu` is selected. Normal `cargo` builds require no
+CUDA compiler, and serving continues to honor `CUDA_DISABLE_JIT=1`. Cores
+exported without `CodecLayout.gpu_module` support `off` and `cpu`; requesting
+`gpu` fails at startup with a message suggesting `cpu` or re-export. Decoding
+verifies both stored and original checksums before completing a restore and
+retains source windows through the last rank's copy fence.
 
 ## 1. Scope and configurations
 
@@ -457,8 +538,10 @@ page count, the rank count, the per-rank plane sizes and row bytes, the page
 segment offset, the row segment offset, the row checksum, and the creation
 time. Versions 1 and 2 encode each plane size as `u64`; version 3 uses `u32`
 plane sizes so wider rank/plane catalogs fit the same header block. Row sizes
-remain `u64`. New records use version 3 when every plane fits `u32`, otherwise
-the `u64` format is retained. All encodings still require the header to fit 4 KiB.
+remain `u64`. Version 4 stores the variable-length shares described in
+[Lossless KV compression](#0-lossless-kv-compression). New raw records use
+version 3 when every plane fits `u32`, otherwise the `u64` format is retained.
+All encodings still require the header to fit 4 KiB.
 Versions 2 and 3 use flag bit 31 for a replicated page segment and bit 30 for a
 replicated row; version 3 also permits non-replicated records. Page offsets use
 one fixed stride for the whole record. Version-1 and version-2 records still
@@ -861,7 +944,7 @@ Offload limits interference through bounded work and explicit ownership:
 - Ticket resources belong to the scheduler until `finish_inbound`.
 - A restored endpoint's row and pages describe the same token prefix. GPU
   ancestor pages are retained, and only the missing page suffix is uploaded.
-- Rows and pages are stored byte-exact; no compression or requantization.
+- Storage compression preserves every byte; state is never requantized.
 - Record files are keyed by model and execution-state identity plus layout
   fingerprint; incompatible state is never restored. Each record directory
   has one process owner through its complete I/O lifetime.
@@ -1523,4 +1606,4 @@ bandwidth from each NVMe root complex to each GPU root complex.
   without copying pages.
 - Page-granular matching in the GPU cache, which depends on rows being cheap
   to refetch.
-- Prefetch of likely continuations, and compression.
+- Prefetch of likely continuations.

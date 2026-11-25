@@ -116,6 +116,7 @@ pub struct PutRequest {
     pub descendant_row: bool,
     pub next_child: Option<PrefixKey>,
     pub row: bool,
+    pub packed: Option<crate::shared::wire::PackedOffer>,
     pub source: PutSource,
 }
 

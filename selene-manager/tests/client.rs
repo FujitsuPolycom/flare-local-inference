@@ -323,6 +323,8 @@ fn a_client_lookup_includes_an_endpoint_exactly_at_the_prompt_length() {
         row: true,
         tier: Tier::Dram,
         bytes: (4 * PAGE + ROW) as u64,
+        packed: false,
+        required_profiles: Vec::new(),
     });
     wait("the exact prompt endpoint", || {
         let ticket = requester.client.begin_lookup(&history, 0);
@@ -351,6 +353,8 @@ fn an_instance_restores_a_neighbours_host_record_through_the_real_manager() {
         row: true,
         tier: Tier::Dram,
         bytes: (pages * PAGE + ROW) as u64,
+        packed: false,
+        required_profiles: Vec::new(),
     });
     // The manager learns of it; the requester's lookup then finds it.
     wait("the manager to offer the record", || {
@@ -420,6 +424,7 @@ fn put_request(history: &TestHistory, pages: usize) -> (PutRequest, PrefixKey) {
             descendant_row: false,
             next_child: None,
             row: true,
+            packed: None,
             source: PutSource::Host(Box::new(Bytes { data, sums, row, page_bytes: PAGE, row_bytes: ROW })),
         },
         key,
@@ -649,6 +654,174 @@ fn a_busy_source_restores_every_request_over_tcp() {
 }
 
 #[test]
+fn flare_restores_mixed_manager_records_through_shm_and_tcp() {
+    use flare_selene::{
+        Job, PageCopier, Reply, testing::Packet,
+        shared::{
+            codec::Plan,
+            packed,
+            wire::{PackedOffer, PackedUnit},
+        },
+    };
+    use std::sync::Mutex;
+    let raw_row: Vec<u8> = (0..ROW).map(|j| ((j / 12 + 2) % 4) as u8).collect();
+    let plan = Plan::new(ROW, &[]).unwrap();
+    let mut packet = vec![0u8; plan.max_packet()];
+    let (_, used) = plan
+        .encode_capture(PackedUnit::default(), &[3; 32], &raw_row, &mut packet, None)
+        .unwrap();
+    packet.truncate(used);
+    let original_crc = packed::crc32(&raw_row);
+    struct Intake {
+        layout: Layout,
+        received: Arc<Mutex<Vec<Packet>>>,
+        replies: Vec<Reply>,
+    }
+    impl PageCopier for Intake {
+        fn layout(&self) -> &Layout {
+            &self.layout
+        }
+        fn codec_receive_profiles(&self) -> Vec<[u8; 32]> {
+            vec![[3; 32]]
+        }
+        fn submit(&mut self, job: Job) -> Result<()> {
+            let window = job.codec.unwrap();
+            let packets = &window.packets;
+            self.received
+                .lock()
+                .unwrap()
+                .extend(packets.iter().map(|p| Packet {
+                    unit: p.unit.clone(),
+                    data: unsafe { p.chunks() }.concat().into(),
+                }));
+            self.replies.push(Reply {
+                id: job.id,
+                window: job.window,
+                direction: job.direction,
+                result: Ok(()),
+                bytes: packets.iter().map(|p| p.unit.stored_length).sum(),
+                elapsed: Duration::from_millis(1),
+            });
+            Ok(())
+        }
+        fn poll(&mut self, out: &mut Vec<Reply>) {
+            out.append(&mut self.replies);
+        }
+        fn in_flight(&self) -> usize {
+            self.replies.len()
+        }
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+    for (i, local) in [true, false].into_iter().enumerate() {
+        let mut manager = Manager::new();
+        let root = manager.base.join("records");
+        manager.config.root = Some(root.clone());
+        manager.config.nvme = 64 << 20;
+        manager.config.listen = Some(free_address());
+        manager.config.listen_data = Some(free_address());
+        let h = history();
+        let pages = i + 1;
+        let mut units: Vec<_> = (0..pages)
+            .map(|p| {
+                let data: Arc<[u8]> = expected_page(p).into();
+                Packet {
+                    unit: PackedUnit {
+                        original_length: PAGE as u64,
+                        stored_length: PAGE as u64,
+                        raw_xxh3: checksum(&data),
+                        logical_index: p as u64,
+                        ..Default::default()
+                    },
+                    data: data.into(),
+                }
+            })
+            .collect();
+        units.push(Packet {
+            unit: PackedUnit {
+                kind: 1,
+                representation: 1,
+                original_length: ROW as u64,
+                stored_length: packet.len() as u64,
+                profile: vec![3; 32],
+                original_crc,
+                stored_crc: packed::crc32(&packet),
+                ..Default::default()
+            },
+            data: packet.clone().into(),
+        });
+        let geometry = geo();
+        let fingerprint = fingerprint(&geometry);
+        let directory = root.join(flare_selene::record::directory_name(&[7; 32], &fingerprint));
+        std::fs::create_dir_all(&directory).unwrap();
+        let tokens = pages as u64 * PT;
+        let key = h.key_at(tokens).unwrap();
+        let header = flare_selene::record::Header::new(
+            &geometry,
+            [7; 32],
+            fingerprint,
+            key,
+            None,
+            h.bucket_at(tokens).unwrap(),
+            pages as u32,
+            std::time::SystemTime::now(),
+        )
+        .unwrap()
+        .with_packed(PackedOffer {
+            first_page: 0,
+            units: units.iter().map(|p| p.unit.clone()).collect(),
+        })
+        .unwrap();
+        let mut file = header.packed_metadata().unwrap();
+        for p in &units {
+            file.extend_from_slice(&p.data);
+        }
+        std::fs::write(directory.join(flare_selene::record::file_name(&key)), file).unwrap();
+        manager.run();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let copier = Arc::new(Mutex::new(Intake {
+            layout: Layout::new(&geometry).unwrap(),
+            received: received.clone(),
+            replies: vec![],
+        }));
+        let client = PoolClient::start(
+            config_on(&manager, 1, local, &geometry),
+            None,
+            copier,
+            Arc::new(OkRegistrar),
+            flare_selene::pool::Roots::System,
+            STARTUP_WAIT,
+        )
+        .unwrap();
+        let mut reader = Instance {
+            client,
+            gpu: Default::default(),
+            events: vec![],
+        };
+        reader.ready();
+        wait("packed store publication", || {
+            let ticket = reader.client.begin_lookup(&h, 0);
+            wait("lookup", || !matches!(ticket.state(), LookupState::Pending));
+            matches!(ticket.state(),LookupState::Ready(a) if a.candidates.iter().any(|c|c.plan.key.consumed_tokens==pages as u64*PT))
+        });
+        let ids = (0..pages as u32).collect::<Vec<_>>();
+        let fetch = fetch_for(&mut reader, &h, pages, &ids);
+        reader.client.fetch(fetch).unwrap();
+        reader
+            .event("packed restore", |e| {
+                if let PoolEvent::Fetched { result, .. } = e {
+                    Some(result.as_ref().map(|_| ()).map_err(|f| f.error.to_string()))
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(*received.lock().unwrap(), units);
+    }
+}
+
+#[test]
 fn a_record_put_into_the_manager_store_is_restored_by_another_instance() {
     let manager = Manager::start();
     let mut writer = instance(&manager, 1);
@@ -706,6 +879,8 @@ fn a_gpu_checkpoint_is_exported_by_device_copies_and_its_pin_released() {
         row: true,
         tier: Tier::Gpu,
         bytes: (pages * PAGE + ROW) as u64,
+        packed: false,
+        required_profiles: Vec::new(),
     });
     wait("the manager to offer it", || {
         let ticket = requester.client.begin_lookup(&history, 0);
@@ -778,6 +953,8 @@ fn announcements_survive_a_manager_restart_and_the_instances_reconnect() {
         row: true,
         tier: Tier::Dram,
         bytes: (4 * PAGE + ROW) as u64,
+        packed: false,
+        required_profiles: Vec::new(),
     });
     let offered = |requester: &Instance| {
         let ticket = requester.client.begin_lookup(&history, 0);
@@ -818,6 +995,8 @@ fn a_restore_through_the_real_manager_still_works_after_the_manager_restarts() {
         row: true,
         tier: Tier::Dram,
         bytes: (pages * PAGE + ROW) as u64,
+        packed: false,
+        required_profiles: Vec::new(),
     });
     let offered = |requester: &Instance| {
         let ticket = requester.client.begin_lookup(&history, 0);
@@ -1389,8 +1568,18 @@ fn memory_instance(
     geometry: &[CacheGeometry],
     slots: usize,
 ) -> (PooledStore<MemoryStore>, GpuMemory) {
+    pooled_memory_with(manager, geometry, slots, |copier, _| copier)
+}
+
+fn pooled_memory_with(
+    manager: &Manager,
+    geometry: &[CacheGeometry],
+    slots: usize,
+    wrap: impl FnOnce(flare_selene::SharedCopier, &Layout) -> flare_selene::SharedCopier,
+) -> (PooledStore<MemoryStore>, GpuMemory) {
     let (transfers, gpu) = SimulatedGpu::shared_mapped(geometry).unwrap();
     let layout = Layout::new(geometry).unwrap();
+    let transfers = wrap(transfers, &layout);
     let intake = flare_selene::offload::intake_slots(&layout, 1);
     let pool = SlabPool::new(layout.page_record_bytes, intake + slots, intake).unwrap();
     let memory = MemoryStore::new([7; 32], pool, transfers).unwrap();
@@ -1411,6 +1600,66 @@ fn an_evicted_dram_record_reaches_the_manager_store_and_is_restored_by_another_i
     let intake = flare_selene::offload::intake_slots(&layout, 1);
     let slots = intake + 8 + 2 * layout.row_slots();
     let (mut store, gpu) = memory_instance(&manager, &geometry, slots);
+    let (first, first_history) = publication(&gpu, 1, 4);
+    let (second, second_history) = publication(&gpu, 2, 4);
+    let (third, third_history) = publication(&gpu, 3, 4);
+    publish(&mut store, &first);
+    publish(&mut store, &second);
+    // The manager hears of both once their checksums are done.
+    drive(&mut store, "the records to be announced", |_| {
+        offered(&requester, &first_history) && offered(&requester, &second_history)
+    });
+
+    // The third needs the room: the coldest record moves to the manager first.
+    publish(&mut store, &third);
+    drive(&mut store, "the first record to leave", |store| {
+        store.lookup(&first_history, 0, u64::MAX).is_none()
+    });
+    assert!(store.lookup(&second_history, 0, u64::MAX).is_some());
+    assert!(store.lookup(&third_history, 0, u64::MAX).is_some());
+    // Another instance restores it from the manager's store.
+    restore_salted(&mut requester, &first_history, 1, 4, &mut store);
+    flare_selene::HostStore::close(&mut store).unwrap();
+}
+
+#[test]
+fn a_codec_reader_retires_raw_to_a_raw_only_manager_session_and_another_instance_restores_it() {
+    let manager = Manager::start();
+    let mut requester = instance(&manager, 2);
+    requester.ready();
+    let geometry = geo();
+    let layout = Layout::new(&geometry).unwrap();
+    let intake = flare_selene::offload::intake_slots(&layout, 1);
+    let slots = intake + 8 + 2 * layout.row_slots();
+    // The host offers a restore profile, while the pool transport advertises raw-only capabilities.
+    struct Reader(flare_selene::SharedCopier, Layout);
+    impl flare_selene::PageCopier for Reader {
+        fn layout(&self) -> &Layout {
+            &self.1
+        }
+        fn codec_receive_profiles(&self) -> Vec<[u8; 32]> {
+            vec![[3; 32]]
+        }
+        fn submit(&mut self, job: flare_selene::Job) -> Result<()> {
+            assert!(
+                job.codec.is_none(),
+                "raw-only peer received a packed mirror"
+            );
+            self.0.lock().unwrap().submit(job)
+        }
+        fn poll(&mut self, replies: &mut Vec<flare_selene::Reply>) {
+            self.0.lock().unwrap().poll(replies);
+        }
+        fn in_flight(&self) -> usize {
+            self.0.lock().unwrap().in_flight()
+        }
+        fn close(&mut self) -> Result<()> {
+            self.0.lock().unwrap().close()
+        }
+    }
+    let (mut store, gpu) = pooled_memory_with(&manager, &geometry, slots, |copier, layout| {
+        Arc::new(std::sync::Mutex::new(Reader(copier, layout.clone())))
+    });
     let (first, first_history) = publication(&gpu, 1, 4);
     let (second, second_history) = publication(&gpu, 2, 4);
     let (third, third_history) = publication(&gpu, 3, 4);
@@ -2566,6 +2815,8 @@ fn offer_host_record(
         row: true,
         tier: Tier::Dram,
         bytes: (pages * PAGE + ROW) as u64,
+        packed: false,
+        required_profiles: Vec::new(),
     });
     wait("the manager to offer the record", || {
         let ticket = requester.client.begin_lookup(history, 0);
@@ -2710,6 +2961,8 @@ fn a_gpu_checkpoint_on_another_host_is_relayed_through_reserved_staging() {
         row: true,
         tier: Tier::Gpu,
         bytes: (pages * PAGE + ROW) as u64,
+        packed: false,
+        required_profiles: Vec::new(),
     });
     wait("the manager to offer it", || {
         let ticket = requester.client.begin_lookup(&history, 0);

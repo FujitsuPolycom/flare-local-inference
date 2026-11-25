@@ -21,6 +21,8 @@
 //!   WINDOW  0x01  index u32, record u32, first_page u32, page_count u32,
 //!                 row u8, length u64, row_xxh3 u64, slot u64,
 //!                 page_xxh3 u64 * page_count
+//!   PACKED_WINDOW 0x08  same shape through length, manifest length u32, PackedWindow
+//!                       protobuf, then length bytes on the stream
 //!   END     0x02  no window follows; the transfer is complete
 //!   ABORT   0x03  text_len u16, text: the manager ended the transfer
 //! manager -> instance, a put (the instance answers each GRANT with FILLED):
@@ -41,6 +43,8 @@
 //! the stream carrier. Windows arrive in index order and only the transfer's own windows are
 //! ever named, so a reader needs no state beyond the grant's plan to check them.
 
+use super::{packed, wire::PackedWindow};
+use prost::Message;
 use std::io;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -69,6 +73,7 @@ const GRANT: u8 = 0x04;
 const FILLED: u8 = 0x05;
 const CREDIT: u8 = 0x06;
 const ACCEPT: u8 = 0x07;
+const PACKED_WINDOW: u8 = 0x08;
 
 /// The `slot` of a window whose payload follows it on the connection.
 pub const NO_SLOT: u64 = u64::MAX;
@@ -95,8 +100,9 @@ pub struct Shape {
 }
 
 /// A window of a claim, with the checksums stored with its record.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Window {
+    pub packed: Option<PackedWindow>,
     pub shape: Shape,
     pub page_xxh3: Vec<u64>,
     pub row_xxh3: u64,
@@ -105,8 +111,24 @@ pub struct Window {
     pub slot: u64,
 }
 
+impl Window {
+    pub fn packed(shape: Shape, manifest: PackedWindow) -> Self {
+        Self::packed_in_slot(shape, manifest, NO_SLOT)
+    }
+
+    pub fn packed_in_slot(shape: Shape, manifest: PackedWindow, slot: u64) -> Self {
+        Self {
+            shape,
+            packed: Some(manifest),
+            page_xxh3: Vec::new(),
+            row_xxh3: 0,
+            slot,
+        }
+    }
+}
+
 /// A frame the manager sends.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ToInstance {
     /// A window of a claim; its payload follows.
     Window(Window),
@@ -212,11 +234,19 @@ impl ToInstance {
         let mut out = Vec::new();
         match self {
             ToInstance::Window(window) => {
-                out.push(WINDOW);
-                put_shape(&mut out, &window.shape);
-                out.extend_from_slice(&window.row_xxh3.to_le_bytes());
-                out.extend_from_slice(&window.slot.to_le_bytes());
-                put_sums(&mut out, &window.page_xxh3);
+                if let Some(units) = &window.packed {
+                    out.push(PACKED_WINDOW);
+                    put_shape(&mut out, &window.shape);
+                    out.extend_from_slice(&window.slot.to_le_bytes());
+                    out.extend_from_slice(&(units.encoded_len() as u32).to_le_bytes());
+                    units.encode(&mut out).expect("Vec write");
+                } else {
+                    out.push(WINDOW);
+                    put_shape(&mut out, &window.shape);
+                    out.extend_from_slice(&window.row_xxh3.to_le_bytes());
+                    out.extend_from_slice(&window.slot.to_le_bytes());
+                    put_sums(&mut out, &window.page_xxh3);
+                }
             }
             ToInstance::End => out.push(END),
             ToInstance::Abort(text) => {
@@ -271,6 +301,7 @@ impl ToInstance {
                 let slot = reader.read_u64_le().await?;
                 let page_xxh3 = read_sums(reader, shape.page_count, max_pages).await?;
                 Ok(ToInstance::Window(Window {
+                    packed: None,
                     shape,
                     page_xxh3,
                     row_xxh3,
@@ -288,6 +319,30 @@ impl ToInstance {
                 Ok(ToInstance::Abort(
                     String::from_utf8_lossy(&text).into_owned(),
                 ))
+            }
+            PACKED_WINDOW => {
+                let mut bytes = [0; SHAPE_BYTES];
+                reader.read_exact(&mut bytes).await?;
+                let shape = parse_shape(&bytes)?;
+                let slot = reader.read_u64_le().await?;
+                let size = reader.read_u32_le().await? as usize;
+                if size > packed::MAX_DIRECTORY || shape.page_count > max_pages {
+                    return Err(invalid("oversized packed window"));
+                }
+                let mut bytes = vec![0; size];
+                reader.read_exact(&mut bytes).await?;
+                let window =
+                    PackedWindow::decode(&*bytes).map_err(|_| invalid("bad packed window"))?;
+                if window.units.len() > packed::MAX_UNITS
+                    || window
+                        .units
+                        .iter()
+                        .try_fold(0u64, |sum, u| sum.checked_add(u.stored_length))
+                        != Some(shape.length)
+                {
+                    return Err(invalid("packed window length disagrees with units"));
+                }
+                Ok(Self::Window(Window::packed_in_slot(shape, window, slot)))
             }
             GRANT => {
                 let mut shape = [0u8; SHAPE_BYTES];
@@ -428,12 +483,14 @@ mod tests {
     async fn every_manager_frame_survives_a_round_trip() {
         for frame in [
             ToInstance::Window(Window {
+                packed: None,
                 shape: shape(),
                 page_xxh3: vec![1, 2, u64::MAX],
                 row_xxh3: 9,
                 slot: NO_SLOT,
             }),
             ToInstance::Window(Window {
+                packed: None,
                 shape: shape(),
                 page_xxh3: vec![1, 2, 3],
                 row_xxh3: 0,
@@ -478,6 +535,7 @@ mod tests {
     #[test]
     fn a_window_has_the_documented_bytes() {
         let bytes = ToInstance::Window(Window {
+            packed: None,
             shape: Shape {
                 index: 1,
                 record: 2,
@@ -519,6 +577,7 @@ mod tests {
     async fn hostile_frames_are_refused_without_allocating_what_they_claim() {
         // More pages than the reader allows.
         let mut bytes = ToInstance::Window(Window {
+            packed: None,
             shape: Shape {
                 page_count: 1 << 30,
                 ..shape()

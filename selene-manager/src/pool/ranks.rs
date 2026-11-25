@@ -63,6 +63,7 @@ impl Core {
     ) -> Option<u64> {
         let _ = tx.try_send(v2::RankServerMessage {
             m: Some(v2::rank_server_message::M::Attached(v2::RankAttached {
+                codec: None,
                 status: status as i32,
                 generation: 0,
                 mode: v2::RankMode::Unspecified as i32,
@@ -108,6 +109,13 @@ impl Core {
             return self.rank_refuse(&tx, S::RankBadSecret);
         }
         if attach.rank == 0 || attach.rank >= world {
+            return self.rank_refuse(&tx, S::RankBadRank);
+        }
+        let Ok(offered_codec) = flare_selene::shared::packed::canonical_caps(attach.codec.as_ref())
+        else {
+            return self.rank_refuse(&tx, S::RankBadRank);
+        };
+        if offered_codec != self.sessions[&sid].offered_codec {
             return self.rank_refuse(&tx, S::RankBadRank);
         }
         let shm_capable = peer.shared_memory(self.euid, self.egid);
@@ -175,6 +183,7 @@ impl Core {
         );
         let _ = tx.try_send(v2::RankServerMessage {
             m: Some(v2::rank_server_message::M::Attached(v2::RankAttached {
+                codec: self.sessions[&sid].codec.clone(),
                 status: S::RankOk as i32,
                 generation: aid,
                 mode: mode as i32,
@@ -366,11 +375,22 @@ mod tests {
         nonce: Nonce,
         peer: OpenPeer,
     ) -> (u64, mpsc::Receiver<v2::ServerMessage>) {
+        open_rank0_offer(core, world, nonce, peer, None)
+    }
+
+    fn open_rank0_offer(
+        core: &mut Core,
+        world: usize,
+        nonce: Nonce,
+        peer: OpenPeer,
+        codec: Option<v2::CodecCaps>,
+    ) -> (u64, mpsc::Receiver<v2::ServerMessage>) {
         let (tx, rx) = mpsc::channel(64);
         let sid = core
             .open(
                 peer,
                 v2::OpenSession {
+                    codec,
                     manager_incarnation: core.incarnation,
                     instance_id: INSTANCE.to_vec(),
                     scope: Some(scope(world)),
@@ -420,6 +440,7 @@ mod tests {
 
     fn attach(rank: u32, nonce: u8) -> v2::RankAttach {
         v2::RankAttach {
+            codec: None,
             manager_incarnation: 0,
             instance_id: INSTANCE.to_vec(),
             rank0_nonce: RANK0.to_vec(),
@@ -446,6 +467,50 @@ mod tests {
             Some(M::Attached(a)) => S::try_from(a.status).unwrap(),
             other => panic!("expected an Attached, got {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn different_raw_fallback_offers_cannot_attach_to_one_instance() {
+        let mut core = core();
+        let peer = unix(&core);
+        open_rank0(&mut core, 2, RANK0, peer);
+        let mut rank = attach(1, 5);
+        rank.codec = Some(v2::CodecCaps {
+            envelope_revision: 3,
+            receive_profiles: Vec::new(),
+        });
+        let peer = unix(&core);
+        let (agent, messages) = join(&mut core, rank, peer);
+        assert_eq!(status(&messages), S::RankBadRank);
+        assert!(agent.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rank_caps_must_match_before_superseding_an_attachment() {
+        let mut core = core();
+        let peer = unix(&core);
+        let mut first = attach(1, 5);
+        let caps = v2::CodecCaps {
+            envelope_revision: 4,
+            receive_profiles: vec![vec![3; 32]],
+        };
+        open_rank0_offer(&mut core, 2, RANK0, peer, Some(caps.clone()));
+        first.codec = Some(caps);
+        let peer = unix(&core);
+        let (agent, messages) = join(&mut core, first.clone(), peer);
+        assert_eq!(status(&messages), S::RankOk);
+        let peer = unix(&core);
+        first.codec = None;
+        let (replacement, messages) = join(&mut core, first, peer);
+        assert_eq!(status(&messages), S::RankBadRank);
+        assert!(replacement.is_none());
+        let agent = agent.unwrap();
+        assert!(!core.agents[&agent].drain_only);
+
+        let peer = unix(&core);
+        let replacement = open_rank0(&mut core, 2, RANK0, peer);
+        assert!(core.agents[&agent].drain_only);
+        assert!(!core.ranks_ready(replacement));
     }
 
     #[tokio::test(flavor = "multi_thread")]

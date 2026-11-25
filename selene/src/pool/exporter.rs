@@ -45,6 +45,31 @@ pub trait HostPin: Send {
     /// Copy the span into `dst` (page records, then the row) and return its
     /// persisted checksums. May block on a device: it runs on a copy thread.
     fn read(&mut self, window: &HostWindow, dst: &mut [u8]) -> Result<Checksums>;
+    /// Optional packed unit directory for one record in the pinned chain.
+    fn packed_offer_for(&self, _record: usize) -> Option<crate::shared::wire::PackedOffer> {
+        None
+    }
+    /// Optional combined packed unit directory when every record in the pinned chain is stored packed.
+    fn packed_offer(&self) -> Option<crate::shared::wire::PackedOffer> {
+        let count = self.chain().records.len();
+        if count == 0 {
+            return None;
+        }
+        let mut first_page = 0u64;
+        let mut units = Vec::new();
+        for i in 0..count {
+            let offer = self.packed_offer_for(i)?;
+            if i == 0 {
+                first_page = offer.first_page;
+            }
+            units.extend(offer.units);
+        }
+        Some(crate::shared::wire::PackedOffer { first_page, units })
+    }
+    /// Copy packed bytes for `window` into `dst`, returning bytes written.
+    fn read_packed(&mut self, _window: &HostWindow, _dst: &mut [u8]) -> Result<usize> {
+        Err(crate::Error::new("host pin does not carry packed records"))
+    }
 }
 
 /// Bytes a store or a probe supplies for a put, window by window.

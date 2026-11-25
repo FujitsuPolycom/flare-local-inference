@@ -136,6 +136,23 @@ fn retain(prepared: &mut Prepared, agreed: &HashMap<PrefixKey, bool>) -> Result<
     Ok(())
 }
 
+fn compression_tag(mode: super::KvCompression) -> u8 {
+    match mode {
+        super::KvCompression::Off => 0,
+        super::KvCompression::Cpu => 1,
+        super::KvCompression::Gpu => 2,
+    }
+}
+
+fn parse_compression_tag(tag: u8) -> Result<super::KvCompression> {
+    match tag {
+        0 => Ok(super::KvCompression::Off),
+        1 => Ok(super::KvCompression::Cpu),
+        2 => Ok(super::KvCompression::Gpu),
+        _ => Err(invalid("invalid lossless KV compression mode in rank handshake")),
+    }
+}
+
 /// Whether this rank serves a disk store its peers can mirror; a memory tier keeps records in
 /// one process's memory, which other hosts cannot reach.
 fn mirrored(prepared: &Prepared) -> Result<bool> {
@@ -195,6 +212,11 @@ pub fn join_rank_zero(
     let limit = prepared
         .as_ref()
         .map(|prepared| prepared.resolved.disk_limit);
+    let compression = prepared
+        .as_ref()
+        .and_then(|prepared| prepared.geometry.first())
+        .map(|rank| rank.placement)
+        .unwrap_or_default();
     let mut offers = vec![Vec::new()];
     for peer_local in &local {
         let mut offer = vec![enabled as u8];
@@ -207,6 +229,7 @@ pub fn join_rank_zero(
             offer.extend(token);
             offer.extend(layout.unwrap_or_default());
             offer.extend(limit.unwrap_or_default().to_le_bytes());
+            offer.push(compression_tag(compression));
             offer.extend((address.to_string().len() as u32).to_le_bytes());
             offer.extend(address.to_string().as_bytes());
         }
@@ -222,12 +245,19 @@ pub fn join_rank_zero(
             let mut reader = Reader(&reply[1..]);
             let peer_layout = reader.take(16)?;
             let peer_limit = reader.u64()?;
+            let peer_compression = parse_compression_tag(reader.u8()?)?;
             reader.end()?;
             if let Some(layout) = layout
                 && peer_layout != layout
             {
                 return Err(invalid(format!(
                     "rank {} describes a different cache layout than rank zero; every rank of a multi-host core must have the same plane and row sizes",
+                    index + 1
+                )));
+            }
+            if peer_compression != compression {
+                return Err(invalid(format!(
+                    "rank {} selected different lossless KV compression settings; configure the same mode on every rank",
                     index + 1
                 )));
             }
@@ -324,18 +354,25 @@ pub fn join_peer(
 ) -> Result<Option<Service>> {
     // Read what the offer needs, then release the guard: taking the prepared
     // resources below locks the same shared cell.
-    let (enabled, layout, limit) = match store.map(Shared::lock).as_ref().and_then(|g| g.as_ref()) {
-        Some(prepared) => (
-            mirrored(prepared)?,
-            crate::geometry::fingerprint(&prepared.geometry),
-            prepared.resolved.disk_limit,
-        ),
-        None => (false, [0; 16], 0),
-    };
+    let (enabled, layout, limit, compression) =
+        match store.map(Shared::lock).as_ref().and_then(|g| g.as_ref()) {
+            Some(prepared) => (
+                mirrored(prepared)?,
+                crate::geometry::fingerprint(&prepared.geometry),
+                prepared.resolved.disk_limit,
+                prepared
+                    .geometry
+                    .first()
+                    .map(|rank| rank.placement)
+                    .unwrap_or_default(),
+            ),
+            None => (false, [0; 16], 0, super::KvCompression::Off),
+        };
     let mut record = vec![enabled as u8];
     if enabled {
         record.extend(layout);
         record.extend(limit.to_le_bytes());
+        record.push(compression_tag(compression));
     }
     let records = exchange(&record)?;
     let offer = &records[0];
@@ -367,6 +404,7 @@ pub fn join_peer(
     let token = reader.take(16)?;
     let zero_layout = reader.take(16)?;
     let zero_limit = reader.u64()?;
+    let zero_compression = parse_compression_tag(reader.u8()?)?;
     let length = reader.u32()? as usize;
     let address = std::str::from_utf8(reader.take(length)?)
         .map_err(|_| invalid("rank zero's prefix record address is malformed"))?;
@@ -374,6 +412,11 @@ pub fn join_peer(
     if zero_layout != layout {
         return Err(invalid(format!(
             "rank {rank} describes a different cache layout than rank zero; every rank of a multi-host core must have the same plane and row sizes"
+        )));
+    }
+    if zero_compression != compression {
+        return Err(invalid(format!(
+            "rank {rank} selected different lossless KV compression settings; configure the same mode on every rank"
         )));
     }
     let limit = zero_limit.min(limit);

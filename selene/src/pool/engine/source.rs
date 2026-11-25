@@ -185,12 +185,16 @@ impl Engine {
             })
             .collect();
         let row = chain.row.is_some();
-        self.pinned(export, records, row, Pin::Gpu(chain));
+        let packed = vec![None; records.len()];
+        self.pinned(export, records, packed, row, Pin::Gpu(chain));
     }
 
     /// The store pinned a host-tier chain for the export.
     pub(crate) fn on_host_pinned(&mut self, export: ExportId, pin: Box<dyn HostPin>) {
         let chain = pin.chain().clone();
+        let packed: Vec<Option<wire::PackedOffer>> = (0..chain.records.len())
+            .map(|i| pin.packed_offer_for(i))
+            .collect();
         let records = chain
             .records
             .iter()
@@ -204,6 +208,7 @@ impl Engine {
         self.pinned(
             export,
             records,
+            packed,
             chain.row,
             Pin::Host(Arc::new(Mutex::new(pin))),
         );
@@ -211,7 +216,14 @@ impl Engine {
 
     /// Answer an export request with the chain that was pinned for it, or
     /// release the pin if the export can no longer use it.
-    fn pinned(&mut self, export: ExportId, expected: Vec<ExpectedRecord>, row: bool, pin: Pin) {
+    fn pinned(
+        &mut self,
+        export: ExportId,
+        expected: Vec<ExpectedRecord>,
+        packed: Vec<Option<wire::PackedOffer>>,
+        row: bool,
+        pin: Pin,
+    ) {
         let id = export.0;
         let release = |engine: &Engine, pin: Pin| {
             // A GPU pin is the worker's to release; a host pin releases on drop.
@@ -228,7 +240,20 @@ impl Engine {
         }
         let (page_bytes, row_bytes) = (self.st.page_record_bytes(), self.st.row_record_bytes());
         let total: u64 = expected.iter().map(|r| u64::from(r.pages)).sum();
-        let bytes = total * page_bytes + if row { row_bytes } else { 0 };
+        let any_packed = packed.iter().any(Option::is_some);
+        let bytes: u64 = expected
+            .iter()
+            .zip(&packed)
+            .map(|(r, offer)| match offer {
+                Some(offer) => offer.units.iter().map(|u| u.stored_length).sum(),
+                None => u64::from(r.pages) * page_bytes + if r.row { row_bytes } else { 0 },
+            })
+            .sum();
+        // Multi-process rank agents (`self.ranks.is_some()`) hold single-rank packed records
+        // rather than world-wide offers; CLI startup rejects `--rank` + `--prefix-cache-pool` +
+        // compression in `PrefixCacheOffload::validate_topology`, and direct `PoolClient` callers
+        // are still guarded below by `shared::packed::Layout::new`'s world-wide rank-coverage
+        // check (`ClaimReason::ChainGap`).
         let valid = !expected.is_empty() && row == run.want_row;
         // A GPU export always has its staging reserved; a host export with none
         // reserved streams.
@@ -252,9 +277,37 @@ impl Engine {
             }
             return release(self, pin);
         }
+        let mut coverage = Coverage::new(expected.clone());
+        if any_packed {
+            let geometry = &self.st.scope.geometry;
+            let ranks: Vec<_> = geometry
+                .ranks
+                .iter()
+                .map(|r| crate::record::RankSizes {
+                    planes: r.plane_bytes.clone(),
+                    row_bytes: r.row_bytes,
+                })
+                .collect();
+            for (i, (r, offer)) in expected.iter().zip(&packed).enumerate() {
+                let Some(offer) = offer else { continue };
+                let first = (r.key.consumed_tokens / geometry.page_tokens)
+                    .checked_sub(u64::from(r.pages));
+                let layout = first.and_then(|first| {
+                    crate::shared::packed::Layout::new(offer.clone(), &ranks, first, r.pages).ok()
+                });
+                let Some(layout) = layout.filter(|l| r.row == (l.row_bytes() != 0)) else {
+                    self.source.exports.remove(&id);
+                    self.pin_refused(id, wire::ClaimReason::ChainGap);
+                    return release(self, pin);
+                };
+                coverage.set_packed_layout(i, layout);
+            }
+        }
         let records: Vec<wire::Record> = expected
             .iter()
-            .map(|r| wire::Record {
+            .zip(packed)
+            .map(|(r, offer)| wire::Record {
+                packed: offer,
                 key: Some(codec::key_to(r.key)),
                 first_page: r.first_page,
                 pages: r.pages,
@@ -282,7 +335,7 @@ impl Engine {
             return release(self, pin);
         };
         run.phase = Phase::Pinned;
-        run.coverage = Some(Coverage::new(expected));
+        run.coverage = Some(coverage);
         run.pin = Some(pin);
         let reference = run.reference.clone();
         self.emit(Out::PinAck(wire::PinAck {
@@ -389,7 +442,8 @@ impl Engine {
         let Some(staging) = self.net.clone() else {
             return;
         };
-        let spec = wire::WindowSpec {
+        let mut spec = wire::WindowSpec {
+            packed: None,
             index: shape.index,
             region: wire::Region::Staging as i32,
             offset: staging.offset(slot),
@@ -399,6 +453,15 @@ impl Engine {
             page_count: shape.page_count,
             row: shape.row,
         };
+        if let Some(units) = self
+            .source
+            .exports
+            .get(&export)
+            .and_then(|run| run.coverage.as_ref())
+            .and_then(|cov| cov.pinned_units(&spec))
+        {
+            spec.packed = Some(wire::PackedWindow { units });
+        }
         let taken = self.export_window(export, spec, Some(slot));
         if !taken {
             self.free_slot(slot);
@@ -449,8 +512,8 @@ impl Engine {
                     address + count * page_bytes as usize,
                 );
                 run.out.jobs_outstanding += jobs.len() as u32;
-                run.windows.insert(spec.index, spec);
-                let sent = run.out.fan_out(self.ranks.as_mut(), spec);
+                run.windows.insert(spec.index, spec.clone());
+                let sent = run.out.fan_out(self.ranks.as_mut(), spec.clone());
                 run.failed |= sent.is_err();
                 for job in jobs {
                     self.queue_job(
@@ -464,7 +527,9 @@ impl Engine {
             }
             Pin::Host(pin) => {
                 let pin = pin.clone();
-                run.windows.insert(spec.index, spec);
+                let is_packed = spec.packed.is_some();
+                let expected_len = spec.length as usize;
+                run.windows.insert(spec.index, spec.clone());
                 let span = HostWindow {
                     record: spec.record,
                     first_page: spec.first_page,
@@ -473,13 +538,28 @@ impl Engine {
                 };
                 let job = run.out.fill_host(
                     FillOwner::Export(id),
-                    spec,
+                    spec.clone(),
                     address,
                     slot,
                     self.ranks.as_ref(),
-                    Box::new(move |dst| pin.lock().unwrap().read(&span, dst)),
+                    Box::new(move |dst| {
+                        if is_packed {
+                            let written = pin.lock().unwrap().read_packed(&span, dst)?;
+                            if written != expected_len {
+                                return Err(crate::Error::new(format!(
+                                    "packed export wrote {written} bytes, expected {expected_len}"
+                                )));
+                            }
+                            Ok(Checksums {
+                                pages: Vec::new(),
+                                row: None,
+                            })
+                        } else {
+                            pin.lock().unwrap().read(&span, dst)
+                        }
+                    }),
                 );
-                run.failed |= run.out.fan_out(self.ranks.as_mut(), spec).is_err();
+                run.failed |= run.out.fan_out(self.ranks.as_mut(), spec.clone()).is_err();
                 if !self.submit_fill(job) {
                     let run = self.source.exports.get_mut(&id).expect("present");
                     run.out.jobs_outstanding -= 1;
@@ -556,7 +636,7 @@ impl Engine {
         };
         if run.failed {
             self.fill_failed(export, index);
-        } else if let Some(spec) = run.windows.get(&index).copied() {
+        } else if let Some(spec) = run.windows.get(&index).cloned() {
             if !self.window_still_running(export, index) {
                 let sums = self
                     .source
@@ -593,11 +673,12 @@ impl Engine {
             .is_some_and(|run| run.reference.is_some());
         let sums = persisted
             .map(Ok)
-            .unwrap_or_else(|| self.window_sums(spec, on_channel));
+            .unwrap_or_else(|| self.window_sums(spec.clone(), on_channel));
         let result = sums.and_then(|sums| {
             let run = self.source.exports.get_mut(&export).expect("present");
             run.windows.remove(&spec.index);
-            run.out.filled(spec, sums, on_channel, self.ranks.is_some())
+            run.out
+                .filled(spec.clone(), sums, on_channel, self.ranks.is_some())
         });
         match result {
             Ok(Some((sums, rank_sums))) => self.emit(Out::WindowFilled(wire::WindowFilled {

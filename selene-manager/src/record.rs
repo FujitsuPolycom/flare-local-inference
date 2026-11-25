@@ -94,14 +94,21 @@ pub fn verify_record(bytes: &[u8], header: &Header, row: bool) -> Result<()> {
     {
         return Err(invalid("record header or length"));
     }
+    if let Some(layout) = &header.packed {
+        return flare_selene::shared::packed::verify_units(
+            layout.units(0, layout.page_count(), row).unwrap(),
+            &bytes[header.page_segment as usize..],
+        )
+        .map_err(|e| invalid(e.to_string()));
+    }
     for page in 0..header.tail_pages as usize {
-        let start = header.page_segment as usize + page * header.page_record_bytes() as usize;
+        let start = header.page_segment as usize + page * header.stored_page_bytes() as usize;
         let expected = u64::from_le_bytes(
             bytes[4096 + page * 8..4096 + page * 8 + 8]
                 .try_into()
                 .unwrap(),
         );
-        if checksum(&bytes[start..start + header.page_record_bytes() as usize]) != expected {
+        if checksum(&bytes[start..start + header.stored_page_bytes() as usize]) != expected {
             return Err(invalid("disk page checksum"));
         }
     }

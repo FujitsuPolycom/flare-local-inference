@@ -1538,6 +1538,7 @@ async fn a21_a_pin_larger_than_the_reservation_fails_no_windows() {
     let request = w.source.export_request().await;
     // The chain grew: the source reports more pages than were reserved.
     let records = vec![v2::Record {
+        packed: None,
         key: Some(pool::pkey(1024)),
         first_page: 0,
         pages: 40,

@@ -369,6 +369,7 @@ impl Client {
             published_tail_pages: chain_pages
                 - parent.map_or(0, |parent| parent.consumed_tokens / page_tokens),
             mode: v2::CopyMode::SharedWindows as i32,
+            packed: None,
         }
     }
 
@@ -446,6 +447,7 @@ impl Client {
             key,
             parent,
             options,
+            None,
             None,
         )
         .await

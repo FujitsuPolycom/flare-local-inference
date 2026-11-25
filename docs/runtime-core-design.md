@@ -270,6 +270,25 @@ N-gram table payloads are appended directly from checkpoint
 file ranges during rank export, without materializing their contents in
 preparation memory.
 
+### Checkpoint codec layout
+
+The optional `CacheContract.codec_layout` (`CodecLayout`) declares lossless
+storage formats that Selene may use for cache write-back and restore across
+memory, local disk, and pool tiers.
+Cores without this field serve with compression off. Requesting compression
+requires a supported layout.
+
+The optional `CodecLayout.gpu_module` names a compiled cubin module stored in
+each rank's `modules` table for GPU checkpoint compression. Helios skips loading
+this module when `--lossless-kv-compression` is `off` or `cpu`, and loads it
+lazily when `--lossless-kv-compression gpu` is requested. Cores exported without
+`gpu_module` continue to serve with `off` and `cpu`.
+
+A unit is one rank's share of a logical cache page or one continuation row.
+Each field names an execution buffer, a byte offset and length within its
+unit, and a storage encoding. Revision 1 field encodings and block sizes are
+specified in [`selene-manager/PROTOCOL.md`](../selene-manager/PROTOCOL.md#lossless-packet-format).
+
 ### Native export transfers and progress
 
 The exporter in `heliopause/src/export/` performs bulk I/O while the GIL is
@@ -694,7 +713,9 @@ Helios rejects graph operation identifiers 10, 11, and 13 and the graph kinds
 implemented: loading and serving cores that recorded those operations.
 
 Unselected graph templates and executables are never reconstructed. Functions
-used only by omitted graphs are dropped, as are unused modules without globals.
+used only by omitted graphs are dropped, as are unused modules without globals,
+except the codec module named by `CodecLayout.gpu_module` while
+`--lossless-kv-compression gpu` is active.
 Modules with globals retain their persistent contents. Weights, MTP weights,
 and fixed scratch remain intact because opaque kernel parameters and persistent
 device storage can embed their addresses. `SchedulerLimits.max_active` controls

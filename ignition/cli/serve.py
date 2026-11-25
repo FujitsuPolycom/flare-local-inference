@@ -148,7 +148,8 @@ def export(args) -> int:
         except (ValueError, OSError) as error:
             raise UsageError(str(error)) from error
     with export_options(cache, no_weights=getattr(args, 'no_weights', False) or reuse_weights is not None,
-                        reuse_weights=reuse_weights):
+                        reuse_weights=reuse_weights,
+                        kernel_cache=configuration.directory('kernel_cache')):
         if args.ranks > 1:
             code, result = _export_hosts(args)
         else:

@@ -114,11 +114,16 @@ pub(super) fn pool_scope(
 ) -> crate::Result<crate::shared::Scope> {
     let mut scope = crate::shared::Scope::new(identity, geometry::fingerprint(geometry), geometry)?;
     for rank in &mut scope.geometry.ranks {
-        for bytes in rank.plane_bytes.iter_mut().chain([&mut rank.row_bytes]) {
-            *bytes = bytes.div_ceil(geometry::BLOCK_BYTES) * geometry::BLOCK_BYTES;
-        }
+        pad_pool_rank(&mut rank.plane_bytes, &mut rank.row_bytes);
     }
     Ok(scope)
+}
+
+/// A session advertises each plane and row at its stored, block-aligned size.
+pub fn pad_pool_rank(planes: &mut [u64], row: &mut u64) {
+    for bytes in planes.iter_mut().chain([row]) {
+        *bytes = bytes.next_multiple_of(geometry::BLOCK_BYTES);
+    }
 }
 
 #[cfg(test)]

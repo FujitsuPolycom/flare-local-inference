@@ -537,8 +537,14 @@ stream carrier by `length` payload bytes, then `END`; for a put `GRANT` from the
 carrier. On the RDMA carrier the payload never travels on the connection: the manager writes a
 claim's window into a private slot the instance lent (`CREDIT`) and then names it in `WINDOW`;
 the manager answers an RDMA `HELLO` with `ACCEPT`, its own queue-pair description. `ABORT` (with
-text) is the manager ending a transfer early.
-Puts and rank legs use the stream carrier. Windows arrive in index
+text) is the manager ending a transfer early. `PACKED_WINDOW` (tag 8) carries the window shape,
+the RDMA destination slot (`NO_SLOT` on stream), a u32 manifest length, the serialized
+`PackedWindow`, and on the stream carrier the stored bytes; on the RDMA carrier the manager writes
+the compressed bytes into the credited slot before naming it in `PACKED_WINDOW`. Writers with
+active compression may attach `PutBegin.packed` (`PackedOffer`) so the manager allocates the
+compressed v4 extent directly in its arena (`PutAccept.packed = true`), grants packed put windows,
+verifies unit checksums on ingest, and flushes the record verbatim to NVMe. Puts and rank legs use
+the stream carrier. Windows arrive in index
 order and are checked by the receiver's coverage exactly as shared windows are, so a transfer that
 ends short or over is a `COPY_ERROR`; `COPY_OK` waits for `END`.
 
@@ -1038,3 +1044,86 @@ record the manager rewrites with the checksums it computed.
 Rank legs and puts use TCP. Each transfer owns its queue pair, whose destruction fences all
 outstanding work before its handler reports `Closed`. The manager never advertises its region
 keys or addresses; only the instance's private transfer staging is remotely writable.
+
+### Opaque checkpoint envelopes (revision 4)
+
+`OpenSession.codec` (9) and `SessionOpened.codec` (7) negotiate an envelope revision and a set
+of 32-byte receive-profile digests. An absent acknowledgement permits raw transfers only. A
+rank offers its capabilities in `RankAttach.codec` (7) and receives the acknowledgement in
+`RankAttached.codec` (4). Every process of an instance must offer identical capabilities. A
+mismatched attach is refused before it can supersede the live rank. Packed windows use shared
+memory, a TCP stream, or credited RDMA slots (`PACKED_WINDOW` with a non-`NO_SLOT` slot).
+
+Instance holdings may be raw or packed, and `PutBegin.packed` (15) may supply pre-encoded
+packed units (`PutAccept.packed` confirms acceptance). For manager-owned records, lookup
+requires the receiver to support every packed profile in the chain. A claim repeats this check
+on the pinned records. `Record.packed` (6) describes each selected suffix in the grant. Units
+are ordered by absolute page index and stored rank, followed by the endpoint row's ranks. Each
+unit names its replica destinations. A literal carries the original bytes and their XXH3. A
+packet carries its profile and CRC-32/IEEE checksums of the stored and original bytes.
+
+`WindowSpec.packed` (9) identifies the units in a shared window. TCP tag 8 carries the
+little-endian window shape, a little-endian u32 manifest length, a protobuf `PackedWindow` and
+the selected bytes. Each rank receives the units it owns or replicates. A window contains whole
+pages or an indivisible row and retains its source until release and fencing. The reader checks
+the manifest against the pinned selection, checks stored bytes before decode, and checks the
+original CRC before publishing the restore.
+
+The first 4,096-byte disk block uses the raw common fields through creation time at offset 165.
+Version is 4, and the raw row checksum field is zero. At offsets 173, 181, 185 and 189 are the
+directory offset (u64, 4096), directory length (u32), directory CRC-32/IEEE (u32), and
+untruncated physical record length (u64). The directory is a protobuf message with repeated
+RankPlanes at 1 and PackedOffer at 2. It is bounded to 2 MiB, 16,384 units and 64 ranks. The
+payload follows immediately. Physical offsets are checked prefix sums. Actual EOF at or beyond
+the end of the pages but short of the complete row means page-only. EOF within the pages or
+directory is invalid. Compaction truncates at the row offset. A refill publishes a replacement
+record. The directory is immutable, including after a truncate. Disk write-back and shutdown
+publish the physical file length from the chosen header.
+
+### Lossless packet format
+
+A packet encodes one rank's block-padded share of one page or continuation
+row. Layout revision 1 names the packet profile `ZKV1/v1/64-pivots`.
+All header and directory words are little-endian u32. The 16-byte header
+contains the four bytes `ZKV1`, version 1, the frame count and the original
+byte length. Each 4-byte directory entry stores the frame's payload length in
+bits 0–30 and sets bit 31 when the frame is stored literally without
+compression. Frame payloads follow the directory in order with no gaps or
+trailing bytes. Decoders derive frame boundaries from the declared layout and
+validate every header field and frame length before decoding.
+
+Matrix fields (`encoding = 1`) are grouped up to four 128 × 128 binary32
+matrices per frame. Each matrix runs a bit-exact 64-pivot low-rank predictor,
+splits residual widths (`0..=32`) into four little-endian `u16` lane word
+counts, each followed by that many `u32` low-bit words, and compresses the
+concatenated group widths as a standard Zstandard frame.
+Non-matrix fields are chunked up to 64 KiB per frame, apply byte-lane shuffle
+or compound page value/scale split-shuffle, and compress each frame as a
+standard Zstandard frame. Any frame whose encoded payload is not smaller than
+its raw bytes is stored literally with bit 31 set.
+
+The GPU codec profile `GKV1/v2/64-pivots-rans32` uses the same field
+transforms and bit-exact 64-pivot matrix predictor, coalesces transformed
+streams into 64 KiB chunks, and compresses each chunk with a 32-way
+warp-interleaved 12-bit static rANS coder (RLE, sparse table, dense table, or
+literal fallback). A `GKV1` packet begins with a 24-byte header of six
+little-endian `u32` words (`GKV1`, version 2, `original_bytes`, `num_chunks`,
+`num_mats`, and `low_bytes`), followed at byte 24 by the `num_chunks`-word
+`u32` chunk directory (bits 0–30 carry payload length; bit 31 marks a literal
+chunk), then `num_mats * 4` little-endian `u16` matrix low-bit lane word
+counts, then chunk payloads, and finally `low_bytes` of 4-lane low-bit
+payloads. Both `cpu` and `gpu` modes decode `GKV1` and `ZKV1` packets and
+verify stored and original CRC-32/IEEE checksums before publishing restored
+bytes.
+
+| Field encoding | Storage in one block |
+|---|---|
+| 0 | One uninterpreted byte |
+| 1 | One 128 × 128 binary32 matrix, 65,536 bytes, aligned to four bytes. The predictor uses 64 pivots. |
+| 2 | One bfloat16 element, two bytes |
+| 20, 32 | One convolution history entry of ten or sixteen bfloat16 elements (20 or 32 bytes), transposed by byte lane |
+| 40 | 256 rows of 512 FP8 values and four binary32 scales per row, 135,168 bytes |
+| 41 | 64 rows of 128 FP8 values followed by 64 binary32 scales, 8,448 bytes |
+| 42 | 64 rows of 512 FP8 values, 32,768 bytes |
+| 45 | 64 rows of 512 packed FP4 data bytes and 16 scale bytes, 33,792 bytes |
+| 47 | 64 rows of 256 packed FP4 data bytes and 32 scale bytes, 18,432 bytes |

@@ -106,7 +106,8 @@ def _peer(parent, snapshot, config, rank, rendezvous, connection, control, prepa
             dist.barrier()
             storage.peer_storage.reset()
             dist.barrier()
-            with export_options(cache.cache, no_weights=cache.no_weights, reuse_weights=cache.reuse_weights) if cache else nullcontext():
+            with export_options(cache.cache, no_weights=cache.no_weights, reuse_weights=cache.reuse_weights,
+                                kernel_cache=cache.kernel_cache) if cache else nullcontext():
                 core = export_model(model, recorder, storage, path, options=options, sources=True)
             control.send({"peer_memory": list(storage.peer_storage.owned.items()),
                           "memory_inventory": core.memory_inventory})

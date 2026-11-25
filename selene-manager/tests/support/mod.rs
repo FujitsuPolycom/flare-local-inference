@@ -26,7 +26,7 @@ use std::{
 pub mod channel;
 pub mod net;
 pub mod pool;
-mod put;
+pub mod put;
 #[cfg(feature = "rdma")]
 pub mod rdma;
 pub mod store_client;
@@ -42,14 +42,16 @@ pub fn key(tokens: u64) -> Key {
 }
 
 pub fn descriptor() -> Descriptor {
+    let mut rank = RankSizes {
+        planes: vec![4000],
+        row_bytes: 1000,
+    };
+    flare_selene::pool::pad_pool_rank(&mut rank.planes, &mut rank.row_bytes);
     Descriptor {
         identity: [7; 32],
         fingerprint: [3; 16],
         page_tokens: 64,
-        ranks: vec![RankSizes {
-            planes: vec![4000],
-            row_bytes: 1000,
-        }],
+        ranks: vec![rank],
         pool_name: "tenant".into(),
     }
 }
@@ -162,22 +164,36 @@ pub fn content_for(
     parent: Option<Key>,
     first: u32,
 ) -> (Header, Vec<u8>, Vec<u64>) {
+    content_with_payload(descriptor, key, parent, first, None)
+}
+
+pub fn content_with_payload(
+    descriptor: &Descriptor,
+    key: Key,
+    parent: Option<Key>,
+    first: u32,
+    payload: Option<&[u8]>,
+) -> (Header, Vec<u8>, Vec<u64>) {
     let pages = key.consumed_tokens / descriptor.page_tokens - u64::from(first);
     let mut header = selene_manager::record::new_header(descriptor, key, parent, [4; 16], pages as u32).unwrap();
     let mut bytes = vec![0; header.length_with_row() as usize];
     let page_bytes = header.page_record_bytes() as usize;
-    let mut hashes = Vec::new();
-    for page in 0..pages as usize {
-        let offset = header.page_segment as usize + page * page_bytes;
-        let data = &mut bytes[offset..offset + page_bytes];
-        for (index, byte) in data.iter_mut().enumerate() {
-            *byte = ((page + first as usize) * 31 + index * 7) as u8;
+    if let Some(payload) = payload {
+        bytes[header.page_segment as usize..].copy_from_slice(payload);
+    } else {
+        for (page, data) in bytes[header.page_segment as usize..header.row_segment as usize]
+            .chunks_exact_mut(page_bytes).enumerate()
+        {
+            for (index, byte) in data.iter_mut().enumerate() {
+                *byte = ((page + first as usize) * 31 + index * 7) as u8;
+            }
         }
-        hashes.push(flare_selene::shared::record::checksum(data));
+        for (index, byte) in bytes[header.row_segment as usize..].iter_mut().enumerate() {
+            *byte = (key.consumed_tokens as usize + index * 13) as u8;
+        }
     }
-    for (index, byte) in bytes[header.row_segment as usize..].iter_mut().enumerate() {
-        *byte = (key.consumed_tokens as usize + index * 13) as u8;
-    }
+    let hashes: Vec<_> = bytes[header.page_segment as usize..header.row_segment as usize]
+        .chunks_exact(page_bytes).map(flare_selene::shared::record::checksum).collect();
     header.row_checksum =
         flare_selene::shared::record::checksum(&bytes[header.row_segment as usize..]);
     bytes[..4096].copy_from_slice(&encode_header(&header));

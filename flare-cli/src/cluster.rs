@@ -253,6 +253,7 @@ pub fn peer(
         let phase = progress.phase("Join host prefix stores", None);
         let records = flare_helios::offload::shard::join_peer(
             owner.offload(),
+            owner.gpu_codec_cubins().to_vec(),
             &mut stream,
             cluster.rank,
             cluster.world,

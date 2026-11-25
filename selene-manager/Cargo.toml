@@ -21,7 +21,7 @@ rdma = ["dep:ibverbs-sys", "flare-selene/rdma"]
 [dependencies]
 flare-eos = { path = "../eos" }
 rcgen = { version = "0.14", features = ["pem"], optional = true }
-flare-selene = { path = "../selene" }
+flare-selene = { path = "../selene", default-features = false }
 blake2 = "0.10"
 ibverbs-sys = { version = "0.3.2", optional = true }
 libc = "0.2"

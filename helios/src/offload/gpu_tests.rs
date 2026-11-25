@@ -56,7 +56,7 @@ mod memory {
 
     use crate::{
         cache::PrefixHistory,
-        offload::{registrar::CudaRegistrar, transfer::Transfers},
+        offload::{registrar::CudaRegistrar, transfer::Copiers},
     };
 
     const IDENTITY: [u8; 32] = [7; 32];
@@ -123,7 +123,7 @@ mod memory {
         .unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
         let transfers = Arc::new(Mutex::new(
-            Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
+            Copiers::new(Vec::new()).start(&[(context, device)], geometry.clone(), Some(&pool)).unwrap(),
         ));
         let mut store = MemoryStore::new(IDENTITY, pool, transfers.clone()).unwrap();
         let consumed = u64::from(pages) * pt;
@@ -283,7 +283,7 @@ mod memory {
         .unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
         let transfers = Arc::new(Mutex::new(
-            Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
+            Copiers::new(Vec::new()).start(&[(context, device)], geometry.clone(), Some(&pool)).unwrap(),
         ));
         let mut store = MemoryStore::new(IDENTITY, pool, transfers.clone()).unwrap();
 
@@ -453,7 +453,7 @@ mod memory {
         .unwrap();
         small.register(&CudaRegistrar, context).unwrap();
         let transfers = Arc::new(Mutex::new(
-            Transfers::start(&[(context, device)], geometry.clone(), &small).unwrap(),
+            Copiers::new(Vec::new()).start(&[(context, device)], geometry.clone(), Some(&small)).unwrap(),
         ));
         let mut store = MemoryStore::new(IDENTITY, small, transfers).unwrap();
         assert_eq!(store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
@@ -557,7 +557,7 @@ mod composite {
 
     use crate::{
         cache::PrefixHistory,
-        offload::{registrar::CudaRegistrar, transfer::Transfers},
+        offload::{registrar::CudaRegistrar, transfer::Copiers},
     };
 
     const IDENTITY: [u8; 32] = [0x3c; 32];
@@ -585,7 +585,7 @@ mod composite {
         pool: SlabPool,
     ) -> Staged {
         let transfers = Arc::new(Mutex::new(
-            Transfers::start(&[(context, device)], geometry.to_vec(), &pool).unwrap(),
+            Copiers::new(Vec::new()).start(&[(context, device)], geometry.to_vec(), Some(&pool)).unwrap(),
         ));
         Staged::new(
             Some(pool),
@@ -647,7 +647,7 @@ mod composite {
         .unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
         let transfers = Arc::new(Mutex::new(
-            Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
+            Copiers::new(Vec::new()).start(&[(context, device)], geometry.clone(), Some(&pool)).unwrap(),
         ));
         let memory = MemoryStore::new_flat(IDENTITY, pool.clone(), transfers.clone()).unwrap();
         let disk = DiskStore::new(
@@ -853,7 +853,7 @@ mod composite {
         .unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
         let transfers = Arc::new(Mutex::new(
-            Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
+            Copiers::new(Vec::new()).start(&[(context, device)], geometry.clone(), Some(&pool)).unwrap(),
         ));
         let memory = MemoryStore::new_flat(IDENTITY, pool.clone(), transfers.clone()).unwrap();
         let disk = DiskStore::new(
@@ -1001,7 +1001,7 @@ mod composite {
         .unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
         let transfers = Arc::new(Mutex::new(
-            Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
+            Copiers::new(Vec::new()).start(&[(context, device)], geometry.clone(), Some(&pool)).unwrap(),
         ));
         let memory = MemoryStore::new_flat(IDENTITY, pool.clone(), transfers.clone()).unwrap();
         let disk = DiskStore::new(
@@ -1263,12 +1263,12 @@ mod composite {
             .unwrap();
             pool.register(&CudaRegistrar, context).unwrap();
             let transfers = Arc::new(Mutex::new(
-                Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
+                Copiers::new(Vec::new()).start(&[(context, device)], geometry.clone(), Some(&pool)).unwrap(),
             ));
             let memory = MemoryStore::new_flat(IDENTITY, pool, transfers).unwrap();
             let staging_pool = memory.pool().clone();
             let transfers = Arc::new(Mutex::new(
-                Transfers::start(&[(context, device)], geometry.clone(), &staging_pool).unwrap(),
+                Copiers::new(Vec::new()).start(&[(context, device)], geometry.clone(), Some(&staging_pool)).unwrap(),
             ));
             let lock = flare_selene::testing::directory_lock(&directory).unwrap();
             let scanned = record::scan(&lock, &IDENTITY, &fingerprint, geometry[0].page_tokens, &record::rank_sizes(&geometry)).unwrap();
@@ -1426,7 +1426,7 @@ mod disk_store {
 
     use crate::{
         cache::PrefixHistory,
-        offload::{registrar::CudaRegistrar, transfer::Transfers},
+        offload::{registrar::CudaRegistrar, transfer::Copiers},
     };
 
     const IDENTITY: [u8; 32] = [0x5a; 32];
@@ -1555,7 +1555,7 @@ mod disk_store {
             .unwrap();
             pool.register(&CudaRegistrar, context).unwrap();
             let transfers = Arc::new(Mutex::new(
-                Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
+                Copiers::new(Vec::new()).start(&[(context, device)], geometry.clone(), Some(&pool)).unwrap(),
             ));
             let disk = DiskThread::start("flare-offload-disk").unwrap();
             DiskStore::new(

@@ -82,6 +82,25 @@ mod tests {
             Settings::resolve(config, Path::new("user"), Path::new("config.toml")).unwrap();
         assert!(settings.load_options(&["first", "second"]).is_err());
     }
+
+    #[test]
+    fn prefix_cache_compression_parses_and_reaches_load_options() {
+        for (value, expected) in [
+            ("off", flare_helios::offload::KvCompression::Off),
+            ("cpu", flare_helios::offload::KvCompression::Cpu),
+            ("gpu", flare_helios::offload::KvCompression::Gpu),
+        ] {
+            let config =
+                Configuration::parse(&format!("[prefix_cache]\ncompression='{value}'\n")).unwrap();
+            let settings =
+                Settings::resolve(config, Path::new("user"), Path::new("config.toml")).unwrap();
+            assert_eq!(
+                settings.load_options(&[]).unwrap().prefix_cache.compression,
+                expected
+            );
+        }
+        assert!(Configuration::parse("[prefix_cache]\ncompression='bogus'\n").is_err());
+    }
 }
 impl Settings {
     pub fn load(path: Option<&Path>) -> Result<Self> {
@@ -107,6 +126,14 @@ impl Settings {
         };
         let memory_reserve = size(configuration.memory.reserve.as_deref(), "memory.reserve")?;
         let prefix_cache = PrefixCacheOffload {
+            compression: nonempty(configuration.prefix_cache.compression.as_deref())
+                .map(|value| {
+                    value
+                        .parse()
+                        .map_err(|error| format!("prefix_cache.compression: {error}"))
+                })
+                .transpose()?
+                .unwrap_or_default(),
             memory_bytes: size(
                 nonempty(configuration.prefix_cache.memory.as_deref()),
                 "prefix_cache.memory",

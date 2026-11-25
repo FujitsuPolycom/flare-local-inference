@@ -291,6 +291,25 @@ message CacheContract {
   uint64 page_tokens = 1;
   repeated HistoryRegion regions = 2;
   repeated PageTableView page_tables = 3;
+  // Optional storage description used for lossless checkpoint write-back and restore.
+  CodecLayout codec_layout = 4;
+}
+message CodecLayout {
+  // Revision 1 describes fields within a rank's page or continuation row.
+  uint32 revision = 1;
+  repeated CodecField fields = 2;
+  // Optional compiled cubin module name in each rank's `modules` table for
+  // GPU checkpoint compression. Loaded lazily only when GPU compression is active.
+  optional string gpu_module = 3;
+}
+message CodecField {
+  // Execution buffer containing this field.
+  string buffer = 1;
+  // Byte interval in one cache unit, relative to the buffer's base.
+  uint64 offset = 2;
+  uint64 length = 3;
+  // Block storage format defined in the prepared model contract.
+  uint32 encoding = 4;
 }
 message HistoryRegion {
   HistoryKind kind = 1;

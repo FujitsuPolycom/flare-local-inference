@@ -460,15 +460,17 @@ impl Local {
         extent: &Extent,
         within: usize,
         length: u64,
+        packed: bool,
     ) -> Result<u64> {
         let length = usize::try_from(length).map_err(|_| invalid("window length overflows"))?;
-        if !within.is_multiple_of(PAGE_BYTES as usize)
-            || !length.is_multiple_of(PAGE_BYTES as usize)
-            || within
-                .checked_add(length)
-                .is_none_or(|end| end > extent.bytes().len())
+        if !packed && (!within.is_multiple_of(PAGE_BYTES as usize) || !length.is_multiple_of(PAGE_BYTES as usize)) {
+            return Err(invalid("raw window is not page aligned"));
+        }
+        if within
+            .checked_add(length)
+            .is_none_or(|end| end > extent.bytes().len())
         {
-            return Err(invalid("window exceeds its extent or is not page aligned"));
+            return Err(invalid("window exceeds its extent"));
         }
         let offset = extent
             .offset()
@@ -1283,12 +1285,15 @@ mod tests {
         let (local, _cleanup) = local(&name, 8192, 8192);
         let extent = Arc::new(local.staging().allocate(4096).unwrap());
         assert_eq!(
-            local.offset(Region::Staging, &extent, 0, 4096).unwrap(),
+            local.offset(Region::Staging, &extent, 0, 4096, false).unwrap(),
             extent.offset() as u64
         );
-        assert!(local.offset(Region::Staging, &extent, 1, 4096).is_err());
-        assert!(local.offset(Region::Staging, &extent, 0, 4097).is_err());
-        assert!(local.offset(Region::Staging, &extent, 4096, 4096).is_err());
+        assert!(local.offset(Region::Staging, &extent, 1, 4095, false).is_err());
+        assert!(local.offset(Region::Staging, &extent, 1, 4095, true).is_ok());
+        assert!(local.offset(Region::Staging, &extent, 1, 4096, true).is_err());
+        assert!(local.offset(Region::Staging, &extent, 1, 4096, false).is_err());
+        assert!(local.offset(Region::Staging, &extent, 0, 4097, false).is_err());
+        assert!(local.offset(Region::Staging, &extent, 4096, 4096, false).is_err());
         let hold = extent.clone();
         drop(extent);
         assert_eq!(local.staging_used(), 4096);

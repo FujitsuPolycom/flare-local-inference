@@ -28,9 +28,46 @@ use flare_selene::{CacheGeometry, HostStore};
 use crate::Result;
 
 pub use flare_selene::offload::{
-    Binding, PrefixCacheOffload, Preparation, Prepared, Resolved, Shared, input_memory_bytes,
-    parse_drain_on_shutdown, parse_max_age, parse_size,
+    KvCompression, PrefixCacheOffload, Preparation, Prepared, Resolved, Shared,
+    input_memory_bytes, parse_drain_on_shutdown, parse_max_age, parse_size,
 };
+
+#[derive(Clone, Debug)]
+pub struct Binding {
+    inner: flare_selene::offload::Binding,
+    gpu_cubins: Vec<std::sync::Arc<Vec<u8>>>,
+}
+
+impl Binding {
+    pub(crate) fn new(
+        inner: flare_selene::offload::Binding,
+        gpu_cubins: Vec<std::sync::Arc<Vec<u8>>>,
+    ) -> Self {
+        Self { inner, gpu_cubins }
+    }
+
+    pub fn inputs(&self) -> Option<flare_selene::input::InputStore> {
+        self.inner.inputs()
+    }
+
+    pub fn rank(&self) -> usize {
+        self.inner.rank()
+    }
+
+    pub fn shares(&self, other: &Self) -> bool {
+        self.inner.shares(&other.inner)
+    }
+
+    pub fn sharded(&self) -> bool {
+        self.inner.sharded()
+    }
+
+    pub fn take(&self) -> Option<(Prepared, Vec<std::sync::Arc<Vec<u8>>>)> {
+        self.inner
+            .take()
+            .map(|prepared| (prepared, self.gpu_cubins.clone()))
+    }
+}
 
 pub fn prepare(
     options: &PrefixCacheOffload,
@@ -65,8 +102,14 @@ pub fn prepare_with_inputs(
     )?)
 }
 
-pub fn open(prepared: Prepared) -> Result<Box<dyn HostStore>> {
-    Ok(flare_selene::offload::open(prepared, &transfer::Copiers)?)
+pub fn open(
+    prepared: Prepared,
+    gpu_cubins: Vec<std::sync::Arc<Vec<u8>>>,
+) -> Result<Box<dyn HostStore>> {
+    Ok(flare_selene::offload::open(
+        prepared,
+        &transfer::Copiers::new(gpu_cubins),
+    )?)
 }
 
 /// One bounded ordinary-memory window for serialized prepared inputs and disk-read leases.

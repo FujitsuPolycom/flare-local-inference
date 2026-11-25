@@ -150,6 +150,7 @@ pub enum Phase {
 }
 
 pub struct Win {
+    pub packed: Option<v2::PackedWindow>,
     pub plan: PlannedWindow,
     pub region: i32,
     pub offset: u64,
@@ -319,6 +320,7 @@ impl Claim {
     pub(super) fn spec(&self, index: usize) -> v2::WindowSpec {
         let window = &self.windows[index];
         v2::WindowSpec {
+            packed: window.packed.clone(),
             index: window.plan.index,
             region: window.region,
             offset: window.offset,
@@ -620,9 +622,22 @@ impl Core {
         ) else {
             return refuse(self, v2::ClaimReason::ChainGap);
         };
-        let shapes = shapes_of(&walk, m.want_row);
+        if walk.nodes.iter().any(|n| {
+            !flare_selene::shared::packed::permits_holding(
+                self.sessions[&sid].codec.as_ref(),
+                n.packed,
+                &n.required_profiles,
+            )
+        }) {
+            self.count("codec_incompatible_total", "action=\"claim\"");
+            return refuse(self, v2::ClaimReason::ChainGap);
+        }
+        if source == SourceId::Manager {
+            return self.manager_claim(sid, key, &m, walk, &geometry, mode);
+        }
+        // Pinning supplies the stored lengths. Until then the raw shape bounds every packet.
         let Some(plan) = windows::plan(
-            &shapes,
+            &shapes_of(&walk, m.want_row),
             geometry.page_bytes(),
             geometry.row_bytes(),
             self.cfg.limits.max_window_bytes,
@@ -630,9 +645,6 @@ impl Core {
             return refuse(self, v2::ClaimReason::InvalidClaim);
         };
         let total = windows::total_bytes(&plan);
-        if source == SourceId::Manager {
-            return self.manager_claim(sid, key, &m, walk, &geometry, mode);
-        }
 
         // Retained staging: required for a GPU export, preferred for host tiers.
         let mut block = None;
@@ -837,6 +849,7 @@ impl Core {
             .map(|(index, node)| {
                 let first_page = if index == 0 { walk.skip_pages } else { 0 };
                 v2::Record {
+                    packed: None,
                     key: Some(key_to(node.key)),
                     first_page,
                     pages: node.tail_pages - first_page,
@@ -884,7 +897,23 @@ impl Core {
         }
         let terminal = claim.is_terminal();
         match answer {
-            Ok(GetAnswer::Leased { windows, .. }) => {
+            Ok(GetAnswer::Leased {
+                windows, packed, ..
+            }) => {
+                let caps = self
+                    .sessions
+                    .get(&claim.requester_sid)
+                    .and_then(|s| s.codec.as_ref());
+                if packed.iter().flatten().any(|offer| {
+                    !flare_selene::shared::packed::permits_offer(caps, offer)
+                }) {
+                    self.count("codec_incompatible_total", "action=\"claim\"");
+                    self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::ChainGap);
+                    return;
+                }
+                for (record, offer) in claim.records.iter_mut().zip(packed) {
+                    record.packed = offer
+                }
                 claim.manager.as_mut().unwrap().remaining = windows;
                 if terminal || claim.state != v2::ClaimState::Requested {
                     return;
@@ -945,6 +974,11 @@ impl Core {
                             .get(first..first + count)
                             .map(|pages| (pages.to_vec(), *row_sum))
                     });
+                let sums = if grant.packed.is_some() {
+                    Some((Vec::new(), 0))
+                } else {
+                    sums
+                };
                 let Some((page_xxh3, row_xxh3)) = sums else {
                     self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::CopyError);
                     return;
@@ -958,6 +992,7 @@ impl Core {
                     length: grant.length,
                 };
                 let window = Win {
+                    packed: grant.packed,
                     plan,
                     region: grant.region,
                     offset: grant.offset,
@@ -972,6 +1007,7 @@ impl Core {
                 while claim.windows.len() <= index {
                     // A window index the store skipped is not in anyone's hands.
                     let mut filler = Win {
+                        packed: None,
                         plan,
                         region: grant.region,
                         offset: 0,
@@ -1109,15 +1145,109 @@ impl Core {
         {
             return bad(self, v2::ClaimReason::CopyError);
         }
-        let Some(plan) = windows::plan(
-            &shapes,
-            claim.page_bytes,
-            claim.row_bytes,
-            limits.max_window_bytes,
-        ) else {
-            return bad(self, v2::ClaimReason::CopyError);
+        let any_packed = ack.records.iter().any(|record| record.packed.is_some());
+        let planned: Vec<(PlannedWindow, Option<v2::PackedWindow>)> = if any_packed {
+            let Some(session) = self.sessions.get(&claim.requester_sid) else {
+                return bad(self, v2::ClaimReason::RequesterLost);
+            };
+            let caps = session.codec.as_ref();
+            let Some(descriptor) = self
+                .scopes
+                .get(&session.scope)
+                .map(|s| s.valid.descriptor.clone())
+            else {
+                return bad(self, v2::ClaimReason::CopyError);
+            };
+            if ack
+                .records
+                .iter()
+                .filter_map(|record| record.packed.as_ref())
+                .any(|offer| !flare_selene::shared::packed::permits_offer(caps, offer))
+            {
+                self.count("codec_incompatible_total", "action=\"claim\"");
+                return bad(self, v2::ClaimReason::ChainGap);
+            }
+            let page_bytes = claim.page_bytes;
+            let row_bytes = claim.row_bytes;
+            let mut planned = Vec::new();
+            for (rec_idx, (record, shape)) in ack.records.iter().zip(&shapes).enumerate() {
+                if let Some(offer) = &record.packed {
+                    let Ok(rec_key) = key_from(record.key.as_ref()) else {
+                        return bad(self, v2::ClaimReason::CopyError);
+                    };
+                    let Some(first) = (rec_key.consumed_tokens / descriptor.page_tokens)
+                        .checked_sub(u64::from(record.pages))
+                    else {
+                        return bad(self, v2::ClaimReason::CopyError);
+                    };
+                    let Ok(layout) = flare_selene::shared::packed::Layout::new(
+                        offer.clone(),
+                        &descriptor.ranks,
+                        first,
+                        record.pages,
+                    ) else {
+                        return bad(self, v2::ClaimReason::CopyError);
+                    };
+                    if record.row != (layout.row_bytes() != 0) {
+                        return bad(self, v2::ClaimReason::CopyError);
+                    }
+                    for span in layout.windows(0, record.row, limits.max_window_bytes) {
+                        let Some(units) =
+                            layout.units(span.first as usize, span.pages as usize, span.row)
+                        else {
+                            return bad(self, v2::ClaimReason::CopyError);
+                        };
+                        let first_page = if span.pages == 0 && span.row {
+                            0
+                        } else {
+                            record.first_page + span.first
+                        };
+                        planned.push((
+                            PlannedWindow {
+                                index: planned.len() as u32,
+                                record: rec_idx as u32,
+                                first_page,
+                                page_count: span.pages,
+                                row: span.row,
+                                length: span.length,
+                            },
+                            Some(v2::PackedWindow {
+                                units: units.to_vec(),
+                            }),
+                        ));
+                    }
+                } else {
+                    let Some(mut sub) = windows::plan(
+                        std::slice::from_ref(shape),
+                        page_bytes,
+                        row_bytes,
+                        limits.max_window_bytes,
+                    ) else {
+                        return bad(self, v2::ClaimReason::CopyError);
+                    };
+                    for w in &mut sub {
+                        w.index = planned.len() as u32;
+                        w.record = rec_idx as u32;
+                        planned.push((*w, None));
+                    }
+                }
+            }
+            if planned.is_empty() {
+                return bad(self, v2::ClaimReason::CopyError);
+            }
+            planned
+        } else {
+            let Some(plan) = windows::plan(
+                &shapes,
+                claim.page_bytes,
+                claim.row_bytes,
+                limits.max_window_bytes,
+            ) else {
+                return bad(self, v2::ClaimReason::CopyError);
+            };
+            plan.into_iter().map(|w| (w, None)).collect()
         };
-        let total = windows::total_bytes(&plan);
+        let total: u64 = planned.iter().map(|(w, _)| w.length).sum();
         let claim = self.claims.get_mut(&key).expect("claim exists");
         if claim.retained {
             let capacity = claim
@@ -1133,14 +1263,15 @@ impl Core {
             .as_ref()
             .map_or(0, |block| block.offset() as u64);
         let mut running = 0u64;
-        claim.windows = plan
+        claim.windows = planned
             .into_iter()
-            .map(|plan| {
+            .map(|(plan, packed)| {
                 let offset = base + running;
                 if claim.retained {
                     running += plan.length;
                 }
                 Win {
+                    packed,
                     plan,
                     region: v2::Region::Staging as i32,
                     offset,
@@ -1267,6 +1398,7 @@ impl Core {
                             shape: shape_for(spec, layout, *rank as usize),
                             region,
                             offset: spec.offset,
+                            packed: spec.packed.is_some(),
                         },
                     );
                 }
@@ -1313,6 +1445,25 @@ impl Core {
         }
         if status != v2::FillStatus::FillOk {
             return Err(Violation::new("WindowFilled without a status"));
+        }
+        if window.packed.is_some() {
+            if !m.page_xxh3.is_empty() || m.has_row || !m.rank_sums.is_empty() {
+                self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::CopyError);
+                return Ok(());
+            }
+            self.window_parts(
+                ChanOwner::Source(key),
+                m.index,
+                vec![(
+                    0,
+                    SliceSums {
+                        pages: Vec::new(),
+                        row: None,
+                    },
+                )],
+                0,
+            );
+            return Ok(());
         }
         if claim.mp.src.layout.world() > 1 && (!m.page_xxh3.is_empty() || m.rank_sums.is_empty()) {
             self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::CopyError);
@@ -2104,7 +2255,10 @@ pub(super) fn shape_for(
         first_page: spec.first_page,
         page_count: spec.page_count,
         row: spec.row,
-        length: layout.slice_bytes(rank, spec.page_count, spec.row),
+        length: spec.packed.as_ref().map_or_else(
+            || layout.slice_bytes(rank, spec.page_count, spec.row),
+            |_| spec.length,
+        ),
     }
 }
 
@@ -2153,6 +2307,8 @@ mod tests {
         core.sessions.insert(
             1,
             Session {
+                offered_codec: None,
+                codec: None,
                 sid: 1,
                 instance: INSTANCE,
                 nonce: NONCE,
@@ -2206,6 +2362,7 @@ mod tests {
         claim.row = true;
         claim.granted_at = Some(now);
         claim.windows = vec![Win {
+            packed: None,
             plan,
             region: v2::Region::Staging as i32,
             offset: 0,
@@ -2329,6 +2486,7 @@ mod tests {
                 key: crate::Key::default(),
                 chain_pages: 1,
                 row: true,
+                packed: false,
                 accepted: None,
                 legs: Vec::new(),
                 deferred_commit: None,

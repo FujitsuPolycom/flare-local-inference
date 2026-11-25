@@ -138,6 +138,7 @@ impl NetRig {
         Event::Window {
             claim,
             window: Window {
+                packed: None,
                 shape,
                 page_xxh3: sums,
                 row_xxh3: row,

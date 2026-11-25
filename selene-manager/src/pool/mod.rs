@@ -110,7 +110,18 @@ pub fn entry_from(entry: &v2::IndexEntry) -> Checked<Entry> {
     if key.consumed_tokens == 0 {
         return Err(Violation::new("zero consumed_tokens"));
     }
+    if entry.required_profiles.len() > 64
+        || entry.required_profiles.iter().any(|p| p.len() != 32)
+        || (!entry.packed && !entry.required_profiles.is_empty())
+    {
+        return Err(Violation::new("invalid packed index entry profiles"));
+    }
+    let mut required_profiles = entry.required_profiles.clone();
+    required_profiles.sort_unstable();
+    required_profiles.dedup();
     Ok(Entry {
+        packed: entry.packed,
+        required_profiles,
         key,
         parent,
         bucket,
@@ -131,6 +142,8 @@ pub fn entry_to(entry: &Entry) -> v2::IndexEntry {
         row: entry.row,
         tier: tier_to(entry.tier) as i32,
         bytes: entry.bytes,
+        packed: entry.packed,
+        required_profiles: entry.required_profiles.clone(),
     }
 }
 

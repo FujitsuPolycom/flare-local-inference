@@ -35,6 +35,10 @@ impl Fixture {
             .collect();
         Self {
             transfers: Transfers {
+                decode: None,
+                profile: None,
+                receive_profiles: Vec::new(),
+                async_host_codec: None,
                 layout: Layout::new(&[geometry(64, &[("k", 8192)], 4096)]).unwrap(),
                 ranks,
                 receiver,
@@ -77,6 +81,7 @@ impl Drop for Fixture {
 
 fn job(window: usize, distinct_ids: bool) -> Job {
     Job {
+        codec: None,
         id: JobId(if distinct_ids { window as u64 + 1 } else { 1 }),
         window: if distinct_ids { 0 } else { window as u32 },
         direction: if window == 0 {
@@ -383,4 +388,36 @@ fn offload_transfers_match_model() {
     for edge in edges {
         println!("OFFLOAD_EDGE {edge:?}");
     }
+}
+
+#[test]
+fn a_failed_packed_decode_fences_the_other_two_ranks_before_release() {
+    let mut f = Fixture::new(3);
+    let mut work = job(1, true);
+    work.codec = Some(flare_selene::codec_copy::Window::restore_pinned(0, vec![]));
+    f.submit(work.clone(), 7, false).unwrap();
+    let mut replies = Vec::new();
+    for rank in [1, 2, 0] {
+        f.transfers.absorb(
+            RankReply {
+                id: work.id,
+                window: work.window,
+                rank,
+                result: if rank == 1 {
+                    Err(invalid("original codec checksum mismatch"))
+                } else {
+                    Ok(())
+                },
+                bytes: 0,
+            },
+            &mut replies,
+        );
+        if rank != 0 {
+            assert!(replies.is_empty());
+            assert_eq!(f.transfers.in_flight(), 1);
+        }
+    }
+    assert_eq!(replies.len(), 1);
+    assert!(replies.pop().unwrap().result.is_err());
+    assert_eq!(f.transfers.in_flight(), 0);
 }

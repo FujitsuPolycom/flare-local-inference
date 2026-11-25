@@ -379,6 +379,8 @@ message OpenSession {
   // puts, answers exports); each other rank attaches with `Rank` using this secret
   // and moves only its own slice. See "Rank agents".
   bytes rank_secret = 8;
+  // Checkpoint formats this reader accepts.
+  CodecCaps codec = 9;
 }
 
 enum OpenStatus {
@@ -396,6 +398,8 @@ message SessionOpened {
   bytes scope_id = 3;
   uint32 export_slots = 4;
   ReadinessInfo readiness = 6;
+  // Checkpoint formats this connection can receive.
+  CodecCaps codec = 7;
 }
 
 // Orderly close from the client. After sending it the client sends nothing more.
@@ -451,6 +455,8 @@ message IndexEntry {
   Tier tier = 7;
   // Payload bytes of this record, excluding any envelope.
   uint64 bytes = 9;
+  bool packed = 10;
+  repeated bytes required_profiles = 11;
 }
 
 message Notice {
@@ -635,6 +641,8 @@ message Record {
   uint32 pages = 4;
   // True only on the last record, and only if the claim wanted the row.
   bool row = 5;
+  // Directory of stored units for a packed record suffix.
+  PackedOffer packed = 6;
 }
 
 // The manager's single authoritative per-claim state (PROTOCOL.md). Only the
@@ -726,8 +734,8 @@ message DataChannelRef {
   bytes token = 3;          // opaque, 32 bytes.
 }
 
-// A window in a manager-owned region. All offsets and lengths are multiples of
-// 4096. Neither side may touch bytes outside [offset, offset + length), nor keep
+// Raw windows have 4096-byte aligned offsets and lengths. Packed windows may
+// begin and end at any byte in the region. Neither side may touch bytes outside [offset, offset + length), nor keep
 // using a window after releasing or filling it (see ownership in PROTOCOL.md).
 message WindowSpec {
   uint32 index = 1;          // ordinal within the claim or put, from 0, without holes.
@@ -742,8 +750,11 @@ message WindowSpec {
   // The window carries the row after its pages (or alone). Only in the window
   // that completes the last record.
   bool row = 8;
+  // Present when this window contains the listed units in order.
+  PackedWindow packed = 9;
 }
-// length == page_count * Geometry.page_record_bytes + (row ? row_record_bytes : 0).
+// Raw length is page_count * page_record_bytes plus row_record_bytes when row is set.
+// Packed length is the sum of the stored unit lengths.
 
 // A window the source filled and the requester may now read. The checksums are
 // the source's and the requester verifies them after copying out. For a DRAM or
@@ -1000,6 +1011,8 @@ message PutBegin {
   PrefixKey next_child = 13;
   // A ready descendant on the unbranched path can supply a restore row.
   bool descendant_row = 14;
+  // Optional pre-encoded packed units covering 0..chain_pages (and row when set).
+  PackedOffer packed = 15;
 }
 
 message PutAccept {
@@ -1014,6 +1027,8 @@ message PutAccept {
   // A multi-process writer: the channel of each peer rank that is in channel mode.
   repeated RankChannel rank_channels = 7;
   CaptureRole capture_role = 8;
+  // True when the manager accepted the put using the offered packed v4 layout.
+  bool packed = 9;
 }
 
 // A window to fill, STAGING or ARENA region. At most Limits.window_credits
@@ -1129,6 +1144,8 @@ message RankAttach {
   uint32 rank = 4;             // 1 .. ranks-1.
   bytes agent_nonce = 5;       // 16 random bytes, fresh per agent process.
   bytes rank_secret = 6;
+  // Checkpoint formats this connection can receive.
+  CodecCaps codec = 7;
 }
 
 // The agent's own drain attestation for one transfer. The only thing besides
@@ -1160,10 +1177,42 @@ message RankAttached {
   // Assigned from the session-incarnation counter. A transfer is bound to it.
   uint64 generation = 2;
   RankMode mode = 3;
+  // Checkpoint formats accepted for the rank.
+  CodecCaps codec = 4;
 }
 
 // The agent must stop work, drain, send its RankFences and RankGoodbye, and end.
 message RankClosing {
   ClosingReason reason = 1;
   string detail = 2;
+}
+
+// Capability is scoped to one connection. A missing acknowledgement means raw only.
+message CodecCaps {
+  // Record format revision understood by the reader.
+  uint32 envelope_revision = 1;
+  // 32-byte layout digests the reader can decode.
+  repeated bytes receive_profiles = 2;
+}
+// Units in stored rank order for each page, followed by the endpoint row.
+message PackedOffer {
+  uint64 first_page = 1; // Absolute index of the first offered page.
+  repeated PackedUnit units = 2;
+}
+// Units whose concatenated stored bytes form one window.
+message PackedWindow { repeated PackedUnit units = 1; }
+message PackedUnit {
+  enum Kind { PAGE = 0; ROW = 1; }
+  enum Representation { LITERAL = 0; PACKET = 1; }
+  Kind kind = 1; // Page share or continuation row share.
+  uint64 logical_index = 2; // Absolute page index, or zero for the endpoint row.
+  uint32 stored_rank = 3; // Rank that owns this copy.
+  Representation representation = 4; // Original bytes or a lossless packet.
+  bytes profile = 5; // 32-byte layout digest for a packet. Empty for literals.
+  uint64 original_length = 6; // Byte length after restore, including layout padding.
+  uint64 stored_length = 7; // Byte length in the record payload.
+  repeated uint32 replicas = 8; // Additional destination ranks, in ascending order.
+  fixed32 stored_crc = 9; // CRC-32/IEEE of the packet.
+  fixed32 original_crc = 10; // CRC-32/IEEE after decoding the packet.
+  fixed64 raw_xxh3 = 11; // Literal units only.
 }

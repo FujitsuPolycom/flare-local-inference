@@ -343,6 +343,7 @@ async fn d6_a_put_whose_writer_dies_mid_window_fails_and_the_same_record_stores_
             bucket: vec![4; 16],
             published_tail_pages: 32,
             mode: v2::CopyMode::DataChannel as i32,
+            packed: None,
         }))
         .await;
     let accept = writer

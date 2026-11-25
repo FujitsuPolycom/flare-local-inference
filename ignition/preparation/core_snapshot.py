@@ -18,11 +18,19 @@ class ExportOptions:
     cache: Path
     no_weights: bool = False
     reuse_weights: dict | None = None
+    kernel_cache: Path | None = None
 
 
 @contextmanager
-def export_options(cache, *, no_weights=False, reuse_weights=None):
-    token = _OPTIONS.set(ExportOptions(Path(cache), no_weights, reuse_weights))
+def export_options(cache, *, no_weights=False, reuse_weights=None, kernel_cache=None):
+    token = _OPTIONS.set(
+        ExportOptions(
+            Path(cache),
+            no_weights,
+            reuse_weights,
+            None if kernel_cache is None else Path(kernel_cache),
+        )
+    )
     try:
         yield
     finally:

@@ -33,6 +33,7 @@ struct PinBytes {
     pin: Box<dyn HostPin>,
     page_bytes: usize,
     row_bytes: usize,
+    packed: bool,
 }
 
 impl PutBytes for PinBytes {
@@ -50,7 +51,7 @@ impl PutBytes for PinBytes {
             .ok_or_else(|| Error::new("the chain to write is empty"))?;
         let end = first_page + u64::from(page_count);
         let mut sums = Checksums {
-            pages: Vec::with_capacity(page_count as usize),
+            pages: Vec::with_capacity(if self.packed { 0 } else { page_count as usize }),
             row: None,
         };
         let (mut base, mut offset) = (0u64, 0usize);
@@ -71,17 +72,22 @@ impl PutBytes for PinBytes {
                     page_count: count,
                     row: with_row,
                 };
-                let len =
-                    count as usize * self.page_bytes + if with_row { self.row_bytes } else { 0 };
-                let chunk = dst
-                    .get_mut(offset..offset + len)
-                    .ok_or_else(|| Error::new("the window is smaller than its records"))?;
-                let read = self.pin.read(&window, chunk)?;
-                sums.pages.extend(read.pages);
-                if with_row {
-                    sums.row = read.row;
+                if self.packed {
+                    let n = self.pin.read_packed(&window, &mut dst[offset..])?;
+                    offset += n;
+                } else {
+                    let len = count as usize * self.page_bytes
+                        + if with_row { self.row_bytes } else { 0 };
+                    let chunk = dst
+                        .get_mut(offset..offset + len)
+                        .ok_or_else(|| Error::new("the window is smaller than its records"))?;
+                    let read = self.pin.read(&window, chunk)?;
+                    sums.pages.extend(read.pages);
+                    if with_row {
+                        sums.row = read.row;
+                    }
+                    offset += len;
                 }
-                offset += len;
             }
             base += u64::from(record.pages);
         }
@@ -266,6 +272,8 @@ impl Cascade {
         };
         entry.predecessor_candidates = (key != entry.record.key)
             .then(|| std::mem::take(&mut record.ancestor_keys));
+        let packed_offer = pin.packed_offer();
+        let is_packed = packed_offer.is_some();
         let request = PutRequest {
             key: record.key,
             parent: record.parent,
@@ -282,10 +290,12 @@ impl Cascade {
                 .copied()
                 .or_else(|| entry.path.front().map(|_| entry.record.key)),
             row: record.row,
+            packed: packed_offer,
             source: PutSource::Host(Box::new(PinBytes {
                 pin,
                 page_bytes: self.page_bytes,
                 row_bytes: self.row_bytes,
+                packed: is_packed,
             })),
         };
         if record.tier == Tier::Dram {
@@ -466,6 +476,8 @@ mod tests {
                         pages: vec![10, 11, 12],
                         row: Some(13),
                     }),
+                    packed: None,
+                    slab_bytes: PAGE,
                 },
                 MemorySpan {
                     pages: vec![b, b + PAGE],
@@ -474,6 +486,8 @@ mod tests {
                         pages: vec![20, 21],
                         row: Some(22),
                     }),
+                    packed: None,
+                    slab_bytes: PAGE,
                 },
             ],
             layout: Arc::new(crate::Layout {
@@ -495,6 +509,7 @@ mod tests {
             pin: Box::new(pin),
             page_bytes: PAGE,
             row_bytes: ROW,
+            packed: false,
         };
 
         // A window across the boundary between the records.

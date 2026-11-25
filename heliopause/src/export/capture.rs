@@ -3217,10 +3217,21 @@ pub(crate) fn capture_rank(
         module_bytes += exported.len() as u64;
         module_phase.advance_bytes(exported.len() as u64);
         fs::write(stage.path.join(&file), exported)?;
-        let kernel = kernels
-            .iter()
-            .find(|k| k.module == name)
-            .ok_or_else(|| invalid("registered module has no function"))?;
+        let mut globals = Vec::new();
+        let Some(kernel) = kernels.iter().find(|k| k.module == name) else {
+            if !cubin::global_symbols(&image)?.is_empty() {
+                return Err(invalid(format!(
+                    "standalone module {name} declares globals without a captured kernel"
+                )));
+            }
+            output.index.ranks[0].modules.push(wire::Module {
+                name,
+                file: file.clone(),
+                globals,
+            });
+            other_resources.push((file.clone(), file_source(stage.path.join(file))?));
+            continue;
+        };
         let mut module = std::ptr::null_mut();
         cu!(
             &cuda,
@@ -3229,7 +3240,6 @@ pub(crate) fn capture_rank(
             &mut module,
             kernel.function as Handle
         )?;
-        let mut globals = Vec::new();
         for symbol in cubin::global_symbols(&image)? {
             let symbol_c = std::ffi::CString::new(symbol.clone())?;
             let (mut address, mut size) = (0u64, 0usize);

@@ -55,6 +55,8 @@ struct Put {
     bucket: [u8; 16],
     chain_pages: u64,
     row: bool,
+    packed_offer: Option<wire::PackedOffer>,
+    packed_accepted: bool,
     source: Arc<Mutex<Box<dyn PutBytes>>>,
     phase: Phase,
     first_page: u64,
@@ -137,6 +139,7 @@ impl Engine {
             kind: wire::rank_fence::Kind::Put as i32,
             fence_id: id,
             records: vec![wire::Record {
+                packed: None,
                 key: Some(codec::key_to(put.key)),
                 first_page: 0,
                 pages,
@@ -201,6 +204,7 @@ impl Engine {
             } else {
                 wire::CopyMode::SharedWindows
             } as i32,
+            packed: request.packed.clone(),
         }));
         self.writer.puts.insert(
             id,
@@ -211,6 +215,8 @@ impl Engine {
                 bucket: request.bucket,
                 chain_pages: request.chain_pages,
                 row: request.row,
+                packed_offer: request.packed,
+                packed_accepted: false,
                 source: match request.source {
                     PutSource::Host(bytes) => Arc::new(Mutex::new(bytes)),
                 },
@@ -267,7 +273,7 @@ impl Engine {
     /// The record the manager accepted, as a header and a checksum segment.
     fn put_header(&self, put: &Put) -> crate::Result<Header> {
         let scope = &self.st.scope;
-        Header::new(
+        let header = Header::new(
             &scope.record_geometry(),
             scope.model_identity,
             scope.layout_fingerprint,
@@ -277,7 +283,30 @@ impl Engine {
             (put.chain_pages - put.first_page) as u32,
             SystemTime::now(),
         )
-        .map(|header| header.with_capture_role(put.capture_role))
+        .map(|header| header.with_capture_role(put.capture_role))?;
+        if put.packed_accepted
+            && let Some(offer) = &put.packed_offer
+        {
+            let first = put.first_page;
+            let end = put.chain_pages;
+            let units: Vec<_> = offer
+                .units
+                .iter()
+                .filter(|u| match wire::packed_unit::Kind::try_from(u.kind) {
+                    Ok(wire::packed_unit::Kind::Page) => {
+                        u.logical_index >= first && u.logical_index < end
+                    }
+                    Ok(wire::packed_unit::Kind::Row) => put.row,
+                    Err(_) => false,
+                })
+                .cloned()
+                .collect();
+            return header.with_packed(wire::PackedOffer {
+                first_page: first,
+                units,
+            });
+        }
+        Ok(header)
     }
 
     pub(crate) fn on_put_accept(&mut self, accept: wire::PutAccept) {
@@ -308,18 +337,41 @@ impl Engine {
             && role == crate::CaptureRole::Endpoint
             && put.child_paths < 2;
         let put = self.writer.puts.get_mut(&id).expect("present");
+        if put.packed_offer.is_some() && !accept.packed {
+            return self.fail_put(
+                id,
+                Error::new("the manager rejected packed storage for a compressed host record"),
+            );
+        }
         put.capture_role = role;
         put.first_page = accept.first_page;
         put.parent = parent;
+        put.packed_accepted = accept.packed;
         let header = match self.put_header(&self.writer.puts[&id]) {
             Ok(header) => header,
             Err(error) => return self.fail_put(id, error),
         };
         let expected = header.length(offered_row);
-        let row = if accept.record_bytes == expected {
-            offered_row
-        } else if offered_row && can_send_pages_only && accept.record_bytes == header.row_segment {
-            false
+        let (row, final_header) = if accept.record_bytes == expected {
+            (offered_row, header)
+        } else if offered_row && can_send_pages_only {
+            let put = self.writer.puts.get_mut(&id).expect("present");
+            put.row = false;
+            let page_only_header = match self.put_header(&self.writer.puts[&id]) {
+                Ok(h) => h,
+                Err(error) => return self.fail_put(id, error),
+            };
+            if accept.record_bytes == page_only_header.row_segment {
+                (false, page_only_header)
+            } else {
+                return self.fail_put(
+                    id,
+                    Error::new(format!(
+                        "the manager expects a {}-byte record, this client writes {expected}",
+                        accept.record_bytes
+                    )),
+                );
+            }
         } else {
             return self.fail_put(
                 id,
@@ -337,12 +389,19 @@ impl Engine {
         }
         let put = self.writer.puts.get_mut(&id).expect("present");
         put.row = row;
-        put.coverage = Some(Coverage::new(vec![ExpectedRecord {
+        let mut coverage = Coverage::new(vec![ExpectedRecord {
             key: put.key,
             first_page: 0,
             pages: pages as u32,
             row: put.row,
-        }]));
+        }]);
+        if put.packed_accepted
+            && let Some(layout) = final_header.packed
+        {
+            coverage.set_packed_layout(0, (*layout).clone());
+        }
+        let put = self.writer.puts.get_mut(&id).expect("present");
+        put.coverage = Some(coverage);
         put.sums = vec![0; pages as usize];
         put.phase = Phase::Accepted;
         if self.ranks.is_some()
@@ -374,7 +433,8 @@ impl Engine {
         let Some(staging) = self.net.clone() else {
             return;
         };
-        let spec = wire::WindowSpec {
+        let mut spec = wire::WindowSpec {
+            packed: None,
             index: shape.index,
             region: wire::Region::Staging as i32,
             offset: staging.offset(slot),
@@ -384,6 +444,15 @@ impl Engine {
             page_count: shape.page_count,
             row: shape.row,
         };
+        if let Some(units) = self
+            .writer
+            .puts
+            .get(&put)
+            .and_then(|run| run.coverage.as_ref())
+            .and_then(|cov| cov.pinned_units(&spec))
+        {
+            spec.packed = Some(wire::PackedWindow { units });
+        }
         if !self.put_window(put, spec, Some(slot)) {
             self.free_slot(slot);
         }
@@ -425,11 +494,11 @@ impl Engine {
             return true;
         };
         let first = put.first_page + dest;
-        put.windows.insert(spec.index, (spec, dest));
+        put.windows.insert(spec.index, (spec.clone(), dest));
         let bytes = put.source.clone();
         let job = put.out.fill_host(
             FillOwner::Put(id),
-            spec,
+            spec.clone(),
             address,
             slot,
             self.ranks.as_ref(),
@@ -440,7 +509,7 @@ impl Engine {
                     .fill(first, spec.page_count, spec.row, dst)
             }),
         );
-        let fan_out = put.out.fan_out(self.ranks.as_mut(), spec);
+        let fan_out = put.out.fan_out(self.ranks.as_mut(), spec.clone());
         if !self.submit_fill(job) {
             let put = self.writer.puts.get_mut(&id).expect("present");
             put.out.jobs_outstanding -= 1;
@@ -479,19 +548,27 @@ impl Engine {
         let Some((spec, dest)) = put.windows.remove(&window) else {
             return;
         };
-        let Some(sums) = supplied.filter(|s| s.pages.len() == spec.page_count as usize) else {
-            return self.fail_put(id, Error::new("a window's checksums are missing"));
+        let sums = if put.packed_accepted {
+            Checksums {
+                pages: Vec::new(),
+                row: None,
+            }
+        } else {
+            let Some(sums) = supplied.filter(|s| s.pages.len() == spec.page_count as usize) else {
+                return self.fail_put(id, Error::new("a window's checksums are missing"));
+            };
+            // A multi-process writer cannot state whole-page checksums; the manager computes the
+            // ones the record keeps.
+            if self.ranks.is_none() {
+                for (i, sum) in sums.pages.iter().enumerate() {
+                    put.sums[dest as usize + i] = *sum;
+                }
+                if spec.row {
+                    put.row_sum = sums.row;
+                }
+            }
+            sums
         };
-        // A multi-process writer cannot state whole-page checksums; the manager computes the
-        // ones the record keeps.
-        if self.ranks.is_none() {
-            for (i, sum) in sums.pages.iter().enumerate() {
-                put.sums[dest as usize + i] = *sum;
-            }
-            if spec.row {
-                put.row_sum = sums.row;
-            }
-        }
         let result = put
             .out
             .filled(spec, sums, put.via_channel, self.ranks.is_some());
@@ -617,6 +694,9 @@ impl Engine {
     fn commit_put(&mut self, id: u64) {
         let put = &self.writer.puts[&id];
         let metadata = self.put_header(put).and_then(|mut header| {
+            if header.packed.is_some() {
+                return header.packed_metadata();
+            }
             header.row_checksum = put.row_sum.unwrap_or(0);
             let mut bytes = header.encode()?.to_vec();
             let mut sums = vec![0u8; header.checksum_bytes() as usize];

@@ -21,6 +21,11 @@ use crate::{Error, Result};
 /// Alignment of every plane inside a record and of every direct-I/O transfer.
 pub const BLOCK_BYTES: u64 = 4096;
 
+/// Round `bytes` up to the next [`BLOCK_BYTES`] boundary, returning `None` on overflow.
+pub fn padded_bytes(bytes: u64) -> Option<u64> {
+    bytes.checked_next_multiple_of(BLOCK_BYTES)
+}
+
 /// One runtime-sized allocation addressed by unit index.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Plane {
@@ -32,12 +37,21 @@ pub struct Plane {
 impl Plane {
     /// Bytes one unit occupies inside a record.
     pub fn padded_bytes(&self) -> u64 {
-        self.unit_bytes.div_ceil(BLOCK_BYTES) * BLOCK_BYTES
+        padded_bytes(self.unit_bytes).expect("plane padded byte length overflow")
     }
 
     pub fn unit_address(&self, index: u64) -> u64 {
         self.address + index * self.unit_bytes
     }
+}
+
+/// Prepared transform for a byte interval within a named physical allocation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodecField {
+    pub buffer: String,
+    pub offset: u64,
+    pub length: u64,
+    pub encoding: u32,
 }
 
 /// One rank's checkpoint storage: the row plane and the page planes in name order.
@@ -51,9 +65,24 @@ pub struct CacheGeometry {
     /// KV ids sharing physical bytes with each snapshot row, excluding execution rows.
     /// Ownership of a snapshot excludes every page in its range through GPU retirement.
     pub snapshot_pages: Vec<std::ops::Range<u32>>,
+    pub codec_fields: Vec<CodecField>,
+    pub placement: crate::offload::KvCompression,
 }
 
 impl CacheGeometry {
+    #[cfg(feature = "codec")]
+    pub fn codec_profile(&self) -> Option<[u8; 32]> {
+        self.checked_codec_profile().ok()
+    }
+
+    #[cfg(feature = "codec")]
+    pub fn checked_codec_profile(&self) -> std::result::Result<[u8; 32], String> {
+        crate::shared::codec_layout::profile(
+            self,
+            crate::shared::codec_layout::revision_for(self.placement),
+        )
+    }
+
     /// Bytes a page occupies on the GPU across every plane.
     pub fn page_bytes(&self) -> u64 {
         self.planes.iter().map(|plane| plane.unit_bytes).sum()

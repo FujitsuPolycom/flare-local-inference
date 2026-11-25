@@ -111,12 +111,10 @@ impl Pair for LocalRdma {
             .peer
             .as_ref()
             .ok_or_else(|| invalid("RDMA pair is not connected"))?;
-        if len == 0
-            || !len.is_multiple_of(4096)
-            || !offset.is_multiple_of(4096)
-            || !remote_offset.is_multiple_of(4096)
-        {
-            return Err(invalid("RDMA range is not 4096-aligned"));
+        // Local packed windows and multi-rank gathered runs may carry arbitrary byte lengths
+        // and byte offsets within the 4096-aligned remote staging slot validated by the caller.
+        if len == 0 {
+            return Err(invalid("RDMA range length must be non-zero"));
         }
         let mr = match region {
             Region::Arena => self.device.arena,
@@ -263,10 +261,8 @@ pub(crate) mod tests {
             }
         }
         for (offset, len, remote) in [
-            (1, 4096, 0),
-            (0, 1, 0),
-            (0, 4096, 1),
             (BYTES as u64, 4096, 0),
+            (BYTES as u64 - 10, 11, 0),
             (0, 0, 0),
         ] {
             assert!(a.write(Region::Arena, offset, len, remote).is_err());
@@ -276,6 +272,31 @@ pub(crate) mod tests {
         assert_eq!(
             unsafe { regions_b.bytes(Region::Staging, 0, 4096).unwrap() },
             unsafe { regions_a.bytes(Region::Arena, 0, 4096).unwrap() }
+        );
+        // Packed compressed windows carry arbitrary byte lengths and local arena offsets.
+        let unaligned_off = 17usize;
+        let unaligned_len = 4133usize;
+        unsafe {
+            for index in 0..unaligned_len {
+                *regions_a.mapping(Region::Arena).0.add(unaligned_off + index) =
+                    ((index * 7 + 3) % 251) as u8;
+            }
+        }
+        a.write(
+            Region::Arena,
+            unaligned_off as u64,
+            unaligned_len as u64,
+            4096,
+        )
+        .unwrap();
+        wait(&mut a);
+        assert_eq!(
+            unsafe { regions_b.bytes(Region::Staging, 4096, unaligned_len as u64).unwrap() },
+            unsafe {
+                regions_a
+                    .bytes(Region::Arena, unaligned_off as u64, unaligned_len as u64)
+                    .unwrap()
+            }
         );
         // Exercise a write larger than the old piece size.
         let len = 2 * (1 << 20) + 4096;

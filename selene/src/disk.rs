@@ -159,6 +159,8 @@ pub const MAX_TAIL_PAGES: u32 = (CHECKSUM_SCRATCH_BYTES / 8) as u32;
 pub enum Operation {
     ReadRecord,
     WriteRecord,
+    WritePacked,
+    ReadPacked,
     Create,
     WritePages,
     WriteRow,
@@ -170,6 +172,16 @@ pub enum Operation {
     Close,
     Truncate,
     Unlink,
+}
+
+/// Payload backing for [`Job::WritePacked`].
+#[derive(Debug)]
+pub enum PackedPayload {
+    /// Caller-owned buffers (e.g. standalone `DiskStore` device captures).
+    Owned(Vec<Vec<u8>>),
+    /// Pinned host `(addr, len)` spans that remain valid until the job replies
+    /// (e.g. `CompositeStore` spilling a pinned packed `MemoryRecord`).
+    Pinned(Vec<(usize, usize)>),
 }
 
 /// Work for the disk thread. Buffers are host addresses of page or row slots.
@@ -193,6 +205,23 @@ pub enum Job {
         temporary: PathBuf,
         span: Span,
         publish: Option<(PathBuf, u64)>,
+    },
+    /// Write a complete v4 packed (or literal-fallback v3) record file and publish it.
+    WritePacked {
+        id: JobId,
+        temporary: PathBuf,
+        path: PathBuf,
+        header: Header,
+        metadata: Vec<u8>,
+        payloads: PackedPayload,
+        sync: bool,
+    },
+    /// Read a contiguous byte range from an open v4 packed record file.
+    ReadPacked {
+        id: JobId,
+        window: u32,
+        offset: u64,
+        length: usize,
     },
     /// Create the temporary file for a record and keep it open under `id`.
     Create {
@@ -289,8 +318,10 @@ pub struct Reply {
     /// Bytes moved by this job; for `Commit`, every byte written for the record.
     pub bytes: u64,
     pub elapsed: std::time::Duration,
-    /// The header read by `Open`.
+    /// The header read by `Open` or committed by `Commit` / `WritePacked`.
     pub header: Option<Header>,
+    /// Payload bytes returned by `ReadPacked`.
+    pub payload: Option<Arc<Vec<u8>>>,
 }
 
 pub struct DiskThread {
@@ -525,7 +556,26 @@ impl Worker {
                     if let Some(gate) = &self.faults.read_gate {
                         gate.wait().map_err(Error::carrying)?;
                     }
-                    self.ring.transfer(&file, &[span], false)
+                    let required_end = span
+                        .offset
+                        .checked_add(span.length as u64)
+                        .ok_or_else(|| invalid("record read offset overflow"))?;
+                    let span = Span {
+                        length: span
+                            .length
+                            .checked_next_multiple_of(4096)
+                            .ok_or_else(|| invalid("record read length overflow"))?,
+                        ..span
+                    };
+                    let bytes =
+                        self.ring
+                            .transfer_until(&file, &[span], false, Some(required_end))?;
+                    #[cfg(any(test, feature = "test-support"))]
+                    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) } & libc::O_DIRECT != 0
+                    {
+                        self.faults.trace(b'r');
+                    }
+                    Ok(bytes)
                 })();
                 #[cfg(any(test, feature = "test-support"))]
                 self.faults.trace(b'R');
@@ -549,9 +599,35 @@ impl Worker {
                             self.faults.checkpoint("parent_write");
                         }
                     }
-                    let file = flare_eos::direct_update_file(&temporary, true)
-                        .map_err(|e| io_failure("open record writer", e))?;
-                    let bytes = self.ring.transfer(&file, &[span], true)?;
+                    let (file, bytes) = if span.aligned() {
+                        let file = flare_eos::direct_update_file(&temporary, true)
+                            .map_err(|e| io_failure("open record writer", e))?;
+                        let bytes = self.ring.transfer(&file, &[span], true)?;
+                        #[cfg(any(test, feature = "test-support"))]
+                        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) } & libc::O_DIRECT
+                            != 0
+                        {
+                            self.faults.trace(b'w');
+                        }
+                        (file, bytes)
+                    } else {
+                        use std::os::unix::fs::FileExt;
+                        // V4 recovery rejects bytes beyond the declared record extent.
+                        // Packed payloads can end between direct-I/O block boundaries.
+                        let file = OpenOptions::new()
+                            .create(true)
+                            .truncate(false)
+                            .write(true)
+                            .open(&temporary)
+                            .map_err(|e| io_failure("open packed record writer", e))?;
+                        // The caller retains immutable input until this job completes.
+                        let bytes = unsafe {
+                            std::slice::from_raw_parts(span.address as *const u8, span.length)
+                        };
+                        file.write_all_at(bytes, span.offset)
+                            .map_err(|e| io_failure("write packed record", e))?;
+                        (file, span.length as u64)
+                    };
                     if let Some((path, final_length)) = publish {
                         file.set_len(final_length)
                             .map_err(|e| io_failure("size record", e))?;
@@ -563,6 +639,35 @@ impl Worker {
                 self.faults.trace(b'W');
                 reply(id, Operation::WriteRecord, 0, result)
             }
+            Job::WritePacked {
+                id,
+                temporary,
+                path,
+                header,
+                metadata,
+                payloads,
+                sync,
+            } => match self.write_packed(temporary, &path, header, &metadata, &payloads, sync) {
+                Ok((bytes, header)) => {
+                    let mut done = reply(id, Operation::WritePacked, 0, Ok(bytes));
+                    done.header = Some(header);
+                    done
+                }
+                Err(error) => reply(id, Operation::WritePacked, 0, Err(error)),
+            },
+            Job::ReadPacked {
+                id,
+                window,
+                offset,
+                length,
+            } => match self.read_packed(id, offset, length) {
+                Ok(payload) => {
+                    let mut done = reply(id, Operation::ReadPacked, window, Ok(payload.len() as u64));
+                    done.payload = Some(payload);
+                    done
+                }
+                Err(error) => reply(id, Operation::ReadPacked, window, Err(error)),
+            },
             Job::Create {
                 id,
                 temporary,
@@ -608,6 +713,7 @@ impl Worker {
                     bytes,
                     elapsed: std::time::Duration::ZERO,
                     header: Some(header),
+                    payload: None,
                 },
                 Err(error) => reply(id, Operation::Open, 0, Err(error)),
             },
@@ -879,9 +985,105 @@ impl Worker {
         }
     }
 
+    fn write_packed(
+        &mut self,
+        temporary: PathBuf,
+        path: &Path,
+        header: Header,
+        metadata: &[u8],
+        payloads: &PackedPayload,
+        sync: bool,
+    ) -> Result<(u64, Header)> {
+        use std::io::Write as _;
+        #[cfg(any(test, feature = "test-support"))]
+        self.faults.before_io().map_err(Error::carrying)?;
+        let outcome = (|| {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&temporary)
+                .map_err(|e| io_failure("create packed record file", e))?;
+            file.write_all(metadata)
+                .map_err(|e| io_failure("write packed record metadata", e))?;
+            let mut total = metadata.len() as u64;
+            match payloads {
+                PackedPayload::Owned(chunks) => {
+                    for chunk in chunks {
+                        file.write_all(chunk)
+                            .map_err(|e| io_failure("write packed record payload", e))?;
+                        total += chunk.len() as u64;
+                    }
+                }
+                PackedPayload::Pinned(spans) => {
+                    for &(addr, len) in spans {
+                        // SAFETY: Caller pins the source slabs until `Operation::WritePacked` replies.
+                        let slice = unsafe { std::slice::from_raw_parts(addr as *const u8, len) };
+                        file.write_all(slice)
+                            .map_err(|e| io_failure("write packed record payload", e))?;
+                        total += len as u64;
+                    }
+                }
+            }
+            self.publish(&file, &temporary, path, sync)?;
+            Ok(total)
+        })();
+        if outcome.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        outcome.map(|bytes| (bytes, header))
+    }
+
+    fn read_packed(&mut self, id: JobId, offset: u64, length: usize) -> Result<Arc<Vec<u8>>> {
+        use flare_eos::FileReadAt as _;
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(gate) = &self.faults.read_gate {
+            gate.wait().map_err(Error::carrying)?;
+        }
+        let reading = reading(&mut self.records, id)?;
+        if reading.header.packed.is_none() {
+            return Err(invalid(format!(
+                "record file {} is not a v4 packed record",
+                reading.path.display()
+            )));
+        }
+        let mut buf = vec![0u8; length];
+        if length > 0 {
+            reading.file.read_exact_at(&mut buf, offset).map_err(|e| {
+                io_failure(format!("read packed record {}", reading.path.display()), e)
+            })?;
+        }
+        Ok(Arc::new(buf))
+    }
+
     fn open(&mut self, id: JobId, path: PathBuf, mut expected: Header) -> Result<(u64, Header)> {
         if self.records.contains_key(&id) {
             return Err(invalid(format!("disk job {} is already open", id.0)));
+        }
+        if expected.packed.is_some() {
+            let mut file = File::open(&path)
+                .map_err(|e| io_failure(format!("open packed record file {}", path.display()), e))?;
+            let meta = Header::read_metadata(&mut file).map_err(|e| {
+                io_failure(format!("read packed record header of {}", path.display()), e)
+            })?;
+            let header = Header::decode(&meta)
+                .map_err(|error| invalid(format!("record file {}: {error}", path.display())))?;
+            if header != expected {
+                return Err(invalid(format!(
+                    "record file {} has a different header than the indexed record",
+                    path.display()
+                )));
+            }
+            self.records.insert(
+                id,
+                Record::Reading(Reading {
+                    file,
+                    path,
+                    header: header.clone(),
+                    checksums: Vec::new(),
+                }),
+            );
+            return Ok((meta.len() as u64, header));
         }
         let file = flare_eos::direct_file(&path, false)
             .map_err(|error| direct_open_failure("open record file", &path, error))?;
@@ -1034,6 +1236,7 @@ fn reply(id: JobId, operation: Operation, window: u32, outcome: Result<u64>) -> 
         bytes,
         elapsed: std::time::Duration::ZERO,
         header: None,
+        payload: None,
     }
 }
 
@@ -1145,6 +1348,11 @@ pub struct Span {
     pub offset: u64,
     pub length: usize,
 }
+impl Span {
+    fn aligned(&self) -> bool {
+        aligned(self.address as u64) && aligned(self.offset) && aligned(self.length as u64)
+    }
+}
 
 /// A span piece of at most [`CHUNK_BYTES`], the unit the ring carries.
 #[derive(Clone, Copy, Debug, Default)]
@@ -1213,6 +1421,16 @@ impl Ring {
     /// completed, so the caller's buffers are quiescent whatever the outcome.
     /// An undrainable ring retains the call and its buffers through shutdown.
     fn transfer(&mut self, file: &File, spans: &[Span], write: bool) -> Result<u64> {
+        self.transfer_until(file, spans, write, None)
+    }
+
+    fn transfer_until(
+        &mut self,
+        file: &File,
+        spans: &[Span],
+        write: bool,
+        required_end: Option<u64>,
+    ) -> Result<u64> {
         if let Some(reason) = &self.broken {
             return Err(invalid(format!(
                 "disk thread ring failed earlier: {reason}"
@@ -1295,7 +1513,11 @@ impl Ring {
                             io::Error::from_raw_os_error(-result),
                         )
                     });
-                } else if result as u32 != chunk.length {
+                } else if (result as u64)
+                    < required_end.map_or(u64::from(chunk.length), |end| {
+                        end.saturating_sub(chunk.offset).min(chunk.length.into())
+                    })
+                {
                     failure.get_or_insert_with(|| {
                         invalid(format!(
                             "short direct {verb} of {result} bytes at file offset {}; {} were requested",
@@ -1303,7 +1525,7 @@ impl Ring {
                         ))
                     });
                 } else {
-                    moved += chunk.length as u64;
+                    moved += result as u64;
                 }
             }
         }
@@ -1704,6 +1926,37 @@ mod tests {
         io::{Seek, SeekFrom, Write as _},
         time::{Duration, Instant, SystemTime},
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn packed_final_read_accepts_only_a_complete_logical_window() {
+        let Some(directory) = test_directory("packed-final-window") else {
+            return;
+        };
+        let path = directory.join("row");
+        let file_bytes: Vec<_> = (0..7180).map(|i| (i % 251) as u8).collect();
+        fs::write(&path, &file_bytes).unwrap();
+        let file = Arc::new(flare_eos::direct_file(&path, false).unwrap());
+        let thread = DiskThread::start("packed-final-window").unwrap();
+        let output = AlignedBuffer::new(4096).unwrap();
+        let required = file_bytes.len() - 4096;
+        for length in [required, required + 1] {
+            thread
+                .submit(Job::ReadRecord {
+                    id: JobId(1),
+                    file: file.clone(),
+                    span: Span {
+                        address: output.address(),
+                        offset: 4096,
+                        length,
+                    },
+                })
+                .unwrap();
+            let result = wait(&thread, 1).pop().unwrap().result;
+            assert_eq!(result.is_ok(), length == required, "{result:?}");
+        }
+        assert_eq!(&output.as_slice()[..required], &file_bytes[4096..]);
+    }
 
     #[cfg(unix)]
     #[test]

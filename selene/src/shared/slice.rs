@@ -15,7 +15,7 @@
 //! [`SliceLayout`] is the one place that arithmetic lives, for the manager and the instance.
 
 use super::identity::Geometry;
-use crate::{Error, Result, geometry::BLOCK_BYTES, record::checksum};
+use crate::{Error, Result, geometry::padded_bytes, record::checksum};
 
 /// Where one rank's bytes lie in a page record and in the row record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,10 +42,6 @@ pub struct SliceLayout {
     row_record: u64,
 }
 
-fn padded(bytes: u64) -> u64 {
-    bytes.div_ceil(BLOCK_BYTES) * BLOCK_BYTES
-}
-
 impl SliceLayout {
     pub fn new(geometry: &Geometry) -> Result<Self> {
         if geometry.ranks.is_empty() {
@@ -54,8 +50,13 @@ impl SliceLayout {
         let (mut page, mut row) = (0u64, 0u64);
         let mut ranks = Vec::with_capacity(geometry.ranks.len());
         for rank in &geometry.ranks {
-            let page_len: u64 = rank.plane_bytes.iter().map(|b| padded(*b)).sum();
-            let row_len = padded(rank.row_bytes);
+            let page_len = rank.plane_bytes.iter().try_fold(0u64, |acc, &b| {
+                let p = padded_bytes(b).ok_or_else(|| Error::new("plane padded byte overflow"))?;
+                acc.checked_add(p)
+                    .ok_or_else(|| Error::new("page padded byte overflow"))
+            })?;
+            let row_len = padded_bytes(rank.row_bytes)
+                .ok_or_else(|| Error::new("row padded byte overflow"))?;
             if page_len == 0 || row_len == 0 {
                 return Err(Error::new("a rank has an empty plane or row"));
             }

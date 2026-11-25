@@ -115,9 +115,14 @@ Windows native builds also require Perl for the bundled static OpenSSL build,
 alongside the C/C++ toolchain. The resulting binaries do not require OpenSSL DLLs.
 
 The JPEG decoder builds its bundled libjpeg-turbo source. Preparation requires
-the CUDA toolkit, including `nvcc` and CUPTI. Native build libraries discover
-the system toolkit; `[paths] cuda` overrides that discovery with an explicit
-toolkit directory.
+the CUDA toolkit, including `nvcc` and CUPTI; core export also invokes `nvcc`
+to compile the embedded GPU KV-cache codec module (`kv_codec_gpu.cu`) for cores
+that declare a codec layout. Compiled cubins are cached under
+`[paths] kernel_cache/kv_codec` when configured, falling back to a private
+mode-`0700` user directory under `$TMPDIR` (or a fresh temporary directory) when
+`kernel_cache` is unset or unwritable. Native build libraries discover the
+system toolkit; `[paths] cuda` overrides that discovery with an explicit toolkit
+directory.
 
 The `prepare` extra installs `cuda-tile[tileiras]`, including the `tileiras`
 compiler toolchain required by cuTile kernels during model preparation.

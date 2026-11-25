@@ -77,6 +77,17 @@ impl TierView {
     /// Announce a node that became ready, or whose row was dropped, with the
     /// parent the manager should chain it under.
     pub fn announce(&mut self, notice: &NodeNotice, parent: Option<PrefixKey>) {
+        self.announce_packed(notice, parent, None);
+    }
+
+    /// Announce a node, optionally as a packed holding with its stored byte size
+    /// and required decode profiles.
+    pub fn announce_packed(
+        &mut self,
+        notice: &NodeNotice,
+        parent: Option<PrefixKey>,
+        packed: Option<(u64, Vec<Vec<u8>>)>,
+    ) {
         match notice.event {
             NodeEvent::Ready => {
                 self.announced.insert(notice.key);
@@ -84,6 +95,12 @@ impl TierView {
             NodeEvent::RowDropped if self.announced.contains(&notice.key) => {}
             _ => return,
         }
+        let raw_bytes = notice.tail_pages as u64 * self.page_record_bytes
+            + if notice.row { self.row_record_bytes } else { 0 };
+        let (bytes, is_packed, required_profiles) = match packed {
+            Some((stored_bytes, profiles)) => (stored_bytes, true, profiles),
+            None => (raw_bytes, false, Vec::new()),
+        };
         self.announcer.saved(IndexEntry {
             key: notice.key,
             parent,
@@ -91,8 +108,9 @@ impl TierView {
             tail_pages: notice.tail_pages as u32,
             row: notice.row,
             tier: self.tier,
-            bytes: notice.tail_pages as u64 * self.page_record_bytes
-                + if notice.row { self.row_record_bytes } else { 0 },
+            bytes,
+            packed: is_packed,
+            required_profiles,
         });
     }
 

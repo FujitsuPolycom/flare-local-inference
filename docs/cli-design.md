@@ -745,6 +745,7 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--embedding-table-storage disk\|ram` | PLE and Engram table storage; both modes deliver compact GPU rows | `disk` |
 | `--embedding-table-cache-size SIZE` | Per-host RAM budget for cached disk-backed PLE/Engram rows, including the index, usage counters and miss workspace; accepts sizes such as `1G` or `2GiB`; `0` disables | `4GiB` on discrete GPUs; `1GiB` on unified-memory GPUs such as DGX Spark |
 | `--embedding-table-resident-scales` / `--no-embedding-table-resident-scales` | Keep original embedding scale bytes in host RAM while weights remain on disk; adds to the row-cache budget | Enabled on discrete GPUs; disabled on unified-memory GPUs |
+| `--lossless-kv-compression off\|cpu\|gpu` | Lossless KV-cache checkpoint compression (`off` raw, `cpu` Zstd `ZKV1`, `gpu` core-embedded pure-CUDA rANS `GKV1`); see [prefix-cache-offload.md](prefix-cache-offload.md#0-lossless-kv-compression). | `[prefix_cache] compression`, otherwise `off` |
 | `--prefix-cache-memory SIZE` | Warm host memory for prefix checkpoints and prepared inputs, such as `16G`; `0` disables warm retention | `[prefix_cache] memory`, otherwise `0` |
 | `--prefix-cache-disk DIR` | Directory for prefix checkpoints and prepared inputs on disk | `[paths] prefix_cache`, otherwise disabled |
 | `--prefix-cache-disk-limit SIZE` | Disk retention limit, such as `100G`; `0` disables | `[prefix_cache] disk_limit`, otherwise 10% of free space |
@@ -1349,6 +1350,7 @@ memory = ""                      # Warm checkpoints and CPU inputs; empty or 0: 
 drain_on_shutdown = "off"         # Pooled DRAM persistence: on, off, or a duration.
 disk_limit = ""                  # Empty: 10% of free disk space when disk retention is enabled.
 max_age = "off"                  # Expire host records by time since last use: off or a duration.
+compression = "off"              # Lossless checkpoint compression: off, cpu, or gpu.
 
 [models."qwen3.8-flash"]          # Per-model overrides of [defaults].
 max_concurrency = 2
@@ -1364,7 +1366,7 @@ cuda = "/opt/cuda"                # Explicit CUDA toolkit directory for native b
 
 Ignition rejects any section or key outside its schema. Native Flare ignores
 keys it does not use, except in `[prefix_cache]`, where it accepts only `memory`,
-`disk_limit`, `drain_on_shutdown`, and `max_age`.
+`disk_limit`, `drain_on_shutdown`, `max_age`, and `compression`.
 
 `[models.<alias>]` overrides `[defaults]`; flags override both.
 Both sections accept `speculative_token_capacity`, overridden during preparation

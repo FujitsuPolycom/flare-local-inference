@@ -26,7 +26,8 @@ _SECTIONS = {
                  "speculative_token_capacity": int, "speculative_graph_budget": int, "speculative_method": str},
     "memory": {"reserve": str},
     "preparation": {"compile_workers": int, "autotune_effort": str, "checkpoint_token_file": str, "force_moe_decode_a16": bool},
-    "prefix_cache": {"memory": str, "disk_limit": str, "drain_on_shutdown": str, "max_age": str},
+    "prefix_cache": {"memory": str, "disk_limit": str, "drain_on_shutdown": str, "max_age": str,
+                     "compression": str},
     "paths": {"hub_cache": str, "kernel_cache": str, "core_cache": str, "export_staging": str,
               "prefix_cache": str, "cuda": str},
 }
@@ -43,6 +44,7 @@ _BUILT_IN = {
     "preparation.autotune_effort": "default",
     "preparation.checkpoint_token_file": "~/.config/flare/agent.token",
     "prefix_cache.memory": "", "prefix_cache.disk_limit": "", "prefix_cache.drain_on_shutdown": "", "prefix_cache.max_age": "off",
+    "prefix_cache.compression": "off",
     "paths.hub_cache": "~/.cache/huggingface/hub", "paths.kernel_cache": "~/.cache/flare/kernels",
     "paths.core_cache": "~/.cache/flare/cores",
     "paths.export_staging": "",
@@ -127,6 +129,8 @@ class Configuration:
                     seconds = 0
                 if not 0.5e-9 < seconds < 2**63:
                     raise UsageError(f'prefix_cache {key} {text!r} must be {"on, " if key == "drain_on_shutdown" else ""}off, or a positive duration such as 90s or 2m')
+            if key == "compression" and value.strip() not in ("", "off", "cpu", "gpu"):
+                raise UsageError(f"{path}: compression in [{section}] must be off, cpu, or gpu")
             if key == "autotune_effort" and value not in AUTOTUNE_EFFORTS:
                 raise UsageError(f"{path}: autotune_effort must be one of {', '.join(AUTOTUNE_EFFORTS)}")
             if key == "port" and not 1 <= value <= 65535:

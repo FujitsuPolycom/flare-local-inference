@@ -98,6 +98,16 @@ impl Configuration {
                         .map(parse_max_age)
                         .transpose()?;
                 }
+                if serving.lossless_kv_compression.is_none() {
+                    serving.lossless_kv_compression =
+                        nonempty(self.prefix_cache.compression.as_deref())
+                            .map(|value| {
+                                value
+                                    .parse()
+                                    .map_err(|error| format!("prefix_cache.compression: {error}"))
+                            })
+                            .transpose()?;
+                }
                 if serving.prefix_cache_disk.is_none() {
                     serving.prefix_cache_disk = nonempty(self.paths.prefix_cache.as_deref())
                         .map(|path| expand(home, Path::new(path)));
@@ -672,13 +682,43 @@ namespace = "publisher"
             );
         }
         let (_, run) = configured(
-            "[prefix_cache]\nmemory=''\ndisk_limit=''\n[paths]\nprefix_cache=''",
+            "[prefix_cache]\nmemory=''\ndisk_limit=''\ncompression=''\n[paths]\nprefix_cache=''",
             &["flare", "run", "model"],
             &[],
         );
         assert!(run.prefix_cache_memory.is_none());
         assert!(run.prefix_cache_disk_limit.is_none());
         assert!(run.prefix_cache_disk.is_none());
+        assert!(run.lossless_kv_compression.is_none());
+    }
+
+    #[test]
+    fn prefix_cache_compression_config_and_flag_precedence() {
+        let (_, run) = configured(
+            "[prefix_cache]\ncompression='gpu'\nmemory='1G'\n",
+            &["flare", "run", "model.safetensors"],
+            &[],
+        );
+        assert_eq!(
+            run.load_options().prefix_cache.compression,
+            flare_helios::offload::KvCompression::Gpu
+        );
+        let (_, overridden) = configured(
+            "[prefix_cache]\ncompression='gpu'\nmemory='1G'\n",
+            &[
+                "flare",
+                "run",
+                "model.safetensors",
+                "--lossless-kv-compression",
+                "cpu",
+            ],
+            &[],
+        );
+        assert_eq!(
+            overridden.load_options().prefix_cache.compression,
+            flare_helios::offload::KvCompression::Cpu
+        );
+        assert!(Configuration::parse("[prefix_cache]\ncompression='invalid'\n").is_err());
     }
     #[test]
     fn prefix_cache_age_reaches_flags_config_and_ranks() {

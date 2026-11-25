@@ -185,6 +185,7 @@ pub enum StoreEvent {
 /// Counters every store maintains; rates are bytes per second of completed transfers.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct StoreStats {
+    pub decode: crate::codec_copy::DecodeStats,
     pub retirement_paths: u64,
     pub retirement_max_depth: u64,
     pub retirement_ns: u64,
