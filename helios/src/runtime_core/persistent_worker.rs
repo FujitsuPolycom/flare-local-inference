@@ -27,6 +27,9 @@ use crate::{Error, ExecutionError, Result};
 const WORKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKER_DRAIN_SPIN_POLLS: u32 = 64;
 const WORKER_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(1);
+/// Non-portable CTA cluster width (16 CTAs) requested for the compute green context when the
+/// device reports at least 8-SM co-scheduling alignment and at least 16 remaining compute SMs.
+const PREFERRED_COMPUTE_COSCHEDULED_SMS: u32 = 16;
 
 /// Partitioned CUDA Green Contexts and non-blocking streams for a core with a persistent worker.
 pub(super) struct GreenContextPartition {
@@ -45,14 +48,23 @@ pub(super) struct GreenContextPartition {
 // `NativeResources`, which serializes creation and teardown.
 unsafe impl Send for GreenContextPartition {}
 
+/// Planned `cuDevSmResourceSplit` requests for the worker and compute groups.
+struct SmSplitPlan {
+    primary: [DevSmResourceGroupParams; 2],
+    fallback: Option<[DevSmResourceGroupParams; 2]>,
+    min_compute_coscheduled: u32,
+}
+
 /// Plan two structured SM resource groups for `cuDevSmResourceSplit`:
 /// group 0 receives `requested_worker_sms` rounded up to the device's co-scheduled SM alignment,
 /// and group 1 uses discovery mode (`sm_count = 0`) with `CU_DEV_SM_RESOURCE_GROUP_BACKFILL`
 /// to claim all remaining SMs while preserving co-scheduled SM alignment for multi-CTA clusters.
-fn plan_sm_split(
-    device_sm: DevSmResource,
-    requested_worker_sms: u32,
-) -> Result<([DevSmResourceGroupParams; 2], u32)> {
+///
+/// When the device reports at least 8-SM co-scheduled alignment and at least 16 compute SMs remain,
+/// `primary` requests `coscheduled_sm_count = 16` on the compute group so kernels opting into
+/// non-portable 16-CTA clusters can instantiate in the compute green context, with `fallback`
+/// retrying at the device's baseline alignment if the driver rejects 16.
+fn plan_sm_split(device_sm: DevSmResource, requested_worker_sms: u32) -> Result<SmSplitPlan> {
     let total_sms = device_sm.sm_count;
     if total_sms == 0 {
         return Err(invalid("device reported zero streaming multiprocessors"));
@@ -73,7 +85,7 @@ fn plan_sm_split(
             "persistent worker requested {requested_worker_sms} SMs (aligned to {aligned_worker} at co-scheduled alignment {coscheduled}) out of {total_sms}, leaving insufficient structured compute SMs"
         )));
     }
-    let params = [
+    let base_params = [
         DevSmResourceGroupParams {
             sm_count: aligned_worker,
             coscheduled_sm_count: coscheduled,
@@ -89,7 +101,42 @@ fn plan_sm_split(
             reserved: [0; 12],
         },
     ];
-    Ok((params, coscheduled))
+    let remaining_sms = total_sms - aligned_worker;
+    if coscheduled >= 8
+        && PREFERRED_COMPUTE_COSCHEDULED_SMS > coscheduled
+        && remaining_sms >= PREFERRED_COMPUTE_COSCHEDULED_SMS
+    {
+        let mut preferred = base_params;
+        preferred[1].coscheduled_sm_count = PREFERRED_COMPUTE_COSCHEDULED_SMS;
+        Ok(SmSplitPlan {
+            primary: preferred,
+            fallback: Some(base_params),
+            min_compute_coscheduled: coscheduled,
+        })
+    } else {
+        Ok(SmSplitPlan {
+            primary: base_params,
+            fallback: None,
+            min_compute_coscheduled: coscheduled,
+        })
+    }
+}
+
+/// Invoke `cuDevSmResourceSplit` with the primary split plan and retry with the baseline-aligned
+/// fallback if the driver rejects the wider compute co-scheduled alignment.
+fn split_sm_groups(
+    plan: SmSplitPlan,
+    mut invoke: impl FnMut(&mut [DevSmResourceGroupParams; 2]) -> c_int,
+) -> (c_int, [DevSmResourceGroupParams; 2]) {
+    let mut active = plan.primary;
+    let status = invoke(&mut active);
+    if status != 0 {
+        if let Some(mut fallback) = plan.fallback {
+            let fallback_status = invoke(&mut fallback);
+            return (fallback_status, fallback);
+        }
+    }
+    (status, active)
 }
 
 impl GreenContextPartition {
@@ -128,20 +175,21 @@ impl GreenContextPartition {
                 let device_sm_info = device_sm
                     .sm()
                     .ok_or_else(|| invalid("device did not report an SM resource"))?;
-                let (mut group_params, coscheduled) =
-                    plan_sm_split(device_sm_info, requested_worker_sms)?;
+                let plan = plan_sm_split(device_sm_info, requested_worker_sms)?;
+                let coscheduled = plan.min_compute_coscheduled;
                 let mut groups = [DevResource::zeroed(), DevResource::zeroed()];
-                driver.check(
-                    "cuDevSmResourceSplit",
+                let (status, group_params) = split_sm_groups(plan, |params| {
+                    groups = [DevResource::zeroed(), DevResource::zeroed()];
                     (gc.dev_sm_resource_split)(
                         groups.as_mut_ptr(),
                         2,
                         &device_sm,
                         null_mut(),
                         0,
-                        group_params.as_mut_ptr(),
-                    ),
-                )?;
+                        params.as_mut_ptr(),
+                    )
+                });
+                driver.check("cuDevSmResourceSplit", status)?;
                 let worker_split = groups[0]
                     .sm()
                     .ok_or_else(|| invalid("worker SM split did not return an SM resource"))?;
@@ -827,40 +875,87 @@ mod tests {
             sm_coscheduled_alignment: 8,
             flags: 0,
         };
-        let (params, align) = plan_sm_split(sm103, 8).unwrap();
-        assert_eq!(align, 8);
-        assert_eq!(params[0].sm_count, 8);
-        assert_eq!(params[0].coscheduled_sm_count, 8);
-        assert_eq!(params[0].flags, 0);
-        assert_eq!(params[1].sm_count, 0);
-        assert_eq!(params[1].coscheduled_sm_count, 8);
-        assert_eq!(params[1].flags, CU_DEV_SM_RESOURCE_GROUP_BACKFILL);
+        let plan = plan_sm_split(sm103, 8).unwrap();
+        assert_eq!(plan.min_compute_coscheduled, 8);
+        assert_eq!(plan.primary[0].sm_count, 8);
+        assert_eq!(plan.primary[0].coscheduled_sm_count, 8);
+        assert_eq!(plan.primary[0].flags, 0);
+        assert_eq!(plan.primary[1].sm_count, 0);
+        assert_eq!(plan.primary[1].coscheduled_sm_count, 16);
+        assert_eq!(plan.primary[1].flags, CU_DEV_SM_RESOURCE_GROUP_BACKFILL);
+        let fallback = plan.fallback.expect("expected baseline fallback plan");
+        assert_eq!(fallback[0].sm_count, 8);
+        assert_eq!(fallback[1].coscheduled_sm_count, 8);
+        assert_eq!(fallback[1].flags, CU_DEV_SM_RESOURCE_GROUP_BACKFILL);
 
         // Unaligned requests round up to co-scheduled alignment.
-        let (rounded, _) = plan_sm_split(sm103, 4).unwrap();
-        assert_eq!(rounded[0].sm_count, 8);
-        let (rounded_12, _) = plan_sm_split(sm103, 12).unwrap();
-        assert_eq!(rounded_12[0].sm_count, 16);
+        let rounded = plan_sm_split(sm103, 4).unwrap();
+        assert_eq!(rounded.primary[0].sm_count, 8);
+        assert_eq!(rounded.primary[1].coscheduled_sm_count, 16);
+        let rounded_12 = plan_sm_split(sm103, 12).unwrap();
+        assert_eq!(rounded_12.primary[0].sm_count, 16);
+        assert_eq!(rounded_12.primary[1].coscheduled_sm_count, 16);
+
+        // Remaining compute SMs below 16 stay at the device's baseline co-scheduled alignment.
+        let narrow = plan_sm_split(sm103, 144).unwrap();
+        assert_eq!(narrow.primary[0].sm_count, 144);
+        assert_eq!(narrow.primary[1].coscheduled_sm_count, 8);
+        assert!(narrow.fallback.is_none());
 
         // Requests leaving fewer than one aligned compute partition fail.
         assert!(plan_sm_split(sm103, 0).is_err());
         assert!(plan_sm_split(sm103, 145).is_err());
         assert!(plan_sm_split(sm103, 152).is_err());
 
-        // SM8x devices use 2-SM co-scheduling alignment.
+        // SM8x devices use 2-SM co-scheduling alignment with no 16-CTA upgrade.
         let sm80 = DevSmResource {
             sm_count: 108,
             min_sm_partition_size: 2,
             sm_coscheduled_alignment: 2,
             flags: 0,
         };
-        let (params80, align80) = plan_sm_split(sm80, 6).unwrap();
-        assert_eq!(align80, 2);
-        assert_eq!(params80[0].sm_count, 6);
-        assert_eq!(params80[0].coscheduled_sm_count, 2);
-        assert_eq!(params80[1].sm_count, 0);
-        assert_eq!(params80[1].coscheduled_sm_count, 2);
-        assert_eq!(params80[1].flags, CU_DEV_SM_RESOURCE_GROUP_BACKFILL);
+        let plan80 = plan_sm_split(sm80, 6).unwrap();
+        assert_eq!(plan80.min_compute_coscheduled, 2);
+        assert_eq!(plan80.primary[0].sm_count, 6);
+        assert_eq!(plan80.primary[0].coscheduled_sm_count, 2);
+        assert_eq!(plan80.primary[1].sm_count, 0);
+        assert_eq!(plan80.primary[1].coscheduled_sm_count, 2);
+        assert_eq!(plan80.primary[1].flags, CU_DEV_SM_RESOURCE_GROUP_BACKFILL);
+        assert!(plan80.fallback.is_none());
+    }
+
+    #[test]
+    fn split_sm_groups_retries_baseline_alignment_when_driver_rejects_cluster16() {
+        let sm103 = DevSmResource {
+            sm_count: 152,
+            min_sm_partition_size: 8,
+            sm_coscheduled_alignment: 8,
+            flags: 0,
+        };
+
+        // Primary 16-SM compute alignment succeeds without invoking fallback.
+        let mut seen = Vec::new();
+        let (status, active) = split_sm_groups(plan_sm_split(sm103, 8).unwrap(), |params| {
+            seen.push(params[1].coscheduled_sm_count);
+            0
+        });
+        assert_eq!(status, 0);
+        assert_eq!(seen, vec![16]);
+        assert_eq!(active[1].coscheduled_sm_count, 16);
+
+        // Driver rejection of 16 falls back to the device's 8-SM co-scheduled alignment.
+        let mut seen_fallback = Vec::new();
+        let (status, active) = split_sm_groups(plan_sm_split(sm103, 8).unwrap(), |params| {
+            seen_fallback.push(params[1].coscheduled_sm_count);
+            if params[1].coscheduled_sm_count == 16 {
+                1
+            } else {
+                0
+            }
+        });
+        assert_eq!(status, 0);
+        assert_eq!(seen_fallback, vec![16, 8]);
+        assert_eq!(active[1].coscheduled_sm_count, 8);
     }
 
     #[test]
