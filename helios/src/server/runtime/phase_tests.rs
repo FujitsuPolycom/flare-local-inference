@@ -531,7 +531,7 @@ fn reasoning_budget_cuts_or_plainly_continues_with_exact_history_and_usage() {
             incoming.prompt.reasoning_cut = Some(budget_cut(4, after));
             sender.send(vec![incoming]).unwrap();
             let mut worker = fixture.worker(receiver);
-            worker.admit().unwrap();
+            let _ = worker.admit().unwrap();
             let mut first = [1; 3];
             if let Some(at) = close_at {
                 first[at] = 4;
@@ -597,7 +597,7 @@ fn reasoning_budget_cuts_when_ignored_eos_is_the_last_pass_token() {
     incoming.prompt.ignore_eos = true;
     sender.send(vec![incoming]).unwrap();
     let mut worker = fixture.worker(receiver);
-    worker.admit().unwrap();
+    let _ = worker.admit().unwrap();
     let mut sequence = 0;
     budget_pass(&mut worker, &mut sequence, &[1, 1, 5]);
     let (incoming, parked) = worker.parked.front().unwrap();
@@ -605,7 +605,7 @@ fn reasoning_budget_cuts_when_ignored_eos_is_the_last_pass_token() {
     assert_eq!(incoming.prompt.max_new_tokens, 2);
     assert_eq!(parked.carried.generated_tokens, 4);
     assert_eq!(worker.metrics.snapshot(false).reasoning_budget_cuts, 1);
-    worker.admit().unwrap();
+    let _ = worker.admit().unwrap();
     budget_pass(&mut worker, &mut sequence, &[2, 2]);
     assert_eq!(
         budget_events(&mut generation),
@@ -625,7 +625,7 @@ fn reasoning_budget_cuts_after_a_multi_token_speculative_completion() {
     let mut worker = fixture.worker(receiver);
     worker.scheduler.enable_speculation(&[1, 4]).unwrap();
     worker.scheduler.fixed_speculative_width(Some(4)).unwrap();
-    worker.admit().unwrap();
+    let _ = worker.admit().unwrap();
     advance(&mut worker, GraphKind::Init, 1, None);
     advance(&mut worker, GraphKind::Prefill, 2, Some(1));
     advance(&mut worker, GraphKind::Snapshot, 3, None);
@@ -667,7 +667,7 @@ fn reasoning_budget_cuts_after_a_multi_token_speculative_completion() {
             .render()
             .contains("flare_reasoning_budget_cuts_total 1\n")
     );
-    worker.admit().unwrap();
+    let _ = worker.admit().unwrap();
     budget_pass(&mut worker, &mut sequence, &[2]);
     assert_eq!(
         budget_events(&mut generation),
@@ -746,7 +746,7 @@ fn reasoning_budget_does_not_inject_a_close_inside_a_tool_call() {
         let (sender, receiver) = mpsc::channel();
         sender.send(vec![incoming]).unwrap();
         let mut worker = fixture.worker(receiver);
-        worker.admit().unwrap();
+        let _ = worker.admit().unwrap();
         let mut sequence = 0;
         let token = |text| fixture.frontend.tokenizer().token_to_id(text).unwrap();
         let samples = [
@@ -768,7 +768,7 @@ fn reasoning_budget_does_not_inject_a_close_inside_a_tool_call() {
         assert_eq!(incoming.prompt.max_new_tokens, (8 - budget) as u32);
         assert_eq!(parked.carried.generated_tokens, budget as u32);
         assert_eq!(worker.metrics.snapshot(false).reasoning_budget_cuts, 0);
-        worker.admit().unwrap();
+        let _ = worker.admit().unwrap();
         budget_pass(&mut worker, &mut sequence, &samples[budget..]);
         let (tail, finished, _) = budget_events(&mut generation);
         tokens.extend(tail);
@@ -826,10 +826,10 @@ fn reasoning_budget_streams_reasoning_then_content_on_chat_and_messages() {
         let (sender, receiver) = mpsc::channel();
         sender.send(vec![incoming]).unwrap();
         let mut worker = fixture.worker(receiver);
-        worker.admit().unwrap();
+        let _ = worker.admit().unwrap();
         let mut sequence = 0;
         budget_pass(&mut worker, &mut sequence, &[1, 1]);
-        worker.admit().unwrap();
+        let _ = worker.admit().unwrap();
         budget_pass(&mut worker, &mut sequence, &[2, 2]);
         while let Ok(event) = generation.events.try_recv() {
             match event {
@@ -908,7 +908,7 @@ fn reasoning_budget_does_not_readmit_eos_or_user_stops() {
         incoming.prompt.stop_sequences = sequences;
         sender.send(vec![incoming]).unwrap();
         let mut worker = fixture.worker(receiver);
-        worker.admit().unwrap();
+        let _ = worker.admit().unwrap();
         budget_pass(&mut worker, &mut 0, &samples);
         assert_eq!(
             budget_events(&mut generation).1,
@@ -929,7 +929,7 @@ fn forced_reasoning_close_obeys_text_stops_and_park_cancellation() {
         incoming.prompt.stop_strings = vec![if mode == 0 { "bx" } else { "xc" }.into()];
         sender.send(vec![incoming]).unwrap();
         let mut worker = fixture.worker(receiver);
-        worker.admit().unwrap();
+        let _ = worker.admit().unwrap();
         let mut sequence = 0;
         budget_pass(&mut worker, &mut sequence, &[1, 1]);
         let (tokens, finished, _) = budget_events(&mut generation);
@@ -943,19 +943,19 @@ fn forced_reasoning_close_obeys_text_stops_and_park_cancellation() {
             if mode == 1 {
                 let carried = worker.parked[0].1.carried;
                 generation.cancel();
-                worker.admit().unwrap();
+                let _ = worker.admit().unwrap();
                 let event = generation.events.try_recv().unwrap();
                 assert!(matches!(event, GenerationEvent::Finished {
                     prompt_tokens: 1, generated_tokens: 3, reused_prompt_tokens,
                     termination: crate::output::Termination::Cancelled, stop_sequence: None, ..
                 } if reused_prompt_tokens == carried.reused_prompt_tokens.unwrap_or(0)));
-                worker.admit().unwrap();
+                let _ = worker.admit().unwrap();
                 assert!(generation.events.try_recv().is_err(), "duplicate terminal event");
                 assert!(worker.parked.is_empty());
                 assert!(worker.active.iter().all(Option::is_none));
                 assert_eq!(worker.metrics.cancelled.load(Ordering::Relaxed), 1);
             } else {
-                worker.admit().unwrap();
+                let _ = worker.admit().unwrap();
                 budget_pass(&mut worker, &mut sequence, &[2]);
                 assert_eq!(budget_events(&mut generation).1, vec![(1, 4, "stop")]);
                 assert!(worker.parked.is_empty());
@@ -989,7 +989,7 @@ fn reasoning_budget_only_injects_a_close_allowed_by_the_grammar() {
         );
         sender.send(vec![incoming]).unwrap();
         let mut worker = fixture.worker(receiver);
-        worker.admit().unwrap();
+        let _ = worker.admit().unwrap();
         let mut sequence = 0;
         budget_pass(&mut worker, &mut sequence, &[1, 1]);
         if allows_close {
@@ -1003,7 +1003,7 @@ fn reasoning_budget_only_injects_a_close_allowed_by_the_grammar() {
                 .as_ref()
                 .unwrap();
             assert!(grammar.allows(2));
-            worker.admit().unwrap();
+            let _ = worker.admit().unwrap();
             budget_pass(&mut worker, &mut sequence, &[2, 2]);
             assert_eq!(
                 budget_events(&mut generation),
@@ -1015,7 +1015,7 @@ fn reasoning_budget_only_injects_a_close_allowed_by_the_grammar() {
             assert_eq!(incoming.prompt.max_new_tokens, 3);
             assert_eq!(parked.carried.generated_tokens, 2);
             assert_eq!(worker.metrics.snapshot(false).reasoning_budget_cuts, 0);
-            worker.admit().unwrap();
+            let _ = worker.admit().unwrap();
             budget_pass(&mut worker, &mut sequence, &[2, 2, 2]);
             assert_eq!(
                 budget_events(&mut generation),
@@ -1039,10 +1039,10 @@ fn reasoning_budget_omits_only_the_forced_tokens_logprob() {
         }
         sender.send(vec![incoming]).unwrap();
         let mut worker = fixture.worker(receiver);
-        worker.admit().unwrap();
+        let _ = worker.admit().unwrap();
         let mut sequence = 0;
         budget_pass(&mut worker, &mut sequence, &[1, 1]);
-        worker.admit().unwrap();
+        let _ = worker.admit().unwrap();
         budget_pass(&mut worker, &mut sequence, &[2, 2]);
         let (tokens, finished, logprobs) = budget_events(&mut generation);
         assert_eq!(finished, vec![(1, 5, "length")]);
@@ -2357,7 +2357,7 @@ fn a_gpu_hit_refreshes_the_host_record_at_admission() {
     worker.attach_store(Some(Box::new(FakeStore::new(None))));
     let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
     sender.send(vec![incoming]).unwrap();
-    worker.admit().unwrap();
+    let _ = worker.admit().unwrap();
     assert!(worker.active[0].is_some());
     assert_eq!(fake_store(&mut worker).reused, [key]);
 }
@@ -2921,7 +2921,7 @@ fn pins(worker: &Worker<'_>, id: crate::cache::CheckpointId) -> u64 {
 fn export_request(
     export: u64,
     key: crate::cache::PrefixKey,
-    generation: u64,
+    _generation: u64,
     begin_tokens: u64,
 ) -> flare_selene::StoreEvent {
     flare_selene::StoreEvent::ExportRequested {
@@ -3081,7 +3081,7 @@ fn only_pooled_stores_hear_of_evictions() {
         let (queued, generation) = fixture.incoming(vec![9; 150], 4);
         std::mem::forget(generation);
         worker.pending.push_back(queued);
-        worker.admit().unwrap();
+        let _ = worker.admit().unwrap();
         worker.service_store().unwrap();
         let evicted = &fake_store(&mut worker).evicted;
         assert_eq!(evicted.len(), usize::from(pooled));
@@ -3111,7 +3111,7 @@ fn a_pooled_lookup_starts_at_arrival_and_ends_at_admission() {
         group.push(incoming);
     }
     sender.send(group).unwrap();
-    worker.admit().unwrap();
+    let _ = worker.admit().unwrap();
     assert_eq!(fake_store(&mut worker).begun, [70; 5]);
     // Admission consulted the ticket and then released it.
     assert_eq!(fake_store(&mut worker).tickets_seen, [true; 4]);
@@ -3127,7 +3127,7 @@ fn a_pooled_lookup_starts_at_arrival_and_ends_at_admission() {
     assert!(worker.pending[0].pool_lookup.is_some());
     // Cancelling the waiting request withdraws its lookup with it.
     generations[4].cancelled.store(true, Ordering::Release);
-    worker.admit().unwrap();
+    let _ = worker.admit().unwrap();
     assert!(worker.pending.is_empty());
     assert_eq!(withdrawn.load(Ordering::Relaxed), 5);
 }
@@ -3148,7 +3148,7 @@ fn a_full_gpu_hit_starts_no_pool_lookup_or_admission_hold() {
     assert!(fake_store(&mut worker).begun.is_empty());
     assert!(worker.pending[0].pool_lookup.is_none());
     assert_eq!(worker.pending[0].pool_plan.as_ref().unwrap().history().token_count(), 70);
-    worker.admit().unwrap();
+    let _ = worker.admit().unwrap();
     assert!(worker.active[0].is_some());
     assert!(fake_store(&mut worker).tickets_seen.is_empty());
     assert_eq!(fake_store(&mut worker).reused, [key]);
@@ -3162,7 +3162,7 @@ fn a_refused_pool_lookup_retries_only_when_admission_is_eligible() {
     worker.scheduler.share_snapshot_pages(&vec![0..2; 16]).unwrap();
     let (running, running_generation) = fixture.incoming(vec![7; 70], 4);
     worker.enqueue(vec![running]);
-    worker.admit().unwrap();
+    let _ = worker.admit().unwrap();
 
     let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
     let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
@@ -3175,7 +3175,7 @@ fn a_refused_pool_lookup_retries_only_when_admission_is_eligible() {
     worker.enqueue(vec![incoming]);
     assert_eq!(fake_store(&mut worker).begun, [70]);
 
-    worker.admit().unwrap();
+    let _ = worker.admit().unwrap();
     assert_eq!(fake_store(&mut worker).begun, [70; 2]);
     assert_eq!(worker.pending.len(), 1);
     assert!(worker.pending[0].blocked.is_some());
@@ -3192,7 +3192,7 @@ fn a_refused_pool_lookup_retries_only_when_admission_is_eligible() {
     assert_eq!(worker.scheduler.stats().cache_lookups, 1);
 
     running_generation.cancelled.store(true, Ordering::Release);
-    worker.admit().unwrap();
+    let _ = worker.admit().unwrap();
     assert!(worker.pending.is_empty());
     assert_eq!(fake_store(&mut worker).begun, [70; 3]);
     assert_eq!(fake_store(&mut worker).fetched.len(), 1);
@@ -3228,7 +3228,7 @@ fn refused_pool_lookups_retry_only_for_selected_requests() {
     }
     worker.enqueue(group);
     assert_eq!(fake_store(&mut worker).begun, [70; 6]);
-    worker.admit().unwrap();
+    let _ = worker.admit().unwrap();
     assert_eq!(worker.active.iter().flatten().count(), 4);
     assert_eq!(worker.pending.len(), 2);
     assert_eq!(fake_store(&mut worker).begun, [70; 10]);
@@ -3273,7 +3273,7 @@ fn a_first_pool_lookup_starts_while_blocked_and_retries_when_selected() {
     incoming.pool_lookup_started =
         Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
     worker.pending.push_back(incoming);
-    worker.admit().unwrap();
+    let _ = worker.admit().unwrap();
     assert_eq!(fake_store(&mut worker).begun, [70; 2]);
     assert_eq!(worker.pending.len(), 1);
     assert!(worker.active.iter().all(Option::is_none));
@@ -3284,7 +3284,7 @@ fn a_first_pool_lookup_starts_while_blocked_and_retries_when_selected() {
             candidates: vec![],
         })),
     );
-    worker.admit().unwrap();
+    let _ = worker.admit().unwrap();
     assert_eq!(fake_store(&mut worker).begun, [70; 2]);
     assert!(worker.pending.is_empty());
     assert!(worker.active[0].is_some());
@@ -3303,7 +3303,7 @@ fn gpu_residency_is_rechecked_using_the_queued_history() {
     worker.enqueue(vec![incoming]);
     assert_eq!(worker.pending[0].pool_plan.as_ref().unwrap().resident_tokens(), 0);
     let checkpoint = unpinned_checkpoint(&mut worker, 0, 70);
-    worker.admit().unwrap();
+    let _ = worker.admit().unwrap();
     let handle = worker.active[0].as_ref().unwrap().request;
     assert_eq!(worker.scheduler.request(handle).unwrap().prefix(), Some(checkpoint));
     assert_eq!(fake_store(&mut worker).begun, [70]);
@@ -3388,7 +3388,7 @@ fn a_local_store_builds_no_lookup_and_a_failed_restore_starts_none() {
     let mut store = FakeStore::new(Some(host_hit(&history, 70)));
     store.pooled = true;
     worker.attach_store(Some(Box::new(store)));
-    worker.admit().unwrap();
+    let _ = worker.admit().unwrap();
     let (_, ticket) = fake_store(&mut worker).fetched.pop().unwrap();
     fake_store(&mut worker)
         .events
@@ -3571,7 +3571,7 @@ fn an_idle_worker_holds_a_pending_pool_lookup_until_answer_or_deadline() {
         assert_eq!(grace, Duration::from_millis(2));
         assert!(worker.pending[0].awaits_pool(started + grace - Duration::from_nanos(1)));
         assert!(!worker.pending[0].awaits_pool(started + grace));
-        worker.admit().unwrap();
+        let _ = worker.admit().unwrap();
         assert!(worker.active.iter().all(Option::is_none));
         assert_eq!(worker.pending.len(), 1);
         assert_eq!(worker.idle_wait(), Duration::from_micros(100));
@@ -3591,7 +3591,7 @@ fn an_idle_worker_holds_a_pending_pool_lookup_until_answer_or_deadline() {
         } else {
             worker.pending[0].pool_lookup_started = Some(Instant::now() - grace);
         }
-        worker.admit().unwrap();
+        let _ = worker.admit().unwrap();
         assert!(worker.active[0].is_some());
         assert!(worker.pending.is_empty());
         assert_eq!(worker.idle_wait(), Duration::from_millis(2));
@@ -3631,7 +3631,7 @@ fn a_pending_pool_lookup_does_not_hold_other_requests() {
             candidates: vec![],
         })),
     );
-    worker.admit().unwrap();
+    let _ = worker.admit().unwrap();
     assert!(worker.active[0].is_some());
     assert_eq!(worker.pending.len(), 1);
     assert!(worker.pending[0].pool_lookup.is_some());
@@ -3977,7 +3977,7 @@ fn exercise_text_preemption(
             if forced {
                 expected.push(cut.close);
             }
-            worker.admit().unwrap();
+            let _ = worker.admit().unwrap();
             budget_pass(
                 &mut worker,
                 &mut sequence,

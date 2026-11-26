@@ -6182,7 +6182,6 @@ mod tests {
     #[test]
     fn async_host_codec_multi_wave_endpoint_with_incompressible_row_releases_idle_scratch() {
         use crate::shared::codec::Plan;
-        use crate::store::TierStore;
         use crate::testing::{CodecCopier, GpuMemory};
 
         const PAGES: usize = 40; // Exceeds max 32-page wave so compression spans 2 waves.

@@ -1154,7 +1154,7 @@ pub(crate) mod tests {
     fn xtml_message_close_mask_matches_output_parser() {
         use crate::model::contract::{ToolParser, ToolParserKind};
         use crate::output::{
-            Event, Input, ModelOutput, OutputConfig, OutputPipeline, Termination,
+            Event, Input, OutputConfig, OutputPipeline, Termination,
             tagged::{OutputConfig as TaggedConfig, OutputStart},
         };
 

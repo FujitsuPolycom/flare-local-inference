@@ -227,7 +227,7 @@ fn gpus(world: usize) -> Vec<[u8; 16]> {
     (0..world).map(|r| [50 + r as u8; 16]).collect()
 }
 
-fn config(args: &Args, name: &str, gpus: Vec<[u8; 16]>) -> PoolConfig {
+fn config(args: &Args, gpus: Vec<[u8; 16]>) -> PoolConfig {
     PoolConfig {
         address: PoolAddress::Unix(args.socket.clone()),
         ca: None,
@@ -254,7 +254,7 @@ fn main() {
 fn source(args: &Args) {
     let (copier, _gpu) = SimulatedGpu::shared(&ranks(args.world)).unwrap();
     let mut client = PoolClient::start(
-        config(args, "source", vec![[1; 16]]),
+        config(args, vec![[1; 16]]),
         None,
         copier,
         Arc::new(NoRegistration),
@@ -314,7 +314,7 @@ fn rank0(args: &Args) {
     }
     let (copier, gpu) = SimulatedGpu::shared(&[local()]).unwrap();
     let mut client = PoolClient::start(
-        config(args, "requester", gpus(args.world)),
+        config(args, gpus(args.world)),
         Some(links.into_iter().map(Option::unwrap).collect()),
         copier,
         Arc::new(NoRegistration),

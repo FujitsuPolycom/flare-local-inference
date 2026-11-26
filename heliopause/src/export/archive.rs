@@ -9,8 +9,10 @@ use super::{
     ExportResult as Result,
     io::{self, Identity, Source},
 };
+#[cfg(test)]
+pub(crate) use helios_core::runtime_core::is_snapshot_blob_name as blob_name;
 pub(crate) use helios_core::runtime_core::{
-    LegacyLayout as Layout, MAX_LEGACY_HEADER as MAX_HEADER, is_snapshot_blob_name as blob_name,
+    LegacyLayout as Layout, MAX_LEGACY_HEADER as MAX_HEADER,
 };
 use std::{
     collections::BTreeMap,

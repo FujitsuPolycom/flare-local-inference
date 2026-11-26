@@ -23,6 +23,7 @@ use super::{ExecutionManifest, GraphKind, DEFAULT_COMPLETION_TOKEN_CAPACITY, REQ
 /// write to the coherent mapped word clearing the monitor). `PARK_LIMIT_US` is the longest
 /// intentional wait per park; scheduling can add to it.
 struct CompletionWake {
+    #[cfg_attr(not(all(target_arch = "aarch64", target_os = "linux")), allow(dead_code))]
     word: PinnedHost,
     device: usize,
 }
