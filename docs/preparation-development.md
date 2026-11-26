@@ -8,6 +8,40 @@ For running preparation, use [model preparation and serving](model-preparation.m
 Recipe and execution-component changes also require
 [model development](model-development.md).
 
+## Recipe parameters and preparation manifests
+
+Each recipe declares its preparation contract by binding a frozen
+`RecipeParameters` instance (`ignition/parameters.py`) on `Recipe.parameters`.
+`RecipeParameters` is both compositional and subclassable:
+
+- Core `ignition` defines the universal preparation fields (`max_concurrency`,
+  `prefill_chunk`, `autotune_effort`, `compile_workers`, `lock_gpu_clocks`,
+  `compiled_forwards`, `roce_ring`, `roce_chain`) and four optional Helios
+  `GraphOperation` ABI groups (`SpeculationParameters`, `VisionParameters`,
+  `PromptLogprobsParameters`, `MixedPrefillParameters`).
+- External recipe packages define shared `ParameterGroup` components and
+  recipe-specific `RecipeParameters` subclasses without adding model names or
+  model flags to core `ignition`.
+- Each parameter field declares its CLI spelling, bounds or choices, help
+  metadata, `ParameterScope` (`DEPLOYMENT`, `COMBINE`, `TARGET_WEIGHT`,
+  `DRAFT_WEIGHT`), manifest key, and status summary label via `param(...)`.
+- `ignition.cli.parse_args` resolves the selected recipe offline (without
+  importing PyTorch or touching the network) and registers only that recipe's
+  flags for parsing and `MODEL --help`. Bare `ignition export --help` prints
+  universal core flags and the declared recipe table.
+- `planning.Plan` carries the resolved `parameters` instance directly and
+  invokes its `validate`, `filter_world_sizes`, `adjust_weights_bytes`,
+  `adjust_rank_costs`, `adjust_page_tokens`, `shortfall_options`,
+  `status_parts`, `to_dict`, `manifest_parameters`, and `reproduction_args`
+  hooks.
+- `ignition.preparation.rebuild_manifest.from_plan` constructs
+  `PreparationManifest` (`parameters` and `reproduction_args`) exclusively by
+  serializing `plan.parameters` alongside checkpoint provenance, emitting only
+  parameters declared by the selected recipe.
+- `BasePreparationConfig` (`ignition/preparation/bootstrap.py`) embeds
+  `parameters` directly so recipe `PreparationConfig` classes forward universal
+  and ABI properties from `plan.parameters` through `common_preparation_kwargs`.
+
 ## Operator declaration, tuning, and binding
 
 - Use b12x's autotuning and warmup facilities during preparation. Do not pin

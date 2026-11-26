@@ -9,6 +9,7 @@ import pytest
 
 from ignition.cli import main
 from ignition.declaration import Checkpoint, RankCosts, Recipe, SamplingDefaults
+from ignition.parameters import RecipeParameters
 from ignition.preparation import provenance
 from ignition.preparation.source_identity import source_identity
 
@@ -29,10 +30,11 @@ def _sample_recipe():
         ),
         context=8192,
         page_tokens=128,
-        concurrency=4,
-        max_concurrency=8,
-        max_draft_tokens=0,
-        prefill_chunk=1024,
+        parameters=RecipeParameters(
+            max_concurrency=4,
+            max_concurrency_limit=8,
+            prefill_chunk=1024,
+        ),
         ranks=MappingProxyType({1: RankCosts(1 << 20, 1 << 20, 1 << 28)}),
         prepare=lambda *args, **kwargs: None,
         usage=lambda prepared: (),
@@ -66,8 +68,11 @@ def test_explicit_recipe_and_prog_appear_in_help_without_global_registry(capsys)
         main(["export", "custom-toy-1b", "--help"], recipes=(recipe,), prog="custom-ignition")
     assert exc.value.code == 0
     out = capsys.readouterr().out
+    normalized = " ".join(out.split())
     assert "Model recipe: custom-toy-1b" in out
     assert "example/Custom-Toy-1B" in out
+    assert "1..8; default: 4" in normalized
+    assert "64..8192; multiple of 64; default: 1024" in normalized
 
 
 def test_main_binds_source_roots_for_source_identity(tmp_path, monkeypatch):

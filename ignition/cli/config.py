@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ignition.errors import UsageError
+from ignition.parameters import AUTOTUNE_EFFORTS
 
 DEFAULT_PATH = Path("~/.config/flare/config.toml")
 
@@ -22,24 +23,21 @@ _SECTIONS = {
     "publishing": {"signing_key": str, "namespace": str, "official_source": str},
     "server": {"host": str, "port": int, "api_key": str, "thinking_token_budget": int,
                "scheduler_checkpoint_extra_work_fraction": (int, float)},
-    "defaults": {"model": str, "max_concurrency": int, "image_concurrency": int,
-                 "speculative_token_capacity": int, "speculative_graph_budget": int, "speculative_method": str},
+    "defaults": {"model": str, "max_concurrency": int},
     "memory": {"reserve": str},
-    "preparation": {"compile_workers": int, "autotune_effort": str, "checkpoint_token_file": str, "force_moe_decode_a16": bool},
+    "preparation": {"compile_workers": int, "autotune_effort": str, "checkpoint_token_file": str},
     "prefix_cache": {"memory": str, "disk_limit": str, "drain_on_shutdown": str, "max_age": str,
                      "compression": str},
     "paths": {"hub_cache": str, "kernel_cache": str, "core_cache": str, "export_staging": str,
               "prefix_cache": str, "cuda": str},
 }
-_MODEL_KEYS = {"max_concurrency": int, "image_concurrency": int,
-               "speculative_token_capacity": int, "speculative_graph_budget": int, "speculative_method": str}
+_MODEL_KEYS = {"max_concurrency": int}
 # Empty prefix-cache values leave the decision to Flare, which derives them from the host.
 _BUILT_IN = {
     "server.host": "127.0.0.1", "server.port": 8000, "server.api_key": "",
     "server.thinking_token_budget": None,
     "server.scheduler_checkpoint_extra_work_fraction": 0.05,
     "memory.reserve": "0",
-    "preparation.force_moe_decode_a16": False,
     "preparation.compile_workers": 0,
     "preparation.autotune_effort": "default",
     "preparation.checkpoint_token_file": "~/.config/flare/agent.token",
@@ -51,7 +49,6 @@ _BUILT_IN = {
     "paths.prefix_cache": "",
     "paths.cuda": "",
 }
-AUTOTUNE_EFFORTS = ("off", "default", "audit")
 _SIZE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:([KMGT])(?:iB|B)?)?", re.IGNORECASE)
 
 
@@ -137,8 +134,7 @@ class Configuration:
                 raise UsageError(f"{path}: port in [{section}] must be 1 through 65535")
             if key == "thinking_token_budget" and not 1 <= value <= 2**32 - 1:
                 raise UsageError(f"{path}: thinking_token_budget in [{section}] must be a positive 32-bit integer")
-            if key in ("max_concurrency", "image_concurrency", "speculative_token_capacity",
-                       "speculative_graph_budget", "compile_workers") and value < 1:
+            if key in ("max_concurrency", "compile_workers") and value < 1:
                 raise UsageError(f"{path}: {key} in [{section}] must be at least 1")
 
     def get(self, key: str, flag=None) -> Setting:
@@ -160,15 +156,12 @@ class Configuration:
         return self.values.get("defaults", {}).get("model")
 
     def max_concurrency(self, alias: str, recipe_default: int, flag: int | None = None) -> Setting:
-        return self.model_setting(alias, "max_concurrency", recipe_default, flag)
-
-    def model_setting(self, alias: str, key: str, recipe_default, flag=None) -> Setting:
         if flag is not None:
             return Setting(flag, "flag")
         for section, table in ((f'[models."{alias}"]', self.values.get("models", {}).get(alias, {})),
                                ("[defaults]", self.values.get("defaults", {}))):
-            if key in table:
-                return Setting(table[key], section)
+            if "max_concurrency" in table:
+                return Setting(table["max_concurrency"], section)
         return Setting(recipe_default, "recipe")
 
     @property
@@ -193,13 +186,8 @@ class Configuration:
             "", "[defaults]",
             f'# model = "{model}"',
             f"# max_concurrency = {max_concurrency}",
-            '# image_concurrency = 4          # active image requests; bounded by max_concurrency',
-            '# speculative_method = "mtp"    # proposal method; Qwen Flash also supports dflash2',
-            '# speculative_token_capacity = 8  # wider target graphs require batch * width within this limit',
-            '# speculative_graph_budget = 64  # packed round graphs; excludes width-one and ordinary graphs',
             "", "[preparation]",
             '# compile_workers = 24           # CPU processes per host; default: automatic, bounded by memory',
-            '# force_moe_decode_a16 = false   # Qwen Flash NVFP4 decode/verify A16, calibrated A4 prefill',
             '# autotune_effort = "default"    # off, default, audit',
             "", "[memory]",
             f'# reserve = "{self.get("memory.reserve").value}"'
