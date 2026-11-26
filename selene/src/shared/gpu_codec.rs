@@ -8,8 +8,8 @@
 //! bit-exact `GKV1/v2` CPU decoding while `helios` owns the GPU execution engine.
 
 use super::codec::{
-    Checksum, Encoding, MATRIX_BYTES, MATRIX_ELEMS, Plan, byte_shuffle_decode, crc32_chunks_par,
-    crc32_par, page_split_decode, unpack_restore_f32_128,
+    Checksum, Encoding, MATRIX_BYTES, MATRIX_ELEMS, PAGE_SCALE_TMP, Plan, byte_shuffle_decode,
+    crc32_chunks_par, crc32_par, page_split_decode, unpack_restore_f32_128,
 };
 use rayon::prelude::*;
 use std::cell::RefCell;
@@ -605,7 +605,7 @@ impl GpuPlan {
                     trans_buf[c.trans_offset..c.trans_offset + c.length]
                         .copy_from_slice(&ans_buf[c.ans_offset..c.ans_offset + c.length]);
                 }
-                let apply_op = |op: &TransformOp, dst: &mut [u8], tmp: &mut [u8; 4096]| -> Result<()> {
+                let apply_op = |op: &TransformOp, dst: &mut [u8], tmp: &mut [u8; PAGE_SCALE_TMP]| -> Result<()> {
                     let src = &trans_buf[op.offset..op.offset + op.length];
                     match op.encoding {
                         Encoding::Bytes => {
@@ -638,12 +638,12 @@ impl GpuPlan {
                     }
                     p.install(|| {
                         op_slices.into_par_iter().try_for_each_init(
-                            || [0u8; 4096],
+                            || [0u8; PAGE_SCALE_TMP],
                             |tmp, (op, dst)| apply_op(op, dst, tmp),
                         )
                     })?;
                 } else {
-                    let mut tmp = [0u8; 4096];
+                    let mut tmp = [0u8; PAGE_SCALE_TMP];
                     for op in &self.transforms {
                         apply_op(op, &mut out[op.offset..op.offset + op.length], &mut tmp)?;
                     }
@@ -871,6 +871,7 @@ mod tests {
             (Encoding::Fp8Page512, 32_768),
             (Encoding::WindowFp4, 33_792),
             (Encoding::LatentFp4, 18_432),
+            (Encoding::Latent576, 73_728),
             (Encoding::Bytes, 512),
         ] {
             fields.push(Field {
@@ -960,5 +961,83 @@ mod tests {
             assert!(s.ans_buf.capacity() <= MAX_RETAINED_DECODE_SCRATCH);
             assert!(s.trans_buf.capacity() <= MAX_RETAINED_DECODE_SCRATCH);
         });
+    }
+
+    #[test]
+    fn gpu_plan_coalesces_latent576_latent_and_key_streams_separately() {
+        use crate::geometry::{CacheGeometry, CodecField, Plane};
+        use crate::offload::KvCompression;
+        use crate::shared::codec_layout::{REVISION_CPU, REVISION_GPU, plans_and_profile};
+
+        let mut planes = Vec::new();
+        let mut codec_fields = Vec::new();
+        for layer in 0..24usize {
+            let latent_name = format!("layer{layer}.latent");
+            let index_name = format!("layer{layer}.indexer");
+            planes.push(Plane {
+                name: latent_name.clone(),
+                address: 0,
+                unit_bytes: 73_728,
+            });
+            codec_fields.push(CodecField {
+                buffer: latent_name,
+                offset: 0,
+                length: 73_728,
+                encoding: 48,
+            });
+            planes.push(Plane {
+                name: index_name.clone(),
+                address: 0,
+                unit_bytes: 16_896,
+            });
+            codec_fields.push(CodecField {
+                buffer: index_name,
+                offset: 0,
+                length: 16_896,
+                encoding: 41,
+            });
+        }
+        codec_fields.push(CodecField {
+            buffer: "state_pool".into(),
+            offset: 0,
+            length: 4096,
+            encoding: 2,
+        });
+        let geo = CacheGeometry {
+            page_tokens: 128,
+            page_capacity: 4,
+            row_capacity: 2,
+            row: Plane {
+                name: "state_pool".into(),
+                address: 0,
+                unit_bytes: 4096,
+            },
+            planes,
+            snapshot_pages: Vec::new(),
+            codec_fields,
+            placement: KvCompression::Gpu,
+        };
+
+        let ([page_plan, _], gpu_profile) = plans_and_profile(&geo, REVISION_GPU).unwrap();
+        let (_, cpu_profile) = plans_and_profile(&geo, REVISION_CPU).unwrap();
+        assert_ne!(gpu_profile, cpu_profile);
+
+        let gplan = GpuPlan::from_plan(&page_plan).unwrap();
+        // Pools are ordered by `(kind, lane)`:
+        // - Index132 (kind 41): 48 * 8_192 B values (6 chunks of 65_536 B) + 4 * 3_072 B scale lanes
+        // - Latent576 (kind 48): 24 * 65_536 B latent (24 chunks) + 24 * 8_192 B key (3 chunks)
+        // - Alignment gaps (kind u32::MAX): 24 * 3_584 B (2 chunks of 43_008 B)
+        assert_eq!(gplan.num_chunks(), 6 + 4 + 24 + 3 + 2);
+        assert_eq!(gplan.chunk_sizes()[0..6], [65_536; 6]);
+        assert_eq!(gplan.chunk_sizes()[6..10], [3_072; 4]);
+        assert_eq!(gplan.chunk_sizes()[10..37], [65_536; 27]);
+        assert_eq!(gplan.chunk_sizes()[37..39], [43_008; 2]);
+
+        // Unassigned encoding IDs are rejected while existing IDs remain valid.
+        for bad_id in [43u32, 44, 46, 49, 99] {
+            let mut bad_geo = geo.clone();
+            bad_geo.codec_fields[0].encoding = bad_id;
+            assert!(plans_and_profile(&bad_geo, REVISION_GPU).is_err());
+        }
     }
 }

@@ -2034,6 +2034,7 @@ mod imp {
                 (Encoding::Fp8Page512, 32_768),
                 (Encoding::WindowFp4, 33_792),
                 (Encoding::LatentFp4, 18_432),
+                (Encoding::Latent576, 73_728),
                 (Encoding::Bytes, 512),
             ] {
                 fields.push(Field {
@@ -2168,6 +2169,7 @@ mod imp {
             for (enc, len) in [
                 (Encoding::LatentFp4, 18_432),
                 (Encoding::Fp8Page512, 32_768),
+                (Encoding::Latent576, 73_728),
                 (Encoding::Bfloat16, 4096),
                 (Encoding::Bytes, 512),
             ] {
@@ -2354,6 +2356,220 @@ mod imp {
             assert!(err.to_string().contains("stored"));
             assert!(b_dst.bytes().iter().all(|&b| b == 0x5A));
             drop(bcodec);
+        }
+
+        #[test]
+        #[ignore = "exercises pure-CUDA GPU KV codec on real CUDA GPU"]
+        fn gpu_codec_latent576_24_layer_roundtrip_and_compression_vs_bytes() {
+            let cubin_path = std::env::var("FLARE_TEST_KV_CODEC_CUBIN")
+                .expect("set FLARE_TEST_KV_CODEC_CUBIN to a compiled kv_codec_gpu.cubin");
+            let cubin = std::fs::read(&cubin_path).expect("read cubin");
+
+            let driver = Driver::load().unwrap();
+            let mut ctx = std::ptr::null_mut();
+            unsafe {
+                driver.check("cuInit", (driver.init)(0)).unwrap();
+                driver
+                    .check(
+                        "cuDevicePrimaryCtxRetain",
+                        (driver.primary_ctx_retain)(&mut ctx, 0),
+                    )
+                    .unwrap();
+            }
+            struct PrimaryCtx<'a>(&'a Driver);
+            impl Drop for PrimaryCtx<'_> {
+                fn drop(&mut self) {
+                    unsafe {
+                        let _ = (self.0.primary_ctx_release)(0);
+                    }
+                }
+            }
+            let _guard = PrimaryCtx(&driver);
+            let stream = Stream::open_lowest_priority(ctx as usize, 0).unwrap();
+            let event = stream.blocking_event().unwrap();
+
+            const LAYERS: usize = 24;
+            const LATENT_BYTES: usize = 73_728;
+            const TOTAL: usize = LAYERS * LATENT_BYTES;
+            let latent_fields: Vec<Field> = (0..LAYERS)
+                .map(|l| Field {
+                    offset: l * LATENT_BYTES,
+                    length: LATENT_BYTES,
+                    encoding: Encoding::Latent576,
+                })
+                .collect();
+            let raw_fields: Vec<Field> = (0..LAYERS)
+                .map(|l| Field {
+                    offset: l * LATENT_BYTES,
+                    length: LATENT_BYTES,
+                    encoding: Encoding::Bytes,
+                })
+                .collect();
+
+            let latent_plan = Plan::new(TOTAL, &latent_fields).unwrap();
+            let raw_plan = Plan::new(TOTAL, &raw_fields).unwrap();
+            let latent_gplan = GpuPlan::from_plan(&latent_plan).unwrap();
+            let raw_gplan = GpuPlan::from_plan(&raw_plan).unwrap();
+
+            // Synthetic 128x576 FP8 E4M3 pages where normalized latent columns [0..512) follow a
+            // tight unit-scale exponent range and key/RoPE columns [512..576) occupy a distinct
+            // higher-magnitude exponent band.
+            let mut src = vec![0u8; TOTAL];
+            let mut rng = 0x517c_c1b7_2722_0a95u64;
+            let mut next_u8 = || -> u8 {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                (rng >> 56) as u8
+            };
+            for l in 0..LAYERS {
+                let base = l * LATENT_BYTES;
+                for r in 0..128usize {
+                    let row = base + r * 576;
+                    for c in 0..512usize {
+                        let u = next_u8();
+                        // Normalized E4M3 latent values clustered around exponents 4..7 (|x| ~ 0.25..2.0).
+                        let sign = (u & 1) << 7;
+                        let exp = match (u >> 1) & 15 {
+                            0..=7 => 6u8,
+                            8..=12 => 5u8,
+                            13..=14 => 7u8,
+                            _ => 4u8,
+                        };
+                        let mant = (u >> 5) & 7;
+                        src[row + c] = sign | (exp << 3) | mant;
+                    }
+                    for c in 0..64usize {
+                        let u = next_u8();
+                        // Key/RoPE E4M3 values in a wider shifted band (exponents 8..11).
+                        let sign = (u & 1) << 7;
+                        let exp = match (u >> 1) & 15 {
+                            0..=8 => 9u8,
+                            9..=13 => 10u8,
+                            14 => 8u8,
+                            _ => 11u8,
+                        };
+                        let mant = (u >> 5) & 7;
+                        src[row + 512 + c] = sign | (exp << 3) | mant;
+                    }
+                }
+            }
+
+            let mut src_mem = stream.mapped_host_buffer(TOTAL).unwrap();
+            let mut dst_mem = stream.mapped_host_buffer(TOTAL).unwrap();
+            src_mem.bytes_mut().copy_from_slice(&src);
+            dst_mem.bytes_mut().fill(0xA5);
+            let src_addr = stream.mapped_address(&src_mem).unwrap() as u64;
+            let dst_addr = stream.mapped_address(&dst_mem).unwrap() as u64;
+            let spans = [DeviceSpan {
+                device: src_addr,
+                offset: 0,
+                length: TOTAL,
+            }];
+            let dst_spans = [DeviceSpan {
+                device: dst_addr,
+                offset: 0,
+                length: TOTAL,
+            }];
+            let profile = [0x48u8; 32];
+
+            let mut codec =
+                GpuRankCodec::new(&latent_gplan, &raw_gplan, 4, &cubin, &stream, &event).unwrap();
+
+            let (lat_u, lat_pkt) = codec
+                .encode_from_device_with(
+                    &latent_gplan,
+                    PackedUnit::default(),
+                    &profile,
+                    &spans,
+                    &stream,
+                    &event,
+                    |u, b| (u, b.to_vec()),
+                )
+                .unwrap();
+            let (raw_u, raw_pkt) = codec
+                .encode_from_device_with(
+                    &raw_gplan,
+                    PackedUnit::default(),
+                    &profile,
+                    &spans,
+                    &stream,
+                    &event,
+                    |u, b| (u, b.to_vec()),
+                )
+                .unwrap();
+            assert_eq!(lat_u.representation, Representation::Packet as i32);
+            assert_eq!(raw_u.representation, Representation::Packet as i32);
+            assert!(
+                lat_pkt.len() < raw_pkt.len(),
+                "expected Latent576 ({}) < Bytes(0) ({})",
+                lat_pkt.len(),
+                raw_pkt.len()
+            );
+
+            // GPU->GPU decode bit-exact
+            codec
+                .decode_to_device(
+                    &latent_gplan,
+                    &[&lat_pkt],
+                    &dst_spans,
+                    lat_u.stored_crc,
+                    lat_u.original_crc,
+                    &stream,
+                    &event,
+                )
+                .unwrap();
+            assert_eq!(dst_mem.bytes(), &src[..]);
+
+            // GPU->CPU cross-decode bit-exact (both serial and multi-worker pooled paths)
+            let mut cpu_out = vec![0u8; TOTAL];
+            latent_gplan
+                .decode_checked_cpu(
+                    &[&lat_pkt],
+                    &mut cpu_out,
+                    lat_u.stored_crc,
+                    lat_u.original_crc,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(cpu_out, src);
+            cpu_out.fill(0x5A);
+            let pool = flare_selene::shared::codec::cpu_pool().unwrap();
+            latent_gplan
+                .decode_checked_cpu(
+                    &[&lat_pkt],
+                    &mut cpu_out,
+                    lat_u.stored_crc,
+                    lat_u.original_crc,
+                    Some(pool),
+                )
+                .unwrap();
+            assert_eq!(cpu_out, src);
+
+            // CPU ZKV1 round-trip and comparison vs Bytes(0)
+            let mut z_lat_buf = vec![0u8; latent_plan.max_packet()];
+            let (z_lat_u, z_lat_len) = latent_plan
+                .encode_capture(Default::default(), &profile, &src, &mut z_lat_buf, None)
+                .unwrap();
+            let mut z_raw_buf = vec![0u8; raw_plan.max_packet()];
+            let (_, z_raw_len) = raw_plan
+                .encode_capture(Default::default(), &profile, &src, &mut z_raw_buf, None)
+                .unwrap();
+            assert!(
+                z_lat_len < z_raw_len,
+                "expected ZKV1 Latent576 ({z_lat_len}) < Bytes(0) ({z_raw_len})"
+            );
+            cpu_out.fill(0x5A);
+            latent_plan
+                .decode_checked(
+                    &[&z_lat_buf[..z_lat_len]],
+                    &mut cpu_out,
+                    z_lat_u.stored_crc,
+                    z_lat_u.original_crc,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(cpu_out, src);
         }
     }
 }

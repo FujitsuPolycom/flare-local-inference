@@ -1127,3 +1127,4 @@ bytes.
 | 42 | 64 rows of 512 FP8 values, 32,768 bytes |
 | 45 | 64 rows of 512 packed FP4 data bytes and 16 scale bytes, 33,792 bytes |
 | 47 | 64 rows of 256 packed FP4 data bytes and 32 scale bytes, 18,432 bytes |
+| 48 | 128 rows of 512 FP8 latent values and 64 FP8 key values per row, 73,728 bytes |

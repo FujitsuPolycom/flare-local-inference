@@ -1286,6 +1286,7 @@ static bool page_layout(uint32_t kind, PageLayout &out) {
         case 42: out = {32768, 64, 512, 512, 1, false}; return true;
         case 45: out = {33792, 64, 512, 528, 1, false}; return true;
         case 47: out = {18432, 64, 256, 288, 1, false}; return true;
+        case 48: out = {73728, 128, 512, 576, 1, false}; return true;
         default: return false;
     }
 }
@@ -1372,6 +1373,11 @@ int kv_page_split_shuffle(uint8_t *dst, const uint8_t *src, size_t n, uint32_t k
             if (p.planar || sc_row == 0) {
                 std::memcpy(d, s, nval);
                 if (ns) shuffle_bytes_impl(d + nval, s + nval, ns, p.scale_w, false);
+            } else if (p.scale_w <= 1) {
+                for (size_t r = 0; r < p.rows; ++r) {
+                    std::memcpy(d + r * p.cols, s + r * p.stride, p.cols);
+                    std::memcpy(d + nval + r * sc_row, s + r * p.stride + p.cols, sc_row);
+                }
             } else {
                 for (size_t r = 0; r < p.rows; ++r) {
                     std::memcpy(d + r * p.cols, s + r * p.stride, p.cols);
@@ -1383,6 +1389,11 @@ int kv_page_split_shuffle(uint8_t *dst, const uint8_t *src, size_t n, uint32_t k
             if (p.planar || sc_row == 0) {
                 std::memcpy(d, s, nval);
                 if (ns) shuffle_bytes_impl(d + nval, s + nval, ns, p.scale_w, true);
+            } else if (p.scale_w <= 1) {
+                for (size_t r = 0; r < p.rows; ++r) {
+                    std::memcpy(d + r * p.stride, s + r * p.cols, p.cols);
+                    std::memcpy(d + r * p.stride + p.cols, s + nval + r * sc_row, sc_row);
+                }
             } else {
                 shuffle_bytes_impl(tmp, s + nval, ns, p.scale_w, true);
                 for (size_t r = 0; r < p.rows; ++r) {

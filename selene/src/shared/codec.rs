@@ -30,7 +30,7 @@ const MATRIX_GROUP: usize = 4;
 const MATRIX_MAX_LOW_BYTES: usize = 3968 * 4 * 4;
 const MAX_BYTE_FRAME: usize = 65_536;
 const MAX_FRAME_BUF: usize = 135_168;
-const PAGE_SCALE_TMP: usize = 4096;
+pub(crate) const PAGE_SCALE_TMP: usize = 4096;
 const PAR_CRC_MIN: usize = 1 << 20;
 const PAR_CRC_CHUNK: usize = 1 << 20;
 
@@ -136,6 +136,7 @@ pub enum Encoding {
     Fp8Page512,
     WindowFp4,
     LatentFp4,
+    Latent576,
 }
 
 /// Physical block geometry for compound KV page encodings (shared by CPU and GPU codecs).
@@ -158,6 +159,7 @@ impl Encoding {
             Self::Fp8Page512 => PageSpec { kind: 42, block: 32_768, rows: 64, cols: 512, stride: 512, scale_w: 1, planar: 0 },
             Self::WindowFp4 => PageSpec { kind: 45, block: 33_792, rows: 64, cols: 512, stride: 528, scale_w: 1, planar: 0 },
             Self::LatentFp4 => PageSpec { kind: 47, block: 18_432, rows: 64, cols: 256, stride: 288, scale_w: 1, planar: 0 },
+            Self::Latent576 => PageSpec { kind: 48, block: 73_728, rows: 128, cols: 512, stride: 576, scale_w: 1, planar: 0 },
             _ => return None,
         })
     }
@@ -643,7 +645,7 @@ impl Plan {
                     self.push(offset + start, n, Transform::Shuffle(width as u32))?;
                 }
             }
-            Latent528 | Index132 | Fp8Page512 | WindowFp4 | LatentFp4 => {
+            Latent528 | Index132 | Fp8Page512 | WindowFp4 | LatentFp4 | Latent576 => {
                 let spec = encoding.page_spec().unwrap();
                 multiple(spec.block)?;
                 let chunk = (MAX_BYTE_FRAME / spec.block).max(1) * spec.block;
@@ -1154,6 +1156,7 @@ mod tests {
             (Encoding::Bfloat16, 6_144),
             (Encoding::WindowFp4, 33_792),
             (Encoding::LatentFp4, 18_432),
+            (Encoding::Latent576, 73_728),
         ] {
             let mut state = 2026u32;
             let mut raw: Vec<u8> = (0..size + 16)
@@ -1206,5 +1209,112 @@ mod tests {
         plan.decode_checked(&[&packet], &mut dst, crc32(&packet), crc32(&raw), Some(&pool))
             .unwrap();
         assert_eq!(dst, raw);
+    }
+
+    #[test]
+    fn page_spec_invariants_and_latent576_split_geometry() {
+        for enc in [
+            Encoding::Latent528,
+            Encoding::Index132,
+            Encoding::Fp8Page512,
+            Encoding::WindowFp4,
+            Encoding::LatentFp4,
+            Encoding::Latent576,
+        ] {
+            let spec = enc.page_spec().expect("page spec");
+            let nval = spec.rows * spec.cols;
+            let ns = spec.block - nval;
+            assert!(spec.block <= MAX_FRAME_BUF);
+            assert!(nval <= spec.block);
+            assert_eq!(ns % spec.rows, 0);
+            if spec.scale_w > 1 {
+                assert!(ns <= PAGE_SCALE_TMP);
+            }
+            if spec.planar == 0 {
+                assert_eq!(spec.rows * spec.stride, spec.block);
+            }
+        }
+
+        // Verify exact 128x(512 + 64) forward and inverse split for Latent576 (kind 48).
+        let spec = Encoding::Latent576.page_spec().unwrap();
+        assert_eq!(
+            (spec.kind, spec.block, spec.rows, spec.cols, spec.stride, spec.scale_w, spec.planar),
+            (48, 73_728, 128, 512, 576, 1, 0)
+        );
+        let mut raw = vec![0u8; spec.block];
+        for r in 0..128usize {
+            for c in 0..512usize {
+                raw[r * 576 + c] = ((r * 3 + c) & 0x7f) as u8;
+            }
+            for c in 0..64usize {
+                raw[r * 576 + 512 + c] = (0x80 | ((r + c * 5) & 0x7f)) as u8;
+            }
+        }
+        let mut split = vec![0u8; spec.block];
+        let mut restored = vec![0xa5u8; spec.block];
+        let mut tmp = vec![0u8; PAGE_SCALE_TMP];
+        assert_eq!(
+            unsafe {
+                kv_page_split_shuffle(
+                    split.as_mut_ptr(),
+                    raw.as_ptr(),
+                    raw.len(),
+                    spec.kind,
+                    false,
+                    tmp.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        for r in 0..128usize {
+            assert_eq!(
+                &split[r * 512..(r + 1) * 512],
+                &raw[r * 576..r * 576 + 512]
+            );
+            assert_eq!(
+                &split[65_536 + r * 64..65_536 + (r + 1) * 64],
+                &raw[r * 576 + 512..r * 576 + 576]
+            );
+        }
+        page_split_decode(&mut restored, &split, spec.kind, &mut tmp).unwrap();
+        assert_eq!(restored, raw);
+
+        // Non-multiples of 73_728 are rejected; multi-block fields round-trip and reject corruption.
+        for bad_len in [576usize, 73_727, 73_729] {
+            assert!(
+                Plan::new(
+                    bad_len,
+                    &[Field {
+                        offset: 0,
+                        length: bad_len,
+                        encoding: Encoding::Latent576,
+                    }]
+                )
+                .is_err()
+            );
+        }
+        let mut two_blocks = Vec::with_capacity(spec.block * 2);
+        two_blocks.extend_from_slice(&raw);
+        two_blocks.extend_from_slice(&raw);
+        let plan = Plan::new(
+            two_blocks.len(),
+            &[Field {
+                offset: 0,
+                length: two_blocks.len(),
+                encoding: Encoding::Latent576,
+            }],
+        )
+        .unwrap();
+        let mut dst = vec![0u8; two_blocks.len()];
+        let (unit, mut pkt) = encode_checked_packet(&plan, &two_blocks, &mut dst, None);
+        assert_eq!(
+            unit.representation,
+            super::super::wire::packed_unit::Representation::Packet as i32
+        );
+        pkt[plan.metadata()] ^= 0xff;
+        assert!(
+            plan.decode_checked(&[&pkt], &mut dst, crc32(&pkt), unit.original_crc, None)
+                .is_err()
+        );
     }
 }

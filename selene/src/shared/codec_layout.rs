@@ -26,6 +26,7 @@ fn encoding(id: u32) -> Option<Encoding> {
         42 => Encoding::Fp8Page512,
         45 => Encoding::WindowFp4,
         47 => Encoding::LatentFp4,
+        48 => Encoding::Latent576,
         _ => return None,
     })
 }
