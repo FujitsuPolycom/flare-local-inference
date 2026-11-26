@@ -134,6 +134,77 @@ pub fn revoke(fingerprint: &str, path: Option<&Path>) -> Result<()> {
     eprintln!("Removed trust for signer {fingerprint}.");
     Ok(())
 }
+
+pub fn import_publisher_key(
+    required: &flare::hub::PublisherKeyRequired,
+    options: &ReviewOptions,
+) -> Result<()> {
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        return Err("an unknown publisher key requires interactive review; supply its public profile with --publisher-keys PATH for unattended acquisition".into());
+    }
+    let review = required.review(options)?;
+    confirm_key_import(
+        &review,
+        options.trust_store.as_deref(),
+        io::stdin().lock(),
+        io::stderr().lock(),
+    )
+}
+
+fn confirm_key_import(
+    review: &flare::hub::PublisherKeyReview,
+    trust_store: Option<&Path>,
+    input: impl BufRead,
+    mut output: impl Write,
+) -> Result<()> {
+    let disclosure = &review.disclosure;
+    writeln!(output, "\nReview publisher key")?;
+    writeln!(output, "Publisher:   {}", review.profile.name)?;
+    writeln!(output, "Namespace:   {}", disclosure.namespace)?;
+    writeln!(output, "Fingerprint: {}", disclosure.fingerprint)?;
+    writeln!(output, "Profile:     {}", review.profile_url)?;
+    writeln!(output, "Source:      {}", disclosure.official_source)?;
+    writeln!(
+        output,
+        "Identity:    {}",
+        match &disclosure.identity {
+            Identity::Verified => "Verified via the publisher's repository".to_owned(),
+            Identity::Unverified(reason) => format!("Unverified; {reason}"),
+            Identity::Development => "Local development key; verified by no publisher".to_owned(),
+        }
+    )?;
+    writeln!(output, "Signature:   Valid")?;
+    if let Some(license) = &disclosure.license_name {
+        writeln!(output, "License:     {license}")?;
+    }
+    if let Some(url) = &disclosure.license_url {
+        writeln!(output, "             {url}")?;
+    }
+    writeln!(
+        output,
+        "\nImport enables signature verification. Running the model requires separate publisher and license acceptance."
+    )?;
+    write!(
+        output,
+        "Type {} to import this public profile and continue downloading, or press Enter to cancel: ",
+        disclosure.namespace
+    )?;
+    output.flush()?;
+    let namespace = acceptance_line(input)?;
+    if namespace != disclosure.namespace {
+        return Err("publisher key import declined or did not match".into());
+    }
+    review.import(
+        &Acceptance {
+            fingerprint: disclosure.fingerprint.clone(),
+            namespace,
+        },
+        trust_store,
+    )?;
+    writeln!(output, "Publisher profile imported.\n")?;
+    Ok(())
+}
+
 fn signing_info(
     core: &VerifiedCore,
     fingerprint: &str,
@@ -265,6 +336,94 @@ fn acceptance_line(input: impl BufRead) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key_review(parent: &Path) -> (flare::hub::PublisherKeyReview, std::path::PathBuf) {
+        let (core, profile_path, profile, _) = crate::hub::tests::signed_payload_fixture(parent);
+        let disclosure = flare::trust::review(
+            &core,
+            &ReviewOptions {
+                publisher_keys: vec![profile_path],
+                trust_store: Some(parent.join("trust.toml")),
+                hub: flare::options::HubOptions {
+                    offline: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .disclosure;
+        (
+            flare::hub::PublisherKeyReview {
+                profile,
+                disclosure,
+                profile_url: "https://huggingface.co/publisher/model/resolve/commit/publisher.json"
+                    .into(),
+            },
+            core,
+        )
+    }
+
+    #[test]
+    fn key_import_persists_verification_without_execution_acceptance() {
+        let temp = tempfile::tempdir().unwrap();
+        let trust = temp.path().join("trust.toml");
+        let (review, core) = key_review(temp.path());
+        let mut output = Vec::new();
+        confirm_key_import(
+            &review,
+            Some(&trust),
+            &b"local-development\r\n"[..],
+            &mut output,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains(&review.disclosure.fingerprint));
+        assert!(output.contains(&review.profile_url));
+        assert!(output.contains("Signature:   Valid"));
+        assert!(output.contains("separate publisher and license acceptance"));
+        let empty = temp.path().join("empty.json");
+        std::fs::write(&empty, "[]").unwrap();
+        let imported = flare::trust::review(
+            &core,
+            &ReviewOptions {
+                publisher_keys: vec![empty],
+                trust_store: Some(trust),
+                hub: flare::options::HubOptions {
+                    offline: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!imported.disclosure.remembered);
+        assert_eq!(
+            imported.disclosure.fingerprint,
+            review.disclosure.fingerprint
+        );
+    }
+
+    #[test]
+    fn declining_or_incomplete_key_import_never_persists_a_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let trust = temp.path().join("trust.toml");
+        let (review, _) = key_review(temp.path());
+        for input in [
+            "\n",
+            "wrong\n",
+            " local-development\n",
+            "local-development \n",
+            "local-development",
+            "",
+        ] {
+            assert!(
+                confirm_key_import(&review, Some(&trust), input.as_bytes(), Vec::new()).is_err()
+            );
+            assert!(!trust.exists());
+        }
+    }
+
     #[test]
     fn acceptance_is_exact_and_requires_a_complete_bounded_line() {
         assert_eq!(

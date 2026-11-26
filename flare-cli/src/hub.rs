@@ -43,14 +43,14 @@ pub fn download(
     let cache = flare::cache_support::model_root(options.core_cache.as_deref())
         .map_err(|error| error.to_string())?;
     let progress = flare_helios::core::progress::AcquisitionProgress::new();
-    let display = flare_helios::core::progress::AcquisitionDisplay::new(startup, &progress);
-    display.stage(
-        "Acquire core",
-        flare_helios::core::progress::Counter::Network,
-        None,
-    );
-    let result = (|| -> Result<flare_helios::core::cache::Entry> {
-        let entry = flare::hub::acquire_watched(
+    let acquire = || {
+        let display = flare_helios::core::progress::AcquisitionDisplay::new(startup, &progress);
+        display.stage(
+            "Acquire core",
+            flare_helios::core::progress::Counter::Network,
+            None,
+        );
+        let result = flare::hub::acquire_watched(
             source,
             &resolved,
             gpu_count,
@@ -58,20 +58,38 @@ pub fn download(
             trust_store,
             profiles,
             progress.clone(),
-        )?;
-        flare_helios::core::cache::Root::open(cache)?.publish_entry(&entry)?;
-        Ok(entry)
-    })();
-    match result {
-        Ok(entry) => {
+        );
+        if result.is_ok()
+            || result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.is::<flare::hub::PublisherKeyRequired>())
+        {
             display.finish();
-            Ok(entry)
         }
+        result
+    };
+    let entry = match acquire() {
+        Ok(entry) => entry,
         Err(error) => {
-            drop(display);
-            Err(error)
+            let Some(required) = error.downcast_ref::<flare::hub::PublisherKeyRequired>() else {
+                return Err(error);
+            };
+            crate::trust::import_publisher_key(
+                required,
+                &flare::trust::ReviewOptions {
+                    publisher_keys: publisher_keys.to_vec(),
+                    profiles: profiles.to_vec(),
+                    hub: resolved.clone(),
+                    trust_store: trust_store.map(Path::to_owned),
+                    ..Default::default()
+                },
+            )?;
+            acquire()?
         }
-    }
+    };
+    flare_helios::core::cache::Root::open(cache)?.publish_entry(&entry)?;
+    Ok(entry)
 }
 
 #[cfg(unix)]
@@ -102,15 +120,37 @@ pub fn refresh_model(
     pinned: bool,
     args: &crate::cli::Run,
 ) -> Result<(flare_helios::core::cache::Entry, Option<String>)> {
-    flare::hub::refresh_model(
-        store,
-        entry,
-        pinned,
-        &(&args.hub).into(),
-        args.gpus.len(),
-        &args.publisher_keys,
-        args.trust_store.as_deref(),
-    )
+    let model = entry.model().to_owned();
+    let version = entry.id().to_owned();
+    let refresh = |entry| {
+        flare::hub::refresh_model(
+            store,
+            entry,
+            pinned,
+            &(&args.hub).into(),
+            args.gpus.len(),
+            &args.publisher_keys,
+            args.trust_store.as_deref(),
+        )
+    };
+    match refresh(entry) {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            let Some(required) = error.downcast_ref::<flare::hub::PublisherKeyRequired>() else {
+                return Err(error);
+            };
+            crate::trust::import_publisher_key(
+                required,
+                &flare::trust::ReviewOptions {
+                    publisher_keys: args.publisher_keys.clone(),
+                    hub: (&args.hub).into(),
+                    trust_store: args.trust_store.clone(),
+                    ..Default::default()
+                },
+            )?;
+            refresh(store.entry(&model, &version)?)
+        }
+    }
 }
 #[cfg(test)]
 #[path = "hub_fixtures.rs"]

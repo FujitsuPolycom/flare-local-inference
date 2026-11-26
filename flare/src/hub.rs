@@ -52,6 +52,28 @@ pub struct PublisherKeyReview {
     pub profile_url: String,
 }
 
+impl PublisherKeyReview {
+    /// Import this reviewed profile without accepting execution or confirming publisher identity.
+    pub fn import(
+        &self,
+        acceptance: &crate::trust::Acceptance,
+        trust_store: Option<&Path>,
+    ) -> Result<flare_helios::runtime_core::Publisher> {
+        if acceptance.fingerprint != self.disclosure.fingerprint
+            || acceptance.namespace != self.disclosure.namespace
+            || self.profile.fingerprint() != self.disclosure.fingerprint
+            || self.profile.namespace != self.disclosure.namespace
+        {
+            return Err(
+                "key import must match the displayed fingerprint and exact publisher namespace"
+                    .into(),
+            );
+        }
+        crate::trust::import_profile(&self.profile, trust_store)?;
+        Ok(self.profile.clone())
+    }
+}
+
 impl PublisherKeyRequired {
     /// Fetch a candidate from the pinned acquisition commit and verify signed metadata.
     /// The repository supplying this profile does not establish publisher identity.
@@ -2004,6 +2026,18 @@ fn refresh_model_at(
     )?;
     if options.offline {
         return Ok(entry);
+    }
+    if !resolved.profiles.iter().any(|publisher| {
+        publisher.fingerprint() == resolved.claim.signer
+            && publisher.namespace == resolved.claim.namespace
+    }) {
+        return Err(Box::new(PublisherKeyRequired {
+            primary,
+            profile_url: format!(
+                "{endpoint}/{}/resolve/{}/publisher.json",
+                origin.repository, origin.commit,
+            ),
+        }));
     }
     let access_token = token(options)?;
     // The update check never fetches content; it only needs a transport-scoped
@@ -6510,7 +6544,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn publisher_key_review_verifies_before_import_and_does_not_accept_execution() {
+    fn publisher_key_review_and_cached_refresh_require_import_without_execution_acceptance() {
         let temp = tempfile::tempdir().unwrap();
         let (core, _, publisher, _) = signed_payload_fixture(temp.path());
         let empty_profiles = temp.path().join("empty-profiles.json");
@@ -6563,6 +6597,36 @@ pub(crate) mod tests {
         assert!(!review.disclosure.remembered);
         assert!(!trust.exists());
         assert_eq!(log.lock().unwrap().files.len(), 1);
+        for (fingerprint, namespace) in [
+            ("wrong", review.disclosure.namespace.as_str()),
+            (review.disclosure.fingerprint.as_str(), "wrong"),
+        ] {
+            assert!(
+                review
+                    .import(
+                        &crate::trust::Acceptance {
+                            fingerprint: fingerprint.into(),
+                            namespace: namespace.into(),
+                        },
+                        Some(&trust)
+                    )
+                    .is_err()
+            );
+            assert!(!trust.exists());
+        }
+        review
+            .import(
+                &crate::trust::Acceptance {
+                    fingerprint: review.disclosure.fingerprint.clone(),
+                    namespace: review.disclosure.namespace.clone(),
+                },
+                Some(&trust),
+            )
+            .unwrap();
+        assert_eq!(
+            crate::trust::trusted_profiles(Some(&trust)).unwrap(),
+            vec![publisher]
+        );
         let entry = download_with_token_at(
             &endpoint,
             repository,
@@ -6571,12 +6635,69 @@ pub(crate) mod tests {
             None,
             keys,
             Some(&trust),
-            &[review.profile],
+            &[],
             None,
         )
         .unwrap();
         assert!(entry.directory().exists());
-        assert!(!trust.exists());
+        crate::trust::revoke(&review.disclosure.fingerprint, Some(&trust)).unwrap();
+        let store =
+            flare_helios::core::cache::Root::open(options.core_cache.as_ref().unwrap()).unwrap();
+        let cached = || store.entry(entry.model(), entry.id()).unwrap();
+        let failure = refresh_model_at(
+            &endpoint, &store, cached(), false, &options, 1, keys, Some(&trust), &[],
+        )
+        .err()
+        .expect("cached acquisition also requires key import");
+        let required = failure.downcast_ref::<PublisherKeyRequired>().unwrap();
+        let restored = required
+            .review(&crate::trust::ReviewOptions {
+                publisher_keys: vec![empty_profiles.clone()],
+                hub: options.clone(),
+                trust_store: Some(trust.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(restored.profile_url, review.profile_url);
+        restored
+            .import(
+                &crate::trust::Acceptance {
+                    fingerprint: restored.disclosure.fingerprint.clone(),
+                    namespace: restored.disclosure.namespace.clone(),
+                },
+                Some(&trust),
+            )
+            .unwrap();
+        let refreshed = refresh_model_at(
+            &endpoint, &store, cached(), false, &options, 1, keys, Some(&trust), &[],
+        ).unwrap();
+        assert_eq!(refreshed.id(), entry.id());
+        let options = crate::trust::ReviewOptions {
+            publisher_keys: vec![empty_profiles],
+            hub: options,
+            trust_store: Some(trust.clone()),
+            tensor_parallel: Some(1),
+            ..Default::default()
+        };
+        let execution = crate::trust::review(entry.directory(), &options).unwrap();
+        assert!(!execution.disclosure.remembered);
+        execution
+            .accept(
+                &crate::trust::Acceptance {
+                    fingerprint: review.disclosure.fingerprint,
+                    namespace: review.disclosure.namespace,
+                },
+                false,
+                false,
+                None,
+            )
+            .unwrap();
+        assert!(
+            crate::trust::review(entry.directory(), &options)
+                .unwrap()
+                .disclosure
+                .remembered
+        );
         worker.join().unwrap();
     }
 

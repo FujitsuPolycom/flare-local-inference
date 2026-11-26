@@ -92,6 +92,9 @@ fn unique_profiles(publishers: Vec<Publisher>) -> Result<Vec<Publisher>> {
 #[serde(deny_unknown_fields)]
 struct Store {
     trusted: Vec<Entry>,
+    /// Imported verification profiles do not grant execution acceptance or establish identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    imported: Vec<Publisher>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -127,22 +130,35 @@ impl Entry {
         })
     }
 }
-/// Public profiles remembered in an explicit trust store. Entries without a
-/// stored key cannot verify signatures themselves and are omitted.
+/// Imported and accepted public profiles. Acceptance entries without a stored key are omitted.
 pub fn trusted_profiles(store: Option<&Path>) -> Result<Vec<Publisher>> {
     let store = load_store(&store_path(store)?)?;
-    Ok(store.trusted.iter().filter_map(Entry::profile).collect())
+    let mut profiles = store.imported;
+    for profile in store.trusted.iter().filter_map(Entry::profile) {
+        if !profiles.iter().any(|imported| {
+            imported.fingerprint() == profile.fingerprint()
+                && imported.namespace == profile.namespace
+        }) {
+            profiles.push(profile);
+        }
+    }
+    Ok(profiles)
 }
 
-/// The verification key remembered for the claim's signer and namespace when the store holds
-/// one, so a core accepted earlier verifies without a profile or a network request.
+/// A stored verification profile for the claim's signer and namespace, including imports
+/// that have not been accepted for execution.
 pub fn remembered_profile(claim: &CoreClaim, store: Option<&Path>) -> Result<Option<Publisher>> {
     let store = load_store(&store_path(store)?)?;
     Ok(store
         .trusted
         .iter()
         .find(|e| e.fingerprint == claim.signer && e.namespace == claim.namespace)
-        .and_then(Entry::profile))
+        .and_then(Entry::profile)
+        .or_else(|| {
+            store.imported.into_iter().find(|profile| {
+                profile.fingerprint() == claim.signer && profile.namespace == claim.namespace
+            })
+        }))
 }
 fn fingerprint_valid(value: &str) -> bool {
     value.len() == 64
@@ -185,6 +201,16 @@ fn load_store(path: &Path) -> Result<Store> {
         Err(error) => return Err(error.into()),
     };
     let store: Store = toml::from_str(&bytes)?;
+    if store.imported.len() > 256 {
+        return Err("the publisher-profile limit has been reached".into());
+    }
+    let mut imported = std::collections::HashSet::new();
+    for profile in &store.imported {
+        profile.validate()?;
+        if !imported.insert((profile.fingerprint(), &profile.namespace)) {
+            return Err("duplicate imported publisher profile".into());
+        }
+    }
     let mut seen = std::collections::HashSet::new();
     for entry in &store.trusted {
         if !fingerprint_valid(&entry.fingerprint)
@@ -218,7 +244,7 @@ fn load_store(path: &Path) -> Result<Store> {
     }
     Ok(store)
 }
-fn modify(path: &Path, update: impl FnOnce(&mut Store)) -> Result<()> {
+fn modify(path: &Path, update: impl FnOnce(&mut Store) -> Result<()>) -> Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -244,7 +270,7 @@ fn modify(path: &Path, update: impl FnOnce(&mut Store)) -> Result<()> {
     #[cfg(windows)]
     crate::windows::lock(&lock)?;
     let mut store = load_store(path)?;
-    update(&mut store);
+    update(&mut store)?;
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(format!(".{}.tmp", std::process::id()));
     let temporary = PathBuf::from(temporary);
@@ -273,6 +299,21 @@ fn modify(path: &Path, update: impl FnOnce(&mut Store)) -> Result<()> {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+pub(crate) fn import_profile(profile: &Publisher, given: Option<&Path>) -> Result<()> {
+    profile.validate()?;
+    modify(&store_path(given)?, |store| {
+        store.imported.retain(|previous| {
+            previous.fingerprint() != profile.fingerprint()
+                || previous.namespace != profile.namespace
+        });
+        if store.imported.len() >= 256 {
+            return Err("the publisher-profile limit has been reached".into());
+        }
+        store.imported.push(profile.clone());
+        Ok(())
+    })
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -346,6 +387,14 @@ pub fn resolve_identity_for_claim(
     )?;
     profiles.extend(supplied.iter().cloned());
     let mut profiles = unique_profiles(profiles)?;
+    for profile in &store.imported {
+        if !profiles.iter().any(|existing| {
+            existing.fingerprint() == profile.fingerprint()
+                && existing.namespace == profile.namespace
+        }) {
+            profiles.push(profile.clone());
+        }
+    }
     // The publisher's repository is consulted on every load that is not offline, so a key the
     // publisher removed from publisher.json stops loading everywhere, remembered or not. When it
     // cannot be consulted, a previously confirmed identity stands.
@@ -554,6 +603,7 @@ impl Review {
                         && previous.namespace == entry.namespace)
                 });
                 store.trusted.push(entry);
+                Ok(())
             })?;
         }
         Ok((authorized, publisher))
@@ -567,7 +617,11 @@ pub fn revoke(fingerprint: &str, given: Option<&Path>) -> Result<()> {
     modify(&store_path(given)?, |store| {
         store
             .trusted
-            .retain(|entry| entry.fingerprint != fingerprint)
+            .retain(|entry| entry.fingerprint != fingerprint);
+        store
+            .imported
+            .retain(|profile| profile.fingerprint() != fingerprint);
+        Ok(())
     })?;
     Ok(())
 }
@@ -583,6 +637,58 @@ mod tests {
             public_key: [7; 32],
             development: true,
         }
+    }
+
+    #[test]
+    fn imported_profiles_are_deduplicated_and_revoked_without_accepting_execution() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("trust.toml");
+        let publisher = development_publisher();
+        fs::write(&path, "trusted = []\n").unwrap();
+        assert!(trusted_profiles(Some(&path)).unwrap().is_empty());
+        import_profile(&publisher, Some(&path)).unwrap();
+        import_profile(&publisher, Some(&path)).unwrap();
+        let store = load_store(&path).unwrap();
+        assert!(store.trusted.is_empty());
+        assert_eq!(store.imported, vec![publisher.clone()]);
+        assert_eq!(
+            trusted_profiles(Some(&path)).unwrap(),
+            vec![publisher.clone()]
+        );
+        revoke(&publisher.fingerprint(), Some(&path)).unwrap();
+        assert!(trusted_profiles(Some(&path)).unwrap().is_empty());
+        assert!(load_store(&path).unwrap().trusted.is_empty());
+    }
+
+    #[test]
+    fn supplied_profiles_take_precedence_over_imported_display_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("trust.toml");
+        let publisher = development_publisher();
+        import_profile(&publisher, Some(&path)).unwrap();
+        let empty = directory.path().join("empty.json");
+        fs::write(&empty, "[]").unwrap();
+        let claim = CoreClaim {
+            signer: publisher.fingerprint(),
+            namespace: publisher.namespace.clone(),
+            official_source: "local-development".into(),
+            development: true,
+        };
+        let mut supplied = publisher;
+        supplied.name = "Preparation host signer".into();
+        let resolved = resolve_identity_for_claim(
+            claim,
+            &[empty],
+            std::slice::from_ref(&supplied),
+            &crate::options::HubOptions {
+                offline: true,
+                ..Default::default()
+            },
+            Some(&path),
+        )
+        .unwrap();
+        assert_eq!(resolved.profiles, vec![supplied]);
+        assert!(resolved.remembered.is_none());
     }
 
     #[test]
@@ -731,14 +837,19 @@ mod windows_tests {
                             public_key: None,
                             name: None,
                             identity: None,
-                        })
+                        });
+                        Ok(())
                     })
                     .unwrap()
                 });
             }
         });
         assert_eq!(load_store(&path).unwrap().trusted.len(), 8);
-        modify(&path, |store| store.trusted.clear()).unwrap();
+        modify(&path, |store| {
+            store.trusted.clear();
+            Ok(())
+        })
+        .unwrap();
         assert!(load_store(&path).unwrap().trusted.is_empty());
         fs::remove_dir_all(directory).unwrap();
     }

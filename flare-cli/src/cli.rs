@@ -345,6 +345,7 @@ pub struct Download {
     pub gpus: Vec<i32>,
 
     /// Additional publisher verification profiles (JSON); repeatable.
+    /// Interactive acquisition can review and import a profile from the repository.
     #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]
     pub publisher_keys: Vec<PathBuf>,
 
@@ -856,6 +857,7 @@ pub struct Run {
 pub struct ServingOptions {
     /// Additional publisher verification profiles (JSON); does not grant execution trust.
     /// Development cores default to ~/.config/flare/development-publisher.json.
+    /// Interactive acquisition can review and import a profile from the repository.
     #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]
     pub publisher_keys: Vec<PathBuf>,
     /// Verify stored allocation and table ranges before loading model GPU resources.

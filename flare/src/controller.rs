@@ -522,12 +522,13 @@ mod publisher_key_tests {
             .unwrap();
         let profile = wait_for_publisher_key(&response, &progress, &worker.shared).unwrap();
         assert_eq!(profile.fingerprint(), disclosure.fingerprint);
-        let restored = Persistent::load(&worker.settings.state_file).unwrap();
-        assert_eq!(restored.publisher_profiles, vec![profile]);
+        let profiles =
+            crate::trust::trusted_profiles(worker.settings.trust_store.as_deref()).unwrap();
+        assert_eq!(profiles, vec![profile]);
+        assert!(!worker.settings.state_file.exists());
         let review = crate::trust::review(
             &core,
             &TrustOptions {
-                profiles: restored.publisher_profiles,
                 hub: crate::options::HubOptions {
                     offline: true,
                     ..Default::default()
@@ -538,7 +539,7 @@ mod publisher_key_tests {
         )
         .unwrap();
         assert!(!review.disclosure.remembered);
-        assert!(!worker.settings.trust_store.as_ref().unwrap().exists());
+        assert!(worker.settings.trust_store.as_ref().unwrap().exists());
         assert!(worker.pending_key.is_none());
         worker.shutdown();
     }
@@ -584,7 +585,7 @@ mod publisher_key_tests {
     fn publisher_key_save_failure_keeps_the_review_pending() {
         let temp = tempfile::tempdir().unwrap();
         let (mut worker, response, _, _) = awaiting_key(temp.path());
-        std::fs::create_dir(&worker.settings.state_file).unwrap();
+        std::fs::create_dir(worker.settings.trust_store.as_ref().unwrap()).unwrap();
         let disclosure = worker
             .pending_key
             .as_ref()
@@ -2883,27 +2884,17 @@ impl Worker {
         if self.shared.cancelled(request.operation) || request.decision != decision {
             return Err("The publisher key review has expired".into());
         }
-        if request.review.disclosure.fingerprint != fingerprint
-            || request.review.disclosure.namespace != namespace
-        {
-            return Err(
-                "Key import must match the displayed fingerprint and exact publisher namespace"
-                    .into(),
-            );
-        }
-        let profile = request.review.profile.clone();
-        let mut persistent = self.persistent.clone();
-        persistent.publisher_profiles.retain(|previous| {
-            previous.fingerprint() != fingerprint || previous.namespace != namespace
-        });
-        if persistent.publisher_profiles.len() >= 256 {
-            return Err("The desktop publisher-profile limit has been reached".into());
-        }
-        persistent.publisher_profiles.push(profile.clone());
-        persistent.save(&self.settings.state_file)?;
-        self.persistent = persistent;
+        let profile = request
+            .review
+            .import(
+                &TrustAcceptance {
+                    fingerprint: fingerprint.to_owned(),
+                    namespace: namespace.to_owned(),
+                },
+                self.settings.trust_store.as_deref(),
+            )
+            .map_err(|error| error.to_string())?;
         self.shared.update(|state| {
-            state.publisher_profiles = self.persistent.publisher_profiles.clone();
             state.view.publisher_key = None;
         });
         let request = self.pending_key.take().unwrap();

@@ -1,8 +1,9 @@
 # Production signing
 
 Ignition signs runtime cores with Ed25519. Source builds contain no embedded
-publisher profiles. Supply a public profile with `--publisher-keys`, or provision
-profiles when building a distribution as described in
+publisher profiles. Supply a public profile with `--publisher-keys`, import it
+during CLI or desktop acquisition, or provision profiles when building a
+distribution as described in
 [runtime core protection](runtime-core-design.md#publisher-authentication-and-executable-access).
 
 Publisher profiles verify signatures; they do not verify identity. Flare checks
@@ -10,11 +11,13 @@ identity through `publisher.json` at the root of the core's official source
 repository. Execution requires first-use acceptance. Private keys never belong
 in source control, cores, or publisher profiles.
 
-The Windows desktop client can review and import a public profile published with
-a payload-format core at its acquisition commit. This permits downloading cores
-signed with a development key from another preparation host. The dialog verifies
-the signed catalog and requires explicit key import; execution acceptance remains
-separate. See [desktop acquisition](../flare-winui/README.md#use).
+The CLI and Windows desktop client can review and import a public profile
+published with a payload-format core at its acquisition commit. This permits
+downloading cores signed with a development key from another preparation host. Both clients verify
+the signed catalog and require the exact namespace for explicit key import.
+Imported profiles persist in the shared trust file without accepting execution.
+See [CLI acquisition](cli-design.md#downloading-published-cores) and
+[desktop acquisition](../flare-winui/README.md#use).
 
 ## Publish the verification key
 

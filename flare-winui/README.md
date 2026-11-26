@@ -116,7 +116,10 @@ It checks the profile's fingerprint and namespace against the core and verifies
 the signed catalog before showing **Review publisher key**. The dialog shows
 the key fingerprint, profile source, publisher identity status, and model license.
 Type the displayed namespace to import the public profile and continue downloading,
-or cancel the download. Imported profiles persist in desktop application state.
+or cancel the download. Imported profiles persist separately from execution
+approvals in the trust file, which the CLI also reads. Profiles imported by
+desktop builds that stored them in application state remain available to the
+desktop client.
 Importing a profile enables signature verification; it does not establish publisher
 identity or accept execution. First use still requires the publisher and license
 review before loading. Invalid signatures and mismatched profiles prevent import.

@@ -935,6 +935,22 @@ deployments in the Flare model cache. Repository snapshots are hardlinks into th
 shared blob store, so resolved core files are directly readable and identical
 bytes are stored once. The returned core is a leased Flare cache entry.
 
+For payload-format cores with an unknown signing key, `flare run` and
+`flare download` fetch `publisher.json` from the resolved repository commit and
+verify the signed catalog before requesting import. The terminal disclosure shows
+the fingerprint, namespace, profile URL, publisher identity status, and license.
+Type the exact namespace to import the public profile and resume acquisition. Empty or mismatched
+input cancels import. Unattended acquisition requires an explicit public profile
+through `--publisher-keys PATH`; execution-approval flags do not import keys.
+
+Imported profiles are stored in the trust file's `imported` list, separately from
+execution approvals in `trusted`, and are available to the CLI and desktop client
+when they use the same trust file. Import neither confirms publisher identity nor
+accepts model execution or license terms. `flare run` still requires its separate
+first-use acceptance, and online loads still enforce publisher revocation.
+Existing trust files without `imported` remain readable; binaries that reject
+unknown trust-file fields require a separate trust file after profiles are imported.
+
 When a file is absent from a snapshot, Flare resolves its Hub ETag and size and
 checks them against the blob namespace for that endpoint and repository.
 Dependency planning resolves identities and sizes for the pinned commit in batch
@@ -1557,7 +1573,8 @@ sampling defaults and request ranges, and per-rank fixed memory and graph counts
 
 The command verifies the signed index using embedded publisher profiles, profiles
 provided with `--publisher-keys` (development cores default to
-`~/.config/flare/development-publisher.json`), and remembered trust-store keys.
+`~/.config/flare/development-publisher.json`), and imported or accepted trust-store
+keys.
 It opens referenced companion files to check their layout, but reads no stored
 weights, decodes no executables, initializes no GPU, and requests no license
 acceptance. Verification uses no network access. `--rank N` selects one rank of a
