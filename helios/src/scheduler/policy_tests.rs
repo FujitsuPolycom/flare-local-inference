@@ -5414,3 +5414,388 @@ fn large_batch_single_low_acceptance_round_does_not_collapse_calibration() {
     assert_eq!((next.batch_capacity, next.token_capacity), (32, 2),
         "single correlated B=32 dip must not trap scheduler in W=1");
 }
+
+const DEEPSEEK_16K_PREFILL_CATALOG: [usize; 11] = [
+    256, 512, 1024, 2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384,
+];
+
+fn realistic_sm120_duration_ns(kind: GraphKind, capacity: usize) -> u64 {
+    match kind {
+        GraphKind::Prefill => 15_000_000 + (capacity as u64 * 230_000_000) / 16_384,
+        GraphKind::TerminalPrefill => 18_000_000 + (capacity as u64 * 230_000_000) / 16_384,
+        GraphKind::ScoredPrefill => 20_000_000 + (capacity as u64 * 230_000_000) / 16_384,
+        GraphKind::Init | GraphKind::Restore => 150_000,
+        GraphKind::Snapshot => 500_000,
+        GraphKind::Decode | GraphKind::Resume => 12_000_000,
+        _ => 1_000_000,
+    }
+}
+
+fn cold_deepseek_16k_engine(with_terminal: bool) -> RequestScheduler {
+    let mut s = RequestScheduler::new(
+        [41; 32],
+        SchedulerLimits {
+            max_active: 1,
+            request_slots: 1,
+            max_sequence_tokens: 131_072,
+            prefill_chunk_size: 16_384,
+            pages: 4096,
+            snapshots: 32,
+        },
+        SchedulerCapabilities {
+            completion_token_capacity: 16,
+            vocabulary: 1024,
+            page_tokens: 64,
+            vision: crate::model::VisionCapabilities::disabled(),
+            draft_pages_per_request: 0,
+            completion_inputs: vec![],
+            speculative_allocations: vec![],
+            state_rows_per_request: None,
+        },
+    )
+    .unwrap();
+    s.prefill_graphs(&DEEPSEEK_16K_PREFILL_CATALOG).unwrap();
+    if with_terminal {
+        s.terminal_prefill_graphs(&DEEPSEEK_16K_PREFILL_CATALOG).unwrap();
+    }
+    let mut graphs = super::tests::duration_graphs(1);
+    graphs.retain(|g| g.kind != GraphKind::Prefill);
+    for &capacity in &DEEPSEEK_16K_PREFILL_CATALOG {
+        graphs.push(crate::execution::GraphDescriptor {
+            tuned_bindings: vec![],
+            confidence_width: 0,
+            name: format!("prefill{capacity}"),
+            kind: GraphKind::Prefill,
+            sampling_mode: SamplingMode::General,
+            draft_tokens: 0,
+            handle: 100 + capacity,
+            batch_capacity: 1,
+            token_capacity: capacity,
+            packed_token_capacity: 0,
+            prefill_capacity: 0,
+            estimated_duration_ns: 0,
+            input_bindings: vec![],
+        });
+        if with_terminal {
+            graphs.push(crate::execution::GraphDescriptor {
+                tuned_bindings: vec![],
+                confidence_width: 0,
+                name: format!("terminal_prefill{capacity}"),
+                kind: GraphKind::TerminalPrefill,
+                sampling_mode: SamplingMode::General,
+                draft_tokens: 0,
+                handle: 1000 + capacity,
+                batch_capacity: 1,
+                token_capacity: capacity,
+                packed_token_capacity: 0,
+                prefill_capacity: 0,
+                estimated_duration_ns: 0,
+                input_bindings: vec![],
+            });
+        }
+    }
+    s.graph_durations(&graphs).unwrap();
+    s
+}
+
+#[derive(Debug)]
+struct PrefillRunMetrics {
+    launches: usize,
+    prefill_discoveries: usize,
+    total_discoveries: usize,
+    init_origin: PlanOrigin,
+    prefill_ns: u64,
+    sequence: Vec<(GraphKind, usize, usize, PlanOrigin)>,
+}
+
+fn run_cold_request_metrics(
+    s: &mut RequestScheduler,
+    req_id: u32,
+    prompt_tokens: usize,
+) -> PrefillRunMetrics {
+    let handle = add(s, req_id, prompt_tokens, 1);
+    let mut launches = 0usize;
+    let mut prefill_discoveries = 0usize;
+    let mut total_discoveries = 0usize;
+    let mut init_origin = PlanOrigin::Ordinary;
+    let mut prefill_ns = 0u64;
+    let mut sequence = Vec::new();
+    while s.request(handle).is_ok() {
+        let plan = s.plan().expect("request must make progress");
+        let dur = realistic_sm120_duration_ns(plan.kind, plan.token_capacity);
+        if plan.origin == PlanOrigin::Discovery {
+            total_discoveries += 1;
+        }
+        if plan.kind == GraphKind::Init {
+            init_origin = plan.origin;
+        }
+        if plan.kind.is_prefill() {
+            launches += 1;
+            if plan.origin == PlanOrigin::Discovery {
+                prefill_discoveries += 1;
+            }
+            prefill_ns += dur;
+            sequence.push((plan.kind, plan.token_capacity, plan.lanes[0].tokens, plan.origin));
+        }
+        let fence = Fence(s.submitted.0 + 1);
+        s.commit(&plan, fence).unwrap();
+        s.advance_to(s.now_ns + dur).unwrap();
+        complete_timed(s, &plan, fence, 0, true, gpu_time(dur));
+    }
+    PrefillRunMetrics {
+        launches,
+        prefill_discoveries,
+        total_discoveries,
+        init_origin,
+        prefill_ns,
+        sequence,
+    }
+}
+
+#[test]
+fn cold_deepseek_16k_prefill_uses_natural_fit_discovery() {
+    let cases: [(&str, usize, usize, usize, usize); 6] = [
+        // (label, prompt_tokens, expected_launches, expected_req1_prefill_disc, expected_tail_cap)
+        ("8K", 8_192, 1, 1, 8_192),
+        ("16K", 16_384, 1, 1, 16_384),
+        ("32K", 32_768, 2, 2, 16_384),
+        ("64K", 65_536, 4, 2, 16_384),
+        ("124K", 126_976, 8, 2, 12_288),
+        ("124000", 124_000, 8, 2, 10_240),
+    ];
+    for (label, prompt, expected_launches, expected_req1_disc, expected_tail_cap) in cases {
+        let mut s = cold_deepseek_16k_engine(true);
+        for req in 1..=3u32 {
+            let m = run_cold_request_metrics(&mut s, req, prompt);
+            let ms = m.prefill_ns as f64 / 1e6;
+            let tok_s = prompt as f64 / (ms / 1e3);
+            let seq: Vec<String> = m
+                .sequence
+                .iter()
+                .map(|(k, c, t, o)| {
+                    let tag = match k {
+                        GraphKind::TerminalPrefill => "T",
+                        _ => "P",
+                    };
+                    let d = if *o == PlanOrigin::Discovery { "*" } else { "" };
+                    format!("{tag}{c}({t}){d}")
+                })
+                .collect();
+            println!(
+                "AB prompt={label}({prompt}) req={req} launches={} prefill_disc={} total_disc={} init={:?} ms={ms:.2} tok_s={tok_s:.0} seq=[{}]",
+                m.launches,
+                m.prefill_discoveries,
+                m.total_discoveries,
+                m.init_origin,
+                seq.join(",")
+            );
+            assert_eq!(m.launches, expected_launches, "{label} req={req} launches");
+            assert_eq!(
+                m.prefill_discoveries,
+                if req == 1 { expected_req1_disc } else { 0 },
+                "{label} req={req} prefill discoveries"
+            );
+            assert_eq!(
+                m.init_origin,
+                if req == 1 { PlanOrigin::Discovery } else { PlanOrigin::Ordinary },
+                "{label} req={req} init origin"
+            );
+            for &(kind, cap, _, _) in &m.sequence[..m.sequence.len() - 1] {
+                assert_eq!((kind, cap), (GraphKind::Prefill, 16_384), "{label} req={req} full chunk");
+            }
+            let &(last_kind, last_cap, _, _) = m.sequence.last().unwrap();
+            assert_eq!(
+                (last_kind, last_cap),
+                (GraphKind::TerminalPrefill, expected_tail_cap),
+                "{label} req={req} terminal chunk"
+            );
+        }
+    }
+
+    // Without TerminalPrefill catalog, a cold 124K prompt also runs 7x Prefill(16384) + Prefill(12288).
+    let mut no_term = cold_deepseek_16k_engine(false);
+    let r1 = run_cold_request_metrics(&mut no_term, 1, 126_976);
+    assert_eq!((r1.launches, r1.prefill_discoveries), (8, 2));
+    assert_eq!(
+        r1.sequence.iter().map(|&(_, cap, _, _)| cap).collect::<Vec<_>>(),
+        vec![16_384, 16_384, 16_384, 16_384, 16_384, 16_384, 16_384, 12_288]
+    );
+    let r2 = run_cold_request_metrics(&mut no_term, 2, 126_976);
+    assert_eq!((r2.launches, r2.prefill_discoveries, r2.total_discoveries), (8, 0, 0));
+}
+
+#[test]
+fn measured_faster_smaller_prefill_still_beats_larger_natural_fit_by_value_rate() {
+    let mut s = cold_deepseek_16k_engine(false);
+    // Measure Prefill(8192) at 100 ms (81.92 tok/ms), leaving every other prefill unmeasured.
+    set_cost(&mut s, GraphKind::Init, 1, 1, 150_000);
+    set_cost(&mut s, GraphKind::Snapshot, 1, 1, 500_000);
+    set_cost(&mut s, GraphKind::Prefill, 1, 8_192, 100 * MS);
+
+    let handle = add(&mut s, 1, 32_768, 1);
+    let init = measured_step(&mut s, 150_000, 0);
+    assert_eq!(init.kind, GraphKind::Init);
+
+    // Chunk 1 discovers the unmeasured natural-fit Prefill(16384) at 245 ms (66.87 tok/ms).
+    let first = measured_step(&mut s, 245 * MS, 0);
+    assert_eq!(
+        (first.kind, first.token_capacity, first.origin),
+        (GraphKind::Prefill, 16_384, PlanOrigin::Discovery)
+    );
+
+    // Chunks 2 and 3 have 16384 and 8192 remaining: measured Prefill(8192) beats Prefill(16384)
+    // by ordinary ValueRate (81.92 vs 66.87 tok/ms), and unmeasured smaller shapes do not preempt.
+    let second = measured_step(&mut s, 100 * MS, 0);
+    assert_eq!(
+        (second.kind, second.token_capacity, second.origin),
+        (GraphKind::Prefill, 8_192, PlanOrigin::Ordinary)
+    );
+    let third = measured_step(&mut s, 100 * MS, 0);
+    assert_eq!(
+        (third.kind, third.token_capacity, third.origin),
+        (GraphKind::Prefill, 8_192, PlanOrigin::Ordinary)
+    );
+    assert_eq!(s.request(handle).unwrap().consumed_tokens, 32_768);
+}
+
+#[test]
+fn refresh_start_still_calibrates_stale_smaller_prefill_shapes() {
+    let mut s = cold_deepseek_16k_engine(false);
+    set_cost(&mut s, GraphKind::Init, 1, 1, 150_000);
+    set_cost(&mut s, GraphKind::Snapshot, 1, 1, 500_000);
+    set_cost(&mut s, GraphKind::Prefill, 1, 8_192, 130 * MS);
+    set_cost(&mut s, GraphKind::Prefill, 1, 16_384, 245 * MS);
+
+    // Expire Prefill(8192) while keeping Init, Snapshot, and Prefill(16384) fresh.
+    s.advance_to(s.now_ns + s.policy.estimate_ttl_ns).unwrap();
+    set_cost(&mut s, GraphKind::Init, 1, 1, 150_000);
+    set_cost(&mut s, GraphKind::Snapshot, 1, 1, 500_000);
+    set_cost(&mut s, GraphKind::Prefill, 1, 16_384, 245 * MS);
+
+    let handle = add(&mut s, 1, 32_768, 1);
+    let init = measured_step(&mut s, 150_000, 0);
+    assert_eq!((init.kind, init.origin), (GraphKind::Init, PlanOrigin::Ordinary));
+
+    // With full refresh credit, RefreshStart probes stale Prefill(8192); unmeasured smaller
+    // capacities (256..6144, 10240..14336) never trigger Discovery.
+    s.refresh.credit_ns = refresh::CREDIT_CAP_NS;
+    let probe = measured_step(&mut s, 130 * MS, 0);
+    let key_8k = cost::Key {
+        drafts: 0,
+        kind: GraphKind::Prefill,
+        batch: 1,
+        tokens: 8_192,
+        prefill: 0,
+        packed: 0,
+    };
+    assert_eq!(
+        (probe.kind, probe.token_capacity, probe.origin),
+        (GraphKind::Prefill, 8_192, PlanOrigin::RefreshStart(key_8k))
+    );
+    let next = measured_step(&mut s, 245 * MS, 0);
+    assert_eq!(
+        (next.kind, next.token_capacity, next.origin),
+        (GraphKind::Prefill, 16_384, PlanOrigin::Ordinary)
+    );
+    assert_eq!(s.request(handle).unwrap().consumed_tokens, 24_576);
+}
+
+#[test]
+fn cold_scored_prefill_checkpoint_cuts_and_atomic_spans_use_natural_fit_discovery() {
+    // 1. Cold ScoredPrefill runs 32K in two 16384 chunks without stepping down.
+    let mut scored = cold_deepseek_16k_engine(false);
+    scored.scored_prefill_graphs(&DEEPSEEK_16K_PREFILL_CATALOG).unwrap();
+    let mut graphs = super::tests::duration_graphs(1);
+    graphs.retain(|g| g.kind != GraphKind::Prefill);
+    for &capacity in &DEEPSEEK_16K_PREFILL_CATALOG {
+        for (kind, base) in [(GraphKind::Prefill, 100usize), (GraphKind::ScoredPrefill, 2000)] {
+            graphs.push(crate::execution::GraphDescriptor {
+                tuned_bindings: vec![],
+                confidence_width: 0,
+                name: format!("{kind:?}-{capacity}"),
+                kind,
+                sampling_mode: SamplingMode::General,
+                draft_tokens: 0,
+                handle: base + capacity,
+                batch_capacity: 1,
+                token_capacity: capacity,
+                packed_token_capacity: 0,
+                prefill_capacity: 0,
+                estimated_duration_ns: 0,
+                input_bindings: vec![],
+            });
+        }
+    }
+    scored.graph_durations(&graphs).unwrap();
+    let h = scored
+        .admit(RequestSpec {
+            prompt: vec![7; 32_768],
+            message_boundaries: vec![],
+            conditioning: vec![],
+            max_new_tokens: 1,
+            grammar_constrained: false,
+            host_stops: false,
+            prompt_logprobs: true,
+            growable_output: false,
+        })
+        .unwrap();
+    assert_eq!(measured_step(&mut scored, 150_000, 0).kind, GraphKind::Init);
+    let c1 = measured_step(&mut scored, 250 * MS, 0);
+    assert_eq!(
+        (c1.kind, c1.token_capacity, c1.lanes[0].tokens, c1.origin),
+        (GraphKind::ScoredPrefill, 16_384, 16_384, PlanOrigin::Discovery)
+    );
+    let c2 = measured_step(&mut scored, 250 * MS, 0);
+    assert_eq!(
+        (c2.kind, c2.token_capacity, c2.lanes[0].tokens, c2.origin),
+        (GraphKind::ScoredPrefill, 16_384, 16_384, PlanOrigin::Ordinary)
+    );
+    assert_eq!(scored.request(h).unwrap().consumed_tokens, 32_768);
+
+    // 2. Cold checkpoint anchor cut discovers tightest fit (1024 for 1000), then tightest fit
+    // for remaining tail (4096 for 3096), without probing 256/512/2048.
+    let mut cut_sched = cold_deepseek_16k_engine(false);
+    let h = cut_sched
+        .admit(RequestSpec {
+            prompt: vec![8; 4_096],
+            message_boundaries: vec![1_000],
+            conditioning: vec![],
+            max_new_tokens: 4,
+            grammar_constrained: false,
+            host_stops: false,
+            prompt_logprobs: false,
+            growable_output: false,
+        })
+        .unwrap();
+    assert_eq!(measured_step(&mut cut_sched, 150_000, 0).kind, GraphKind::Init);
+    let anchor_chunk = measured_step(&mut cut_sched, 30 * MS, 0);
+    assert_eq!(
+        (anchor_chunk.token_capacity, anchor_chunk.lanes[0].tokens, anchor_chunk.origin),
+        (1_024, 1_000, PlanOrigin::Discovery)
+    );
+    assert_eq!(measured_step(&mut cut_sched, 500_000, 0).kind, GraphKind::Snapshot);
+    let tail_chunk = measured_step(&mut cut_sched, 72 * MS, 0);
+    assert_eq!(
+        (tail_chunk.token_capacity, tail_chunk.lanes[0].tokens, tail_chunk.origin),
+        (4_096, 3_096, PlanOrigin::Discovery)
+    );
+    assert_eq!(cut_sched.request(h).unwrap().consumed_tokens, 4_096);
+
+    // 3. Cold atomic prefill span (10000..17000 inside 20000) achieves max single-step work
+    // 10000, so natural-fit discovery picks 10240 first, then 10240 for the remaining 10000.
+    let mut span_sched = cold_deepseek_16k_engine(false);
+    let h = add(&mut span_sched, 9, 20_000, 4);
+    span_sched.set_prefill_spans(h, &[10_000..17_000]).unwrap();
+    assert_eq!(measured_step(&mut span_sched, 150_000, 0).kind, GraphKind::Init);
+    let s1 = measured_step(&mut span_sched, 158 * MS, 0);
+    assert_eq!(
+        (s1.token_capacity, s1.lanes[0].tokens, s1.origin),
+        (10_240, 10_000, PlanOrigin::Discovery)
+    );
+    let s2 = measured_step(&mut span_sched, 158 * MS, 0);
+    assert_eq!(
+        (s2.token_capacity, s2.lanes[0].tokens, s2.origin),
+        (10_240, 10_000, PlanOrigin::Ordinary)
+    );
+    assert_eq!(span_sched.request(h).unwrap().consumed_tokens, 20_000);
+}
