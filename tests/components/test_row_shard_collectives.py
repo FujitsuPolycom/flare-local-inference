@@ -212,19 +212,23 @@ def test_a_functional_chunked_gather_allocates_its_staging_and_output_in_the_for
 class _FakeDmaAllReduce:
     """Stand-in for `b12x.comm.pcie.DmaAllReduce` in CPU unit tests."""
 
-    def __init__(self, *, world=4, max_bytes=1 << 26, accept_rs=True, accept_ag=True):
+    def __init__(self, *, world=4, max_bytes=1 << 26, accept_rs=True, accept_ag=True, accept_a2a=True):
         self.world_size = world
         self.max_bytes = max_bytes
         self.group = object()
         self.calls = []
         self._accept_rs = accept_rs
         self._accept_ag = accept_ag
+        self._accept_a2a = accept_a2a
 
     def should_reduce_scatter(self, inp):
         return self._accept_rs
 
     def should_all_gather(self, inp):
         return self._accept_ag
+
+    def should_all_to_all(self, inp):
+        return self._accept_a2a
 
     def reduce_scatter(self, inp, *, out, plan):
         self.calls.append(("reduce_scatter", tuple(inp.shape), tuple(out.shape), out.data_ptr(), plan))
@@ -234,6 +238,11 @@ class _FakeDmaAllReduce:
         self.calls.append(("all_gather", tuple(inp.shape), tuple(out.shape), out.data_ptr(), plan))
         for rank in range(self.world_size):
             out[rank].copy_(inp + rank)
+
+    def all_to_all(self, inp, *, out, plan):
+        self.calls.append(("all_to_all", tuple(inp.shape), tuple(out.shape), inp.data_ptr(), out.data_ptr(), plan))
+        # Reverse peer slices deterministically so tests catch missing or wrong-order copies.
+        out.copy_(inp.flip(0))
 
 
 @pytest.fixture
@@ -479,6 +488,7 @@ def test_concurrent_row_shard_validation_and_scratch_checks(
     concurrent = wrapper(dma_op, workspace=arena, session=object(),
                          parallel_plans=(local_plan,), send_buffer=send_buf)
     assert concurrent.stream_handle == 17
+    assert concurrent.copy_input is True
     assert dma_op.concurrent_input is send_buf
     assert arena._parallel_plans == [(dma_op.plan, local_plan)]
     assert finalizers == [concurrent.validate_scratch]
@@ -487,3 +497,243 @@ def test_concurrent_row_shard_validation_and_scratch_checks(
     dma_op.plan.scratch_nbytes = 256
     with pytest.raises(ValueError, match="requires a plan without caller scratch"):
         concurrent.validate_scratch()
+
+
+def test_prepared_all_to_all_fits_single_rank_dispatch_and_fx(prepared_dma):
+    from torch.fx.experimental.proxy_tensor import make_fx
+    from ignition.components.collectives import PreparedAllToAll
+
+    queries, plans, declarations = prepared_dma
+    source = torch.arange(64, dtype=torch.bfloat16).reshape(4, 2, 8)
+    output = torch.zeros_like(source)
+    full_bytes = source.numel() * source.element_size()
+
+    # Eligibility checks across runtime surface, shape, contiguity, alignment, capacity, and dtype.
+    assert PreparedAllToAll.fits(_FakeDmaAllReduce(max_bytes=full_bytes), source, output)
+    assert not PreparedAllToAll.fits(None, source, output)
+    assert not PreparedAllToAll.fits(_runtime(), source, output)
+    class _FakeDmaNoAllToAll(_FakeDmaAllReduce):
+        should_all_to_all = property(lambda self: (_ for _ in ()).throw(AttributeError()))
+    assert not PreparedAllToAll.fits(_FakeDmaNoAllToAll(max_bytes=full_bytes), source, output)
+    assert not PreparedAllToAll.fits(_FakeDmaAllReduce(max_bytes=full_bytes - 1), source, output)
+    assert not PreparedAllToAll.fits(_FakeDmaAllReduce(max_bytes=full_bytes, accept_a2a=False), source, output)
+    assert not PreparedAllToAll.fits(_FakeDmaAllReduce(world=2, max_bytes=full_bytes), source, output)
+    assert not PreparedAllToAll.fits(_FakeDmaAllReduce(max_bytes=full_bytes), source.view(-1), output.view(-1))
+    assert not PreparedAllToAll.fits(_FakeDmaAllReduce(max_bytes=full_bytes), source, torch.zeros(4, 16, dtype=torch.bfloat16))
+    assert not PreparedAllToAll.fits(_FakeDmaAllReduce(max_bytes=full_bytes), source.transpose(1, 2), output.transpose(1, 2))
+    assert not PreparedAllToAll.fits(
+        _FakeDmaAllReduce(max_bytes=full_bytes),
+        torch.zeros(4, 6, dtype=torch.bfloat16),
+        torch.zeros(4, 6, dtype=torch.bfloat16),
+    )
+    # 16-byte-aligned uint8 and float8_e4m3fn buffers are accepted too.
+    u8_src = torch.arange(128, dtype=torch.uint8).reshape(4, 2, 16)
+    u8_out = torch.zeros_like(u8_src)
+    assert PreparedAllToAll.fits(_FakeDmaAllReduce(max_bytes=128), u8_src, u8_out)
+
+    # Single-rank fallback copies source into output (and handles in-place).
+    single_out = torch.empty_like(source)
+    single = PreparedAllToAll(source, single_out, runtime=None, session=None, coordinator=None, name="a2a.single")
+    assert single.single
+    assert single(source) is single_out and torch.equal(single_out, source)
+    assert single(source, source) is source
+    with pytest.raises(ValueError, match="single-rank"):
+        PreparedAllToAll(source, torch.empty(4, 16, dtype=torch.bfloat16),
+                         runtime=None, session=None, coordinator=None, name="a2a.bad")
+
+    # Multi-rank DMA prepare, eager dispatch, dependencies, and uint8 metadata query mapping.
+    runtime = _FakeDmaAllReduce(world=4)
+    op = PreparedAllToAll(source, output, runtime=runtime, session=object(),
+                          coordinator=SimpleNamespace(hosts=()), name="dma.a2a")
+    u8_op = PreparedAllToAll(u8_src, u8_out, runtime=runtime, session=object(),
+                             coordinator=SimpleNamespace(hosts=()), name="dma.a2a.u8")
+    assert op.dma and u8_op.dma
+    assert [(q.shape, q.dtype) for q in queries] == [
+        ((4, 2, 8), torch.bfloat16),
+        ((4, 16), torch.bfloat16),
+    ]
+
+    state_calls = []
+    fake_state = SimpleNamespace(
+        run_all_to_all=lambda inp, *, out: state_calls.append(
+            ("run_a2a", tuple(inp.shape), inp.dtype, out.data_ptr())
+        ),
+    )
+    declarations[0].prepare_call(fake_state).run()
+    declarations[1].prepare_call(fake_state).run()
+    assert state_calls == [
+        ("run_a2a", (4, 2, 8), torch.bfloat16, output.data_ptr()),
+        ("run_a2a", (4, 2, 16), torch.uint8, u8_out.data_ptr()),
+    ]
+
+    dep = torch.ones(1)
+    assert op(source) is output and torch.equal(output, source.flip(0))
+    out_dep = torch.zeros_like(output)
+    assert op(source, out_dep, dependencies=(dep,)) is out_dep and torch.equal(out_dep, source.flip(0))
+    assert u8_op(u8_src) is u8_out and torch.equal(u8_out, u8_src.flip(0))
+    assert runtime.calls == [
+        ("all_to_all", (4, 2, 8), (4, 2, 8), source.data_ptr(), output.data_ptr(), plans[0]),
+        ("all_to_all", (4, 2, 8), (4, 2, 8), source.data_ptr(), out_dep.data_ptr(), plans[0]),
+        ("all_to_all", (4, 2, 16), (4, 2, 16), u8_src.data_ptr(), u8_out.data_ptr(), plans[1]),
+    ]
+
+    # FX graph selection for plain vs dependency custom op.
+    op.functional(session=object())
+
+    def forward(x, ordering):
+        a = op(x)
+        b = op(x, dependencies=(ordering,))
+        return a + b
+
+    graph = make_fx(forward, tracing_mode="fake")(source, dep).graph
+    plain = [n for n in graph.nodes if n.target == torch.ops.flare.pcie_all_to_all.default]
+    with_dep = [n for n in graph.nodes if n.target == torch.ops.flare.pcie_all_to_all_dep.default]
+    assert len(plain) == 1 and len(with_dep) == 1
+    assert with_dep[0].args[2][0].op == "placeholder"
+
+
+def test_concurrent_all_to_all_validation_and_scratch_checks(monkeypatch, prepared_dma):
+    from ignition.components import collectives
+    from ignition.components.collectives import ConcurrentAllToAll, PreparedAllToAll
+    from ignition.preparation.scratch import ScratchArena
+
+    finalizers = []
+    monkeypatch.setattr(collectives, "register_finalizer", lambda session, fn: finalizers.append(fn))
+
+    source = torch.zeros(4, 2, 8, dtype=torch.bfloat16)
+    local_plan = object()
+    arena = ScratchArena("cpu", overlap=True)
+    arena._auxiliary_stream = SimpleNamespace(cuda_stream=29)
+
+    single_op = PreparedAllToAll(source, source.clone(), runtime=None, session=None, coordinator=None, name="single")
+    with pytest.raises(ValueError, match="requires a prepared PCIe DMA channel"):
+        ConcurrentAllToAll(single_op, workspace=arena, session=object(), parallel_plans=(local_plan,))
+
+    dma_op = PreparedAllToAll(source, source.clone(), runtime=_FakeDmaAllReduce(), session=object(),
+                              coordinator=SimpleNamespace(hosts=()), name="dma.a2a")
+    for bad_ws, bad_plans in (
+        (object(), (local_plan,)),
+        (ScratchArena("cpu", overlap=False), (local_plan,)),
+        (arena, ()),
+    ):
+        with pytest.raises(ValueError, match="requires an overlap arena and local plans"):
+            ConcurrentAllToAll(dma_op, workspace=bad_ws, session=object(), parallel_plans=bad_plans)
+
+    send_buf = source.clone()
+    concurrent = ConcurrentAllToAll(
+        dma_op, workspace=arena, session=object(), parallel_plans=(local_plan,),
+        send_buffer=send_buf, copy_input=False,
+    )
+    assert concurrent.stream_handle == 29
+    assert concurrent.copy_input is False
+    assert dma_op.concurrent_input is send_buf
+    assert arena._parallel_plans == [(dma_op.plan, local_plan)]
+    assert finalizers == [concurrent.validate_scratch]
+
+    concurrent.validate_scratch()
+    dma_op.plan.scratch_nbytes = 128
+    with pytest.raises(ValueError, match="requires a plan without caller scratch"):
+        concurrent.validate_scratch()
+
+
+def test_concurrent_start_skips_send_buffer_copy_when_pointers_match(monkeypatch, prepared_dma):
+    from contextlib import contextmanager
+    from ignition.components import collectives
+    from ignition.components.collectives import (
+        ConcurrentAllGather, ConcurrentAllReduce, ConcurrentAllToAll,
+        ConcurrentGatherShards, ConcurrentReduceScatter,
+        PreparedAllGather, PreparedAllReduce, PreparedAllToAll,
+        PreparedGatherShards, PreparedReduceScatter,
+    )
+    from ignition.preparation.scratch import ScratchArena
+
+    @contextmanager
+    def _noop_stream(_stream):
+        yield
+
+    class _FakeExternalStream:
+        def __init__(self, stream, device=None):
+            self.stream = stream
+            self.device = device
+
+        def wait_stream(self, _other):
+            pass
+
+    monkeypatch.setattr(torch.cuda, "ExternalStream", _FakeExternalStream)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _dev: _FakeExternalStream(0))
+    monkeypatch.setattr(torch.cuda, "stream", _noop_stream)
+
+    class _CountingDma(_FakeDmaAllReduce):
+        def all_reduce(self, inp, *, out, plan):
+            self.calls.append(("all_reduce", inp.data_ptr(), out.data_ptr()))
+            out.copy_(inp)
+
+        def reduce_scatter(self, inp, *, out, plan):
+            self.calls.append(("reduce_scatter", inp.data_ptr(), out.data_ptr()))
+            out.copy_(inp.view(self.world_size, *out.shape).sum(dim=0))
+
+        def all_gather(self, inp, *, out, plan):
+            self.calls.append(("all_gather", inp.data_ptr(), out.data_ptr()))
+            out[:] = inp
+
+        def all_to_all(self, inp, *, out, plan):
+            self.calls.append(("all_to_all", inp.data_ptr(), out.data_ptr()))
+            out.copy_(inp.flip(0))
+
+    import b12x.comm.pcie as pcie
+    monkeypatch.setattr(pcie, "DmaAllReduce", _CountingDma)
+    monkeypatch.setattr(collectives, "register_finalizer", lambda session, fn: None)
+
+    arena = ScratchArena("cpu", overlap=True)
+    arena._auxiliary_stream = SimpleNamespace(cuda_stream=41)
+    coord = SimpleNamespace(hosts=())
+
+    cases = [
+        (PreparedAllReduce, ConcurrentAllReduce, torch.arange(64, dtype=torch.bfloat16).reshape(8, 8),
+         torch.zeros(8, 8, dtype=torch.bfloat16)),
+        (PreparedReduceScatter, ConcurrentReduceScatter, torch.arange(64, dtype=torch.bfloat16).reshape(8, 8),
+         torch.zeros(2, 8, dtype=torch.bfloat16)),
+        (PreparedGatherShards, ConcurrentGatherShards, torch.arange(16, dtype=torch.bfloat16).reshape(2, 8),
+         torch.zeros(8, 8, dtype=torch.bfloat16)),
+        (PreparedAllGather, ConcurrentAllGather, torch.arange(16, dtype=torch.bfloat16).reshape(2, 8),
+         torch.zeros(4, 2, 8, dtype=torch.bfloat16)),
+        (PreparedAllToAll, ConcurrentAllToAll, torch.arange(64, dtype=torch.bfloat16).reshape(4, 2, 8),
+         torch.zeros(4, 2, 8, dtype=torch.bfloat16)),
+    ]
+
+    for op_cls, concurrent_cls, src, dst in cases:
+        runtime = _CountingDma(world=4)
+        send_buf = src.clone()
+        op = op_cls(src, dst, runtime=runtime, session=object(), coordinator=coord, name="ptr_test")
+        concurrent = concurrent_cls(
+            op, workspace=arena, session=object(), parallel_plans=(object(),), send_buffer=send_buf
+        )
+
+        # Spy on Tensor.copy_ targeted at send_buf only.
+        send_copies = 0
+        orig_copy_ = torch.Tensor.copy_
+
+        def tracked_copy_(self, other, *args, **kwargs):
+            nonlocal send_copies
+            if self.data_ptr() == send_buf.data_ptr():
+                send_copies += 1
+            return orig_copy_(self, other, *args, **kwargs)
+
+        monkeypatch.setattr(torch.Tensor, "copy_", tracked_copy_)
+        try:
+            # 1. Identical pointer: zero send_buf.copy_ calls, collective reads send_buf directly.
+            send_buf.fill_(3.0)
+            pending = concurrent.start(send_buf)
+            concurrent.finish(pending, torch.ones(1))
+            assert send_copies == 0
+            assert runtime.calls[-1][1] == send_buf.data_ptr()
+
+            # 2. Distinct pointer: send_buf.copy_(src) runs once and updates send_buf.
+            distinct = src + 1
+            pending2 = concurrent.start(distinct)
+            concurrent.finish(pending2, torch.ones(1))
+            assert send_copies == 1
+            assert torch.equal(send_buf, distinct)
+            assert runtime.calls[-1][1] == send_buf.data_ptr()
+        finally:
+            monkeypatch.setattr(torch.Tensor, "copy_", orig_copy_)

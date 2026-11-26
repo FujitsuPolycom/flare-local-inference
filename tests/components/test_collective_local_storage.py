@@ -10,9 +10,10 @@ import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 
 from ignition.components.collectives import (
-    ConcurrentAllGather, ConcurrentGatherShards, ConcurrentReduceScatter,
-    PreparedAllGather, PreparedAllReduce, PreparedChunkedAllGather,
-    PreparedGatherShards, PreparedReduceScatter,
+    ConcurrentAllGather, ConcurrentAllReduce, ConcurrentAllToAll,
+    ConcurrentGatherShards, ConcurrentReduceScatter,
+    PreparedAllGather, PreparedAllReduce, PreparedAllToAll,
+    PreparedChunkedAllGather, PreparedGatherShards, PreparedReduceScatter,
 )
 
 
@@ -136,3 +137,92 @@ def test_functional_all_reduce_fused_addend_with_dependencies():
     assert call.args[2].target == torch.ops.aten.empty_strided.default
     assert call.args[3][0].op == "placeholder"
     assert not any(node.target == torch.ops.aten.add.Tensor for node in graph.nodes)
+
+
+def test_concurrent_copy_input_controls_fx_clone_and_retains_live_ssa_source():
+    full = torch.ones((8, 8), dtype=torch.bfloat16)
+    shard = torch.ones((2, 8), dtype=torch.bfloat16)
+    a2a = torch.ones((4, 2, 8), dtype=torch.bfloat16)
+    dep = torch.ones(1)
+
+    def _make_cases(copy_input):
+        ar = PreparedAllReduce(full, full.clone(), runtime=None, session=None, coordinator=None, name="ar")
+        ar.single, ar.handle, ar.concurrent_input = False, 0, None
+        car = object.__new__(ConcurrentAllReduce)
+        car.reduce, car.stream_handle, car.copy_input = ar, 1, copy_input
+        car.functional(session=None)
+
+        rs = PreparedReduceScatter(full, full.clone(), runtime=None, session=None, coordinator=None, name="rs")
+        rs.single, rs.dma, rs.handle, rs.concurrent_input = False, True, 1, None
+        rs.output = shard.clone()
+        crs = object.__new__(ConcurrentReduceScatter)
+        crs.reduce, crs.stream_handle, crs.copy_input = rs, 1, copy_input
+        crs.functional(session=None)
+
+        gs = PreparedGatherShards(shard, shard.clone(), runtime=None, session=None, coordinator=None, name="gs")
+        gs.single, gs.dma, gs.handle, gs.concurrent_input = False, True, 2, None
+        gs.output = full.clone()
+        cgs = object.__new__(ConcurrentGatherShards)
+        cgs.gather, cgs.stream_handle, cgs.copy_input = gs, 1, copy_input
+        cgs.functional(session=None)
+
+        aa = PreparedAllToAll(a2a, a2a.clone(), runtime=None, session=None, coordinator=None, name="a2a")
+        aa.single, aa.dma, aa.handle, aa.concurrent_input = False, True, 3, None
+        caa = object.__new__(ConcurrentAllToAll)
+        caa.all_to_all, caa.stream_handle, caa.copy_input = aa, 1, copy_input
+        caa.functional(session=None)
+
+        return (
+            (car, full, torch.ops.flare.start_all_reduce.default, torch.ops.flare.join_all_reduce.default),
+            (crs, full, torch.ops.flare.start_reduce_scatter.default, torch.ops.flare.join_reduce_scatter.default),
+            (cgs, shard, torch.ops.flare.start_gather_shards.default, torch.ops.flare.join_gather_shards.default),
+            (caa, a2a, torch.ops.flare.start_all_to_all.default, torch.ops.flare.join_all_to_all.default),
+        )
+
+    # Default copy_input=True emits aten.clone and retains the cloned send tensor until join.
+    for concurrent, sample, start_op, join_op in _make_cases(copy_input=True):
+        def forward_copy(x, d):
+            pending = concurrent.start(x * 2, dependencies=(d,))
+            local = x + 3
+            return concurrent.finish(pending, local)
+
+        graph = make_fx(forward_copy, tracing_mode="fake")(sample, dep).graph
+        start, = [n for n in graph.nodes if n.target == start_op]
+        join, = [n for n in graph.nodes if n.target == join_op]
+        clones = [n for n in graph.nodes if n.target == torch.ops.aten.clone.default]
+        assert len(clones) == 1
+        assert start.args[0] is clones[0]
+        assert join.args[:3] == start.args[:3]
+
+    # Opt-in copy_input=False emits zero aten.clone nodes and retains the functional SSA source in join.
+    for concurrent, sample, start_op, join_op in _make_cases(copy_input=False):
+        def forward_zerocopy(x, d):
+            pending = concurrent.start(x * 2, dependencies=(d,))
+            local = x + 3
+            return concurrent.finish(pending, local)
+
+        graph = make_fx(forward_zerocopy, tracing_mode="fake")(sample, dep).graph
+        start, = [n for n in graph.nodes if n.target == start_op]
+        join, = [n for n in graph.nodes if n.target == join_op]
+        clones = [n for n in graph.nodes if n.target == torch.ops.aten.clone.default]
+        assert not clones
+        assert start.args[0].target == torch.ops.aten.mul.Tensor
+        assert join.args[0] is start.args[0]
+        assert join.args[:3] == start.args[:3]
+
+    # ConcurrentAllGather defaults to zero-copy (copy_input=False) and clones when copy_input=True.
+    gather = PreparedAllGather(shard, shard.clone(), runtime=None, session=None, coordinator=None, name="ag")
+    gather.handle = 4
+    cag = object.__new__(ConcurrentAllGather)
+    cag.gather, cag.stream_handle, cag.copy_input = gather, 1, True
+    cag.functional(session=None)
+
+    def forward_ag(x, d):
+        pending = cag.start(x * 2, dependencies=(d,))
+        return cag.finish(pending, x + 3)
+
+    graph = make_fx(forward_ag, tracing_mode="fake")(shard, dep).graph
+    start, = [n for n in graph.nodes if n.target == torch.ops.flare.start_all_gather.default]
+    join, = [n for n in graph.nodes if n.target == torch.ops.flare.join_all_gather.default]
+    clones = [n for n in graph.nodes if n.target == torch.ops.aten.clone.default]
+    assert len(clones) == 1 and start.args[0] is clones[0] and join.args[0] is clones[0]
