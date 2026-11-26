@@ -16,7 +16,7 @@ from threading import get_ident
 
 import torch
 from b12x.preparation import (
-    AutotuneEffort, MemoryRequirements, PreparationDisplay, PreparationSession,
+    AutotuneEffort, FrozenMapping, MemoryRequirements, PreparationDisplay, PreparationSession,
     autotune_effort as b12x_autotune_effort,
 )
 from b12x.preparation.session import _declaration_key, _plans_of
@@ -515,7 +515,7 @@ class RecordedPreparationSession(PreparationSession):
                 selections.append({"name": request.name, "component": request.plan.component_id,
                     "source": selection.source,
                     "config": request.plan.contract.config_payload(selection.config).to_dict(),
-                    "coverage": dict(coverage.get(request.name, {}))})
+                    "coverage": FrozenMapping(coverage.get(request.name, {})).to_dict()})
             if self._coordinator is not None and (self._sharded or self._coordinator.spans_hosts):
                 self._coordinator.agree_selections(selections)
             self._tune_status = "finalizing"

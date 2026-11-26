@@ -487,3 +487,151 @@ def test_concurrent_row_shard_validation_and_scratch_checks(
     dma_op.plan.scratch_nbytes = 256
     with pytest.raises(ValueError, match="requires a plan without caller scratch"):
         concurrent.validate_scratch()
+
+
+class _FakeIslandAllReduce:
+    """Stand-in for TP16 `b12x.comm.pcie.AllReduce` with an active island runtime."""
+
+    def __init__(self, *, world=16, max_elements=1024 * 7168, override="island_rs", has_island=True):
+        self.world_size = world
+        self._algorithm_override = override
+        self._island_rs = (
+            SimpleNamespace(max_elements=max_elements, group=object()) if has_island else None
+        )
+        self.calls = []
+        self.plans = []
+
+    def should_reduce_scatter(self, inp):
+        return self._island_rs is not None and inp.numel() <= self._island_rs.max_elements
+
+    def should_all_gather(self, inp):
+        return self._island_rs is not None and inp.numel() * self.world_size <= self._island_rs.max_elements
+
+    def should_row_to_col_all_to_all(self, inp):
+        return (
+            self._island_rs is not None
+            and inp.ndim == 2
+            and inp.shape[1] % (self.world_size * 2) == 0
+            and inp.numel() <= self._island_rs.max_elements
+        )
+
+    def plan(self, inp, *, operation, out=None, transport=None):
+        p = SimpleNamespace(
+            operation=operation,
+            shape=tuple(inp.shape),
+            out_shape=None if out is None else tuple(out.shape),
+            transport=transport,
+            scratch_nbytes=0,
+            memory_requirements=lambda: SimpleNamespace(scratch_nbytes=p.scratch_nbytes),
+            request=lambda **kwargs: SimpleNamespace(**kwargs),
+        )
+        self.plans.append(p)
+        return p
+
+    def reduce_scatter(self, inp, *, out, plan):
+        self.calls.append(("reduce_scatter", tuple(inp.shape), tuple(out.shape), plan.operation))
+        out.copy_(inp.view(self.world_size, *out.shape).sum(dim=0))
+
+    def all_gather(self, inp, *, out, plan):
+        self.calls.append(("all_gather", tuple(inp.shape), tuple(out.shape), plan.operation))
+        for r in range(self.world_size):
+            out[r].copy_(inp + r)
+
+    def row_to_col_all_to_all(self, inp, *, out, plan):
+        self.calls.append(("row_to_col_all_to_all", tuple(inp.shape), tuple(out.shape), plan.operation))
+        st, full_c = inp.shape
+        c = full_c // self.world_size
+        out.view(self.world_size, st, c)[:] = inp[:, :c]
+
+
+def test_tp16_island_row_shard_and_all_to_all_dispatch(monkeypatch):
+    import b12x.comm.pcie as pcie
+    import b12x.comm.pcie._owner_preparation as owner_prep
+    from ignition.components import collectives
+    from ignition.components.collectives import (
+        ConcurrentGatherShards,
+        ConcurrentReduceScatter,
+        ConcurrentRowToColAllToAll,
+        PreparedGatherShards,
+        PreparedReduceScatter,
+        PreparedRowToColAllToAll,
+    )
+    from ignition.preparation.scratch import ScratchArena
+
+    monkeypatch.setattr(pcie, "AllReduce", _FakeIslandAllReduce)
+    declarations = []
+    monkeypatch.setattr(collectives, "declare", lambda session, requests, coordinator=None: declarations.extend(requests))
+    monkeypatch.setattr(collectives, "register_finalizer", lambda session, fn: None)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda group: list(range(16)))
+    monkeypatch.setattr(
+        owner_prep,
+        "prepared_call",
+        lambda state, *, inp, out: SimpleNamespace(run=lambda: (inp.shape, out.shape), output=out, capture_safe=True, owners=()),
+    )
+
+    rt = _FakeIslandAllReduce()
+    assert collectives.row_shard_surfaces(rt)
+    assert not collectives.row_shard_surfaces(_FakeIslandAllReduce(override="hierarchical"))
+    assert not collectives.row_shard_surfaces(_FakeIslandAllReduce(has_island=False))
+
+    rs_src = torch.ones(32, 16, dtype=torch.bfloat16)
+    rs_dst = torch.zeros(2, 16, dtype=torch.bfloat16)
+    ag_dst = torch.zeros(32, 16, dtype=torch.bfloat16)
+    a2a_src = torch.ones(2, 32, dtype=torch.bfloat16)
+    a2a_dst = torch.zeros(32, 2, dtype=torch.bfloat16)
+
+    assert PreparedReduceScatter.fits(rt, rs_src, rs_dst)
+    assert PreparedGatherShards.fits(rt, rs_dst, ag_dst)
+    assert PreparedRowToColAllToAll.fits(rt, a2a_src, a2a_dst)
+
+    rs = PreparedReduceScatter(rs_src, rs_dst, runtime=rt, session=object(), coordinator=SimpleNamespace(hosts=()), name="isl.rs")
+    ag = PreparedGatherShards(rs_dst, ag_dst, runtime=rt, session=object(), coordinator=SimpleNamespace(hosts=()), name="isl.ag")
+    a2a = PreparedRowToColAllToAll(a2a_src, a2a_dst, runtime=rt, session=object(), coordinator=SimpleNamespace(hosts=()), name="isl.a2a")
+    rs_conc = PreparedReduceScatter(rs_src, rs_dst, runtime=rt, session=object(), coordinator=SimpleNamespace(hosts=()), name="isl.rs.conc", concurrent=True)
+    ag_conc = PreparedGatherShards(rs_dst, ag_dst, runtime=rt, session=object(), coordinator=SimpleNamespace(hosts=()), name="isl.ag.conc", concurrent=True)
+    assert rs.pcie and not rs.dma
+    assert ag.pcie and not ag.dma
+    assert a2a.pcie
+    assert rs_conc.pcie and ag_conc.pcie
+    assert [(p.operation, p.transport) for p in rt.plans] == [
+        ("reduce_scatter", None),
+        ("all_gather", None),
+        ("row_to_col_all_to_all", None),
+        ("reduce_scatter", "ce_local"),
+        ("all_gather", "ce_local"),
+    ]
+
+    assert rs(rs_src) is rs_dst
+    assert ag(rs_dst) is ag_dst
+    assert a2a(a2a_src) is a2a_dst
+    assert rt.calls == [
+        ("reduce_scatter", (32, 16), (2, 16), "reduce_scatter"),
+        ("all_gather", (2, 16), (16, 2, 16), "all_gather"),
+        ("row_to_col_all_to_all", (2, 32), (32, 2), "row_to_col_all_to_all"),
+    ]
+
+    # Concurrent wrappers accept TP16 island ops and register parallel plans.
+    arena = ScratchArena("cpu", overlap=True)
+    arena._auxiliary_stream = SimpleNamespace(cuda_stream=23)
+    local_plan = object()
+    crs = ConcurrentReduceScatter(rs, workspace=arena, session=object(), parallel_plans=(local_plan,))
+    cag = ConcurrentGatherShards(ag, workspace=arena, session=object(), parallel_plans=(local_plan,))
+    ca2a = ConcurrentRowToColAllToAll(a2a, workspace=arena, session=object(), parallel_plans=(local_plan,))
+    assert arena._parallel_plans == [(rs.plan, local_plan), (ag.plan, local_plan), (a2a.plan, local_plan)]
+    crs.validate_scratch()
+    cag.validate_scratch()
+    ca2a.validate_scratch()
+
+    started = []
+    monkeypatch.setattr(collectives, "_start_reduce_scatter", lambda send, *args: started.append(("rs", send)))
+    monkeypatch.setattr(collectives, "_start_gather_shards", lambda send, *args: started.append(("ag", send)))
+    monkeypatch.setattr(collectives, "_start_row_to_col_all_to_all", lambda send, *args: started.append(("a2a", send)))
+    p_rs_clone = crs.start(rs_src)
+    p_rs_direct = crs.start(rs_src, clone=False)
+    p_ag_direct = cag.start(rs_dst, clone=False)
+    p_a2a_direct = ca2a.start(a2a_src, clone=False)
+    assert p_rs_clone.source is not rs_src
+    assert p_rs_direct.source is rs_src
+    assert p_ag_direct.source is rs_dst
+    assert p_a2a_direct.source is a2a_src
+    assert started[-3:] == [("rs", rs_src), ("ag", rs_dst), ("a2a", a2a_src)]
