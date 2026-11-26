@@ -133,17 +133,47 @@ impl RequestScheduler {
         let right = physical(larger);
         if smaller.kind != larger.kind || smaller.mask != larger.mask
             || smaller.prefill_slot != larger.prefill_slot
-            || left == right || left.iter().zip(right).any(|(a, b)| *a > b) {
+            || left == right {
             return false;
         }
         if smaller.kind == GraphKind::Speculative {
+            let gpu_smaller = self.gpu_prefix_allocation(
+                smaller.batch, smaller.draft_tokens, smaller.capacity, smaller.packed_token_capacity,
+            );
+            if gpu_smaller
+                && smaller.batch < larger.batch
+                && smaller.capacity == larger.capacity
+                && smaller.draft_tokens == larger.draft_tokens
+                && smaller.packed_token_capacity != 0
+                && larger.packed_token_capacity != 0
+                && self.gpu_prefix_allocation(
+                    larger.batch, larger.draft_tokens, larger.capacity, larger.packed_token_capacity,
+                )
+            {
+                let long = long();
+                let needed = long.iter().sum::<usize>().min(larger.packed_token_capacity);
+                if smaller.packed_token_capacity >= needed {
+                    return true;
+                }
+                if left.iter().zip(right).any(|(a, b)| *a > b) {
+                    return false;
+                }
+                let short = short();
+                if smaller.packed_token_capacity != larger.packed_token_capacity
+                    && short.iter().sum::<usize>() > smaller.packed_token_capacity { return false; }
+                return short == long;
+            }
+            if left.iter().zip(right).any(|(a, b)| *a > b) {
+                return false;
+            }
             let short = short();
             let long = long();
-            let gpu = self.gpu_prefix_allocation(smaller.batch, smaller.draft_tokens, smaller.capacity,
-                smaller.packed_token_capacity);
-            if gpu && smaller.packed_token_capacity != larger.packed_token_capacity
+            if gpu_smaller && smaller.packed_token_capacity != larger.packed_token_capacity
                 && short.iter().sum::<usize>() > smaller.packed_token_capacity { return false; }
             return short == long;
+        }
+        if left.iter().zip(right).any(|(a, b)| *a > b) {
+            return false;
         }
         if smaller.kind.is_prefill() {
             return smaller.work == larger.work;
@@ -187,6 +217,40 @@ impl RequestScheduler {
                     dominated[index] = peers.iter().any(|&other| self.dominates_padding_with(
                         &candidates[other], &candidates[index], || length(other), || length(index)));
                 }
+            }
+            // Reject padded GPU-allocated ragged speculative batch capacities when a strictly
+            // tighter prepared batch fits the active cohort with at least as much usable target
+            // token capacity (even when ragged token grids differ across batch buckets, such as
+            // B=4 vs B=6/8).
+            for (index, candidate) in candidates.iter().enumerate() {
+                if dominated[index]
+                    || candidate.kind != GraphKind::Speculative
+                    || candidate.packed_token_capacity == 0
+                    || !self.gpu_prefix_allocation(
+                        candidate.batch,
+                        candidate.draft_tokens,
+                        candidate.capacity,
+                        candidate.packed_token_capacity,
+                    )
+                {
+                    continue;
+                }
+                let lanes = candidate.mask.count_ones() as usize;
+                let needed = length(index).iter().sum::<usize>().min(candidate.packed_token_capacity);
+                dominated[index] = candidates.iter().any(|other| {
+                    other.kind == GraphKind::Speculative
+                        && other.batch >= lanes
+                        && other.batch < candidate.batch
+                        && other.capacity == candidate.capacity
+                        && other.draft_tokens == candidate.draft_tokens
+                        && other.packed_token_capacity >= needed
+                        && self.gpu_prefix_allocation(
+                            other.batch,
+                            other.draft_tokens,
+                            other.capacity,
+                            other.packed_token_capacity,
+                        )
+                });
             }
             dominated
         };

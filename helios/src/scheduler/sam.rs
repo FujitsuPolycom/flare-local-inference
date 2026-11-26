@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 /// Default minimum context suffix length required to emit a copy proposal.
-pub const DEFAULT_MIN_MATCH_LEN: usize = 3;
+pub const DEFAULT_MIN_MATCH_LEN: usize = 6;
 
 /// Maximum number of trailing prompt tokens indexed by default (128 Ki tokens).
 pub const DEFAULT_MAX_PROMPT_TOKENS: usize = 131_072;
@@ -1284,49 +1284,57 @@ mod tests {
     fn prompt_only_match_succeeds_with_zero_prior_output() {
         // Code-edit / RAG scenario: prompt contains a function definition, and the first
         // generated tokens begin quoting it with zero prior decoded output matches.
-        let prompt = vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 20, 30, 40];
-        let mut sam = PromptOutputSAM::new(&prompt);
-        // Even at output_len == 0, prompt self-match finds the earlier [20, 30, 40].
-        let p0 = sam.propose(7).expect("expected prompt match at output_len=0");
-        assert_eq!(p0.match_len, 3);
-        assert_eq!(p0.endpos, 3);
-        assert_eq!(p0.source, MatchSource::Prompt);
-        assert_eq!(p0.tokens, vec![50, 60, 70, 80, 90, 100, 110]);
+        assert_eq!(DEFAULT_MIN_MATCH_LEN, 6);
+        let short_prompt = vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 20, 30, 40, 50, 60];
+        let short_sam = PromptOutputSAM::new(&short_prompt);
+        assert_eq!(short_sam.propose(7), None, "5-token match must not trigger default min_match_len=6");
 
-        // After prefill emits the first output token `50`, suffix [20, 30, 40, 50] matches prompt.
-        sam.push_token(50);
+        let prompt = vec![
+            10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140,
+            20, 30, 40, 50, 60, 70,
+        ];
+        let mut sam = PromptOutputSAM::new(&prompt);
+        // Even at output_len == 0, prompt self-match finds the earlier [20..=70].
+        let p0 = sam.propose(7).expect("expected prompt match at output_len=0");
+        assert_eq!(p0.match_len, 6);
+        assert_eq!(p0.endpos, 6);
+        assert_eq!(p0.source, MatchSource::Prompt);
+        assert_eq!(p0.tokens, vec![80, 90, 100, 110, 120, 130, 140]);
+
+        // After prefill emits the first output token `80`, suffix [20..=80] matches prompt.
+        sam.push_token(80);
         let p1 = sam.propose(7).expect("expected prompt match after first output token");
-        assert_eq!(p1.match_len, 4);
-        assert_eq!(p1.endpos, 4);
+        assert_eq!(p1.match_len, 7);
+        assert_eq!(p1.endpos, 7);
         assert_eq!(p1.source, MatchSource::Prompt);
-        assert_eq!(p1.tokens, vec![60, 70, 80, 90, 100, 110, 20]);
+        assert_eq!(p1.tokens, vec![90, 100, 110, 120, 130, 140, 20]);
     }
 
     #[test]
     fn output_overrides_prompt_recency_on_tie() {
-        // Prompt contains `fn foo() -> i32` = [1, 2, 3, 4, 10, 11, 12].
-        // Output edits it to `fn foo() -> u64` = [1, 2, 3, 4, 99, 98, 97], then repeats [1, 2, 3, 4].
-        let prompt = vec![1, 2, 3, 4, 10, 11, 12, 200, 201];
+        // Prompt contains `fn foo() -> i32` = [1, 2, 3, 4, 5, 6, 10, 11, 12].
+        // Output edits it to `fn foo() -> u64` = [1, 2, 3, 4, 5, 6, 99, 98, 97], then repeats [1..=6].
+        let prompt = vec![1, 2, 3, 4, 5, 6, 10, 11, 12, 200, 201];
         let mut sam = PromptOutputSAM::new(&prompt);
-        sam.push_slice(&[1, 2, 3, 4, 99, 98, 97, 300, 1, 2, 3, 4]);
+        sam.push_slice(&[1, 2, 3, 4, 5, 6, 99, 98, 97, 300, 1, 2, 3, 4, 5, 6]);
         let proposal = sam.propose(5).expect("expected recency-updated output match");
         assert_eq!(proposal.source, MatchSource::Output);
-        assert_eq!(proposal.match_len, 4);
+        assert_eq!(proposal.match_len, 6);
         assert_eq!(proposal.tokens, vec![99, 98, 97, 300, 1]);
     }
 
     #[test]
     fn boundary_straddling_match_spans_prompt_into_output() {
-        // Prompt ends with [10, 20, 30]; output starts with [40, 50, 60, 70, 999, 10, 20, 30, 40].
-        // Longest suffix [10, 20, 30, 40] starts in prompt and ends in output!
-        let prompt = vec![1, 2, 3, 10, 20, 30];
+        // Prompt ends with [10, 20, 30, 40, 50]; output starts with [60, 70, 80, 90, 999, 10..=60].
+        // Longest suffix [10, 20, 30, 40, 50, 60] starts in prompt and ends in output!
+        let prompt = vec![1, 2, 3, 10, 20, 30, 40, 50];
         let mut sam = PromptOutputSAM::new(&prompt);
-        sam.push_slice(&[40, 50, 60, 70, 999, 10, 20, 30, 40]);
+        sam.push_slice(&[60, 70, 80, 90, 999, 10, 20, 30, 40, 50, 60]);
         let proposal = sam.propose(7).expect("expected boundary-straddling match");
-        assert_eq!(proposal.match_len, 4);
-        assert_eq!(proposal.endpos, 6);
+        assert_eq!(proposal.match_len, 6);
+        assert_eq!(proposal.endpos, 8);
         assert_eq!(proposal.source, MatchSource::Output);
-        assert_eq!(proposal.tokens, vec![50, 60, 70, 999, 10, 20, 30]);
+        assert_eq!(proposal.tokens, vec![70, 80, 90, 999, 10, 20, 30]);
 
         // Also test boundary-straddling match exceeding a small boundary_overlap via leftward extension.
         let cfg = SamConfig {
@@ -1355,16 +1363,18 @@ mod tests {
         assert_eq!(empty.state_count(), 1);
         empty.push_token(42);
         assert_eq!(empty.propose(7), None);
-        empty.push_slice(&[42, 42, 42, 42]);
+        empty.push_slice(&[42, 42, 42, 42, 42]);
+        assert_eq!(empty.propose(7), None, "5-token self-overlap is below default min_match_len=6");
+        empty.push_token(42);
         let p = empty.propose(7).expect("expected output-only match on empty prompt");
-        assert_eq!(p.match_len, 4);
+        assert_eq!(p.match_len, 6);
         assert_eq!(p.tokens, vec![42]);
 
         let single = PromptOutputSAM::new(&[7]);
         assert_eq!(single.propose(7), None);
         assert!(single.state_count() <= 2);
 
-        // min_match_len = 2 vs 3 vs 4 and max_draft_len = 0, 1, 23
+        // min_match_len = 2 vs 3 vs 6 and max_draft_len = 0, 1, 23
         let prompt = vec![5, 6, 7, 8, 9, 10, 5, 6];
         let sam2 = PromptOutputSAM::with_config(
             &prompt,
@@ -1473,7 +1483,7 @@ mod tests {
             corpus.push(tok);
         }
         let actual = sam.propose(7);
-        let expected = brute_force_oracle(&corpus, prompt.len(), &corpus, 3, 7);
+        let expected = brute_force_oracle(&corpus, prompt.len(), &corpus, DEFAULT_MIN_MATCH_LEN, 7);
         assert_eq!(actual, expected);
         assert_eq!(actual.unwrap().tokens[0], 3);
     }
@@ -1482,13 +1492,13 @@ mod tests {
     fn conditional_continuations_match_oracle_for_all_prefix_lengths() {
         let prompt = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
         let mut sam = PromptOutputSAM::new(&prompt);
-        sam.push_slice(&[100, 1, 2, 3, 99, 98, 200, 1, 2, 3]);
+        sam.push_slice(&[100, 1, 2, 3, 4, 5, 6, 99, 98, 200, 1, 2, 3, 4, 5, 6]);
         let mut corpus = prompt.clone();
-        corpus.extend_from_slice(&[100, 1, 2, 3, 99, 98, 200, 1, 2, 3]);
+        corpus.extend_from_slice(&[100, 1, 2, 3, 4, 5, 6, 99, 98, 200, 1, 2, 3, 4, 5, 6]);
 
-        // Active drafts branch across both output-matching (99, 98) and prompt-matching (4, 5, 6) paths.
+        // Active drafts branch across both output-matching (99, 98) and prompt-matching (7, 8, 9) paths.
         for active_drafts in [
-            vec![4, 5, 6, 7, 8, 9, 10],
+            vec![7, 8, 9, 10, 11, 12, 13],
             vec![99, 98, 200, 1, 2, 3, 4],
             vec![777, 1, 2, 3, 4, 5, 6],
         ] {
@@ -1497,7 +1507,7 @@ mod tests {
             for a in 0..=active_drafts.len() {
                 let mut query = corpus.clone();
                 query.extend_from_slice(&active_drafts[..a]);
-                let expected = brute_force_oracle(&corpus, prompt.len(), &query, 3, 7);
+                let expected = brute_force_oracle(&corpus, prompt.len(), &query, DEFAULT_MIN_MATCH_LEN, 7);
                 assert_eq!(cond[a], expected, "conditional mismatch at a={a}");
             }
         }
@@ -1516,11 +1526,11 @@ mod tests {
         assert_eq!(req_a.dynamic_memory_bytes(), 0);
         assert_eq!(req_b.dynamic_memory_bytes(), 0);
 
-        req_a.push_slice(&[900, 901, 902, 903, 904, 905, 900, 901, 902]);
-        req_b.push_slice(&[800, 801, 802, 803, 804, 805, 900, 901, 902]);
+        req_a.push_slice(&[900, 901, 902, 903, 904, 905, 906, 907, 908, 900, 901, 902, 903, 904, 905]);
+        req_b.push_slice(&[800, 801, 802, 803, 804, 805, 806, 807, 808, 900, 901, 902, 903, 904, 905]);
 
         let pa = req_a.propose(4).expect("req_a should match its own output");
-        assert_eq!(pa.tokens, vec![903, 904, 905, 900]);
+        assert_eq!(pa.tokens, vec![906, 907, 908, 900]);
         assert_eq!(req_b.propose(4), None, "req_b must not see req_a outputs");
 
         // Verify prompt cap bounds indexed tokens and states for oversized prompts.

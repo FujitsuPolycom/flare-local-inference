@@ -62,6 +62,139 @@ fn equal_counts_from_different_cohorts_and_different_logical_prefixes_are_not_pr
 }
 
 #[test]
+fn tight_batch_prunes_wider_padded_ragged_speculative_shapes_for_active_cohort() {
+    // Reproduces disjoint ragged token budgets across batch buckets (e.g., B=4 P=[5,8,13,20,32]
+    // vs wider padded B=8 P=[9,11,14,18,24,31,64]): a 4-request cohort must stay on tight B=4
+    // even if a wider padded batch reports a faster duration at an intermediate P=11.
+    let mut s = engine(8, true);
+    let b4_shapes = [5usize, 8, 13, 20, 32];
+    let b8_shapes = [9usize, 11, 14, 18, 24, 31, 64];
+    let mut graphs = super::tests::duration_graphs(8);
+    graphs.retain(|g| !(g.kind == GraphKind::Speculative && g.token_capacity > 1));
+    let mut allocations = Vec::new();
+    for &p in &b4_shapes {
+        allocations.push((4, 7, 8, p, crate::execution::PrefixAllocation::Gpu));
+        graphs.push(crate::execution::GraphDescriptor {
+            tuned_bindings: vec![],
+            confidence_width: 7,
+            draft_tokens: 7,
+            draft_source: None,
+            packed_token_capacity: p,
+            name: format!("packed-speculative4x8-drafts7-tokens{p}"),
+            kind: GraphKind::Speculative,
+            sampling_mode: SamplingMode::General,
+            handle: 1,
+            batch_capacity: 4,
+            token_capacity: 8,
+            prefill_capacity: 0,
+            estimated_duration_ns: 11 * MS,
+            input_bindings: vec![],
+        });
+    }
+    for &p in &b8_shapes {
+        allocations.push((8, 7, 8, p, crate::execution::PrefixAllocation::Gpu));
+        graphs.push(crate::execution::GraphDescriptor {
+            tuned_bindings: vec![],
+            confidence_width: 7,
+            draft_tokens: 7,
+            draft_source: None,
+            packed_token_capacity: p,
+            name: format!("packed-speculative8x8-drafts7-tokens{p}"),
+            kind: GraphKind::Speculative,
+            sampling_mode: SamplingMode::General,
+            handle: 1,
+            batch_capacity: 8,
+            token_capacity: 8,
+            prefill_capacity: 0,
+            // Deliberately faster than B=4 to prove pruning blocks padded batch leakage.
+            estimated_duration_ns: if p == 11 { 7 * MS } else { 10 * MS },
+            input_bindings: vec![],
+        });
+    }
+    s.capabilities.speculative_allocations = allocations;
+    s.measured_graph_durations(&graphs).unwrap();
+    s.enable_speculation(&[1, 8]).unwrap();
+
+    let handles = (0..4).map(|id| add(&mut s, id, 64, 4096)).collect::<Vec<_>>();
+    ready(&mut s, &handles);
+
+    let (values, age, _) = s.lane_values(s.window_remaining().unwrap());
+    let mut candidates = Vec::new();
+    s.candidates(&mut candidates, &values, age);
+    assert!(
+        candidates.iter().any(|c| c.kind == GraphKind::Speculative && c.batch == 8 && c.packed_token_capacity == 11),
+        "setup must expose padded B=8 P=11 candidate before pruning"
+    );
+    let count = s.prune_padding(&mut candidates);
+    let retained = &candidates[..count];
+    assert!(
+        retained.iter().any(|c| c.kind == GraphKind::Speculative && c.batch == 4 && c.packed_token_capacity == 13),
+        "tight B=4 ragged shapes must survive pruning"
+    );
+    assert!(
+        !retained.iter().any(|c| c.kind == GraphKind::Speculative && c.batch == 8 && c.capacity == 8),
+        "wider padded B=8 must be pruned for C=4 when tight B=4 covers full target token capacity"
+    );
+
+    let plan = s.plan().unwrap();
+    assert_eq!(plan.kind, GraphKind::Speculative);
+    assert_eq!(plan.batch_capacity, 4, "C=4 must select tight B=4, never padded B=8");
+    assert_eq!(plan.lanes.len(), 4);
+
+    // Negative check: when C=6 exceeds B=4, B=8 is no longer padded relative to B=4 and is selected.
+    let more = (4..6).map(|id| add(&mut s, id, 64, 4096)).collect::<Vec<_>>();
+    ready(&mut s, &more);
+    let plan6 = s.plan().unwrap();
+    assert_eq!(plan6.kind, GraphKind::Speculative);
+    assert_eq!(plan6.batch_capacity, 8, "C=6 exceeds B=4 and must be allowed to select B=8");
+    assert_eq!(plan6.lanes.len(), 6);
+}
+
+#[test]
+fn wider_speculative_batch_is_retained_when_tighter_batch_lacks_token_capacity() {
+    let mut s = engine(8, true);
+    let mut graphs = super::tests::duration_graphs(8);
+    graphs.retain(|g| !(g.kind == GraphKind::Speculative && g.token_capacity > 1));
+    s.capabilities.speculative_allocations = vec![
+        (4, 7, 8, 12, crate::execution::PrefixAllocation::Gpu),
+        (8, 7, 8, 28, crate::execution::PrefixAllocation::Gpu),
+    ];
+    for &(b, p, ns) in &[(4usize, 12usize, 10 * MS), (8, 28, 11 * MS)] {
+        graphs.push(crate::execution::GraphDescriptor {
+            tuned_bindings: vec![],
+            confidence_width: 7,
+            draft_tokens: 7,
+            draft_source: None,
+            packed_token_capacity: p,
+            name: format!("packed-speculative{b}x8-drafts7-tokens{p}"),
+            kind: GraphKind::Speculative,
+            sampling_mode: SamplingMode::General,
+            handle: 1,
+            batch_capacity: b,
+            token_capacity: 8,
+            prefill_capacity: 0,
+            estimated_duration_ns: ns,
+            input_bindings: vec![],
+        });
+    }
+    s.measured_graph_durations(&graphs).unwrap();
+    s.enable_speculation(&[1, 8]).unwrap();
+
+    let handles = (0..4).map(|id| add(&mut s, id, 64, 4096)).collect::<Vec<_>>();
+    ready(&mut s, &handles);
+
+    let (values, age, _) = s.lane_values(s.window_remaining().unwrap());
+    let mut candidates = Vec::new();
+    s.candidates(&mut candidates, &values, age);
+    let count = s.prune_padding(&mut candidates);
+    let retained = &candidates[..count];
+    assert!(
+        retained.iter().any(|c| c.kind == GraphKind::Speculative && c.batch == 8 && c.packed_token_capacity == 28),
+        "B=8 P=28 must remain available when B=4 only offers P=12 < 28"
+    );
+}
+
+#[test]
 fn prefill_keeps_candidate_without_resized_duration() {
     let mut s = engine(1, false);
     s.prefill_graphs(&[128, 256, 512]).unwrap();

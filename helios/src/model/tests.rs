@@ -865,10 +865,10 @@ fn history_draft_packing_forwards_per_request_prompt_sam_continuations() {
     scheduler.enable_history_drafts().unwrap();
     scheduler.fixed_speculative_width(Some(8)).unwrap();
 
-    // Prompt embeds [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20] and ends with [10, 11, 12].
+    // Prompt embeds [10..=22] and ends with [10, 11, 12, 13, 14] (prefill adds 15 -> match_len = 6).
     let mut prompt: Vec<u32> = (100..165).collect();
-    prompt[8..19].copy_from_slice(&[10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
-    prompt[62..65].copy_from_slice(&[10, 11, 12]);
+    prompt[8..21].copy_from_slice(&[10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]);
+    prompt[60..65].copy_from_slice(&[10, 11, 12, 13, 14]);
     let handle = scheduler
         .admit(RequestSpec {
             message_boundaries: vec![],
@@ -897,7 +897,7 @@ fn history_draft_packing_forwards_per_request_prompt_sam_continuations() {
         prompt_logprobs: false,
     });
 
-    // Init -> Prefill (emits `13`, completing [10, 11, 12, 13]) -> Snapshot.
+    // Init -> Prefill (emits `15`, completing [10, 11, 12, 13, 14, 15]) -> Snapshot.
     let mut fence = 1u64;
     while scheduler.request(handle).unwrap().phase != crate::scheduler::RequestPhase::Decode {
         let step = scheduler.plan().unwrap();
@@ -915,7 +915,7 @@ fn history_draft_packing_forwards_per_request_prompt_sam_continuations() {
             submission_sequence: fence as i64,
             consumed_tokens: consumed as i64,
             generated_tokens: if samples { 1 } else { req.generated_tokens as i64 },
-            token_id: if samples { 13 } else { -1 },
+            token_id: if samples { 15 } else { -1 },
             status: 1,
             ..Default::default()
         };
@@ -923,7 +923,7 @@ fn history_draft_packing_forwards_per_request_prompt_sam_continuations() {
         fence += 1;
     }
 
-    // Speculative round packs SAM prompt-copy tokens [14..=20] directly into copy_token_ids.
+    // Speculative round packs SAM prompt-copy tokens [16..=22] directly into copy_token_ids.
     let mut inputs = Inputs::new(&config, &self::manifest(&config)).unwrap();
     let step = scheduler.plan().unwrap();
     assert_eq!((step.kind, step.token_capacity), (GraphKind::Speculative, 8));
@@ -947,7 +947,7 @@ fn history_draft_packing_forwards_per_request_prompt_sam_continuations() {
         .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
         .collect();
     assert_eq!(copy_count, [7]);
-    assert_eq!(copy_ids, [14, 15, 16, 17, 18, 19, 20]);
+    assert_eq!(copy_ids, [16, 17, 18, 19, 20, 21, 22]);
 }
 
 #[test]

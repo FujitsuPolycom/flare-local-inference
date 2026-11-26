@@ -1998,17 +1998,18 @@ fn request_sam_proposes_prompt_continuations_and_isolates_requests() {
     s.enable_speculation(&[1, 2, 4, 8]).unwrap();
     s.fixed_speculative_width(Some(8)).unwrap();
 
-    // Prompt A contains a copiable span [10, 20, 30, 40, 50, 60, 70, 80] and ends with [10, 20, 30].
+    // Prompt A contains a copiable span [10..=100] and ends with [10, 20, 30, 40, 50]
+    // (prefill adds `60` -> 6-token match meeting DEFAULT_MIN_MATCH_LEN = 6).
     let mut prompt_a: Vec<u32> = (500..565).collect();
-    prompt_a[10..18].copy_from_slice(&[10, 20, 30, 40, 50, 60, 70, 80]);
-    prompt_a[62..65].copy_from_slice(&[10, 20, 30]);
+    prompt_a[10..20].copy_from_slice(&[10, 20, 30, 40, 50, 60, 70, 80, 90, 100]);
+    prompt_a[60..65].copy_from_slice(&[10, 20, 30, 40, 50]);
     let mut spec_a = spec(65, 32);
     spec_a.prompt = prompt_a;
     let a = s.admit(spec_a).unwrap();
 
-    // Prompt B ends with [10, 20, 30] but never saw [40, 50, 60, 70, 80].
+    // Prompt B ends with [10, 20, 30, 40, 50] but never saw [60, 70, 80, 90, 100].
     let mut prompt_b: Vec<u32> = (700..765).collect();
-    prompt_b[62..65].copy_from_slice(&[10, 20, 30]);
+    prompt_b[60..65].copy_from_slice(&[10, 20, 30, 40, 50]);
     let mut spec_b = spec(65, 32);
     spec_b.prompt = prompt_b;
     let b = s.admit(spec_b).unwrap();
@@ -2029,7 +2030,7 @@ fn request_sam_proposes_prompt_continuations_and_isolates_requests() {
     }
     s.complete(Fence(1), &init_rec, Default::default()).unwrap();
 
-    // Prefill A (emits first output token `40`) and B (emits first output token `40`).
+    // Prefill A (emits first output token `60`) and B (emits first output token `60`).
     let mut fence_id = 2u64;
     while s.request(a).unwrap().phase != RequestPhase::Decode
         || s.request(b).unwrap().phase != RequestPhase::Decode
@@ -2050,7 +2051,7 @@ fn request_sam_proposes_prompt_continuations_and_isolates_requests() {
                 submission_sequence: fence_id as i64,
                 consumed_tokens: consumed as i64,
                 generated_tokens: if samples { 1 } else { req.generated_tokens as i64 },
-                token_id: if samples { 40 } else { -1 },
+                token_id: if samples { 60 } else { -1 },
                 status: 1,
                 ..Default::default()
             };
@@ -2059,13 +2060,13 @@ fn request_sam_proposes_prompt_continuations_and_isolates_requests() {
         fence_id += 1;
     }
 
-    // Request A matches [10, 20, 30, 40] directly in its own prompt with zero prior output matches.
+    // Request A matches [10, 20, 30, 40, 50, 60] directly in its own prompt with zero prior output matches.
     let (ids_a, count_a) = s.request_history_proposal(a, 7);
     assert_eq!(count_a, 7);
-    assert_eq!(&ids_a[..4], &[50, 60, 70, 80]);
+    assert_eq!(&ids_a[..4], &[70, 80, 90, 100]);
 
     // Shared cross-request history did NOT ingest prompt A, and Request B sees zero prompt leakage.
-    assert_eq!(s.history_proposal(&[10, 20, 30, 40], 7).1, 0);
+    assert_eq!(s.history_proposal(&[10, 20, 30, 40, 50, 60], 7).1, 0);
     assert_eq!(s.request_history_proposal(b, 7).1, 0);
 
     // Output edits in Request A override its earlier prompt continuation on recency.
@@ -2077,16 +2078,16 @@ fn request_sam_proposes_prompt_continuations_and_isolates_requests() {
     comp[a.slot as usize] = CompletionRecord {
         generation: a.generation as i64,
         submission_sequence: fence_id as i64,
-        consumed_tokens: 72,
-        generated_tokens: 8,
-        token_id: 40,
+        consumed_tokens: 73,
+        generated_tokens: 9,
+        token_id: 60,
         status: 1,
         vector: Some(crate::execution::TokenVector {
-            emitted_count: 7,
+            emitted_count: 8,
             offered_drafts: 7,
-            accepted_drafts: 6,
+            accepted_drafts: 7,
             verification_width: 8,
-            tokens: vec![99, 98, 97, 10, 20, 30, 40, -1],
+            tokens: vec![99, 98, 10, 20, 30, 40, 50, 60],
             ..Default::default()
         }),
         ..Default::default()
@@ -2095,7 +2096,7 @@ fn request_sam_proposes_prompt_continuations_and_isolates_requests() {
     fence_id += 1;
     let (ids_after, count_after) = s.request_history_proposal(a, 7);
     assert_eq!(count_after, 7);
-    assert_eq!(&ids_after[..3], &[99, 98, 97]);
+    assert_eq!(&ids_after[..2], &[99, 98]);
 
     // A failed completion (status == 3) must not corrupt A's SAM state.
     let before_out_len = s.request(a).unwrap().sam().unwrap().output_len();
@@ -2105,8 +2106,8 @@ fn request_sam_proposes_prompt_continuations_and_isolates_requests() {
     failed[a.slot as usize] = CompletionRecord {
         generation: a.generation as i64,
         submission_sequence: fence_id as i64,
-        consumed_tokens: 72,
-        generated_tokens: 8,
+        consumed_tokens: 73,
+        generated_tokens: 9,
         token_id: -1,
         status: 3,
         error_code: 1,
