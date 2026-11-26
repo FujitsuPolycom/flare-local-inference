@@ -1805,7 +1805,7 @@ fn mixed_engine(
             .unwrap();
     }
     for &(batch, width, prefill, nanos) in shapes {
-        graphs.push(crate::execution::GraphDescriptor { tuned_bindings: vec![], confidence_width: 0, draft_tokens: 0, packed_token_capacity: 0,
+        graphs.push(crate::execution::GraphDescriptor { tuned_bindings: vec![], confidence_width: 0, draft_tokens: 0, draft_source: None, packed_token_capacity: 0,
             name: format!("mixed-{batch}-{prefill}-{width}"),
             kind: GraphKind::Mixed,
             sampling_mode: SamplingMode::General,
@@ -3565,7 +3565,7 @@ fn joined_round_engine(allocation: crate::execution::PrefixAllocation) -> Reques
         confidence_width: if allocation == crate::execution::PrefixAllocation::Gpu { 7 } else { 0 },
         name: "speculative-b2-d7-w8-p5".into(),
         kind: GraphKind::Speculative, sampling_mode: SamplingMode::General,
-        draft_tokens: 7, handle: 1, batch_capacity: 2, token_capacity: 8,
+        draft_tokens: 7, draft_source: Some(super::speculation::ProposalSource::Mtp), handle: 1, batch_capacity: 2, token_capacity: 8,
         packed_token_capacity: 5, prefill_capacity: 0, estimated_duration_ns: MS, input_bindings: vec![] };
     graphs.push(graph);
     scheduler.measured_graph_durations(&graphs).unwrap();
@@ -3710,7 +3710,7 @@ fn funded_acceptance_probe_compares_offered_prefixes_across_equal_width_budgets(
     for (packed, duration) in [(4, MS), (7, 13 * MS / 10)] {
         graphs.push(crate::execution::GraphDescriptor { tuned_bindings: vec![], confidence_width: 0,
             name: format!("speculative-b2-d7-w8-p{packed}"), kind: GraphKind::Speculative,
-            sampling_mode: SamplingMode::General, draft_tokens: 7, handle: 1,
+            sampling_mode: SamplingMode::General, draft_tokens: 7, draft_source: Some(super::speculation::ProposalSource::Mtp), handle: 1,
             batch_capacity: 2, token_capacity: 8, packed_token_capacity: packed,
             prefill_capacity: 0, estimated_duration_ns: duration, input_bindings: vec![] });
     }
@@ -3850,7 +3850,7 @@ fn registered_ragged_graphs_preserve_physical_width_above_average_row_budget() {
                 name: format!("speculative-b{batch}-d7-w8-p{packed}"),
                 kind: GraphKind::Speculative, sampling_mode: SamplingMode::General,
                 confidence_width: if allocation == PrefixAllocation::Gpu { 7 } else { 0 },
-                draft_tokens: 7, handle: 1, batch_capacity: batch, token_capacity: 8,
+                draft_tokens: 7, draft_source: Some(super::speculation::ProposalSource::Mtp), handle: 1, batch_capacity: batch, token_capacity: 8,
                 packed_token_capacity: packed, prefill_capacity: 0,
                 estimated_duration_ns: MS, input_bindings: vec![],
             });
@@ -3903,7 +3903,7 @@ fn fixed_host_round_engine(batch: usize, packed: usize) -> RequestScheduler {
     for graph in &mut graphs { graph.estimated_duration_ns = 10 * MS; }
     graphs.push(crate::execution::GraphDescriptor { tuned_bindings: vec![], confidence_width: 0,
         name: format!("speculative-b{batch}-d7-w8-p{packed}"), kind: GraphKind::Speculative,
-        sampling_mode: SamplingMode::General, draft_tokens: 7, handle: 1,
+        sampling_mode: SamplingMode::General, draft_tokens: 7, draft_source: Some(super::speculation::ProposalSource::Mtp), handle: 1,
         batch_capacity: batch, token_capacity: 8, packed_token_capacity: packed,
         prefill_capacity: 0, estimated_duration_ns: MS, input_bindings: vec![] });
     scheduler.measured_graph_durations(&graphs).unwrap();
@@ -3991,6 +3991,7 @@ fn fixed_host_speculative_duration_ignores_unmeasured_same_width_sibling() {
     graphs.push(crate::execution::GraphDescriptor {
         tuned_bindings: vec![],
         confidence_width: 0,
+        draft_source: Some(super::speculation::ProposalSource::Mtp),
         name: "speculative-b4-d7-w8-p5".into(),
         kind: GraphKind::Speculative,
         sampling_mode: SamplingMode::General,
@@ -4032,6 +4033,7 @@ fn continuation_candidate_ignores_unmeasured_full_speculative_sibling() {
     graphs.push(crate::execution::GraphDescriptor {
         tuned_bindings: vec![],
         confidence_width: 0,
+        draft_source: Some(super::speculation::ProposalSource::Mtp),
         name: "speculative-b4-d7-w8-p16".into(),
         kind: GraphKind::Speculative,
         sampling_mode: SamplingMode::General,
@@ -4080,7 +4082,7 @@ fn mixed_tail_planning_cpu_measurement() {
         for &(batch, packed) in &shapes {
             graphs.push(crate::execution::GraphDescriptor { tuned_bindings: vec![], confidence_width: if mode == "adaptive_gpu" { 7 } else { 0 },
                 name: format!("speculative-b{batch}-d7-w8-p{packed}"), kind: GraphKind::Speculative,
-                sampling_mode: SamplingMode::General, draft_tokens: 7, handle: 1,
+                sampling_mode: SamplingMode::General, draft_tokens: 7, draft_source: Some(super::speculation::ProposalSource::Mtp), handle: 1,
                 batch_capacity: batch, token_capacity: 8, packed_token_capacity: packed,
                 prefill_capacity: 0, estimated_duration_ns: MS + packed as u64 * 1_000,
                 input_bindings: vec![] });
@@ -4209,7 +4211,7 @@ fn single_lane_packed_engine(page_tokens: usize) -> RequestScheduler {
     for graph in &mut graphs { graph.estimated_duration_ns = 10 * MS; }
     graphs.push(crate::execution::GraphDescriptor { tuned_bindings: vec![], confidence_width: 7,
         name: "speculative-b1-d7-w8-p3".into(), kind: GraphKind::Speculative,
-        sampling_mode: SamplingMode::General, draft_tokens: 7, handle: 1,
+        sampling_mode: SamplingMode::General, draft_tokens: 7, draft_source: Some(super::speculation::ProposalSource::Mtp), handle: 1,
         batch_capacity: 1, token_capacity: 8, packed_token_capacity: 3,
         prefill_capacity: 0, estimated_duration_ns: MS, input_bindings: vec![] });
     scheduler.measured_graph_durations(&graphs).unwrap();
@@ -4355,7 +4357,7 @@ fn fixed_host_prefixes_preserve_lengths_above_255() {
     scheduler.fixed_speculative_width(Some(257)).unwrap();
     let graphs = vec![crate::execution::GraphDescriptor {
         tuned_bindings: vec![], confidence_width: 0, name: "speculative-b1-d256-w257-p257".into(),
-        kind: GraphKind::Speculative, sampling_mode: SamplingMode::General, draft_tokens: 256,
+        kind: GraphKind::Speculative, sampling_mode: SamplingMode::General, draft_tokens: 256, draft_source: Some(super::speculation::ProposalSource::Mtp),
         handle: 1, batch_capacity: 1, token_capacity: 257, packed_token_capacity: 257,
         prefill_capacity: 0, estimated_duration_ns: MS, input_bindings: vec![],
     }];
@@ -4378,6 +4380,7 @@ fn engine_with_terminal_prefill(terminal_capacities: &[usize]) -> RequestSchedul
         graphs.push(crate::execution::GraphDescriptor {
             tuned_bindings: vec![],
             confidence_width: 0,
+            draft_source: None,
             name: format!("prefill-{capacity}"),
             kind: GraphKind::Prefill,
             sampling_mode: SamplingMode::General,
@@ -4395,6 +4398,7 @@ fn engine_with_terminal_prefill(terminal_capacities: &[usize]) -> RequestSchedul
         graphs.push(crate::execution::GraphDescriptor {
             tuned_bindings: vec![],
             confidence_width: 0,
+            draft_source: None,
             name: format!("terminal-prefill-{capacity}"),
             kind: GraphKind::TerminalPrefill,
             sampling_mode: SamplingMode::General,
@@ -4688,6 +4692,7 @@ fn mixed_graphs_excluded_for_deferred_prefill_and_prompt_logprobs() {
         graphs.push(crate::execution::GraphDescriptor {
             tuned_bindings: vec![],
             confidence_width: 0,
+            draft_source: None,
             name: format!("prefill-{capacity}"),
             kind: GraphKind::Prefill,
             sampling_mode: SamplingMode::General,
@@ -4703,6 +4708,7 @@ fn mixed_graphs_excluded_for_deferred_prefill_and_prompt_logprobs() {
         graphs.push(crate::execution::GraphDescriptor {
             tuned_bindings: vec![],
             confidence_width: 0,
+            draft_source: None,
             name: format!("scored-prefill-{capacity}"),
             kind: GraphKind::ScoredPrefill,
             sampling_mode: SamplingMode::General,
@@ -4720,6 +4726,7 @@ fn mixed_graphs_excluded_for_deferred_prefill_and_prompt_logprobs() {
         graphs.push(crate::execution::GraphDescriptor {
             tuned_bindings: vec![],
             confidence_width: 0,
+            draft_source: None,
             name: format!("terminal-prefill-{capacity}"),
             kind: GraphKind::TerminalPrefill,
             sampling_mode: SamplingMode::General,
@@ -4736,6 +4743,7 @@ fn mixed_graphs_excluded_for_deferred_prefill_and_prompt_logprobs() {
     graphs.push(crate::execution::GraphDescriptor {
         tuned_bindings: vec![],
         confidence_width: 0,
+        draft_source: None,
         name: "mixed-2-1-512".into(),
         kind: GraphKind::Mixed,
         sampling_mode: SamplingMode::General,
@@ -5096,6 +5104,7 @@ fn gpu_allocation_surplus_rescues_packed_speculative_at_alpha_one_and_falls_back
     graphs.push(crate::execution::GraphDescriptor {
         name: "packed-16x8-p48".into(),
         kind: GraphKind::Speculative,
+        draft_source: Some(super::speculation::ProposalSource::Mtp),
         sampling_mode: SamplingMode::General,
         handle: graphs.len() + 1,
         batch_capacity: 16,
@@ -5285,6 +5294,7 @@ fn gpu_allocation_surplus_supports_width_two_depth_one_and_falls_back_conservati
     graphs.push(crate::execution::GraphDescriptor {
         name: "packed-16x2-p24".into(),
         kind: GraphKind::Speculative,
+        draft_source: Some(super::speculation::ProposalSource::Mtp),
         sampling_mode: SamplingMode::General,
         handle: graphs.len() + 1,
         batch_capacity: 16,
@@ -5465,6 +5475,7 @@ fn large_prefill_engine(prefill_capacities: &[usize], terminal_capacities: &[usi
         graphs.push(crate::execution::GraphDescriptor {
             tuned_bindings: vec![],
             confidence_width: 0,
+            draft_source: None,
             name: format!("prefill-{capacity}"),
             kind: GraphKind::Prefill,
             sampling_mode: SamplingMode::General,
@@ -5482,6 +5493,7 @@ fn large_prefill_engine(prefill_capacities: &[usize], terminal_capacities: &[usi
         graphs.push(crate::execution::GraphDescriptor {
             tuned_bindings: vec![],
             confidence_width: 0,
+            draft_source: None,
             name: format!("terminal-prefill-{capacity}"),
             kind: GraphKind::TerminalPrefill,
             sampling_mode: SamplingMode::General,

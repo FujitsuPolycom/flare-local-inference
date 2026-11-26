@@ -1718,7 +1718,8 @@ impl<'a> Worker<'a> {
         if kind == GraphKind::Speculative {
             self.metrics.speculative_completed(
                 measured_step.batch_capacity, measured_step.token_capacity,
-                if self.config.speculative_proposal_source == crate::scheduler::speculation::ProposalSource::Mtp {
+                if self.config.speculative_proposal_source == crate::scheduler::speculation::ProposalSource::Mtp
+                    && !self.scheduler.is_copy_only_step(&measured_step) {
                     measured_step.draft_tokens
                 } else { 0 },
                 completion.timing.gpu_ns.into_iter().flatten().max().unwrap_or(0),

@@ -91,9 +91,13 @@ fn validate_inner(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<
         }
     }
     for graph in &manifest.graphs {
+        let copy_only_graph = graph.kind == GraphKind::Speculative
+            && graph.token_capacity > 1
+            && graph.draft_source == Some(speculation::ProposalSource::Copy);
         if matches!(graph.kind, GraphKind::Speculative | GraphKind::Mixed)
             && graph.token_capacity > 1
             && (config.history_drafts
+                || copy_only_graph
                 || config.speculative_proposal_source == speculation::ProposalSource::Copy)
         {
             use super::contract::ValueSource::*;
@@ -113,6 +117,15 @@ fn validate_inner(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<
             {
                 return Err(
                     "copied proposals require prepared token, generation, cursor, and mask inputs"
+                        .into(),
+                );
+            }
+            if copy_only_graph
+                && (graph.confidence_width != 0
+                    || inputs.iter().any(|input| input.source == SpeculativePrefixLimit))
+            {
+                return Err(
+                    "copy-only speculative graphs cannot declare GPU confidence or prefix limits"
                         .into(),
                 );
             }

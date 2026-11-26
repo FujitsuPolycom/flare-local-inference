@@ -68,6 +68,7 @@ fn ready(geometry: Geometry, prompt: usize, budget: u32) -> (RequestScheduler, V
         sampling_mode: SamplingMode::General,
         confidence_width: geometry.drafts,
         draft_tokens: geometry.drafts,
+        draft_source: Some(super::speculation::ProposalSource::Mtp),
         handle: 1,
         batch_capacity: geometry.batch,
         token_capacity: geometry.width,

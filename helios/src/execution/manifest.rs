@@ -188,6 +188,8 @@ pub struct GraphDescriptor {
     pub confidence_width: usize,
     /// Proposal depth of a complete speculative round.
     pub draft_tokens: usize,
+    /// Proposal source declared by the graph (`Mtp` or `Copy` for speculative graphs).
+    pub draft_source: Option<crate::scheduler::speculation::ProposalSource>,
     pub name: String,
     pub kind: GraphKind,
     pub sampling_mode: SamplingMode,
@@ -839,10 +841,13 @@ impl ExecutionManifest {
                 if graph.packed_token_capacity < graph.batch_capacity
                     || graph.packed_token_capacity > graph.batch_capacity.saturating_mul(graph.token_capacity)
                     || graph.draft_tokens > self.completion_token_capacity - 1
-                    || (graph.token_capacity == 1 && graph.draft_tokens != 0) {
+                    || (graph.token_capacity == 1 && graph.draft_tokens != 0)
+                    || (graph.draft_source == Some(crate::scheduler::speculation::ProposalSource::Copy)
+                        && graph.confidence_width != 0) {
                     return Err("speculative B/D/W/P geometry is invalid".into());
                 }
-            } else if graph.packed_token_capacity != 0 || graph.draft_tokens != 0 {
+            } else if graph.packed_token_capacity != 0 || graph.draft_tokens != 0
+                || (graph.kind != GraphKind::Mixed && graph.draft_source.is_some()) {
                 return Err("draft depth and target rows require a speculative operation".into());
             }
             if graph.confidence_width > 0 {

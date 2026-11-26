@@ -354,7 +354,7 @@ pub fn manifest(config: &ModelConfig) -> ExecutionManifest {
                 GraphOperation::Speculative => GraphKind::Speculative,
                 _ => unreachable!(),
             };
-            GraphDescriptor { tuned_bindings: vec![], confidence_width: 0, draft_tokens: if kind == GraphKind::Speculative { fields[2].parse::<usize>().unwrap() - 1 } else { 0 }, packed_token_capacity: if kind == GraphKind::Speculative { fields[1].parse::<usize>().unwrap() * fields[2].parse::<usize>().unwrap() } else { 0 },
+            GraphDescriptor { tuned_bindings: vec![], confidence_width: 0, draft_tokens: if kind == GraphKind::Speculative { fields[2].parse::<usize>().unwrap() - 1 } else { 0 }, draft_source: (kind == GraphKind::Speculative).then_some(config.speculative_proposal_source), packed_token_capacity: if kind == GraphKind::Speculative { fields[1].parse::<usize>().unwrap() * fields[2].parse::<usize>().unwrap() } else { 0 },
                 name: g.graph.clone(),
                 kind,
                 sampling_mode: SamplingMode::General,

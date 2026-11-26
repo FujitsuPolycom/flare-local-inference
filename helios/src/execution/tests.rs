@@ -164,7 +164,7 @@ pub(super) fn manifest() -> ExecutionManifest {
             strides: vec![1],
         },
     ];
-    let graph = GraphDescriptor { tuned_bindings: vec![], confidence_width: 0, draft_tokens: 0, packed_token_capacity: 0,
+    let graph = GraphDescriptor { tuned_bindings: vec![], confidence_width: 0, draft_tokens: 0, draft_source: None, packed_token_capacity: 0,
         name: "decode4".into(),
         kind: GraphKind::Decode,
         sampling_mode: SamplingMode::General,

@@ -141,7 +141,12 @@ impl LoadOptions {
         if !widths.is_empty() && token_capacity == 0 {
             return Err(invalid("speculative token capacity must be positive"));
         }
-        let maximum = execution.graphs.iter().filter(|g| g.kind == "speculative")
+        let source = match config.get("speculative_proposal_source").and_then(Value::as_str).unwrap_or("mtp") {
+            "mtp" => 1,
+            "copy" => 2,
+            _ => return Err(invalid("unknown speculative proposal source")),
+        };
+        let maximum = execution.graphs.iter().filter(|g| g.kind == "speculative" && g.draft_source == source)
             .filter_map(|g| g.draft_tokens).max().unwrap_or(0) as usize;
         let drafts = self.mtp_draft_tokens.unwrap_or(maximum);
         if drafts > maximum {
@@ -158,11 +163,6 @@ impl LoadOptions {
         if widths.is_empty() && self.adaptive_verification.is_some() {
             return Err(invalid("verification policy requires a core captured with speculation"));
         }
-        let source = match config.get("speculative_proposal_source").and_then(Value::as_str).unwrap_or("mtp") {
-            "mtp" => 1,
-            "copy" => 2,
-            _ => return Err(invalid("unknown speculative proposal source")),
-        };
         let adaptive = self.adaptive_verification.unwrap_or(captured_fixed.is_none());
         let eligible_widths: BTreeSet<_> = execution.graphs.iter().filter(|graph|
             graph.kind == "speculative" && graph.batch_capacity <= active.next_power_of_two() as u64
@@ -179,6 +179,9 @@ impl LoadOptions {
         if self.history_drafts == Some(true) && (!enabled || source != 1) {
             return Err(invalid("--history-drafts requires enabled learned speculation"));
         }
+        let history_enabled = enabled && self.history_drafts
+            .unwrap_or_else(|| config.get("history_drafts").and_then(Value::as_bool).unwrap_or(false));
+        let retain_wide_copy = source == 1 && history_enabled && fixed.is_none();
         if enabled && (eligible_widths.iter().all(|width| *width == 1)
             || fixed.is_some_and(|width| !eligible_widths.contains(&width))) {
             return Err(invalid("no captured speculative width fits the requested draft depth and fixed width"));
@@ -188,6 +191,12 @@ impl LoadOptions {
             return Err(invalid("verification token budget requires enabled adaptive speculation and a positive capacity"));
         }
         let selected_token_capacity = verification_token_limit.map_or(token_capacity, |budget| token_capacity.min(budget as u64));
+        let source_widths: BTreeSet<usize> = execution
+            .graphs
+            .iter()
+            .filter(|graph| graph.kind == "speculative" && graph.draft_source == source)
+            .map(|graph| graph.token_capacity as usize)
+            .collect();
         let widths: Vec<_> = widths.into_iter().filter(|_| enabled).collect();
         let multi_rank = cores.len() > 1;
         let mut rank_catalog = None;
@@ -266,18 +275,26 @@ impl LoadOptions {
                 return Err(invalid("execution catalog must describe every captured graph exactly once"));
             }
             execution.graphs.retain(|graph| {
+                let copy_wide = retain_wide_copy
+                    && graph.kind == "speculative"
+                    && graph.draft_source == 2
+                    && graph.token_capacity > 1
+                    && graph.confidence_width == 0
+                    && graph.draft_tokens.is_some_and(|depth| depth as usize > drafts);
                 graph.batch_capacity <= active.next_power_of_two() as u64
                     && graph.speculation_enabled.is_none_or(|value| value == enabled)
                     && (graph.kind != "decode" || !enabled)
                     && (!(graph.kind == "speculative" || graph.kind == "mixed" && enabled)
-                        || enabled && graph.draft_source == source
-                            && graph.draft_tokens.is_some_and(|depth| depth <= drafts as u32)
+                        || enabled
                             && widths.contains(&(graph.token_capacity as usize))
-                            && (graph.token_capacity == 1 || fixed.is_none_or(|width| graph.token_capacity == width as u64)))
+                            && (copy_wide
+                                || (graph.draft_source == source
+                                    && graph.draft_tokens.is_some_and(|depth| depth <= drafts as u32)
+                                    && (graph.token_capacity == 1 || fixed.is_none_or(|width| graph.token_capacity == width as u64)))))
                     && (graph.kind != "speculative" || graph.token_capacity == 1
                         || graph.packed_token_capacity <= selected_token_capacity
-                            && self.mtp_verification_token_budget.is_none_or(|budget|
-                                graph.packed_token_capacity == (budget as u64).min(graph.batch_capacity * graph.token_capacity)))
+                            && (copy_wide || self.mtp_verification_token_budget.is_none_or(|budget|
+                                graph.packed_token_capacity == (budget as u64).min(graph.batch_capacity * graph.token_capacity))))
             });
             let mut depths = std::collections::HashMap::new();
             for graph in &execution.graphs {
@@ -362,11 +379,21 @@ impl LoadOptions {
                 .flatten();
             prune_kernels(core, keep_codec_module)?;
         }
+        let retained_widths: Vec<_> = if !enabled {
+            Vec::new()
+        } else if retain_wide_copy {
+            widths
+        } else {
+            widths
+                .into_iter()
+                .filter(|width| *width == 1 || source_widths.contains(width))
+                .collect()
+        };
         let object = config
             .as_object_mut()
             .ok_or_else(|| invalid("server configuration must be an object"))?;
         object.insert("max_active".into(), active.into());
-        object.insert("speculative_widths".into(), serde_json::json!(widths));
+        object.insert("speculative_widths".into(), serde_json::json!(retained_widths));
         object.insert("speculative_fixed_width".into(), serde_json::json!(fixed));
         if verification_token_limit.is_some() {
             object.insert(
@@ -1844,6 +1871,76 @@ mod tests {
                 assert_eq!(configuration["speculative_widths"], serde_json::json!([]));
             }
         }
+    }
+
+    #[test]
+    fn wide_copy_graphs_retain_only_when_history_drafts_enabled() {
+        let make_core = || {
+            let mut base = round_core(4, 64, true);
+            base.execution.as_mut().unwrap().completion_token_capacity = 24;
+            for (batch, width) in [(1u64, 16u64), (1, 24), (2, 16), (4, 16)] {
+                base.execution.as_mut().unwrap().graphs.push(wire::ExecutionGraph {
+                    name: format!("copy-speculative{batch}x{width}"),
+                    kind: "speculative".into(),
+                    sampling_mode: "general".into(),
+                    batch_capacity: batch,
+                    token_capacity: width,
+                    prefill_capacity: 0,
+                    packed_token_capacity: batch * width,
+                    estimated_duration_ns: 0,
+                    input_bindings: vec![],
+                    tuned_bindings: vec![],
+                    speculation_enabled: Some(true),
+                    draft_tokens: Some((width - 1) as u32),
+                    verify_tokens: Some(width as u32),
+                    draft_source: wire::DraftSource::CopyDraft as i32,
+                    confidence_width: 0,
+                });
+            }
+            refresh_graph_resources(&mut base);
+            base
+        };
+        let cfg = || serde_json::json!({
+            "speculative_widths": [1, 6, 16, 24],
+            "speculative_token_capacity": 64,
+            "speculative_proposal_source": "mtp",
+        });
+
+        // With history_drafts = true: retains both MTP graphs and wide copy graphs.
+        let mut with_history = [make_core()];
+        let mut with_cfg = cfg();
+        LoadOptions { history_drafts: Some(true), ..Default::default() }
+            .select(&mut with_history, &mut with_cfg)
+            .unwrap();
+        assert_eq!(with_cfg["speculative_widths"], serde_json::json!([1, 6, 16, 24]));
+        assert!(with_history[0]
+            .execution
+            .as_ref()
+            .unwrap()
+            .graphs
+            .iter()
+            .any(|g| g.name == "copy-speculative1x24"));
+
+        // With history_drafts = false: prunes wide copy graphs and narrows speculative_widths.
+        let mut without_history = [make_core()];
+        let mut without_cfg = cfg();
+        LoadOptions { history_drafts: Some(false), ..Default::default() }
+            .select(&mut without_history, &mut without_cfg)
+            .unwrap();
+        assert_eq!(without_cfg["speculative_widths"], serde_json::json!([1, 6]));
+        assert!(!without_history[0]
+            .execution
+            .as_ref()
+            .unwrap()
+            .graphs
+            .iter()
+            .any(|g| g.draft_source == 2));
+
+        // --mtp-draft-tokens still validates against the MTP maximum (5), not wide copy depth (23).
+        let mut capped_cfg = cfg();
+        assert!(LoadOptions { mtp_draft_tokens: Some(15), history_drafts: Some(true), ..Default::default() }
+            .select(&mut [make_core()], &mut capped_cfg)
+            .is_err());
     }
 
 }

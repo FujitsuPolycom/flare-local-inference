@@ -5719,6 +5719,7 @@ fn worker_restores_conditioned_windows_with_fresh_generation_and_unchanged_sampl
     manifest.graphs.push(GraphDescriptor { tuned_bindings: vec![],
         confidence_width: 0,
         draft_tokens: 0,
+        draft_source: None,
         name: "Vision-1-256".into(),
         kind: GraphKind::Vision,
         handle: 1,

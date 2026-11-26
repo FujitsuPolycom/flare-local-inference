@@ -164,6 +164,7 @@ pub(crate) fn duration_graphs(active: usize) -> Vec<crate::execution::GraphDescr
             for tokens in 1..=if kind == GraphKind::Speculative { 8 } else { 1 } {
                 graphs.push(crate::execution::GraphDescriptor { tuned_bindings: vec![], confidence_width: 0,
                     draft_tokens: if kind == GraphKind::Speculative { tokens - 1 } else { 0 },
+                    draft_source: (kind == GraphKind::Speculative).then_some(super::speculation::ProposalSource::Mtp),
                     packed_token_capacity: if kind == GraphKind::Speculative { batch * tokens } else { 0 },
                     name: format!("{kind:?}-{batch}-{tokens}"),
                     kind,
@@ -183,7 +184,7 @@ pub(crate) fn duration_graphs(active: usize) -> Vec<crate::execution::GraphDescr
         (GraphKind::Vision, vec![8, 16, 256, 1024, 4096, 16384]),
     ] {
         for tokens in capacities {
-            graphs.push(crate::execution::GraphDescriptor { tuned_bindings: vec![], confidence_width: 0, draft_tokens: 0, packed_token_capacity: 0,
+            graphs.push(crate::execution::GraphDescriptor { tuned_bindings: vec![], confidence_width: 0, draft_tokens: 0, draft_source: None, packed_token_capacity: 0,
                 name: format!("{kind:?}-{tokens}"),
                 kind,
                 sampling_mode: crate::execution::SamplingMode::General,
@@ -4100,4 +4101,451 @@ fn state_slot_extent_uses_storage_geometry_independently_of_completion_capacity(
     let scheduler = RequestScheduler::new([0; 32], fixture.limits.clone(), capabilities).unwrap();
     assert_eq!(scheduler.execution_rows(), 1024);
     assert_eq!(scheduler.snapshot_slot(SnapshotId(3)).0, 1028);
+}
+
+#[test]
+fn wide_copy_verify_selects_w24_on_long_sam_match_and_falls_back_to_mtp_otherwise() {
+    use crate::execution::{ExecutionTiming, PrefixAllocation, TokenVector};
+    use crate::scheduler::speculation::ProposalSource;
+
+    let mut limits = SchedulerLimits {
+        max_active: 4,
+        request_slots: 4,
+        max_sequence_tokens: 4096,
+        prefill_chunk_size: 512,
+        pages: 128,
+        snapshots: 16,
+    };
+    limits.request_slots = 4;
+    let mut capabilities = scheduler(4, 128, 16).capabilities.clone();
+    capabilities.completion_token_capacity = 24;
+    capabilities.vocabulary = 1024;
+    capabilities.speculative_allocations = vec![
+        (1, 0, 1, 1, PrefixAllocation::Host),
+        (2, 0, 1, 2, PrefixAllocation::Host),
+        (4, 0, 1, 4, PrefixAllocation::Host),
+        (1, 7, 8, 8, PrefixAllocation::Gpu),
+        (2, 7, 8, 16, PrefixAllocation::Gpu),
+        (4, 7, 8, 32, PrefixAllocation::Gpu),
+        (1, 15, 16, 16, PrefixAllocation::Host),
+        (1, 23, 24, 24, PrefixAllocation::Host),
+        (2, 15, 16, 32, PrefixAllocation::Host),
+        (4, 15, 16, 64, PrefixAllocation::Host),
+    ];
+
+    let mut graphs = duration_graphs(4);
+    graphs.retain(|g| g.kind != GraphKind::Speculative);
+    for batch in [1usize, 2, 4] {
+        graphs.push(crate::execution::GraphDescriptor {
+            tuned_bindings: vec![],
+            confidence_width: 0,
+            draft_tokens: 0,
+            draft_source: Some(ProposalSource::Mtp),
+            packed_token_capacity: batch,
+            name: format!("speculative{batch}x1"),
+            kind: GraphKind::Speculative,
+            sampling_mode: crate::execution::SamplingMode::General,
+            handle: 1,
+            batch_capacity: batch,
+            token_capacity: 1,
+            prefill_capacity: 0,
+            estimated_duration_ns: 5_000_000,
+            input_bindings: vec![],
+        });
+        graphs.push(crate::execution::GraphDescriptor {
+            tuned_bindings: vec![],
+            confidence_width: 7,
+            draft_tokens: 7,
+            draft_source: Some(ProposalSource::Mtp),
+            packed_token_capacity: batch * 8,
+            name: format!("packed-speculative{batch}x8"),
+            kind: GraphKind::Speculative,
+            sampling_mode: crate::execution::SamplingMode::General,
+            handle: 1,
+            batch_capacity: batch,
+            token_capacity: 8,
+            prefill_capacity: 0,
+            estimated_duration_ns: 6_000_000 + (batch as u64 - 1) * 1_000_000,
+            input_bindings: vec![],
+        });
+    }
+    for (batch, width, dur_ns) in [
+        (1usize, 16usize, 5_950_000u64),
+        (1, 24, 6_450_000),
+        (2, 16, 7_200_000),
+        (4, 16, 9_500_000),
+    ] {
+        graphs.push(crate::execution::GraphDescriptor {
+            tuned_bindings: vec![],
+            confidence_width: 0,
+            draft_tokens: width - 1,
+            draft_source: Some(ProposalSource::Copy),
+            packed_token_capacity: batch * width,
+            name: format!("copy-speculative{batch}x{width}"),
+            kind: GraphKind::Speculative,
+            sampling_mode: crate::execution::SamplingMode::General,
+            handle: 1,
+            batch_capacity: batch,
+            token_capacity: width,
+            prefill_capacity: 0,
+            estimated_duration_ns: dur_ns,
+            input_bindings: vec![],
+        });
+    }
+
+    let mut sched = RequestScheduler::new([0; 32], limits, capabilities).unwrap();
+    sched.enable_speculation(&[1, 8, 16, 24]).unwrap();
+    sched
+        .speculative_graphs(&[(1, 1), (1, 8), (1, 16), (1, 24), (2, 1), (2, 8), (2, 16), (4, 1), (4, 8), (4, 16)])
+        .unwrap();
+    sched.enable_history_drafts().unwrap();
+    sched.measured_graph_durations(&graphs).unwrap();
+
+    // Prompt contains a 32-token span [20..52] followed by a short non-matching tail [900..908].
+    let mut prompt: Vec<u32> = (20..52).collect();
+    prompt.extend(900..908);
+    let req_spec = RequestSpec {
+        prompt: prompt.clone(),
+        message_boundaries: vec![],
+        conditioning: vec![],
+        max_new_tokens: 256,
+        grammar_constrained: false,
+        host_stops: false,
+        prompt_logprobs: false,
+        growable_output: false,
+    };
+    let h = sched.admit(req_spec).unwrap();
+    let mut fence = 1u64;
+    // Advance through Init and Prefill to Decode (first generated token = 20, no >=6 match yet).
+    for _ in 0..4 {
+        let plan = sched.plan().unwrap();
+        if plan.kind == GraphKind::Speculative {
+            break;
+        }
+        sched.commit(&plan, Fence(fence)).unwrap();
+        let mut recs = vec![CompletionRecord::default(); 4];
+        let live = sched.request(h).unwrap();
+        let is_prefill = plan.kind.is_prefill();
+        let mut vec_rec = TokenVector {
+            emitted_count: i64::from(is_prefill),
+            verification_width: 1,
+            tokens: vec![-1; 24],
+            ..Default::default()
+        };
+        if is_prefill {
+            vec_rec.tokens[0] = 20;
+        }
+        recs[h.slot as usize] = CompletionRecord {
+            generation: h.generation as i64,
+            submission_sequence: fence as i64,
+            consumed_tokens: if is_prefill { prompt.len() as i64 } else { live.consumed_tokens as i64 },
+            generated_tokens: live.generated_tokens as i64 + i64::from(is_prefill),
+            token_id: if is_prefill { 20 } else { -1 },
+            status: 1,
+            vector: Some(vec_rec),
+            ..Default::default()
+        };
+        let mut timing = ExecutionTiming::default();
+        timing.gpu_ns[0] = Some(1_000_000);
+        sched.complete(Fence(fence), &recs, timing).unwrap();
+        fence += 1;
+    }
+
+    // Without a >=6-token SAM match, scheduler selects W=8 MTP (NOT W=16/24).
+    let mtp_plan = sched.plan().unwrap();
+    assert_eq!(mtp_plan.kind, GraphKind::Speculative);
+    assert_eq!((mtp_plan.batch_capacity, mtp_plan.token_capacity, mtp_plan.draft_tokens), (1, 8, 7));
+    assert!(!sched.is_copy_only_step(&mtp_plan));
+
+    // Complete that W=8 MTP round emitting tokens [21, 22, 23, 24, 25, 26] so tail ends with
+    // [20..=26] (match_len = 7 >= 6) and 25 continuation tokens [27..52] exist in PromptSAM!
+    sched.commit(&mtp_plan, Fence(fence)).unwrap();
+    let mut recs = vec![CompletionRecord::default(); 4];
+    let emitted_mtp = [21i64, 22, 23, 24, 25, 26];
+    let mut tokens_buf = vec![-1i64; 24];
+    tokens_buf[..emitted_mtp.len()].copy_from_slice(&emitted_mtp);
+    let live = sched.request(h).unwrap();
+    recs[h.slot as usize] = CompletionRecord {
+        generation: h.generation as i64,
+        submission_sequence: fence as i64,
+        consumed_tokens: live.consumed_tokens as i64 + emitted_mtp.len() as i64,
+        generated_tokens: live.generated_tokens as i64 + emitted_mtp.len() as i64,
+        token_id: *emitted_mtp.last().unwrap(),
+        status: 1,
+        vector: Some(TokenVector {
+            emitted_count: emitted_mtp.len() as i64,
+            offered_drafts: 7,
+            accepted_drafts: 5,
+            copy_offered_mask: 0,
+            model_reserved: -1,
+            draft_cache_consumed: 0,
+            verification_width: 8,
+            tokens: tokens_buf,
+        }),
+        ..Default::default()
+    };
+    let mut timing = ExecutionTiming::default();
+    timing.gpu_ns[0] = Some(6_000_000);
+    let conf = vec![vec![0.75f32; 23]; 1];
+    sched.complete_packed_round(Fence(fence), &recs, timing, &conf).unwrap();
+    fence += 1;
+
+    // Now PromptOutputSAM matches [20..=26] (match_len = 7 >= 6) with 23+ continuation tokens -> selects W=24 Copy!
+    let wide_plan = sched.plan().unwrap();
+    assert_eq!(wide_plan.kind, GraphKind::Speculative);
+    assert_eq!(
+        (wide_plan.batch_capacity, wide_plan.token_capacity, wide_plan.draft_tokens, wide_plan.packed_token_capacity),
+        (1, 24, 23, 24)
+    );
+    assert_eq!(wide_plan.lanes[0].tokens, 24);
+    assert!(sched.is_copy_only_step(&wide_plan));
+
+    // Complete W=24 Copy round without proposal_confidence sidecar and with full 23-bit copy_offered_mask.
+    let mtp_before = sched.request(h).unwrap().acceptance().curve(ProposalSource::Mtp, 7, false);
+    sched.commit(&wide_plan, Fence(fence)).unwrap();
+    let mut recs = vec![CompletionRecord::default(); 4];
+    let emitted_wide: Vec<i64> = (27..48).collect(); // 21 emitted tokens (20 accepted drafts + bonus)
+    let mut tokens_buf = vec![-1i64; 24];
+    tokens_buf[..emitted_wide.len()].copy_from_slice(&emitted_wide);
+    let live = sched.request(h).unwrap();
+    recs[h.slot as usize] = CompletionRecord {
+        generation: h.generation as i64,
+        submission_sequence: fence as i64,
+        consumed_tokens: live.consumed_tokens as i64 + emitted_wide.len() as i64,
+        generated_tokens: live.generated_tokens as i64 + emitted_wide.len() as i64,
+        token_id: *emitted_wide.last().unwrap(),
+        status: 1,
+        vector: Some(TokenVector {
+            emitted_count: emitted_wide.len() as i64,
+            offered_drafts: 23,
+            accepted_drafts: 20,
+            copy_offered_mask: (1i64 << 23) - 1, // 23-bit mask 0x7fffff
+            model_reserved: -1,
+            draft_cache_consumed: 0,
+            verification_width: 24,
+            tokens: tokens_buf,
+        }),
+        ..Default::default()
+    };
+    let mut wide_timing = ExecutionTiming::default();
+    wide_timing.gpu_ns[0] = Some(6_450_000);
+    sched.complete_with_survival(Fence(fence), &recs, wide_timing, None).unwrap();
+    fence += 1;
+
+    // MTP curve must remain untouched by the copy-only round.
+    let mtp_after = sched.request(h).unwrap().acceptance().curve(ProposalSource::Mtp, 7, false);
+    assert_eq!(mtp_before, mtp_after);
+
+    // Grammar-constrained request with the exact same long match must NEVER pick wide copy.
+    sched.cancel(h).unwrap();
+    let mut gram_prompt: Vec<u32> = (20..60).collect();
+    gram_prompt.extend(20..27); // Ends with [20..=26], 33 continuation tokens in PromptSAM.
+    let gram_h = sched
+        .admit(RequestSpec {
+            prompt: gram_prompt.clone(),
+            message_boundaries: vec![],
+            conditioning: vec![],
+            max_new_tokens: 128,
+            grammar_constrained: true,
+            host_stops: false,
+            prompt_logprobs: false,
+            growable_output: false,
+        })
+        .unwrap();
+    for _ in 0..4 {
+        let plan = sched.plan().unwrap();
+        if plan.kind == GraphKind::Speculative {
+            assert_eq!(plan.token_capacity, 1);
+            assert!(!sched.is_copy_only_step(&plan));
+            break;
+        }
+        sched.commit(&plan, Fence(fence)).unwrap();
+        let mut recs = vec![CompletionRecord::default(); 4];
+        let live = sched.request(gram_h).unwrap();
+        let is_prefill = plan.kind.is_prefill();
+        let mut vec_rec = TokenVector {
+            emitted_count: i64::from(is_prefill),
+            verification_width: 1,
+            tokens: vec![-1; 24],
+            ..Default::default()
+        };
+        if is_prefill {
+            vec_rec.tokens[0] = 27;
+        }
+        recs[gram_h.slot as usize] = CompletionRecord {
+            generation: gram_h.generation as i64,
+            submission_sequence: fence as i64,
+            consumed_tokens: if is_prefill { gram_prompt.len() as i64 } else { live.consumed_tokens as i64 },
+            generated_tokens: live.generated_tokens as i64 + i64::from(is_prefill),
+            token_id: if is_prefill { 27 } else { -1 },
+            status: 1,
+            vector: Some(vec_rec),
+            ..Default::default()
+        };
+        let mut timing = ExecutionTiming::default();
+        timing.gpu_ns[0] = Some(1_000_000);
+        sched.complete(Fence(fence), &recs, timing).unwrap();
+        fence += 1;
+    }
+
+    // Two concurrent requests both with long SAM matches select 2x16 wide copy.
+    sched.cancel(gram_h).unwrap();
+    let mut prompt_a: Vec<u32> = (100..140).collect();
+    prompt_a.extend(100..107);
+    let mut prompt_b: Vec<u32> = (200..240).collect();
+    prompt_b.extend(200..207);
+    let ha = sched
+        .admit(RequestSpec {
+            prompt: prompt_a.clone(),
+            message_boundaries: vec![],
+            conditioning: vec![],
+            max_new_tokens: 128,
+            grammar_constrained: false,
+            host_stops: false,
+            prompt_logprobs: false,
+            growable_output: false,
+        })
+        .unwrap();
+    let hb = sched
+        .admit(RequestSpec {
+            prompt: prompt_b.clone(),
+            message_boundaries: vec![],
+            conditioning: vec![],
+            max_new_tokens: 128,
+            grammar_constrained: false,
+            host_stops: false,
+            prompt_logprobs: false,
+            growable_output: false,
+        })
+        .unwrap();
+    for _ in 0..8 {
+        let plan = sched.plan().unwrap();
+        if plan.kind == GraphKind::Speculative {
+            assert_eq!((plan.batch_capacity, plan.token_capacity, plan.packed_token_capacity), (2, 16, 32));
+            assert_eq!(plan.lanes.len(), 2);
+            assert!(sched.is_copy_only_step(&plan));
+            break;
+        }
+        sched.commit(&plan, Fence(fence)).unwrap();
+        let mut recs = vec![CompletionRecord::default(); 4];
+        for lane in &plan.lanes {
+            let live = sched.request(lane.request).unwrap();
+            let is_prefill = plan.kind.is_prefill();
+            let tok = if lane.request == ha { 107i64 } else { 207i64 };
+            let mut vec_rec = TokenVector {
+                emitted_count: i64::from(is_prefill),
+                verification_width: 1,
+                tokens: vec![-1; 24],
+                ..Default::default()
+            };
+            if is_prefill {
+                vec_rec.tokens[0] = tok;
+            }
+            recs[lane.request.slot as usize] = CompletionRecord {
+                generation: lane.request.generation as i64,
+                submission_sequence: fence as i64,
+                consumed_tokens: if is_prefill { live.prompt_tokens as i64 } else { live.consumed_tokens as i64 },
+                generated_tokens: live.generated_tokens as i64 + i64::from(is_prefill),
+                token_id: if is_prefill { tok } else { -1 },
+                status: 1,
+                vector: Some(vec_rec),
+                ..Default::default()
+            };
+        }
+        let mut timing = ExecutionTiming::default();
+        timing.gpu_ns[0] = Some(1_000_000);
+        sched.complete(Fence(fence), &recs, timing).unwrap();
+        fence += 1;
+    }
+
+    // Repeated rejections on wide copy drop calibrated copy survival so W=8 MTP wins again.
+    sched.cancel(hb).unwrap();
+    let mut bad_prompt: Vec<u32> = (300..360).collect();
+    bad_prompt.extend(300..307);
+    let bad_h = sched
+        .admit(RequestSpec {
+            prompt: bad_prompt.clone(),
+            message_boundaries: vec![],
+            conditioning: vec![],
+            max_new_tokens: 128,
+            grammar_constrained: false,
+            host_stops: false,
+            prompt_logprobs: false,
+            growable_output: false,
+        })
+        .unwrap();
+    sched.cancel(ha).unwrap();
+    for _ in 0..4 {
+        let plan = sched.plan().unwrap();
+        if plan.kind == GraphKind::Speculative {
+            break;
+        }
+        sched.commit(&plan, Fence(fence)).unwrap();
+        let mut recs = vec![CompletionRecord::default(); 4];
+        let live = sched.request(bad_h).unwrap();
+        let is_prefill = plan.kind.is_prefill();
+        let mut vec_rec = TokenVector {
+            emitted_count: i64::from(is_prefill),
+            verification_width: 1,
+            tokens: vec![-1; 24],
+            ..Default::default()
+        };
+        if is_prefill {
+            vec_rec.tokens[0] = 307;
+        }
+        recs[bad_h.slot as usize] = CompletionRecord {
+            generation: bad_h.generation as i64,
+            submission_sequence: fence as i64,
+            consumed_tokens: if is_prefill { bad_prompt.len() as i64 } else { live.consumed_tokens as i64 },
+            generated_tokens: live.generated_tokens as i64 + i64::from(is_prefill),
+            token_id: if is_prefill { 307 } else { -1 },
+            status: 1,
+            vector: Some(vec_rec),
+            ..Default::default()
+        };
+        let mut timing = ExecutionTiming::default();
+        timing.gpu_ns[0] = Some(1_000_000);
+        sched.complete(Fence(fence), &recs, timing).unwrap();
+        fence += 1;
+    }
+    // Feed 5 consecutive 0-acceptance rejections on W=24 while keeping a matching suffix.
+    let mut fell_back_to_mtp = false;
+    for step_idx in 0..6 {
+        let plan = sched.plan().unwrap();
+        if !sched.is_copy_only_step(&plan) {
+            assert_eq!(plan.token_capacity, 8);
+            fell_back_to_mtp = true;
+            break;
+        }
+        sched.commit(&plan, Fence(fence)).unwrap();
+        let live = sched.request(bad_h).unwrap();
+        let next_tok = 308 + step_idx as i64;
+        let mut tokens_buf = vec![-1i64; 24];
+        tokens_buf[0] = next_tok;
+        let mut recs = vec![CompletionRecord::default(); 4];
+        recs[bad_h.slot as usize] = CompletionRecord {
+            generation: bad_h.generation as i64,
+            submission_sequence: fence as i64,
+            consumed_tokens: live.consumed_tokens as i64 + 1,
+            generated_tokens: live.generated_tokens as i64 + 1,
+            token_id: next_tok,
+            status: 1,
+            vector: Some(TokenVector {
+                emitted_count: 1,
+                offered_drafts: plan.lanes[0].tokens as i64 - 1,
+                accepted_drafts: 0,
+                copy_offered_mask: (1i64 << (plan.lanes[0].tokens - 1)) - 1,
+                model_reserved: -1,
+                draft_cache_consumed: 0,
+                verification_width: plan.token_capacity as i64,
+                tokens: tokens_buf,
+            }),
+            ..Default::default()
+        };
+        let mut timing = ExecutionTiming::default();
+        timing.gpu_ns[0] = Some(6_450_000);
+        sched.complete_with_survival(Fence(fence), &recs, timing, None).unwrap();
+        fence += 1;
+    }
+    assert!(fell_back_to_mtp, "calibrated copy rejection must fall back to W=8 MTP");
 }

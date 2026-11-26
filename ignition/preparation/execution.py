@@ -29,6 +29,7 @@ class GraphSignature:
     packed_token_capacity: int = 0
     draft_tokens: int | None = None
     confidence_width: int = 0
+    draft_source: int = 1
 
     def __post_init__(self):
         if self.kind not in ("init", "restore", "snapshot", "prefill", "terminal_prefill", "scored_prefill",
@@ -98,6 +99,13 @@ class GraphSignature:
                 or (self.confidence_width and (self.kind != "speculative"
                     or self.confidence_width != self.draft_tokens))):
             raise ValueError("confidence width must equal the producing round's draft depth")
+        if type(self.draft_source) is not int or self.draft_source not in (1, 2):
+            raise ValueError("draft_source must be 1 (MTP) or 2 (COPY_DRAFT)")
+        if self.draft_source == 2:
+            if not (self.kind == "speculative" or (self.kind == "mixed" and self.speculation_enabled is True)):
+                raise ValueError("copy draft source requires a speculative graph")
+            if self.confidence_width != 0 or "speculative_prefix_limits" in self.inputs:
+                raise ValueError("copy-only speculative graphs cannot declare GPU confidence or prefix limits")
         if len(set(self.inputs)) != len(self.inputs):
             raise ValueError("graph input names must be unique")
         object.__setattr__(self, "inputs", tuple(field for field in self.inputs
@@ -307,7 +315,8 @@ class PreparedExecution(PreparedGraphBundle):
                 graphs[-1]["packed_token_capacity"] = signature.packed_token_capacity
             if signature.draft_tokens is not None:
                 graphs[-1].update(draft_tokens=signature.draft_tokens,
-                                  verify_tokens=signature.token_capacity, draft_source=1)
+                                  verify_tokens=signature.token_capacity,
+                                  draft_source=signature.draft_source)
         abi_version = 6
         return {"abi_version": abi_version, "completion_token_capacity": self.completion_token_capacity,
                 "context": context, "device": self.device,

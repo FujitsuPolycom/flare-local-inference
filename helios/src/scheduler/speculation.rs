@@ -11,6 +11,15 @@ use crate::{Result, execution::BATCH_CAPACITIES};
 /// Copy provenance uses the nonnegative bits of its signed 64-bit mask.
 pub const COPY_DRAFT_CAPACITY: usize = i64::BITS as usize - 1;
 
+/// Conservative per-step acceptance prior for uncalibrated wide copy-verify rounds.
+pub const WIDE_COPY_PRIOR_RATE: f64 = 0.88;
+
+/// Minimum suffix-automaton match length required before wide copy-verify graphs compete.
+pub const WIDE_COPY_MIN_MATCH_LEN: usize = 6;
+
+const COPY_STEP_PRIOR_WEIGHT: f64 = 4.0;
+const COPY_DEPTH_SHRINK_WEIGHT: f64 = 2.0;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ProposalSource {
     #[default]
@@ -83,6 +92,100 @@ impl PrefixEstimate {
         self.weight = (self.weight_at(generated) + 1.0).min(128.0);
         self.mean += (value - self.mean) / self.weight;
         self.observed_at = generated;
+    }
+}
+
+/// Request-local aged calibration for host copy-draft survival across depths `0..capacity-1`.
+///
+/// Unobserved depths fall back to a geometric curve parameterized by the calibrated
+/// per-step copy acceptance rate (seeded with `WIDE_COPY_PRIOR_RATE`). Observed depths
+/// shrink smoothly toward that geometric prior while preserving monotonicity across depth.
+#[derive(Clone, Debug)]
+pub(super) struct CopyCalibration {
+    step_rate: PrefixEstimate,
+    depths: Vec<Option<PrefixEstimate>>,
+}
+
+impl CopyCalibration {
+    pub fn new(token_capacity: usize) -> Self {
+        Self {
+            step_rate: PrefixEstimate {
+                mean: WIDE_COPY_PRIOR_RATE,
+                weight: COPY_STEP_PRIOR_WEIGHT,
+                observed_at: 0,
+            },
+            depths: vec![None; token_capacity.saturating_sub(1)],
+        }
+    }
+
+    pub fn curve(&self, generated: u32, optimistic: bool) -> Vec<f64> {
+        let rate = if optimistic {
+            self.step_rate.upper(generated)
+        } else {
+            self.step_rate.mean()
+        };
+        let mut bound = 1.0f64;
+        self.depths
+            .iter()
+            .enumerate()
+            .map(|(depth, entry)| {
+                let prior = rate.powi(depth as i32 + 1);
+                let estimate = match entry {
+                    Some(prefix) => {
+                        let w = prefix.weight_at(generated);
+                        let mean = (COPY_DEPTH_SHRINK_WEIGHT * prior + w * prefix.mean())
+                            / (COPY_DEPTH_SHRINK_WEIGHT + w);
+                        if optimistic {
+                            (mean + (20.0f64.ln() / (2.0 * (COPY_DEPTH_SHRINK_WEIGHT + w))).sqrt())
+                                .min(1.0)
+                        } else {
+                            mean
+                        }
+                    }
+                    None => prior,
+                };
+                bound = bound.min(estimate.clamp(0.0, 1.0));
+                bound
+            })
+            .collect()
+    }
+
+    pub fn observe_prefix(
+        &mut self,
+        generated: u32,
+        copy_prefix: usize,
+        accepted: usize,
+        rejected: bool,
+        survival: Option<&[f32]>,
+    ) {
+        let copy_prefix = copy_prefix.min(self.depths.len());
+        if copy_prefix == 0 {
+            return;
+        }
+        let observed = if rejected { copy_prefix } else { accepted.min(copy_prefix) };
+        for depth in 0..observed {
+            let value = survival.map_or(f64::from(depth < accepted), |p| f64::from(p[depth]));
+            if let Some(slot) = self.depths[depth].as_mut() {
+                slot.observe(value, generated);
+            } else {
+                self.depths[depth] = Some(PrefixEstimate {
+                    mean: value,
+                    weight: 1.0,
+                    observed_at: generated,
+                });
+            }
+            if let Some(surv) = survival {
+                let prev = if depth == 0 { 1.0 } else { f64::from(surv[depth - 1]) };
+                if prev > 1e-6 {
+                    let step = (f64::from(surv[depth]) / prev).clamp(0.0, 1.0);
+                    self.step_rate.observe(step, generated);
+                }
+            } else if depth < accepted {
+                self.step_rate.observe(1.0, generated);
+            } else if depth == accepted && rejected {
+                self.step_rate.observe(0.0, generated);
+            }
+        }
     }
 }
 

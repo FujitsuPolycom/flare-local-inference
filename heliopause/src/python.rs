@@ -220,12 +220,23 @@ pub(crate) fn execution_manifest(value: &Bound<'_, PyAny>) -> PyResult<Execution
                 tuning_graph: field!(binding, "tuning_graph", String),
             });
         }
+        let kind = GraphKind::try_from(field!(graph, "kind", String).as_str())
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let draft_source = match graph.get_item("draft_source").ok()
+            .map(|value| value.extract::<u32>()).transpose()? {
+            Some(0) => None,
+            Some(1) => Some(helios_core::scheduler::speculation::ProposalSource::Mtp),
+            Some(2) => Some(helios_core::scheduler::speculation::ProposalSource::Copy),
+            Some(_) => return Err(PyValueError::new_err("unsupported graph draft_source")),
+            None => (kind == GraphKind::Speculative)
+                .then_some(helios_core::scheduler::speculation::ProposalSource::Mtp),
+        };
         graphs.push(GraphDescriptor {
             confidence_width: field!(graph, "confidence_width", usize),
-            draft_tokens: if field!(graph, "kind", String) == "speculative" { field!(graph, "draft_tokens", usize) } else { 0 },
+            draft_tokens: if kind == GraphKind::Speculative { field!(graph, "draft_tokens", usize) } else { 0 },
+            draft_source,
             name: field!(graph, "name", String),
-            kind: GraphKind::try_from(field!(graph, "kind", String).as_str())
-                .map_err(|error| PyValueError::new_err(error.to_string()))?,
+            kind,
             sampling_mode: SamplingMode::try_from(field!(graph, "sampling_mode", String).as_str())
                 .map_err(|error| PyValueError::new_err(error.to_string()))?,
             handle: field!(graph, "handle", usize),

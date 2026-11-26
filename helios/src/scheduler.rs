@@ -263,6 +263,7 @@ pub struct LiveRequest {
     copy_proposal: Option<speculation::CopyProposal>,
     pub(crate) decoded_sequence: decoded_history::DecodedSequence,
     sam: Option<sam::PromptOutputSAM>,
+    copy_calibration: Option<speculation::CopyCalibration>,
     growable_output: bool,
     /// Finishing to free its pages; the runtime readmits its history instead of completing it.
     preempted: bool,
@@ -1103,14 +1104,24 @@ impl RequestScheduler {
         handle: RequestHandle,
         maximum: usize,
     ) -> (Vec<i64>, usize) {
+        let (tokens, count, _) = self.request_history_proposal_with_match_len(handle, maximum);
+        (tokens, count)
+    }
+
+    /// Returns `(padded_tokens, count, match_len)` for a live request's best copy proposal.
+    pub fn request_history_proposal_with_match_len(
+        &self,
+        handle: RequestHandle,
+        maximum: usize,
+    ) -> (Vec<i64>, usize, usize) {
         let maximum = maximum
             .min(self.capabilities.completion_token_capacity.saturating_sub(1))
             .min(speculation::COPY_DRAFT_CAPACITY);
         if maximum == 0 || self.decoded_history.is_none() {
-            return (vec![-1; maximum], 0);
+            return (vec![-1; maximum], 0, 0);
         }
         let Ok(request) = self.request(handle) else {
-            return (vec![-1; maximum], 0);
+            return (vec![-1; maximum], 0, 0);
         };
         let vocabulary = self.capabilities.vocabulary;
         let sam_proposal = request.sam.as_ref().and_then(|sam| {
@@ -1133,12 +1144,68 @@ impl RequestScheduler {
             (Some(sam), Some((shared_tokens, shared_count, shared_match_len)))
                 if shared_count > 0 && shared_match_len > sam.match_len =>
             {
-                (shared_tokens, shared_count)
+                (shared_tokens, shared_count, shared_match_len)
             }
-            (Some(sam), _) => sam.into_padded_i64(maximum),
-            (None, Some((shared_tokens, shared_count, _))) => (shared_tokens, shared_count),
-            (None, None) => (vec![-1; maximum], 0),
+            (Some(sam), _) => {
+                let match_len = sam.match_len;
+                let (padded, count) = sam.into_padded_i64(maximum);
+                (padded, count, match_len)
+            }
+            (None, Some((shared_tokens, shared_count, shared_match_len))) => {
+                (shared_tokens, shared_count, shared_match_len)
+            }
+            (None, None) => (vec![-1; maximum], 0, 0),
         }
+    }
+
+    /// Returns `(available_copy_tokens, match_len)` for a live request without building
+    /// a padded upload vector.
+    pub(crate) fn request_copy_match_stats(
+        &self,
+        handle: RequestHandle,
+        maximum: usize,
+    ) -> (usize, usize) {
+        let maximum = maximum
+            .min(self.capabilities.completion_token_capacity.saturating_sub(1))
+            .min(speculation::COPY_DRAFT_CAPACITY);
+        if maximum == 0 || self.decoded_history.is_none() {
+            return (0, 0);
+        }
+        let Ok(request) = self.request(handle) else {
+            return (0, 0);
+        };
+        let vocabulary = self.capabilities.vocabulary;
+        let sam_stats = request.sam.as_ref().and_then(|sam| {
+            let proposal = sam.propose(maximum)?;
+            let valid_len = proposal
+                .tokens
+                .iter()
+                .position(|&token| (token as usize) >= vocabulary)
+                .unwrap_or(proposal.tokens.len());
+            (valid_len > 0).then_some((valid_len, proposal.match_len))
+        });
+        let shared = self
+            .decoded_history
+            .as_ref()
+            .map(|history| {
+                let (_, count, match_len) = history.lookup_with_match_len(request.tokens(), maximum);
+                (count, match_len)
+            })
+            .filter(|&(count, _)| count > 0);
+        match (sam_stats, shared) {
+            (Some((_sam_len, sam_match)), Some((shared_len, shared_match)))
+                if shared_match > sam_match =>
+            {
+                (shared_len, shared_match)
+            }
+            (Some(sam), _) => sam,
+            (None, Some(shared)) => shared,
+            (None, None) => (0, 0),
+        }
+    }
+
+    pub fn is_copy_only_step(&self, step: &ScheduledStep) -> bool {
+        self.costs.is_copy_only_step(step)
     }
 
     #[cfg(feature = "server")]
@@ -1783,6 +1850,10 @@ impl RequestScheduler {
             .decoded_history
             .is_some()
             .then(|| sam::PromptOutputSAM::new(&spec.prompt));
+        let copy_calibration = self
+            .decoded_history
+            .is_some()
+            .then(|| speculation::CopyCalibration::new(self.capabilities.completion_token_capacity));
         self.slots[slot].generation = generation;
         self.slots[slot].request = Some(LiveRequest {
             image_slot: None,
@@ -1815,6 +1886,7 @@ impl RequestScheduler {
             copy_proposal: None,
             decoded_sequence: Default::default(),
             sam,
+            copy_calibration,
             history,
             tokens: spec.prompt,
             prefix,
@@ -2432,10 +2504,18 @@ impl RequestScheduler {
             let mask = step.lanes.iter().fold(0, |mask, lane| mask | 1 << lane.request.slot);
             self.estimated_round_lengths(mask, step.batch_capacity, step.draft_tokens, step.token_capacity, step.packed_token_capacity, false)
         });
+        let copy_only_step = self.proposal_source == speculation::ProposalSource::Mtp
+            && self.costs.is_copy_only_step(step);
         let expected_tokens = std::array::from_fn(|slot| step.lanes.iter().enumerate()
             .find(|(_, lane)| lane.request.slot as usize == slot).map_or(0.0, |(row, lane)| {
                 if step.lane_kind(row) == GraphKind::Speculative {
-                    self.expected_speculative_tokens(self.request(lane.request).unwrap(), expected_lengths.as_ref().map_or(lane.tokens, |lengths| lengths[slot]))
+                    let request = self.request(lane.request).unwrap();
+                    let width = expected_lengths.as_ref().map_or(lane.tokens, |lengths| lengths[slot]);
+                    if copy_only_step {
+                        self.expected_copy_tokens(request, width)
+                    } else {
+                        self.expected_speculative_tokens(request, width)
+                    }
                 } else if matches!(step.lane_kind(row), GraphKind::Decode | GraphKind::Resume) { 1.0 }
                 else if step.lane_kind(row).is_prefill() { lane.tokens as f64 } else { 0.0 }
             }));
@@ -2712,10 +2792,14 @@ impl RequestScheduler {
         let step = submission.step;
         let now_ns = self.now_ns;
         let proposal_source = self.proposal_source;
+        let copy_only_step = proposal_source == speculation::ProposalSource::Mtp
+            && self.costs.is_copy_only_step(&step);
         // One population update per round: this path for host estimates, `observe_packed_forecasts` for GPU confidence.
         let gpu_confidence = self.gpu_confidence();
-        let host_population = proposal_source == speculation::ProposalSource::Mtp && !gpu_confidence;
-        let collect_calibration = confidence.is_some() && gpu_confidence;
+        let host_population = proposal_source == speculation::ProposalSource::Mtp
+            && !gpu_confidence
+            && !copy_only_step;
+        let collect_calibration = confidence.is_some() && gpu_confidence && !copy_only_step;
         let mut population = Vec::new();
         let mut calibration = Vec::new();
         let mut useful_tokens = [0u64; REQUEST_LANES];
@@ -2773,22 +2857,46 @@ impl RequestScheduler {
             {
                 let vector = record.vector.as_ref().unwrap();
                 let offered = vector.offered_drafts as usize;
+                let accepted = vector.accepted_drafts as usize;
+                let rejected = vector.emitted_count > vector.accepted_drafts;
                 let survival = survival.map(|rows| rows[lane.request.slot as usize].as_slice());
+                let observed_source = if copy_only_step {
+                    speculation::ProposalSource::Copy
+                } else {
+                    proposal_source
+                };
                 request.acceptance.observe(
-                    proposal_source,
+                    observed_source,
                     record.generated_tokens as u32,
                     offered,
-                    vector.accepted_drafts as usize,
-                    vector.emitted_count > vector.accepted_drafts,
+                    accepted,
+                    rejected,
                     survival,
                 );
+                if let Some(copy_cal) = request.copy_calibration.as_mut() {
+                    let copy_prefix = if copy_only_step {
+                        offered
+                    } else {
+                        ((vector.copy_offered_mask.max(0) as u64).trailing_ones() as usize)
+                            .min(offered)
+                    };
+                    if copy_prefix > 0 {
+                        copy_cal.observe_prefix(
+                            record.generated_tokens as u32,
+                            copy_prefix,
+                            accepted,
+                            rejected,
+                            survival,
+                        );
+                    }
+                }
                 // The population and GPU confidence calibration learn from the exact
                 // offered, determined prefix outcomes that update the request's profile.
                 if host_population || collect_calibration {
                     for (depth, realized) in speculation::observed_prefixes(
                         offered,
-                        vector.accepted_drafts as usize,
-                        vector.emitted_count > vector.accepted_drafts,
+                        accepted,
+                        rejected,
                         survival,
                     ) {
                         if host_population {

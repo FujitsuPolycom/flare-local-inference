@@ -70,6 +70,7 @@ pub(super) struct PackedRoundShape {
     pub width: usize,
     pub tokens: usize,
     pub nanos: u64,
+    pub draft_source: Option<super::speculation::ProposalSource>,
 }
 
 struct Estimate {
@@ -77,6 +78,7 @@ struct Estimate {
     replays: ReplayTimes,
     observed_at_ns: u64,
     last_attempt_ns: u64,
+    draft_source: Option<super::speculation::ProposalSource>,
 }
 
 #[derive(Default)]
@@ -164,6 +166,7 @@ impl ActionCosts {
                     replays: ReplayTimes::default(),
                     observed_at_ns: 0,
                     last_attempt_ns: 0,
+                    draft_source: graph.draft_source,
                 },
             ));
         }
@@ -186,8 +189,16 @@ impl ActionCosts {
 
     fn refresh_packed_durations(&mut self) {
         for row in &mut self.packed_round_durations { row.fill(None); }
+        let has_mtp = self.entries.iter().any(|(key, estimate)| {
+            key.kind == GraphKind::Speculative
+                && key.packed != 0
+                && estimate.draft_source != Some(super::speculation::ProposalSource::Copy)
+        });
         for (key, estimate) in &self.entries {
             if key.kind != GraphKind::Speculative || key.packed == 0 { continue; }
+            if has_mtp && estimate.draft_source == Some(super::speculation::ProposalSource::Copy) {
+                continue;
+            }
             let maximum = (key.drafts + 1).min(key.tokens).min(key.packed);
             let nanos = estimate.nanos;
             for duration in self.packed_round_durations[key.batch.trailing_zeros() as usize].iter_mut().take(maximum + 1).skip(1) {
@@ -205,8 +216,31 @@ impl ActionCosts {
         self.entries.iter().filter(|(key, _)| key.kind == GraphKind::Speculative && key.packed != 0)
             .map(|(key, estimate)| PackedRoundShape {
                 batch: key.batch, drafts: key.drafts, width: key.tokens, tokens: key.packed,
-                nanos: estimate.nanos,
+                nanos: estimate.nanos, draft_source: estimate.draft_source,
             })
+    }
+
+    pub fn is_copy_only_step(&self, step: &ScheduledStep) -> bool {
+        step.kind == GraphKind::Speculative
+            && self
+                .index
+                .get(&Key::from_step(step))
+                .is_some_and(|&idx| {
+                    self.entries[idx].1.draft_source
+                        == Some(super::speculation::ProposalSource::Copy)
+                })
+    }
+
+    pub fn max_mtp_draft_tokens(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|(key, estimate)| {
+                key.kind == GraphKind::Speculative
+                    && estimate.draft_source != Some(super::speculation::ProposalSource::Copy)
+            })
+            .map(|(key, _)| key.drafts)
+            .max()
+            .unwrap_or(0)
     }
 
     pub fn shape_duration(
@@ -356,6 +390,7 @@ mod tests {
             sampling_mode: SamplingMode::General,
             confidence_width: drafts,
             draft_tokens: drafts,
+            draft_source: Some(super::super::speculation::ProposalSource::Mtp),
             handle: 1,
             batch_capacity: 16,
             token_capacity: width,
@@ -424,6 +459,7 @@ mod tests {
             sampling_mode: SamplingMode::General,
             confidence_width: 0,
             draft_tokens: 0,
+            draft_source: None,
             handle: 1,
             batch_capacity: 1,
             token_capacity: 512,
