@@ -157,6 +157,16 @@ def format_gpus(indices) -> str:
     return ",".join(map(str, indices))
 
 
+def _validate_row_shard_attention(recipe: Recipe, checkpoint: Checkpoint,
+                                  row_shard_prefill: bool, row_shard_attention: bool) -> None:
+    if not row_shard_attention:
+        return
+    if not row_shard_prefill:
+        raise UsageError("--row-shard-attention requires --row-shard-prefill")
+    if not recipe.row_shard_prefill_world_sizes or recipe.replicated_attention_bytes is None:
+        raise UsageError(f"--row-shard-attention is not supported by {checkpoint.alias}")
+
+
 @dataclass(frozen=True)
 class Plan:
     """Per-rank memory demand and supply for one checkpoint on selected GPUs."""
@@ -193,6 +203,9 @@ class Plan:
     # Prefill replaces eligible tensor-parallel all-reduces with reduce-scatters into each rank's
     # contiguous row shard and shard gathers when the collective runtime provides row-shard surfaces.
     row_shard_prefill: bool = False
+    # Eligible prefill attention layers run on each rank's row shard using replicated attention
+    # projections and KV gathers instead of attention input gathers and output reduce-scatters.
+    row_shard_attention: bool = False
     lock_gpu_clocks: bool = False
     native_dense_activations: bool = False
     force_moe_decode_a16: bool = False
@@ -265,6 +278,9 @@ class Plan:
                 raise UsageError(f"--shard-hyperconnections is not supported by {self.checkpoint.alias}")
             if self.world_size < 2:
                 raise UsageError("--shard-hyperconnections requires tensor parallelism")
+        _validate_row_shard_attention(
+            self.recipe, self.checkpoint, self.row_shard_prefill, self.row_shard_attention
+        )
         if self.row_shard_prefill:
             if not self.recipe.row_shard_prefill_world_sizes:
                 raise UsageError(f"--row-shard-prefill is not supported by {self.checkpoint.alias}")
@@ -399,6 +415,7 @@ class Plan:
             "joint_tuning": self.joint_tuning,
             "shard_hyperconnections": self.shard_hyperconnections,
             "row_shard_prefill": self.row_shard_prefill,
+            "row_shard_attention": self.row_shard_attention,
             "lock_gpu_clocks": self.lock_gpu_clocks,
             "native_dense_activations": self.native_dense_activations,
             "force_moe_decode_a16": self.force_moe_decode_a16,
@@ -442,7 +459,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         roce_chain: bool = False,
         image_concurrency: int | None = None, online_mxfp8: bool = False, online_mxfp8_scope: str | None = None,
         language_model_only: bool = False, mla_compute_mode: str | None = None,
-        row_shard_prefill: bool = False) -> Plan:
+        row_shard_prefill: bool = False, row_shard_attention: bool = False) -> Plan:
     """Size pages and the prefix cache to the supply; the result may not fit.
 
     Weights come from the checkpoint's stored tensors and graphs and scratch from
@@ -513,14 +530,20 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         costs = replace(costs, graph_bytes=costs.graph_bytes - credit)
     # A plan with image slots uses the recipe's image continuation row and vision storage.
     costs = costs.with_image_slots(images)
+    _validate_row_shard_attention(recipe, checkpoint, row_shard_prefill, row_shard_attention)
     plan = Plan(recipe, checkpoint, gpus, concurrency, recipe.prefill_chunk if prefill_chunk is None else prefill_chunk,
                 speculation, 0, 0, 0, reserve_bytes,
-                recipe.weights_bytes(checkpoint, len(gpus), speculation, expert_scale_compression), costs.graph_bytes,
+                recipe.weights_bytes(
+                    checkpoint, len(gpus), speculation, expert_scale_compression,
+                    row_shard_attention=row_shard_attention,
+                    prompt_logprobs=prompt_logprobs,
+                ),
+                costs.graph_bytes,
                 context_parallel=context_parallel and costs.page_tokens is not None,
                 context_parallel_size=context_parallel_size,
                 stream_overlap=stream_overlap and recipe.stream_overlap, mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
                 expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
-                row_shard_prefill=row_shard_prefill, mla_compute_mode=mla_compute_mode,
+                row_shard_prefill=row_shard_prefill, row_shard_attention=row_shard_attention, mla_compute_mode=mla_compute_mode,
                 image_concurrency=images, online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope,
                 language_model_only=language_model_only)
     available = plan.supply_bytes - plan.fixed_bytes
@@ -578,7 +601,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
          expert_scale_compression: str | None = None, roce_ring: bool = False, roce_chain: bool = False,
          image_concurrency: int | None = None, online_mxfp8: bool = False, online_mxfp8_scope: str | None = None,
          language_model_only: bool = False, mla_compute_mode: str | None = None,
-         row_shard_prefill: bool = False) -> Plan:
+         row_shard_prefill: bool = False, row_shard_attention: bool = False) -> Plan:
     """Select GPUs and size the plan, or raise a capacity error that lists working settings.
 
     Without `selected`, the plan uses the smallest supported tensor-parallel size
@@ -616,6 +639,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
         if not recipe.vocabulary_parallel_world_sizes:
             raise UsageError(f"--vocabulary-parallel-sampling is not supported by {checkpoint.alias}")
         world_sizes = tuple(size for size in world_sizes if size in recipe.vocabulary_parallel_world_sizes)
+    _validate_row_shard_attention(recipe, checkpoint, row_shard_prefill, row_shard_attention)
     if row_shard_prefill and not recipe.row_shard_prefill_world_sizes:
         raise UsageError(f"--row-shard-prefill is not supported by {checkpoint.alias}")
     plan_sizes = (tuple(size for size in world_sizes if size in recipe.row_shard_prefill_world_sizes)
@@ -657,7 +681,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
                    stream_overlap=stream_overlap, cache_states=cache_states,
                    mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
                    expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
-                   row_shard_prefill=row_shard_prefill,
+                   row_shard_prefill=row_shard_prefill, row_shard_attention=row_shard_attention,
                    image_concurrency=(None if language_model_only
                                       else (None if image_concurrency is None else min(image_concurrency, concurrency))),
                    online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope, language_model_only=language_model_only,

@@ -52,7 +52,7 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
            image_concurrency: int | None = None, mla_compute_mode: str | None = None,
            lock_gpu_clocks: bool = False, native_dense_activations: bool = False,
            joint_tuning: bool = False, shard_hyperconnections: bool = False,
-           row_shard_prefill: bool = False,
+           row_shard_prefill: bool = False, row_shard_attention: bool = False,
            force_moe_decode_a16: bool | None = None) -> planning.Plan:
     """Select GPUs and estimate memory for one checkpoint from the configuration and command-line intent."""
     workers = compiler_workers(configuration, compile_workers)
@@ -65,7 +65,8 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
         image_concurrency=image_capacity_setting(configuration, model, image_concurrency,
                                                  language_model_only=language_model_only),
         online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope, language_model_only=language_model_only,
-        mla_compute_mode=mla_compute_mode, row_shard_prefill=row_shard_prefill)
+        mla_compute_mode=mla_compute_mode, row_shard_prefill=row_shard_prefill,
+        row_shard_attention=row_shard_attention)
     result = replace(result, compile_workers=workers, hub_cache=configuration.directory("hub_cache"),
                      autotune_effort=tuning_effort(configuration, autotune_effort),
                      force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", force_moe_decode_a16).value,

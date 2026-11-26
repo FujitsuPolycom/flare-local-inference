@@ -305,6 +305,8 @@ def reproduction_arguments(model, plan, *, compiled_forwards, multi_host=False):
         args.append('--shard-hyperconnections')
     if plan.row_shard_prefill:
         args.append('--row-shard-prefill')
+    if plan.row_shard_attention:
+        args.append('--row-shard-attention')
     if plan.joint_tuning:
         args.append('--joint-tuning')
     if not plan.stream_overlap and plan.recipe.stream_overlap:
@@ -389,6 +391,7 @@ def from_plan(model, plan, *, compiled_forwards, multi_host=False):
     add('reserve_bytes', SCOPE_DEPLOYMENT, int(plan.reserve_bytes))
     add('roce_chain', SCOPE_DEPLOYMENT, bool(plan.roce_chain))
     add('roce_ring', SCOPE_DEPLOYMENT, bool(plan.roce_ring))
+    add('row_shard_attention', SCOPE_DEPLOYMENT, bool(plan.row_shard_attention))
     add('row_shard_prefill', SCOPE_DEPLOYMENT, bool(plan.row_shard_prefill))
     add('shard_hyperconnections', SCOPE_DEPLOYMENT, bool(plan.shard_hyperconnections))
     add('stream_overlap', SCOPE_DEPLOYMENT, bool(plan.stream_overlap))

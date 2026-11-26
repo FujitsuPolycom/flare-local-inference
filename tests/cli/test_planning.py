@@ -20,7 +20,7 @@ DRAFTING = Speculation(draft_tokens=3)
 
 
 def _recipe(name="fixture", *, device_gib=60, ranks=(1, 2, 4), speculation=DRAFTING,
-            row_shard_prefill_world_sizes=(), joint_tuning=False):
+            row_shard_prefill_world_sizes=(), replicated_attention_bytes=None, joint_tuning=False):
     checkpoint = Checkpoint(
         alias=f"{name}-alias",
         repository=f"example/{name}",
@@ -51,6 +51,7 @@ def _recipe(name="fixture", *, device_gib=60, ranks=(1, 2, 4), speculation=DRAFT
         speculation=speculation,
         joint_tuning=joint_tuning,
         row_shard_prefill_world_sizes=row_shard_prefill_world_sizes,
+        replicated_attention_bytes=replicated_attention_bytes,
     )
 
 
@@ -97,6 +98,8 @@ def test_row_shard_prefill_validation_automatic_sizing_and_rebuild_manifest(monk
         keys = [parameter.key for parameter in decoded.parameters]
         assert keys == sorted(keys) and len(keys) == len(set(keys))
         by_key = {parameter.key: parameter for parameter in decoded.parameters}
+        assert by_key["row_shard_attention"].scope == proto.PREPARATION_PARAMETER_SCOPE_DEPLOYMENT
+        assert by_key["row_shard_attention"].value.bool_value is False
         assert by_key["row_shard_prefill"].scope == proto.PREPARATION_PARAMETER_SCOPE_DEPLOYMENT
         assert by_key["row_shard_prefill"].value.bool_value == candidate.row_shard_prefill
         assert by_key["online_mxfp8"].scope == proto.PREPARATION_PARAMETER_SCOPE_TARGET_WEIGHT
@@ -206,3 +209,104 @@ def test_preparation_manifest_resolves_scopes_and_dflash2_inheritance(monkeypatc
     assert not decoded_index.HasField("rebuild")
     expected = json_format.ParseDict(manifest, proto.PreparationManifest())
     assert decoded_index.preparation.SerializeToString(deterministic=True) == expected.SerializeToString(deterministic=True)
+
+
+def test_row_shard_attention_accounting_sizing_and_preparation_manifest(monkeypatch):
+    monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
+    per_layer = 128 * MIB
+    mode_layers = {(False, False): 17, (False, True): 19, (True, False): 37, (True, True): 35}
+
+    def replicated(world_size, *, prompt_logprobs=False, mtp_only=False):
+        return 0 if world_size < 2 else mode_layers[(prompt_logprobs, mtp_only)] * per_layer
+
+    with pytest.raises(ValueError, match="replicated_attention_bytes"):
+        _recipe(ranks=(2, 4), row_shard_prefill_world_sizes=(2, 4), replicated_attention_bytes=123)
+
+    prefill_only = _recipe("prefill-only", ranks=(2, 4), row_shard_prefill_world_sizes=(2, 4))
+    with pytest.raises(ValueError, match="replicated_attention_bytes"):
+        prefill_only.weights_bytes(prefill_only.checkpoints[0], 2, DRAFTING, row_shard_attention=True)
+
+    for bad_value in (-1, True, 1.5):
+        bad_recipe = _recipe(
+            "bad",
+            ranks=(2,),
+            row_shard_prefill_world_sizes=(2,),
+            replicated_attention_bytes=lambda w, *, prompt_logprobs=False, mtp_only=False, v=bad_value: v,
+        )
+        with pytest.raises(ValueError, match="non-negative integer"):
+            bad_recipe.weights_bytes(bad_recipe.checkpoints[0], 2, DRAFTING, row_shard_attention=True)
+
+    supported = _recipe(
+        "attn",
+        device_gib=60,
+        ranks=(2, 4),
+        row_shard_prefill_world_sizes=(2, 4),
+        replicated_attention_bytes=replicated,
+    )
+    pair_gpus = (_gpu(0), _gpu(1))
+    draft_only = replace(DRAFTING, mtp_only=True)
+
+    # Every (prompt_logprobs, mtp_only) combination changes replicated bytes independently.
+    for (prompt_logprobs, speculation_cfg), expected_layers in (
+        ((False, DRAFTING), 17),
+        ((False, draft_only), 19),
+        ((True, DRAFTING), 37),
+        ((True, draft_only), 35),
+    ):
+        base = planning.plan(
+            supported, supported.checkpoints[0], pair_gpus, selected=(0, 1), concurrency=4,
+            reserve_bytes=0, speculation=speculation_cfg, prompt_logprobs=prompt_logprobs,
+            row_shard_prefill=True,
+        )
+        attn = planning.plan(
+            supported, supported.checkpoints[0], pair_gpus, selected=(0, 1), concurrency=4,
+            reserve_bytes=0, speculation=speculation_cfg, prompt_logprobs=prompt_logprobs,
+            row_shard_prefill=True, row_shard_attention=True,
+        )
+        assert attn.weights_bytes - base.weights_bytes == expected_layers * per_layer
+        assert attn.pages < base.pages
+        assert attn.to_dict()["row_shard_attention"] is True
+
+    # Automatic GPU sizing steps up from TP2 to TP4 when replicated weights exceed TP2 capacity.
+    tight = _recipe(
+        "tight",
+        device_gib=60,
+        ranks=(2, 4),
+        row_shard_prefill_world_sizes=(2, 4),
+        replicated_attention_bytes=lambda w, *, prompt_logprobs=False, mtp_only=False: 4 * GIB,
+    )
+    tight_gpus = tuple(_gpu(i, free_gib=39) for i in range(4))
+    tp2_without_attn = planning.plan(
+        tight, tight.checkpoints[0], tight_gpus, selected=None, concurrency=4,
+        reserve_bytes=0, speculation=DRAFTING, row_shard_prefill=True,
+    )
+    tp4_with_attn = planning.plan(
+        tight, tight.checkpoints[0], tight_gpus, selected=None, concurrency=4,
+        reserve_bytes=0, speculation=DRAFTING, row_shard_prefill=True, row_shard_attention=True,
+    )
+    assert tp2_without_attn.world_size == 2
+    assert tp4_with_attn.world_size == 4 and tp4_with_attn.row_shard_attention
+
+    # Single-source gating rejects missing --row-shard-prefill and unsupported recipes in plan and fit.
+    with pytest.raises(UsageError, match="--row-shard-attention requires --row-shard-prefill"):
+        planning.plan(
+            supported, supported.checkpoints[0], pair_gpus, selected=(0, 1), concurrency=4,
+            reserve_bytes=0, speculation=DRAFTING, row_shard_attention=True,
+        )
+    with pytest.raises(UsageError, match="--row-shard-attention is not supported by prefill-only-alias"):
+        planning.fit(
+            prefill_only, prefill_only.checkpoints[0], pair_gpus, concurrency=4,
+            reserve_bytes=0, speculation=DRAFTING, row_shard_prefill=True, row_shard_attention=True,
+        )
+
+    # PreparationManifest round-trip records row_shard_attention in deployment scope and reproduction args.
+    manifest = rebuild_manifest.from_plan(SimpleNamespace(directory=None), tp4_with_attn, compiled_forwards=True)
+    assert "--row-shard-prefill" in manifest["reproduction_args"]
+    assert "--row-shard-attention" in manifest["reproduction_args"]
+    encoded = json_format.ParseDict(manifest, proto.PreparationManifest())
+    decoded = proto.PreparationManifest.FromString(encoded.SerializeToString(deterministic=True))
+    keys = [parameter.key for parameter in decoded.parameters]
+    assert keys == sorted(keys) and len(keys) == len(set(keys))
+    by_key = {parameter.key: parameter for parameter in decoded.parameters}
+    assert by_key["row_shard_attention"].scope == proto.PREPARATION_PARAMETER_SCOPE_DEPLOYMENT
+    assert by_key["row_shard_attention"].value.bool_value is True
