@@ -303,8 +303,6 @@ class Recipe:
     moe_decode_a16_intermediate_width: int | None = None
     # Whether tensor-parallel preparation can shard hyperconnection residuals across ranks.
     shard_hyperconnections: bool = False
-    # Whether preparation supports joint decode/prefill kernel tuning.
-    joint_tuning: bool = False
     # Tensor-parallel world sizes that support vocabulary-parallel speculative sampling.
     vocabulary_parallel_world_sizes: tuple[int, ...] = ()
     # Tensor-parallel world sizes that support row-sharded prefill reductions and gathers.

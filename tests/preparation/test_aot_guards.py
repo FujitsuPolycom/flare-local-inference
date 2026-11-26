@@ -1,9 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Grouped forwards retain ordinary guards and storage-alias checks."""
+"""Restored AOT forward guards preserve diagnostics and release portable compiler state."""
 
-from types import SimpleNamespace
 import gc
 import pickle
 import weakref
@@ -12,30 +11,8 @@ import pytest
 import torch
 
 from ignition.preparation.aot import (
-    BindingMismatch, BoundForward, ForwardCache, StorageBackend,
-    _BindingsChecked, _CHECK_BINDINGS, _GuardedForwardCall, _guard_code_cache, _load_inductor,
+    BindingMismatch, BoundForward, StorageBackend, _guard_code_cache, _load_inductor,
 )
-
-
-class Artifact(_GuardedForwardCall):
-    def __init__(self):
-        self.checked = []
-        super().__init__(self.check_storage,
-            SimpleNamespace(check=lambda args: args["forward"].guard,
-                            check_verbose=lambda args: "incompatible owner"),
-            object.__new__(StorageBackend))
-
-    def check_storage(self, owner):
-        if not _CHECK_BINDINGS.get():
-            raise AssertionError("binding validation must not execute a forward")
-        self.checked.append(owner)
-        if not owner.storage_ok:
-            raise BindingMismatch("compiled tensor aliases differ")
-        raise _BindingsChecked
-
-
-def owner(*, guard=True, storage_ok=True):
-    return SimpleNamespace(guard=guard, storage_ok=storage_ok)
 
 
 class GuardedForward:
@@ -161,58 +138,6 @@ def _metadata_owners(backend):
     return owners
 
 
-def test_group_reuses_one_artifact_after_each_existing_guard_and_alias_check():
-    artifact = Artifact()
-    first, second = owner(), owner()
-    template = BoundForward(artifact, first, cache_hit=False)
-    cache = object.__new__(ForwardCache)
-    bound = cache.bind_group(template, {"first": first, "second": second}, signature="same")
-    assert tuple(bound) == ("first", "second")
-    assert all(value.artifact is artifact and value.cache_hit is False for value in bound.values())
-    assert artifact.checked == [first, second]
-
-
-def test_group_rejects_storage_mismatch_on_every_rank_without_recompilation(monkeypatch):
-    import torch.distributed as dist
-
-    artifact = Artifact()
-    first, bad = owner(), owner(storage_ok=False)
-    template = BoundForward(artifact, first, cache_hit=False)
-    coordinator = SimpleNamespace(ranks=(0, 1), group=object())
-    def exchange(results, local, *, group):
-        results[:] = [local, (local[0], local[1], {"bad": "peer guard failure"})]
-    monkeypatch.setattr(dist, "all_gather_object", exchange)
-    with pytest.raises(BindingMismatch, match="compiled tensor aliases differ"):
-        object.__new__(ForwardCache).bind_group(template,
-            {"first": first, "bad": bad}, signature="same", coordinator=coordinator)
-    assert artifact.checked == [first, bad]
-
-
-def test_group_rejects_different_rank_signatures(monkeypatch):
-    import torch.distributed as dist
-
-    artifact = Artifact()
-    first = owner()
-    template = BoundForward(artifact, first, cache_hit=False)
-    coordinator = SimpleNamespace(ranks=(0, 1), group=object())
-    monkeypatch.setattr(dist, "all_gather_object",
-        lambda results, local, *, group: results.__setitem__(slice(None),
-            [local, (("first",), "different", {})]))
-    with pytest.raises(BindingMismatch, match="different grouped forward owners or signatures"):
-        object.__new__(ForwardCache).bind_group(template,
-            {"first": first}, signature="same", coordinator=coordinator)
-
-
-def test_finalized_group_rejects_guard_mismatch_before_checking_storage():
-    artifact = Artifact()
-    first, bad = owner(), owner(guard=False)
-    template = BoundForward(artifact, first, cache_hit=True)
-    with pytest.raises(BindingMismatch, match="incompatible owner"):
-        object.__new__(ForwardCache).bind_group(template,
-            {"first": first, "bad": bad}, signature="same")
-    assert artifact.checked == [first]
-
-
 @pytest.mark.parametrize("restored", [False, True])
 def test_finalization_releases_portable_owners_and_retains_live_checks(tmp_path, restored):
     class Callback:
@@ -287,45 +212,3 @@ def test_finalization_releases_portable_owners_and_retains_live_checks(tmp_path,
     assert callback_ref() is None
     assert all(reference() is None for reference in execution_refs)
     assert type(forward) is GuardedForward
-
-
-@pytest.mark.parametrize("restored", [False, True])
-def test_group_retains_guard_manager_until_last_bound_owner_drops(restored):
-    artifact, first = _compiled_forward()
-    if restored:
-        backend = artifact._artifacts.compiled_fn
-        backend.artifact, backend._serialized_artifact = _load_inductor(
-            backend.artifact.serialize(), torch.device("cpu"))
-        del backend
-    second = GuardedForward()
-    wrapper = artifact._artifacts.guard_manager
-    wrapper_ref = weakref.ref(wrapper)
-    manager_ref = weakref.ref(wrapper._check_function_manager)
-    backend_ref = weakref.ref(artifact._artifacts.compiled_fn)
-    metadata = _metadata_owners(artifact._artifacts.compiled_fn)
-    assert all(value.source_code for value in metadata)
-    bundle_refs = [weakref.ref(value._triton_bundle) for value in metadata
-                   if value._triton_bundle is not None]
-    assert bundle_refs
-    template = BoundForward(artifact, first, cache_hit=True)
-    bound = object.__new__(ForwardCache).bind_group(template,
-        {"first": first, "second": second}, signature="same")
-    assert all(value.source_code == "" and value._triton_bundle is None for value in metadata)
-    del metadata
-    retained = bound.pop("second")
-    del bound, artifact, template, wrapper
-    gc.collect()
-    assert wrapper_ref() is not None
-    assert manager_ref() is not None
-    assert backend_ref() is not None
-    assert all(reference() is None for reference in bundle_refs)
-    torch.testing.assert_close(retained(), torch.full((2,), 2.0))
-    second.offset = 7
-    with pytest.raises(BindingMismatch):
-        retained()
-    del retained
-    gc.collect()
-    assert wrapper_ref() is None
-    assert manager_ref() is None
-    assert backend_ref() is None
-    assert type(first) is type(second) is GuardedForward

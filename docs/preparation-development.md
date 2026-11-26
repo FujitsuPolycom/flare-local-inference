@@ -351,8 +351,7 @@ Preparation-time search ends before graph handoff.
   Complete warmup for the entire catalog before capturing any graph.
   After successful capture and any required instantiation, release the compiled
   Python wrapper and guards while retaining graph, kernel, and storage owners
-  through drain. Grouped forwards release shared guards after their final capture;
-  recipes exposing eager forwards retain guarded callables.
+  through drain. Recipes exposing eager forwards retain guarded callables.
 
 ## Shape and graph-transition validation
 

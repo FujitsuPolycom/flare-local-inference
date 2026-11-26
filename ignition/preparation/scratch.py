@@ -114,13 +114,6 @@ class ScratchArena:
             raise ValueError("parallel scratch requires at least two plans")
         self._parallel_plans.append(plans)
 
-    def replace_parallel_plans(self, replacements):
-        """Rebind declared forks when prepared plan choices change before capture."""
-        if self.frozen:
-            raise RuntimeError("scratch declarations are frozen")
-        self._parallel_plans = [tuple(replacements.get(plan, plan) for plan in group)
-                                for group in self._parallel_plans]
-
     def parallel_nbytes(self, requirement):
         sizes = {}
         def aligned(plan):
@@ -227,8 +220,8 @@ class ScratchArena:
             raise TypeError("scratch binding finalizer must be callable")
         self._finalizers.append(callback)
 
-    def finalize(self, *, group=None, retain=False):
-        """Bind scratch views, retaining callbacks only for preparation trial graphs."""
+    def finalize(self, *, group=None):
+        """Bind scratch views and clear registered finalizers."""
         self._require_active()
         if group is None:
             for callback in self._finalizers:
@@ -257,8 +250,7 @@ class ScratchArena:
                         callback()
                 finally:
                     self._binding_views = None
-        if not retain:
-            self._finalizers.clear()
+        self._finalizers.clear()
 
 
 def _shared_views(layouts):

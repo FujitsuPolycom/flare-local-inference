@@ -198,7 +198,6 @@ class Plan:
     roce_chain: bool = False
     compile_workers: int | None = None
     autotune_effort: str = "default"
-    joint_tuning: bool = False
     shard_hyperconnections: bool = False
     # Prefill replaces eligible tensor-parallel all-reduces with reduce-scatters into each rank's
     # contiguous row shard and shard gathers when the collective runtime provides row-shard surfaces.
@@ -294,13 +293,6 @@ class Plan:
                 )
             if any(gpu.capability == (10, 3) for gpu in self.gpus):
                 raise UsageError("--row-shard-prefill is not qualified on SM103; select SM120 or SM121 GPUs")
-            if self.joint_tuning:
-                raise UsageError("--row-shard-prefill cannot be combined with --joint-tuning")
-        if self.joint_tuning:
-            if not self.recipe.joint_tuning:
-                raise UsageError(f"--joint-tuning is not supported by {self.checkpoint.alias}")
-            if self.autotune_effort == "off":
-                raise UsageError("--joint-tuning requires --autotune-effort default or audit")
 
     @property
     def world_size(self) -> int:
@@ -412,7 +404,6 @@ class Plan:
             "mla_compute_mode": self.mla_compute_mode,
             "compile_workers": self.compile_workers,
             "autotune_effort": self.autotune_effort,
-            "joint_tuning": self.joint_tuning,
             "shard_hyperconnections": self.shard_hyperconnections,
             "row_shard_prefill": self.row_shard_prefill,
             "row_shard_attention": self.row_shard_attention,

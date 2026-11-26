@@ -227,9 +227,6 @@ def _preparation_arguments(running, *, model_default="defaults.model", recipes=(
     advanced.add_argument("--shard-hyperconnections", action="store_true",
                           help="shard Qwen3.8 Flash hyperconnection bottlenecks across TP ranks with"
                                " BF16 gate-logit reduction (default: replicated)")
-    advanced.add_argument("--joint-tuning", action="store_true",
-                          help="jointly tune DeepSeek V4.1 attention projection plans across the prepared"
-                               " prefill, decode, and speculative shapes (default: off)")
     advanced.add_argument("--row-shard-prefill", action="store_true",
                           help="reduce eligible prefill branch outputs into one contiguous row shard per"
                                " rank, run row-local residual mixing on that shard, and gather normalized"

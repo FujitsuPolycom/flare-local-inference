@@ -11,7 +11,6 @@ from ignition import planning
 from ignition.cli import _parser, preparation
 from ignition.cli.config import Configuration
 from ignition.declaration import Checkpoint, RankCosts, Recipe, SamplingDefaults, Speculation
-from ignition.errors import UsageError
 from ignition.preparation.bootstrap import BasePreparationConfig, common_preparation_kwargs
 from ignition.registry import ResolvedModel
 
@@ -20,7 +19,7 @@ MIB = 1 << 20
 
 
 def _fixture_recipe(*, ranks=(1, 2, 4), row_shard_world_sizes=(2, 4),
-                    replicated_attention_bytes=None, joint_tuning=True):
+                    replicated_attention_bytes=None):
     speculation = Speculation(draft_tokens=3)
     checkpoint = Checkpoint(
         alias="fixture-tp-model",
@@ -47,7 +46,6 @@ def _fixture_recipe(*, ranks=(1, 2, 4), row_shard_world_sizes=(2, 4),
         usage=lambda prepared: (),
         sampling_defaults=SamplingDefaults(temperature=1.0, top_p=1.0, top_k=-1),
         speculation=speculation,
-        joint_tuning=joint_tuning,
         benchmark_world_sizes=(2, 4),
         row_shard_prefill_world_sizes=row_shard_world_sizes,
         replicated_attention_bytes=replicated_attention_bytes,
@@ -78,7 +76,7 @@ def test_row_shard_flags_are_model_agnostic(command, flag, attr, capsys):
     assert "supported TP recipes" in section
 
 
-def test_derive_forwards_row_shard_prefill_and_rejects_joint_tuning(tmp_path):
+def test_derive_forwards_row_shard_prefill(tmp_path):
     cfg_path = tmp_path / "config.toml"
     cfg_path.write_text("")
     configuration = Configuration.load(cfg_path)
@@ -97,12 +95,6 @@ def test_derive_forwards_row_shard_prefill_and_rejects_joint_tuning(tmp_path):
     config = BasePreparationConfig(**kwargs)
     assert config.prefill_chunk_size == 4096
     assert config.max_active == 4
-
-    with pytest.raises(UsageError, match="--row-shard-prefill cannot be combined with --joint-tuning"):
-        preparation.derive(
-            configuration, model, host, gpus="0,1", concurrency=concurrency,
-            speculation=recipe.speculation, row_shard_prefill=True, joint_tuning=True,
-        )
 
 
 def test_row_shard_attention_forwarding_and_serve_progress(tmp_path, monkeypatch):

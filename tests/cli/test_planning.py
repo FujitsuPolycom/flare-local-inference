@@ -20,7 +20,7 @@ DRAFTING = Speculation(draft_tokens=3)
 
 
 def _recipe(name="fixture", *, device_gib=60, ranks=(1, 2, 4), speculation=DRAFTING,
-            row_shard_prefill_world_sizes=(), replicated_attention_bytes=None, joint_tuning=False):
+            row_shard_prefill_world_sizes=(), replicated_attention_bytes=None):
     checkpoint = Checkpoint(
         alias=f"{name}-alias",
         repository=f"example/{name}",
@@ -49,7 +49,6 @@ def _recipe(name="fixture", *, device_gib=60, ranks=(1, 2, 4), speculation=DRAFT
         usage=lambda prepared: (),
         sampling_defaults=SamplingDefaults(temperature=1.0, top_p=1.0, top_k=-1),
         speculation=speculation,
-        joint_tuning=joint_tuning,
         row_shard_prefill_world_sizes=row_shard_prefill_world_sizes,
         replicated_attention_bytes=replicated_attention_bytes,
     )
@@ -72,7 +71,7 @@ def test_recipe_validates_row_shard_prefill_world_sizes():
 def test_row_shard_prefill_validation_automatic_sizing_and_rebuild_manifest(monkeypatch):
     monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
     unsupported = _recipe("plain", ranks=(1, 2, 4), row_shard_prefill_world_sizes=())
-    supported = _recipe("sharded", ranks=(1, 2, 4), row_shard_prefill_world_sizes=(2, 4), joint_tuning=True)
+    supported = _recipe("sharded", ranks=(1, 2, 4), row_shard_prefill_world_sizes=(2, 4))
     tp34 = _recipe("tp34", ranks=(3, 4), row_shard_prefill_world_sizes=(4,))
 
     pair_gpus = (_gpu(0), _gpu(1))
@@ -132,13 +131,11 @@ def test_row_shard_prefill_validation_automatic_sizing_and_rebuild_manifest(monk
         planning.plan(tp34, tp34.checkpoints[0], four_gpus[:3], selected=None,
                       concurrency=4, reserve_bytes=0, speculation=DRAFTING, row_shard_prefill=True)
 
-    # SM103 and --joint-tuning are rejected.
+    # SM103 is rejected.
     with pytest.raises(UsageError, match="SM103"):
         planning.plan(supported, supported.checkpoints[0], (_gpu(0, 95, (10, 3)), _gpu(1, 95, (10, 3))),
                       selected=(0, 1), concurrency=4, reserve_bytes=0, speculation=DRAFTING,
                       row_shard_prefill=True)
-    with pytest.raises(UsageError, match="--row-shard-prefill cannot be combined with --joint-tuning"):
-        replace(sharded, joint_tuning=True)
 
 
 def test_preparation_manifest_resolves_scopes_and_dflash2_inheritance(monkeypatch):

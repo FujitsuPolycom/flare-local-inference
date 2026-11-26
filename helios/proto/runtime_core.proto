@@ -164,8 +164,8 @@ message RebuildManifest {
   bool local_checkpoint = 21;
   // Neighbor relays over a chain in rank order; exclusive with roce_ring.
   bool roce_chain = 22;
-  // Preparation-only joint attention-plan selection across the captured text shapes.
-  bool joint_tuning = 23;
+  reserved 23;
+  reserved "joint_tuning";
   // Preparation-only lowrank hyperconnection partitioning with BF16 gate-logit reduction.
   bool shard_hyperconnections = 24;
   reserved 25, 26;

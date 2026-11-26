@@ -48,8 +48,7 @@ def local_components(requests):
 
 def component_key(group):
     """Identify the complete request DAG and the declaration bound to every source name."""
-    return tuple((r.name, portable_declaration(r.plan), tuple(r.dependencies),
-                  getattr(r, "finalist_policy", None)) for r in group)
+    return tuple((r.name, portable_declaration(r.plan), tuple(r.dependencies)) for r in group)
 
 
 def materialization_key(session, group):

@@ -160,23 +160,16 @@ def create_dma_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc
 
 
 def _tuning_results(contributions):
-    """Forward finalist shards in rank order and select ordinary race winners."""
+    """Select the fastest completed candidate for each sharded tuning race."""
     races = {}
     for item in contributions:
         races.setdefault(item.key, []).append(item)
     results = []
     for key in sorted(races):
-        members = races[key]
-        policy = getattr(members[0], "finalist_policy", None)
-        if any(getattr(item, "finalist_policy", None) != policy for item in members):
-            raise ValueError("sharded finalist policies differ across ranks")
-        if policy is not None:
-            results.extend(members)
-        else:
-            completed = [item for item in members if item.assignment is not None]
-            if not completed:
-                raise RuntimeError(f"no rank completed a candidate of tuning race {key!r}")
-            results.append(min(completed, key=lambda item: (item.latency_us, item.candidate_index)))
+        completed = [item for item in races[key] if item.assignment is not None]
+        if not completed:
+            raise RuntimeError(f"no rank completed a candidate of tuning race {key!r}")
+        results.append(min(completed, key=lambda item: (item.latency_us, item.candidate_index)))
     return tuple(results)
 
 
@@ -217,9 +210,8 @@ class CollectivePreparation:
     coordinator releases a collective only after all group members report the
     same declaration. When the session shards tuning, it also relays b12x's
     two exchanges: every rank's cached selections, which b12x reconciles in
-    rank order, and candidate results. Ordinary races use the fastest result;
-    finalist races retain every shard for b12x to consolidate. It is unused
-    after graph handoff.
+    rank order, and candidate results, selecting the fastest result for each
+    race. It is unused after graph handoff.
     """
 
     def __init__(self, group, *, timeout=timedelta(minutes=2)):

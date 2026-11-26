@@ -7,7 +7,7 @@ import pytest
 import torch
 from b12x._lib.compile_pool import CompileJob
 from b12x._lib.scratch import ScratchBufferSpec
-from b12x.preparation import DetectedDevice, DeviceIdentity, FinalistPolicy, Knob, MemoryRequirements, Plan, TuningContract
+from b12x.preparation import DetectedDevice, DeviceIdentity, Knob, MemoryRequirements, Plan, TuningContract
 
 from ignition.preparation.collectives import CollectivePreparation
 from ignition.preparation.tuning_shards import component_key, local_components, materialization_key
@@ -16,7 +16,7 @@ from ignition.preparation.tuning_shards import component_key, local_components, 
 DEVICE = DetectedDevice(0, DeviceIdentity('nvidia', (12, 0), 188, 'RTX PRO 6000 Blackwell'))
 
 
-def request(name, size, *, dependencies=(), memory=0, factory_value=0, shared=False, policy=None, override=None):
+def request(name, size, *, dependencies=(), memory=0, factory_value=0, shared=False, override=None):
     contract = TuningContract(component_id='test.projection', query_schema_version=1, config_schema_version=1,
         query_fields=frozenset({'size'}), config_fields=frozenset({'width'}),
         encode_query=lambda q: {'size': q}, encode_config=lambda c: {'width': c}, decode_config=lambda d: d['width'],
@@ -28,7 +28,7 @@ def request(name, size, *, dependencies=(), memory=0, factory_value=0, shared=Fa
             ScratchBufferSpec(name='tiles', shape=(size + (memory if c == 2 else 0),), dtype=torch.uint8, device=torch.device('cuda', d.ordinal)),)),
         _materialize=lambda s, d: s.config)
     return plan.request(name=name, dependencies=dependencies, prepare_call=lambda s: None,
-        benchmark_call=lambda s: None, finalist_policy=policy)
+        benchmark_call=lambda s: None)
 
 
 def test_local_components_keep_aliases_dependencies_and_collective_neighbors():
@@ -45,12 +45,11 @@ def test_local_components_keep_aliases_dependencies_and_collective_neighbors():
         local_components((request('broken', 32, dependencies=('missing',)),))
 
 
-def test_component_keys_include_pins_and_finalists_and_every_candidate_binding():
+def test_component_keys_include_pins_and_every_candidate_binding():
     def key(**kwargs):
         return component_key([request('projection', 32, **kwargs)])
     assert key(override=2) != key()
     assert key(shared=True) != key()
-    assert key(policy=FinalistPolicy(family_fields=('width',))) != key()
     session=SimpleNamespace(device=DEVICE)
     fingerprint=lambda **kwargs: materialization_key(session, [request('projection',32,**kwargs)])
     assert fingerprint(memory=4) != fingerprint()
@@ -109,8 +108,7 @@ def _gloo_mixed_batch_worker(rank, store_path, queue):
 
         coordinator.prepare = fake_prepare
         try:
-            policy = FinalistPolicy(family_fields=("width",))
-            common = request("shared_proj", 32, policy=policy)
+            common = request("shared_proj", 32)
             reqs = (common, request("rank0_only", 64)) if rank == 0 else (common,)
             batches = RecordedPreparationSession._mixed_tuning_batches(session, reqs)
             assert [(tuple(r.name for r in b), mode) for b, mode in batches] == [

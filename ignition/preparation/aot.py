@@ -766,58 +766,6 @@ class ForwardCache:
             release_unused()
             return result
 
-    def bind_group(self, template, forwards, *, signature, coordinator=None):
-        """Bind one compiled forward to owners with matching guards and storage aliases.
-
-        A grouped caller first prepares its representative through ``prepare_many``.
-        Every rank checks every owner before any grouped graph is captured; a
-        mismatch fails on all ranks and cannot trigger compilation on peers.
-        """
-        if (not forwards or not isinstance(template, BoundForward) or template.pending is not None
-                or not isinstance(template.backend, StorageBackend)):
-            raise ValueError("group binding requires a completed storage-bound forward")
-        artifact = template.artifact
-        failures = {}
-        for name, owner in forwards.items():
-            try:
-                template.prepare_capture()
-                artifact = template.artifact
-                if type(owner) is not type(template.owner):
-                    raise BindingMismatch("grouped forward type differs from its compiled representative")
-                if not artifact.guards.check({"forward": owner}):
-                    reason = artifact.guards.check_verbose({"forward": owner})
-                    raise BindingMismatch(f"compiled forward guard differs: {reason}")
-                token = _CHECK_BINDINGS.set(True)
-                try:
-                    try:
-                        artifact(owner)
-                    except _BindingsChecked:
-                        pass
-                    else:
-                        raise RuntimeError("grouped forward did not validate storage bindings")
-                finally:
-                    _CHECK_BINDINGS.reset(token)
-            except Exception as error:
-                failures[name] = f"{type(error).__name__}: {error}"
-        if coordinator is None:
-            gathered = ((tuple(forwards), signature, failures),)
-            ranks = (0,)
-        else:
-            import torch.distributed as dist
-
-            ranks = coordinator.ranks
-            gathered = [None] * len(ranks)
-            dist.all_gather_object(gathered, (tuple(forwards), signature, failures), group=coordinator.group)
-        if any(names != tuple(forwards) or selected != signature for names, selected, _ in gathered):
-            raise BindingMismatch("tensor-parallel ranks declared different grouped forward owners or signatures")
-        if any(items for _, _, items in gathered):
-            detail = [(rank, name, reason) for rank, (_, _, items) in zip(ranks, gathered, strict=True)
-                      for name, reason in sorted(items.items())]
-            raise BindingMismatch(f"grouped forward bindings differ from compiled guards: {detail[:4]}")
-        return {name: BoundForward(artifact, owner, template.cache_hit,
-                                   execution_identity=template.execution_identity)
-                for name, owner in forwards.items()}
-
     @contextmanager
     def _publication_lock(self, coordinator=None):
         """Hold this host's cache against other launches from compilation through binding.
