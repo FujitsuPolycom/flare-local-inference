@@ -407,9 +407,15 @@ Graph estimates use these GPU observations for both isolated and queued executio
 Host dispatch, completion delivery, and polling time do not enter a graph's cost.
 Missing or zero device intervals neither change an estimate nor make it fresh.
 
-Prefill exploration excludes a larger unmeasured graph when a smaller prepared
-capacity consumes the same tokens up to the next message or prompt endpoint.
-Measured graphs remain eligible according to their observed costs.
+Pure prefill exploration restricts unmeasured graphs (`PREFILL`,
+`TERMINAL_PREFILL`, and `SCORED_PREFILL`) to the natural-fit capacity: the
+smallest registered catalog capacity that achieves the maximum single-step
+token work through the next checkpoint cut, atomic span, or prompt endpoint
+(respecting terminal-completion requirements). Smaller unmeasured prefill
+shapes do not preempt larger fitting graphs during cold discovery, and larger
+padded unmeasured shapes that consume no additional tokens are excluded.
+Measured prefill graphs of every capacity remain eligible according to their
+observed costs and funded timing refresh.
 
 An indeterminate candidate wins over a determinate candidate, then competes by
 expected useful value. Equal values prefer shorter known time, more served

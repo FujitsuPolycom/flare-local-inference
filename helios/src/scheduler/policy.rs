@@ -350,6 +350,37 @@ impl RequestScheduler {
         end.saturating_sub(start)
     }
 
+    /// Smallest registered catalog capacity that achieves the maximum single-step
+    /// prefill work through `cut`, respecting atomic spans and terminal completion.
+    /// Unmeasured pure prefill graphs only participate in cold discovery at this
+    /// capacity so smaller unmeasured shapes do not preempt larger fitting graphs.
+    fn natural_fit_prefill_capacity(
+        &self,
+        request: &LiveRequest,
+        catalog: &[usize],
+        cut: Option<usize>,
+    ) -> Option<usize> {
+        let terminal_only = self.prefill_requires_terminal_completion(request, cut);
+        let mut best: Option<(usize, usize)> = None;
+        for &capacity in catalog {
+            let work = self.prefill_work_through(request, capacity, cut);
+            if work == 0 {
+                continue;
+            }
+            let resolved = self.resolve_prefill_kind(request, capacity, work, cut);
+            if terminal_only && resolved == GraphKind::Prefill {
+                continue;
+            }
+            if self.costs.duration(resolved, 1, capacity).is_none() {
+                continue;
+            }
+            if best.is_none_or(|(_, best_work)| work > best_work) {
+                best = Some((capacity, work));
+            }
+        }
+        best.map(|(capacity, _)| capacity)
+    }
+
     pub fn submission_window_available(&self, duration_ns: u64) -> bool {
         self.submissions.len() < 2
             && !self.submissions.values().any(|s| s.requires_feedback)
@@ -473,9 +504,11 @@ impl RequestScheduler {
             }
         };
         if r.consumed_tokens < r.prompt_tokens as u64 {
+            let catalog = self.prefill_catalog(r.prefill_kind());
             let cut = self.estimated_checkpoint_cut(r);
             let terminal_only = self.prefill_requires_terminal_completion(r, cut);
-            for &capacity in self.prefill_catalog(r.prefill_kind()) {
+            let mut natural_fit = None;
+            for &capacity in catalog {
                 let work = self.prefill_work_through(r, capacity, cut);
                 if work == 0 {
                     continue;
@@ -485,6 +518,13 @@ impl RequestScheduler {
                     continue;
                 }
                 if let Some(ns) = self.costs.duration(kind, 1, capacity) {
+                    if ns == 0
+                        && *natural_fit
+                            .get_or_insert_with(|| self.natural_fit_prefill_capacity(r, catalog, cut))
+                            != Some(capacity)
+                    {
+                        continue;
+                    }
                     consider(
                         ns,
                         value.prefill(
@@ -735,10 +775,17 @@ impl RequestScheduler {
                     let work = self.prefill_work_through(request, extent, cut);
                     if work == 0
                         || (!mixed
-                            && matches!(following, GraphKind::Prefill | GraphKind::TerminalPrefill)
-                            && (self.resolve_prefill_kind(request, extent, work, cut) != following
-                                || (following == GraphKind::Prefill
-                                    && self.prefill_requires_terminal_completion(request, cut))))
+                            && ((matches!(following, GraphKind::Prefill | GraphKind::TerminalPrefill)
+                                && (self.resolve_prefill_kind(request, extent, work, cut)
+                                    != following
+                                    || (following == GraphKind::Prefill
+                                        && self.prefill_requires_terminal_completion(request, cut))))
+                                || (ns == 0
+                                    && self.natural_fit_prefill_capacity(
+                                        request,
+                                        self.prefill_catalog(request.prefill_kind()),
+                                        cut,
+                                    ) != Some(extent))))
                     {
                         continue;
                     }
@@ -910,14 +957,15 @@ impl RequestScheduler {
                 let cut = self.estimated_checkpoint_cut(r);
                 let work = self.prefill_work_through(r, capacity, cut);
                 let resolved = self.resolve_prefill_kind(r, capacity, work, cut);
-                // Explore larger graphs only when they can consume additional tokens.
+                // Restrict unmeasured pure prefill discovery to the natural-fit capacity
+                // so smaller unmeasured shapes do not preempt larger fitting graphs and
+                // larger padded shapes that consume no additional tokens are skipped.
                 if work == 0
                     || resolved != kind
                     || (kind == GraphKind::Prefill
                         && self.prefill_requires_terminal_completion(r, cut))
-                    || (duration_ns == 0 && catalog.iter()
-                        .take_while(|&&smaller| smaller < capacity)
-                        .any(|&smaller| self.prefill_work_through(r, smaller, cut) == work))
+                    || (duration_ns == 0
+                        && self.natural_fit_prefill_capacity(r, catalog, cut) != Some(capacity))
                 {
                     continue;
                 }
