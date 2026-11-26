@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Admission limits and power-of-two capacities for prepared request batches."""
+"""Admission limits and batch capacities for prepared request batches."""
 
 from fractions import Fraction
 import heapq
@@ -10,7 +10,7 @@ from math import isqrt
 
 MAX_CONCURRENCY = 64
 DEFAULT_COMPLETION_TOKEN_CAPACITY = 8
-BATCH_CAPACITIES = (1, 2, 4, 8, 16, 32, 64)
+BATCH_CAPACITIES = (1, 2, 4, 6, 8, 12, 16, 24, 32, 64)
 
 
 def serving_modes(enabled: bool, mtp_only: bool = False) -> tuple[bool, ...]:

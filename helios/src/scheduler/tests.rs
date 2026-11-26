@@ -72,7 +72,11 @@ fn admission_and_completion_cover_configured_concurrency() {
         let step = scheduler.plan().unwrap();
         assert_eq!(step.kind, GraphKind::Init);
         assert_eq!(step.lanes.len(), active);
-        assert_eq!(step.batch_capacity, active.next_power_of_two());
+        let expected_batch = crate::execution::BATCH_CAPACITIES
+            .into_iter()
+            .find(|&batch| batch >= active)
+            .unwrap();
+        assert_eq!(step.batch_capacity, expected_batch);
         scheduler.commit(&step, Fence(1)).unwrap();
         let mut records = vec![CompletionRecord::default(); active.next_power_of_two()];
         for handle in &handles {
@@ -3967,4 +3971,115 @@ fn state_slot_extent_uses_storage_geometry_independently_of_completion_capacity(
     let scheduler = RequestScheduler::new([0; 32], fixture.limits.clone(), capabilities).unwrap();
     assert_eq!(scheduler.execution_rows(), 1024);
     assert_eq!(scheduler.snapshot_slot(SnapshotId(3)).0, 1028);
+}
+
+#[test]
+fn intermediate_batch_capacities_select_tight_buckets_and_preserve_legacy_cores() {
+    // 1) Core with intermediate batch buckets (6, 12, 24) selects B=6 for C=5, B=12 for C=10,
+    //    and B=24 for C=20 across both ordinary decode and speculative rounds.
+    for (concurrency, expected_batch) in [(5usize, 6usize), (10, 12), (20, 24)] {
+        for speculative in [false, true] {
+            let mut s = scheduler(32, 512, 64);
+            if speculative {
+                s.enable_speculation(&[1, 8]).unwrap();
+                let shapes: Vec<_> = crate::execution::BATCH_CAPACITIES
+                    .into_iter()
+                    .filter(|&b| b <= 32)
+                    .flat_map(|b| [(b, 1), (b, 8)])
+                    .collect();
+                s.speculative_graphs(&shapes).unwrap();
+            }
+            for &batch in crate::execution::BATCH_CAPACITIES.iter().filter(|&&b| b <= 32) {
+                let ns = 6_000_000 + batch as u64 * 100_000;
+                s.costs.set_measured(&ScheduledStep {
+                    kind: GraphKind::Decode,
+                    batch_capacity: batch,
+                    token_capacity: 1,
+                    draft_tokens: 0,
+                    packed_token_capacity: 0,
+                    lanes: vec![],
+                    mixed: None,
+                    requires_feedback: false,
+                }, ns);
+                if speculative {
+                    for width in [1usize, 8] {
+                        s.costs.set_measured(&ScheduledStep {
+                            kind: GraphKind::Speculative,
+                            batch_capacity: batch,
+                            token_capacity: width,
+                            draft_tokens: width - 1,
+                            packed_token_capacity: batch * width,
+                            lanes: vec![],
+                            mixed: None,
+                            requires_feedback: false,
+                        }, ns + (width as u64 - 1) * 100_000);
+                    }
+                }
+            }
+            let handles: Vec<_> = (0..concurrency).map(|_| s.admit(spec(64, 32)).unwrap()).collect();
+            for h in &handles {
+                let r = s.request_mut(*h).unwrap();
+                r.phase = RequestPhase::Decode;
+                r.consumed_tokens = 64;
+                r.scheduled_consumed = 64;
+                r.generated_tokens = 1;
+            }
+            let step = s.plan().unwrap();
+            assert_eq!(
+                step.kind,
+                if speculative { GraphKind::Speculative } else { GraphKind::Decode }
+            );
+            assert_eq!(
+                step.batch_capacity, expected_batch,
+                "C={concurrency} speculative={speculative} selected B={} instead of B={expected_batch}",
+                step.batch_capacity
+            );
+            assert_eq!(step.lanes.len(), concurrency);
+        }
+    }
+
+    // 2) Legacy core with only power-of-two batch capacities (1, 2, 4, 8, 16, 32) validates
+    //    and schedules C=5 -> B=8, C=10 -> B=16, C=20 -> B=32 without requiring B=6/12/24.
+    for (concurrency, expected_legacy_batch) in [(5usize, 8usize), (10, 16), (20, 32)] {
+        let mut s = scheduler(32, 512, 64);
+        let legacy_graphs: Vec<_> = duration_graphs(32)
+            .into_iter()
+            .filter(|g| crate::execution::REQUIRED_BATCH_CAPACITIES.contains(&g.batch_capacity))
+            .collect();
+        s.measured_graph_durations(&legacy_graphs).unwrap();
+        s.enable_speculation(&[1, 8]).unwrap();
+        let legacy_shapes: Vec<_> = crate::execution::REQUIRED_BATCH_CAPACITIES
+            .into_iter()
+            .filter(|&b| b <= 32)
+            .flat_map(|b| [(b, 1), (b, 8)])
+            .collect();
+        s.speculative_graphs(&legacy_shapes).unwrap();
+        for &batch in crate::execution::REQUIRED_BATCH_CAPACITIES.iter().filter(|&&b| b <= 32) {
+            let ns = 6_000_000 + batch as u64 * 100_000;
+            for width in [1usize, 8] {
+                s.costs.set_measured(&ScheduledStep {
+                    kind: GraphKind::Speculative,
+                    batch_capacity: batch,
+                    token_capacity: width,
+                    draft_tokens: width - 1,
+                    packed_token_capacity: batch * width,
+                    lanes: vec![],
+                    mixed: None,
+                    requires_feedback: false,
+                }, ns + (width as u64 - 1) * 100_000);
+            }
+        }
+        let handles: Vec<_> = (0..concurrency).map(|_| s.admit(spec(64, 32)).unwrap()).collect();
+        for h in &handles {
+            let r = s.request_mut(*h).unwrap();
+            r.phase = RequestPhase::Decode;
+            r.consumed_tokens = 64;
+            r.scheduled_consumed = 64;
+            r.generated_tokens = 1;
+        }
+        let step = s.plan().unwrap();
+        assert_eq!(step.kind, GraphKind::Speculative);
+        assert_eq!(step.batch_capacity, expected_legacy_batch);
+        assert_eq!(step.lanes.len(), concurrency);
+    }
 }

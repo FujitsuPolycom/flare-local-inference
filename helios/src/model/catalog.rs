@@ -9,7 +9,7 @@
 use crate::{
     Result,
     execution::{
-        BATCH_CAPACITIES, ExecutionManifest, GraphKind, SamplingMode,
+        BATCH_CAPACITIES, ExecutionManifest, GraphKind, REQUIRED_BATCH_CAPACITIES, SamplingMode,
     },
     model::ModelConfig,
     scheduler::speculation,
@@ -139,7 +139,7 @@ fn validate_inner(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<
         if kind == GraphKind::Decode && !config.speculative_widths.is_empty() {
             continue;
         }
-        for batch in batches(config) {
+        for batch in required_batches(config) {
             select(config, manifest, kind, batch, 1, 0, SamplingMode::General)?;
         }
     }
@@ -164,7 +164,7 @@ fn validate_inner(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<
         )?;
     }
     if !config.speculative_widths.is_empty() {
-        for batch in batches(config) {
+        for batch in required_batches(config) {
             if !manifest.graphs.iter().any(|graph| graph.kind == GraphKind::Speculative
                 && graph.batch_capacity == batch && graph.token_capacity == 1) {
                 return Err(format!("prepared model lacks width-one speculative graph for batch {batch}").into());
@@ -185,6 +185,12 @@ fn speculative_shape(config: &ModelConfig, batch: usize, tokens: usize) -> bool 
         && (tokens == 1 || (batch * tokens <= config.speculative_token_capacity && config
             .speculative_fixed_width
             .is_none_or(|width| width == tokens)))
+}
+
+fn required_batches(config: &ModelConfig) -> impl Iterator<Item = usize> {
+    REQUIRED_BATCH_CAPACITIES
+        .into_iter()
+        .filter(|batch| *batch <= config.limits.max_active.next_power_of_two())
 }
 
 fn batches(config: &ModelConfig) -> impl Iterator<Item = usize> {

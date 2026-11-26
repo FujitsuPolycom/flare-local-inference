@@ -97,7 +97,8 @@ impl RequestScheduler {
                 .take_while(|b| *b <= self.limits.max_active.next_power_of_two())
             {
                 let widths: &[usize] = if matches!(kind, GraphKind::Speculative) {
-                    &self.speculative_catalog[batch.ilog2() as usize]
+                    crate::execution::batch_capacity_index(batch)
+                        .map_or(&[], |idx| self.speculative_catalog[idx].as_slice())
                 } else {
                     &[1]
                 };
@@ -208,8 +209,8 @@ impl RequestScheduler {
                 } else if request.generated_tokens < request.max_new_tokens {
                     if self.speculative_widths.is_empty() {
                         consider(GraphKind::Decode, batch, 1, 1.0, true);
-                    } else {
-                        for &width in &self.speculative_catalog[batch.ilog2() as usize] {
+                    } else if let Some(batch_idx) = crate::execution::batch_capacity_index(batch) {
+                        for &width in &self.speculative_catalog[batch_idx] {
                             let tokens = self.speculative_tokens(request, width);
                             if tokens > 0 {
                                 let curve = curve.get_or_insert_with(|| self.powered_curve(request, false));

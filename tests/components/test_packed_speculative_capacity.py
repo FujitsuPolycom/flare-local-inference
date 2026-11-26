@@ -29,14 +29,17 @@ def test_catalog_covers_capacity_endpoints_without_exceeding_row_budget(concurre
 
 
 @pytest.mark.parametrize("width,counts,saturation", [
-    (6, (5, 9, 12, 13, 16, 9), 251),
-    (8, (7, 10, 12, 12, 14, 9), 313),
+    (6, (5, 7, 7, 8, 7, 9, 9, 7, 5), 445),
+    (8, (5, 6, 8, 8, 9, 9, 9, 5, 5), 543),
 ])
-def test_default_density_is_dense_at_batch_one_and_scale_normalized(width, counts, saturation):
+def test_default_density_covers_intermediate_batches_within_graph_budget(width, counts, saturation):
+    assert batch_capacities(32) == (1, 2, 4, 6, 8, 12, 16, 24, 32)
     shapes = packed_speculative_shapes(32, width, 128)
     assert len(shapes) == 64
+    assert max(batch for batch, _ in shapes) == 32
+    assert max(tokens for _, tokens in shapes) == 128
     assert tuple(sum(b == batch for b, _ in shapes) for batch in batch_capacities(32)) == counts
-    assert [tokens for batch, tokens in shapes if batch == 1] == list(range(2, width + 1))
+    assert (1, 2) in shapes and (1, width) in shapes
     complete = packed_speculative_shapes(32, width, 128, 1000)
     assert len(complete) == saturation
     assert set(complete) == {(batch, tokens) for batch in batch_capacities(32)
@@ -44,8 +47,8 @@ def test_default_density_is_dense_at_batch_one_and_scale_normalized(width, count
 
 
 def test_each_budget_adds_one_graph_by_refining_the_largest_relative_gap():
-    previous = packed_speculative_shapes(32, 6, 128, 12)
-    for budget in range(13, 90):
+    previous = packed_speculative_shapes(32, 6, 128, 18)
+    for budget in range(19, 90):
         shapes = packed_speculative_shapes(32, 6, 128, budget)
         assert set(previous) < set(shapes)
         assert len(shapes) == budget
@@ -70,9 +73,9 @@ def test_small_domains_saturate_without_duplicate_endpoints():
         (2, 3), (2, 4), (2, 5), (2, 6), (4, 5), (4, 6))
 
 
-@pytest.mark.parametrize("budget", [0, -1, 11, True, 64.0, None])
+@pytest.mark.parametrize("budget", [0, -1, 17, True, 64.0, None])
 def test_budget_must_cover_mandatory_endpoints(budget):
-    with pytest.raises(ValueError, match="at least 12"):
+    with pytest.raises(ValueError, match="at least 18"):
         packed_speculative_shapes(32, 6, 128, budget)
 
 

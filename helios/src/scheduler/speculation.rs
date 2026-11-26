@@ -37,7 +37,7 @@ pub struct CopyProposal {
     pub grammar_masks: Vec<i32>,
 }
 
-pub fn graph_catalog(widths: &[usize], fixed: Option<usize>, capacity: usize) -> [Vec<usize>; 7] {
+pub fn graph_catalog(widths: &[usize], fixed: Option<usize>, capacity: usize) -> [Vec<usize>; BATCH_CAPACITIES.len()] {
     BATCH_CAPACITIES.map(|batch| if batch <= capacity {
         fixed.map_or_else(|| widths.to_vec(), |width| vec![width])
     } else { Vec::new() })

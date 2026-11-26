@@ -1341,7 +1341,7 @@ fn speculative_cohorts_are_selected_by_expected_lane_value() {
                 .observe(speculation::ProposalSource::Mtp, 0, 7, if index >= 6 { 7 } else { 0 }, true, None);
         }
     }
-    for batch in [1, 2, 4, 8] {
+    for batch in [1, 2, 4, 6, 8] {
         for width in [1, 3, 8] {
             set_cost(&mut s, GraphKind::Speculative, batch, width, 200 * MS);
         }

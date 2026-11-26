@@ -642,11 +642,12 @@ pub unsafe fn serve_rank(
                     return Err(invalid("rank graph completion deadline expired"));
                 }
                 // A peer waiting only on its own running frame parks on it; a prepared frame waits
-                // for rank zero's commit over the socket, which cannot end a park. The yield keeps
-                // the old loop's cooperative handoff after either.
+                // for rank zero's commit over the socket, which cannot end a park. Skip the yield
+                // when park observed the wake word advance so completion polling runs immediately.
                 if active {
-                    if prepared.is_none() { executor.park(); }
-                    std::thread::yield_now();
+                    if !(prepared.is_none() && executor.park()) {
+                        std::thread::yield_now();
+                    }
                 }
             }
         })();

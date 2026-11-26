@@ -728,8 +728,9 @@ impl RequestScheduler {
         let mut order = Vec::with_capacity(available.len());
         let mut frontier = std::collections::BinaryHeap::new();
         for shape in self.costs.packed_round_shapes() {
+            let Some(batch_idx) = crate::execution::batch_capacity_index(shape.batch) else { continue; };
             if shape.batch > self.limits.max_active.next_power_of_two()
-                || !self.speculative_catalog[shape.batch.ilog2() as usize].contains(&shape.width) { continue; }
+                || !self.speculative_catalog[batch_idx].contains(&shape.width) { continue; }
             if self.speculative_fixed_width.is_some()
                 && !self.gpu_prefix_allocation(shape.batch, shape.drafts, shape.width, shape.tokens) {
                 let prefixes = fixed_prefixes.entry((shape.drafts, shape.width)).or_insert_with(|| {

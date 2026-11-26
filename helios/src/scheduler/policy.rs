@@ -550,7 +550,8 @@ impl RequestScheduler {
                         consider(ns, value.decode(1.0, ns as f64 / 1e6));
                     }
                 } else {
-                    for &width in &self.speculative_catalog[batch.ilog2() as usize] {
+                    let Some(batch_idx) = crate::execution::batch_capacity_index(batch) else { continue; };
+                    for &width in &self.speculative_catalog[batch_idx] {
                         if let Some(ns) = self.speculative_duration(r, batch, width)
                         {
                             let curve = curve.get_or_insert_with(|| self.powered_curve(r, false));
@@ -853,8 +854,10 @@ impl RequestScheduler {
             if self.speculative_widths.is_empty() {
                 consider(GraphKind::Decode, batch, 1, 0);
             } else {
-                for &width in &self.speculative_catalog[batch.ilog2() as usize] {
-                    consider(GraphKind::Speculative, batch, width, 0);
+                if let Some(batch_idx) = crate::execution::batch_capacity_index(batch) {
+                    for &width in &self.speculative_catalog[batch_idx] {
+                        consider(GraphKind::Speculative, batch, width, 0);
+                    }
                 }
             }
         }
@@ -1093,10 +1096,12 @@ impl RequestScheduler {
                     .take_while(|b| *b <= self.limits.max_active.next_power_of_two())
                 {
                     if kind == GraphKind::Speculative {
-                        for &capacity in &self.speculative_catalog[batch.ilog2() as usize] {
-                            self.add_candidate(
-                                output, kind, batch, capacity, mask, values, age_price,
-                            );
+                        if let Some(batch_idx) = crate::execution::batch_capacity_index(batch) {
+                            for &capacity in &self.speculative_catalog[batch_idx] {
+                                self.add_candidate(
+                                    output, kind, batch, capacity, mask, values, age_price,
+                                );
+                            }
                         }
                     } else {
                         self.add_candidate(output, kind, batch, 1, mask, values, age_price);

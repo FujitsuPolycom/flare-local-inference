@@ -43,7 +43,7 @@ DECODE_AGE_PRICE = .1
 ADAPTATION_MS = 100.
 ESTIMATE_TTL_NS = 30_000_000_000
 # helios/src/execution/manifest.rs.
-BATCH_CAPACITIES = (1, 2, 4, 8, 16, 32, 64)
+BATCH_CAPACITIES = (1, 2, 4, 6, 8, 12, 16, 24, 32, 64)
 REQUEST_LANES = 64
 
 _KINDS = {"init": "init", "restore": "restore", "prefill": "prefill", "resume": "resume", "snapshot": "snapshot"}

@@ -596,9 +596,9 @@ def test_layout_reads_complete_catalog_and_retains_all_c32_p128_shapes():
                             for name, bindings in fixture.bindings.items()]))
     actual = Layout.of(SimpleNamespace(server_config=config, buffers=buffers,
                                        signatures=signatures, max_active=32))
-    assert actual.graphs == graphs and len(actual.packed_shapes) == 34
+    assert actual.graphs == graphs and len(actual.packed_shapes) == len(shapes) == 51
     assert all(lag == 1 for lag in actual.completion_cursors.values())
-    assert len(actual.confidence_widths) == 28
+    assert len(actual.confidence_widths) == 42
     scheduler = Scheduler(actual, prefix_cache=False)
     requests = [request(i, [10, 11], limit=20) for i in range(32)]
     for current in requests:

@@ -235,7 +235,7 @@ pub(super) struct Metrics {
     replay_readiness_samples: AtomicU64,
     launches: [AtomicU64; 9],
     sampling_launches: [AtomicU64; 5],
-    speculative: [Vec<RoundMetrics>; 7],
+    speculative: [Vec<RoundMetrics>; crate::execution::BATCH_CAPACITIES.len()],
     draft_sources: Vec<[[AtomicU64; 2]; 2]>,
     mixed_grammar_decode_steps: AtomicU64,
     constrained_max_inflight: AtomicU64,
@@ -435,7 +435,8 @@ impl Metrics {
         records: &[CompletionRecord],
     ) {
         self.learned_draft_steps.fetch_add(drafts as u64, Ordering::Relaxed);
-        let counters = &self.speculative[batch.trailing_zeros() as usize][width - 1];
+        let Some(index) = crate::execution::batch_capacity_index(batch) else { return; };
+        let counters = &self.speculative[index][width - 1];
         counters.rounds.fetch_add(1, Ordering::Relaxed);
         counters.gpu_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
         for record in records.iter().filter(|r| r.status != 0) {

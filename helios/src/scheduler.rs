@@ -662,7 +662,7 @@ pub struct RequestScheduler {
     stats: SchedulerStats,
     speculative_widths: Vec<usize>,
     speculative_fixed_width: Option<usize>,
-    speculative_catalog: [Vec<usize>; 7],
+    speculative_catalog: [Vec<usize>; crate::execution::BATCH_CAPACITIES.len()],
     prefill_catalog: Vec<usize>,
     terminal_prefill_catalog: Vec<usize>,
     scored_prefill_catalog: Vec<usize>,
@@ -712,7 +712,7 @@ impl RequestScheduler {
             return Err("invalid model scheduling capabilities".into());
         }
 
-        if !crate::execution::BATCH_CAPACITIES.contains(&limits.request_slots)
+        if !crate::execution::REQUIRED_BATCH_CAPACITIES.contains(&limits.request_slots)
             || limits.max_active > limits.request_slots
             || !(1..=REQUEST_LANES).contains(&limits.max_active)
             || limits.max_sequence_tokens == 0
@@ -1004,10 +1004,12 @@ impl RequestScheduler {
         if self.submitted != Fence(0) || self.slots.iter().any(|s| s.request.is_some()) {
             return Err("speculative graphs must be selected before admission".into());
         }
-        let mut catalog: [Vec<usize>; 7] = Default::default();
+        let mut catalog: [Vec<usize>; crate::execution::BATCH_CAPACITIES.len()] = Default::default();
         for &(batch, width) in shapes {
-            if !crate::execution::BATCH_CAPACITIES.contains(&batch)
-                || batch > self.limits.max_active.next_power_of_two()
+            let Some(index) = crate::execution::batch_capacity_index(batch) else {
+                return Err("loaded speculative shape is outside runtime limits".into());
+            };
+            if batch > self.limits.max_active.next_power_of_two()
                 || !self.speculative_widths.contains(&width)
                 || self
                     .speculative_fixed_width
@@ -1015,20 +1017,26 @@ impl RequestScheduler {
             {
                 return Err("loaded speculative shape is outside runtime limits".into());
             }
-            let widths = &mut catalog[batch.trailing_zeros() as usize];
+            let widths = &mut catalog[index];
             if widths.contains(&width) {
                 return Err("duplicate speculative graph shape".into());
             }
             widths.push(width);
         }
-        for widths in
-            &mut catalog[..self.limits.max_active.next_power_of_two().ilog2() as usize + 1]
-        {
+        let max_batch = self.limits.max_active.next_power_of_two();
+        for (index, widths) in catalog.iter_mut().enumerate() {
+            let batch = crate::execution::BATCH_CAPACITIES[index];
+            if batch > max_batch {
+                continue;
+            }
             widths.sort_unstable();
             if let Some(fixed) = self.speculative_fixed_width.filter(|fixed| widths.contains(fixed)) {
                 widths.retain(|w| *w == fixed);
             }
-            if !self.speculative_widths.is_empty() && widths.is_empty() {
+            if !self.speculative_widths.is_empty()
+                && widths.is_empty()
+                && crate::execution::REQUIRED_BATCH_CAPACITIES.contains(&batch)
+            {
                 return Err("missing speculative graph for a runtime batch capacity".into());
             }
         }

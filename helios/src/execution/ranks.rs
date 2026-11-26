@@ -65,12 +65,12 @@ impl RankExecutor {
         }
     }
 
-    /// Wait briefly for this rank's running frame; false when the caller should keep polling.
+    /// Wait briefly for this rank's running frame; true when the wake word signaled completion.
     pub(crate) fn park(&self) -> bool {
         match self {
             Self::Local(executor) => executor.park(),
             Self::Parallel(executor) => executor.park(),
-            Self::Threaded(_) => false,
+            Self::Threaded(executor) => executor.park(),
         }
     }
 

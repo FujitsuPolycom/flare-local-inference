@@ -11,7 +11,10 @@ use std::collections::{BTreeSet, HashSet};
 use serde_json::Value;
 
 use super::format::{Core, invalid};
-use crate::{Result, execution::BATCH_CAPACITIES};
+use crate::{
+    Result,
+    execution::{BATCH_CAPACITIES, REQUIRED_BATCH_CAPACITIES},
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct LoadOptions {
@@ -291,7 +294,7 @@ impl LoadOptions {
             execution.graphs.retain(|graph| graph.draft_tokens.is_none_or(|depth|
                 depths[&(graph.kind.clone(), graph.batch_capacity, graph.token_capacity,
                     graph.packed_token_capacity, graph.prefill_capacity, graph.sampling_mode.clone())] == depth));
-            for batch in BATCH_CAPACITIES.into_iter().filter(|batch| *batch <= active.next_power_of_two()) {
+            for batch in REQUIRED_BATCH_CAPACITIES.into_iter().filter(|batch| *batch <= active.next_power_of_two()) {
                 for kind in ["init", "restore", "snapshot", "resume", if enabled { "speculative" } else { "decode" }] {
                     if !execution.graphs.iter().any(|g| g.kind == kind && g.batch_capacity == batch as u64
                         && (kind != "speculative" || g.token_capacity == 1)) {
