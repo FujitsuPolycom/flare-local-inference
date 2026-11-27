@@ -4,7 +4,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use super::{protocol::*, *};
+use super::{
+    ExecutionManifest, Fence, FrameCompletion, Result, VecDeque, invalid, mpsc, protocol::*,
+};
 use crate::execution::{CompletionRecord, ExecutionTiming, GraphKind};
 use std::collections::{BTreeSet, HashSet};
 
@@ -27,17 +29,48 @@ fn completion(fence: u64, graph: usize) -> FrameCompletion {
     }
 }
 
+struct Pending {
+    fence: Fence,
+    graph: usize,
+    grammar: bool,
+    committed: bool,
+    ready: Vec<bool>,
+    completions: Vec<Option<FrameCompletion>>,
+}
+
+impl PendingFrame for Pending {
+    fn fence(&self) -> Fence {
+        self.fence
+    }
+    fn graph(&self) -> usize {
+        self.graph
+    }
+    fn grammar(&self) -> bool {
+        self.grammar
+    }
+    fn committed(&self) -> bool {
+        self.committed
+    }
+    fn ready(&self) -> &[bool] {
+        &self.ready
+    }
+    fn ready_mut(&mut self) -> &mut [bool] {
+        &mut self.ready
+    }
+    fn completions(&self) -> &[Option<FrameCompletion>] {
+        &self.completions
+    }
+    fn completions_mut(&mut self) -> &mut [Option<FrameCompletion>] {
+        &mut self.completions
+    }
+}
+
 fn frame(fence: u64, graph: usize, grammar: bool) -> Pending {
     Pending {
-        step: Arc::new(Step {
-            fence: Fence(fence),
-            graph,
-            grammar,
-            uploads: Vec::new(),
-        }),
-        dispatched: Instant::now(),
+        fence: Fence(fence),
+        graph,
+        grammar,
         committed: false,
-        queued: fence > 1,
         ready: vec![false; 2],
         completions: vec![None, None, None],
     }
@@ -58,10 +91,10 @@ impl State {
                 .pending
                 .iter()
                 .map(|pending| Pending {
-                    step: pending.step.clone(),
-                    dispatched: pending.dispatched,
+                    fence: pending.fence,
+                    graph: pending.graph,
+                    grammar: pending.grammar,
                     committed: pending.committed,
-                    queued: pending.queued,
                     ready: pending.ready.clone(),
                     completions: pending
                         .completions
@@ -97,9 +130,9 @@ impl State {
                     mask | (usize::from(value.is_some()) << rank)
                 });
             result[start..start + 6].copy_from_slice(&[
-                pending.step.fence.0 as usize,
-                pending.step.graph,
-                usize::from(pending.step.grammar),
+                pending.fence.0 as usize,
+                pending.graph,
+                usize::from(pending.grammar),
                 ready,
                 usize::from(pending.committed),
                 done,
@@ -141,10 +174,10 @@ fn rank_coordinator_matches_model_edges() {
             }
         }
         for (index, pending) in state.pending.iter().enumerate() {
-            let fence = pending.step.fence;
+            let fence = pending.fence;
             for peer in 0..2 {
                 let mut after = state.fork();
-                match record_ready(&mut after.pending, peer, fence, pending.step.graph) {
+                match record_ready(&mut after.pending, peer, fence, pending.graph) {
                     Ok(()) => edge(after, [2, fence.0 as usize, peer]),
                     Err(_) => {
                         assert_eq!(after.projection(), before);
@@ -169,7 +202,7 @@ fn rank_coordinator_matches_model_edges() {
             if pending.committed {
                 for rank in 0..3 {
                     let mut after = state.fork();
-                    let value = completion(fence.0, pending.step.graph);
+                    let value = completion(fence.0, pending.graph);
                     let result = if rank == 0 {
                         record_local_completion(&mut after.pending, value)
                     } else {
@@ -185,7 +218,7 @@ fn rank_coordinator_matches_model_edges() {
                 }
             }
             let mut rejected = state.fork();
-            assert!(record_ready(&mut rejected.pending, 0, fence, pending.step.graph ^ 1).is_err());
+            assert!(record_ready(&mut rejected.pending, 0, fence, pending.graph ^ 1).is_err());
             assert_eq!(rejected.projection(), before);
             edge(rejected, [6, 0, 0]);
         }
@@ -284,7 +317,7 @@ fn rank_coordinator_matches_model_completion_identity() {
     );
     record_peer_completion(&mut pending, 1, completion(1, 0)).unwrap();
     let removed = pop_completed_front(&mut pending).unwrap();
-    assert_eq!(removed.step.fence, Fence(1));
+    assert_eq!(removed.fence, Fence(1));
     assert!(
         super::super::parallel::agree(
             removed.completions[0].as_ref().unwrap(),
@@ -330,19 +363,9 @@ fn rank_coordinator_matches_model_pending_window() {
     assert!(!can_submit_pending(&pending, false, &manifest));
     manifest.graphs[0].kind = GraphKind::Speculative;
     assert!(can_submit_pending(&pending, false, &manifest));
-    pending[0].step = Arc::new(Step {
-        fence: Fence(1),
-        graph: 0,
-        grammar: true,
-        uploads: Vec::new(),
-    });
+    pending[0].grammar = true;
     assert!(!can_submit_pending(&pending, false, &manifest));
-    pending[0].step = Arc::new(Step {
-        fence: Fence(1),
-        graph: 0,
-        grammar: false,
-        uploads: Vec::new(),
-    });
+    pending[0].grammar = false;
     pending.push_back(frame(2, 1, false));
     pending[1].committed = true;
     for rank in 0..3 {
@@ -365,28 +388,27 @@ fn rank_coordinator_matches_model_pending_window() {
 #[test]
 fn rank_coordinator_matches_model_partial_dispatch() {
     for failed_peer in 0..=3 {
-        let mut peers = Vec::new();
+        let mut senders = Vec::new();
         let mut receivers = Vec::new();
         for _ in 0..3 {
-            let (sender, commands) = mpsc::channel();
-            let (_, receiver) = mpsc::channel();
-            peers.push(Peer {
-                sender,
-                receiver,
-                thread: None,
-            });
+            let (sender, commands) = mpsc::channel::<(Fence, usize)>();
+            senders.push(sender);
             receivers.push(Some(commands));
         }
         if failed_peer < 3 {
             drop(receivers[failed_peer].take());
         }
-        let result = dispatch_commit(&peers, Fence(7), 1);
+        let result = dispatch_commit(&mut senders, |sender| {
+            sender
+                .send((Fence(7), 1))
+                .map_err(|_| invalid("rank disconnected"))
+        });
         if failed_peer < 3 {
             assert!(
                 result.is_err(),
                 "partial commit dispatch must report disconnected peer"
             );
-            error(result, "rank thread disconnected");
+            error(result, "rank disconnected");
         } else {
             result.unwrap();
         }
@@ -394,7 +416,7 @@ fn rank_coordinator_matches_model_partial_dispatch() {
             if let Some(receiver) = receiver {
                 if index < failed_peer {
                     assert!(
-                        matches!(receiver.try_recv(), Ok(Command::Commit(Fence(7), 1))),
+                        matches!(receiver.try_recv(), Ok((Fence(7), 1))),
                         "commit dispatch lost an accepted peer"
                     );
                 }

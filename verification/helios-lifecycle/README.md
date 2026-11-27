@@ -146,10 +146,31 @@ the preceding frame to be committed. Feedback-dependent frames occupy the window
 exclusively. Queue removal requires every rank's completion for the oldest frame.
 
 The Rust tests call the private helpers in
-`helios/src/execution/threaded/protocol.rs` used by `ThreadedExecutor`.
+`helios/src/execution/threaded/protocol.rs` shared by
+`TensorParallelExecutor` (`helios/src/execution/parallel.rs`) and
+`ThreadedExecutor` (`helios/src/execution/threaded.rs`).
 The 15-integer projection contains submission/removal counts and each pending
 frame's fence, graph, barrier, readiness mask, commitment marker, and completion
 mask. TLC checks observed helper transitions against `RankProtocol.AllowedEdge`.
+
+`DispatchRing.tla` checks `ThreadedExecutor`'s two-slot lock-free `DispatchRing`
+across three ranks (rank zero plus two peers) and three epochs, covering
+two-deep pipelining, backpressure cancellation, parity-slot reuse while an
+earlier committed frame remains in flight, peer validation failure during a
+pipelined second step, and in-flight drain before close. Invariants require
+every-peer readiness before commit (`CommitRequiresEveryPeer`), conflict-free
+parity-slot reuse (`SlotReuseSafe`), observation of committed decisions before
+drain (`NoStrandedCollective`), draining in-flight GPU work before peer close
+(`NoAbandonedInFlightWork`), and bounded ordered execution windows
+(`WindowAndOrder`).
+
+`execution::threaded::tests::dispatch_ring_matches_model_edges` drives the
+production `DispatchRing` atomics and `drain_outstanding_frames` helper across
+all reachable interleavings of two peers and three epochs, emitting an
+18-integer projection checked against `DispatchRing.AllowedEdge`. Both TLA+
+model mutations and Rust source mutations in `check.py --mutations` verify that
+checking `drain` before `decision`, abandoning in-flight work on drain, or
+accepting partial peer readiness is caught immediately.
 
 The commitment transition represents the marker set after successful peer
 dispatch and local submission. CPU exploration checks its eligibility predicate;
@@ -296,11 +317,12 @@ completion fences and truthful drain confirmation. This check verifies how the
 scheduler consumes those signals; it does not verify their CUDA or rank-thread
 implementation.
 
-The rank-helper checks cover the extracted bookkeeping predicates. They do not
-execute `poll_ranks`, `rank_loop`, poison handling, or `close` against CUDA, and
-do not establish all-rank drain or collective progress. The socket coordinator
-in `execution/parallel.rs` is a separate implementation that these checks do not
-cover.
+The rank-helper and `DispatchRing` checks cover the extracted bookkeeping
+predicates, lock-free atomic protocol, and host drain loop. They do not execute
+`poll_ranks`, `rank_loop`, poison handling, or `close` against CUDA, and do not
+establish all-rank hardware drain or collective progress. The socket coordinator
+in `execution/parallel.rs` shares `protocol.rs`, while its socket I/O and peer
+control loop remain outside these checks.
 
 The model permits any nonempty live cohort with a compatible feedback barrier.
 It does not prove scheduling-policy choices or fairness. It checks safety only;

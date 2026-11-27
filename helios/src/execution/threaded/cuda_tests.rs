@@ -4,7 +4,10 @@
  */
 
 use super::*;
-use crate::runtime_core::{NativeResources, driver::Driver, test_support};
+use crate::{
+    execution::OwnedUpload,
+    runtime_core::{NativeResources, driver::Driver, test_support},
+};
 
 fn uploads(limits: [i32; 4], confidence: f32, reset: bool, terminal: bool, slots: [i32; 4]) -> Vec<OwnedUpload> {
     let mut values = vec![
@@ -45,14 +48,9 @@ fn four_cuda_rank_threads_preserve_two_frames_and_device_continuations() {
                          uploads(limits[1], confidence[1], false, false, slots[1])];
             let first = executor.submit(0, &borrowed(&owned[0]), false).unwrap().unwrap();
             assert_eq!(executor.outstanding(), 1);
-            assert!(!executor.can_submit(false));
+            assert!(executor.can_submit(false));
             let deadline = Instant::now() + Duration::from_secs(30);
-            let second = loop {
-                assert!(Instant::now() < deadline, "first frame preparation timed out");
-                if let Some(fence) = executor.submit(0, &borrowed(&owned[1]), false).unwrap() { break fence; }
-                assert!(executor.poll().unwrap().is_none(), "first completion was consumed before the second reservation");
-                thread::yield_now();
-            };
+            let second = executor.submit(0, &borrowed(&owned[1]), false).unwrap().unwrap();
             assert_eq!(second.0, first.0 + 1);
             assert_eq!(executor.outstanding(), 2);
             assert!(!executor.can_submit(false));

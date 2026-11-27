@@ -76,12 +76,29 @@ threads between stages. Runtime-sized rows and pages use a common capacity
 that fits every rank. Payload staging has a process-wide bound.
 
 The scheduler coordinates rank zero and peer execution threads through
-[the threaded executor](../helios/src/execution/threaded.rs). A step carries
-one fence, graph selection, grammar state, and upload set. Each rank validates
-its inputs before commit, launches its graph, and transfers completion
-records. The coordinator retires the fence only when all ranks agree on
-request epochs, consumed-token counts, and status. Rank zero delivers
-sampled output.
+[the threaded executor](../helios/src/execution/threaded.rs). Startup tuning
+graphs and startup completion travel over per-peer channels; serving steps use a
+two-slot lock-free ping-pong ring (`DispatchRing`) with reusable upload buffers
+and no per-step heap allocations. A step carries one fence, graph selection,
+grammar state, and upload set. Rank zero validates the submission locally,
+writes it into parity slot `epoch & 1`, and publishes `prepare_epoch` (waking
+idle peers parked on the ring's condition variable). Each peer observes
+`prepare_epoch`, validates its upload layout, frame capacity, and any rank-local
+Engram staging state without launching CUDA work, drops its slot borrow, and
+writes its cache-aligned readiness word. Only after every peer acknowledges
+readiness does rank zero submit locally and publish a `Commit` decision (or
+`Cancel` if rank zero encounters backpressure, leaving the executor unpoisoned,
+or `Drain` on peer or local error so no rank launches a stranded collective).
+Peers check `decision` for their current epoch before observing `drain`, so a
+step already committed on other ranks still launches on every surviving peer
+even when a pipelined next step fails and requests drain. On `Drain`, each peer
+drains any already-committed in-flight GPU frames through `executor.poll()`
+before closing its executor. Parity slot `epoch & 1` is reused for `epoch >= 3`
+only after `wait_peer_acks((epoch - 1) << 1)` acquires every peer's readiness
+store for `epoch - 1`, which happens strictly after every peer drops its slot
+borrow for `epoch - 2` inside `executor.submit()` (or cancel handling). The
+coordinator retires the fence only when all ranks agree on request epochs,
+consumed-token counts, and status, and rank zero delivers sampled output.
 
 At most two coordinated steps are outstanding. A second step is admitted only
 after the first has been committed, and only when both are ordinary
@@ -90,8 +107,8 @@ operation requires an empty window (`can_submit_pending` in
 `helios/src/execution/threaded/protocol.rs`). A 120-second completion
 deadline bounds stranded collectives. Input frames, completion frames, graph
 owners, and collective storage remain retained until every referencing
-rank finishes. Captured GPU collectives perform the reductions; host
-channels carry control and completion information.
+rank finishes. Captured GPU collectives perform the reductions; the host
+dispatch ring and reply channels carry control and completion information.
 
 ## 4. Preparation diagnostics
 
@@ -148,9 +165,12 @@ to both devices, has these properties on two GPUs:
   contents, and graph replay are unchanged. Rank threads keep their context
   bindings and launch without rebinding, and a graph captured after the
   restore can address a buffer allocated in the peer context.
-- A rank thread blocked on a channel receive through the checkpoint window
-  satisfies the process-image thread rule.
+- A rank thread parked outside CUDA driver calls on a host blocking wait
+  (the `DispatchRing` idle condition variable during serving, or a control
+  channel receive during startup) satisfies the process-image thread rule.
 - No IPC handle or second process is required.
 
 Not qualified: four ranks, graphs that contain b12x spin-barrier collectives,
-and fixed-address import of a shareable handle in a second process.
+process checkpoint and restore while rank threads are parked on the
+`DispatchRing` condition variable, and fixed-address import of a shareable
+handle in a second process.
