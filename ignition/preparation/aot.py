@@ -612,7 +612,11 @@ class BoundForward:
         """Release Python guards after capture while retaining graph execution resources."""
         if isinstance(self.artifact, _GuardedForwardCall):
             self.artifact = _CapturedForwardResources(self.artifact.backend)
-            release_unused()
+            # Guard retirement runs per captured or trial forward while the full model
+            # catalog stays live. Collect young temporaries here (escalating to
+            # generation 2 only under low host RAM) and scan the full heap once at the
+            # phase boundary.
+            release_unused(generation=0)
 
 
 def _completed(pending):

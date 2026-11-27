@@ -14,6 +14,7 @@ from ignition.progress import graph_catalog, phase
 from .aot import ForwardCache, allocation_order
 from .collectives import warmup_wait
 from .compilation import _defer_full_collection
+from .host_memory import release_unused
 from .runtime_core import capture_graph, instantiate_graph, record_export_graph
 
 
@@ -139,8 +140,6 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
                     counted.add(artifact)
                 stage.update(advance=1)
             stage.update(f"{released >> 20} MiB; guards and kernel owners retained")
-        from .host_memory import release_unused
-
         release_unused()
     elif materialize is not None:
         materialize()
@@ -160,6 +159,7 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
             stage.update(advance=1)
     stream.wait_stream(warm)
     ordered_names = _capture_order(names, compiled, coordinator)
+    retired = False
     with phase(progress, label, total=len(names)) as stage:
         for name in ordered_names:
             function = compiled.get(name, functions[name])
@@ -200,10 +200,13 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
                 raise
             if name in compiled and not retain_forwards:
                 function.retire_after_capture()
+                retired = True
             graphs[name] = graph
             stage.update(advance=1)
             if progress is not None:
                 cached = " (compiled cache hit)" if name in compiled and compiled[name].cache_hit else ""
                 progress(f"captured {name} in {monotonic() - started:.2f}s{cached}")
+    if retired:
+        release_unused()
     torch.cuda.synchronize(device)
     return graphs, compiled
