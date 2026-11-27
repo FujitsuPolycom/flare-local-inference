@@ -6,9 +6,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from ignition.parameters import RecipeParameters, SpeculationParameters
 from ignition.preparation.tuning_replicas import TuningReplica
 
 
@@ -23,43 +24,114 @@ def validate_host_topology(roce_ring: bool, roce_chain: bool, hosts: tuple[str, 
 
 @dataclass(frozen=True)
 class BasePreparationConfig:
-    """Common preparation settings accepted by every model recipe bootstrap."""
+    """Common preparation settings accepted by every model recipe bootstrap.
 
-    compile_workers: int | None = None
-    autotune_effort: str = "default"
-    native_dense_activations: bool = False
-    lock_gpu_clocks: bool = False
-    tuning_replica: TuningReplica | None = None
+    Recipe-specific and core ABI preparation options live on `parameters`.
+    """
+
+    parameters: RecipeParameters = field(default_factory=RecipeParameters)
     context: int = 262144
-    prefill_chunk_size: int = 4096
-    max_active: int = 4
     snapshot_budget_bytes: int = 4 << 30
     headroom_bytes: int = 4 << 30
-    compile_decoder: bool = True
     retain_graphs: bool = False
     kernel_cache: Path | None = None
-    mtp_only: bool = False
-    speculative_widths: tuple[int, ...] = (1, 2, 3, 4, 5, 6)
-    speculative_fixed_width: int | None = None
-    speculative_token_capacity: int | None = None
+    tuning_replica: TuningReplica | None = None
+
+    @property
+    def max_active(self) -> int:
+        return self.parameters.max_concurrency
+
+    @property
+    def prefill_chunk_size(self) -> int:
+        return self.parameters.prefill_chunk
+
+    @property
+    def compile_workers(self) -> int | None:
+        return self.parameters.compile_workers
+
+    @property
+    def autotune_effort(self) -> str:
+        return self.parameters.autotune_effort
+
+    @property
+    def lock_gpu_clocks(self) -> bool:
+        return self.parameters.lock_gpu_clocks and self.parameters.autotune_effort != "off"
+
+    @property
+    def compile_decoder(self) -> bool:
+        return self.parameters.compiled_forwards
+
+    @property
+    def roce_ring(self) -> bool:
+        return self.parameters.roce_ring
+
+    @property
+    def roce_chain(self) -> bool:
+        return self.parameters.roce_chain
+
+    @property
+    def speculation(self) -> SpeculationParameters | None:
+        return self.parameters.speculation
+
+    @property
+    def mtp_only(self) -> bool:
+        return bool(self.parameters.speculation and self.parameters.speculation.mtp_only)
+
+    @property
+    def speculative_widths(self) -> tuple[int, ...]:
+        if self.parameters.speculation is None:
+            return (1,)
+        return self.parameters.speculation.widths
+
+    @property
+    def speculative_fixed_width(self) -> int | None:
+        if self.parameters.speculation is None:
+            return None
+        return self.parameters.speculation.fixed_width
+
+    @property
+    def speculative_token_capacity(self) -> int | None:
+        if self.parameters.speculation is None:
+            return None
+        return self.parameters.speculation.effective_token_capacity(self.parameters.max_concurrency)
+
+    @property
+    def speculative_graph_budget(self) -> int | None:
+        if self.parameters.speculation is None:
+            return None
+        return self.parameters.speculation.graph_budget
+
+    @property
+    def prompt_logprobs(self) -> bool:
+        return bool(self.parameters.prompt_logprobs and self.parameters.prompt_logprobs.enabled)
+
+    @property
+    def image_concurrency(self) -> int:
+        if self.parameters.vision is None:
+            return 0
+        return self.parameters.vision.effective_image_concurrency(self.parameters.max_concurrency)
+
+    @property
+    def language_model_only(self) -> bool:
+        return bool(self.parameters.vision and self.parameters.vision.language_model_only)
+
+    @property
+    def mixed_prefill(self) -> bool:
+        return bool(self.parameters.mixed_prefill and self.parameters.mixed_prefill.enabled)
 
 
-def common_preparation_kwargs(plan, *, compile_forwards: bool, kernel_cache: Path | None,
+def common_preparation_kwargs(plan, *, compile_forwards: bool | None = None, kernel_cache: Path | None,
                               retain_graphs: bool) -> dict:
     """Extract the shared PreparationConfig keyword arguments from a sizing Plan."""
+    parameters = plan.parameters
+    if compile_forwards is not None and parameters.compiled_forwards != compile_forwards:
+        parameters = replace(parameters, compiled_forwards=bool(compile_forwards))
     return {
-        "mtp_only": plan.speculation is not None and plan.speculation.mtp_only,
-        "compile_workers": plan.compile_workers,
-        "autotune_effort": plan.autotune_effort,
+        "parameters": parameters,
         "tuning_replica": plan.tuning_replica,
-        "native_dense_activations": plan.native_dense_activations,
-        "lock_gpu_clocks": plan.lock_gpu_clocks and plan.autotune_effort != "off",
-        "max_active": plan.concurrency,
         "context": plan.recipe.context,
-        "prefill_chunk_size": plan.prefill_chunk,
         "snapshot_budget_bytes": plan.snapshots * plan.costs.state_row_bytes,
         "headroom_bytes": plan.headroom_bytes + plan.reserve_bytes,
-        "compile_decoder": compile_forwards,
         "retain_graphs": retain_graphs,
         "kernel_cache": kernel_cache,
     }

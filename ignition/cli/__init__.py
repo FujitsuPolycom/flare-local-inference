@@ -4,34 +4,100 @@
 
 """The `ignition` preparation and diagnostic command line."""
 
+from __future__ import annotations
+
 import argparse
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+import sys
 
-from ignition.errors import FlareError
+from ignition.errors import FlareError, UsageError
+from ignition.parameters import (
+    OptionArity,
+    ParameterContext,
+    RecipeParameters,
+    known_core_abi_flags,
+)
+
+_PREPARATION_COMMANDS = ("export", "debug-serve", "bench")
 
 
-def _parser(*, recipes=(), prog="ignition") -> argparse.ArgumentParser:
-    from functools import partial
-    from . import serve
-    from . import publishing
-    from . import bench
-    from .help import RecipeHelp, recipe_help
+def _add_preparation_base_arguments(subparser: argparse.ArgumentParser, *, command: str,
+                                    recipes=(), prog="ignition", recipe=None, checkpoint=None) -> None:
+    from .help import catalog_epilog, model_epilog
+
+    subparser.usage = "%(prog)s [MODEL] [options]"
+    subparser.epilog = (
+        model_epilog(recipe, checkpoint, prog=prog)
+        if recipe is not None and checkpoint is not None
+        else catalog_epilog(recipes=recipes, prog=prog)
+    )
+    subparser.add_argument(
+        "model", nargs="?", metavar="MODEL",
+        help="recipe alias, repository id, or checkpoint directory (default: defaults.model)",
+    )
+    subparser.add_argument("--official-source", metavar="URL", help="published checkpoint repository URL")
+    subparser.add_argument(
+        "--gpus", metavar="LIST",
+        help="GPU indices relative to CUDA_VISIBLE_DEVICES when set, otherwise NVML indices;"
+             " such as 0, 0,1, or 0-3;"
+             " their count is the tensor-parallel size (default: first GPUs that fit)",
+    )
+    subparser.add_argument("--verbose", action="store_true", help="per-phase detail on stderr")
+
+    include_multi_host = command in ("export", "debug-serve")
+    params = RecipeParameters() if recipe is None else recipe.parameters
+    context = ParameterContext(recipe=recipe, checkpoint=checkpoint, root=params, defaults=params, command=command)
+    params.add_arguments(subparser, context, include_multi_host=include_multi_host)
+
+    advanced = next((g for g in subparser._action_groups if g.title == "advanced options"), None)
+    if advanced is None:
+        advanced = subparser.add_argument_group("advanced options")
+    advanced.add_argument(
+        "--tuning-gpus", metavar="LIST",
+        help="local GPUs for kernel tuning, starting with --gpus and followed by complete"
+             " TP replicas; serving TP size is unchanged (default: serving GPUs)",
+    )
+
+    if include_multi_host:
+        hosts = next((g for g in subparser._action_groups if g.title == "multi-host tensor parallelism"), None)
+        if hosts is None:
+            hosts = subparser.add_argument_group("multi-host tensor parallelism")
+        hosts.add_argument(
+            "--transfer-streams", type=int, choices=range(1, 65), metavar="N",
+            help="checkpoint and export fabric TCP streams per peer, 1..64 (default: 8)",
+        )
+        hosts.add_argument(
+            "--ranks", type=int, default=1, choices=range(1, 17), metavar="N",
+            help="tensor-parallel ranks, one per host; this process is rank zero (default: 1);"
+                 " an export publishes all ranks to the shared model cache on rank zero",
+        )
+        hosts.add_argument(
+            "--rendezvous", metavar="ADDR:PORT",
+            help="IPv4 address and port on which rank zero admits its peers",
+        )
+    else:
+        subparser.set_defaults(roce_ring=False, roce_chain=False)
+
+
+def _parser(*, recipes=(), prog="ignition", recipe=None, checkpoint=None) -> argparse.ArgumentParser:
+    from . import bench, publishing, serve
+    from .help import catalog_epilog
 
     recipes = tuple(recipes)
     parser = argparse.ArgumentParser(
         prog=prog, allow_abbrev=False,
         description="Prepare native runtime cores for NVIDIA SM103, SM120, and SM121 GPUs.",
-        formatter_class=argparse.RawDescriptionHelpFormatter, epilog=recipe_help(recipes=recipes, prog=prog))
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=catalog_epilog(recipes=recipes, prog=prog),
+    )
     subparsers = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
     def command(name, handler, summary):
         subparser = subparsers.add_parser(
-            name, help=summary, description=summary, allow_abbrev=False, add_help=False,
-            formatter_class=argparse.RawDescriptionHelpFormatter)
-        help_action = partial(RecipeHelp, recipes=recipes, prog=prog) if name in ("export", "debug-serve") else "help"
-        subparser.add_argument("-h", "--help",
-                               action=help_action,
-                               help="show this help message and exit")
+            name, help=summary, description=summary, allow_abbrev=False,
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
         subparser.set_defaults(handler=handler)
         subparser.add_argument("--config", type=Path, metavar="PATH",
                                help="configuration file (default: ~/.config/flare/config.toml)")
@@ -40,38 +106,33 @@ def _parser(*, recipes=(), prog="ignition") -> argparse.ArgumentParser:
     exporting = command("export", serve.export, "prepare a native model core in the shared cache")
     weights = exporting.add_mutually_exclusive_group()
     weights.add_argument("--no-weights", action="store_true",
-                           help="require cached stored-data blobs; export execution resources and metadata")
+                         help="require cached stored-data blobs; export execution resources and metadata")
     weights.add_argument("--reuse-weights", action="store_true",
-                        help="reuse the cached default version's weight hashes and layouts without hashing live weights")
+                         help="reuse the cached default version's weight hashes and layouts without hashing live weights")
     exporting.add_argument("--publisher-key", dest="publisher_keys", action="append", type=Path, default=[],
                            help="public publisher profile authenticating the cached weight source")
     exporting.add_argument("--repo-id", metavar="NAMESPACE/REPOSITORY",
                            help="Hugging Face target used to organize local exports (default: recipe target)")
-    _preparation_arguments(exporting, recipes=recipes, prog=prog)
-    benchmarking = command("bench", bench.run,
-        "measure complete prepared GPU graph latency without export or HTTP; not serving throughput")
-    _preparation_arguments(benchmarking, recipes=recipes, prog=prog)
+    _add_preparation_base_arguments(exporting, command="export", recipes=recipes, prog=prog,
+                                    recipe=recipe, checkpoint=checkpoint)
+
+    benchmarking = command(
+        "bench", bench.run,
+        "measure complete prepared GPU graph latency without export or HTTP; not serving throughput",
+    )
+    _add_preparation_base_arguments(benchmarking, command="bench", recipes=recipes, prog=prog,
+                                    recipe=recipe, checkpoint=checkpoint)
     bench.arguments(benchmarking)
-    serving = command("debug-serve", serve.debug_serve,
-                      "prepare and run diagnostic HTTP requests; not for actual serving or performance"
-                      " comparisons against other runtimes. Use ignition export and flare run for those workflows.")
+
+    serving = command(
+        "debug-serve", serve.debug_serve,
+        "prepare and run diagnostic HTTP requests; not for actual serving or performance"
+        " comparisons against other runtimes. Use ignition export and flare run for those workflows.",
+    )
     serving.add_argument("--host", metavar="ADDR", help="listening address (default: server.host, else 127.0.0.1)")
     serving.add_argument("--port", type=int, metavar="N", help="listening port (default: server.port, else 8000)")
-    _preparation_arguments(serving, recipes=recipes, prog=prog)
-    for spanning in (serving, exporting):
-        hosts = spanning.add_argument_group("multi-host tensor parallelism")
-        hosts.add_argument("--roce-ring", action="store_true",
-                           help="route collectives and fabric TCP through neighbors in rank order")
-        hosts.add_argument("--roce-chain", action="store_true",
-                           help="like --roce-ring for hosts cabled as a chain, with no link between the first and"
-                                " last rank")
-        hosts.add_argument("--transfer-streams", type=int, choices=range(1, 65), metavar="N",
-                           help="checkpoint and export fabric TCP streams per peer, 1..64 (default: 8)")
-        hosts.add_argument("--ranks", type=int, default=1, choices=range(1, 17), metavar="N",
-                           help="tensor-parallel ranks, one per host; this process is rank zero (default: 1);"
-                                " an export publishes all ranks to the shared model cache on rank zero")
-        hosts.add_argument("--rendezvous", metavar="ADDR:PORT",
-                           help="IPv4 address and port on which rank zero admits its peers")
+    _add_preparation_base_arguments(serving, command="debug-serve", recipes=recipes, prog=prog,
+                                    recipe=recipe, checkpoint=checkpoint)
     serving.add_argument("--prefix-cache-states", type=int, metavar="N",
                          help="advanced: cached request states kept resident for prefix reuse; fewer leave more"
                               " memory for KV pages (default: sized from free memory)")
@@ -79,8 +140,10 @@ def _parser(*, recipes=(), prog="ignition") -> argparse.ArgumentParser:
                          help="augment learned drafts with continuations from shared decoded history;"
                               " requires prepared history inputs (default: off)")
     diagnostics = serving.add_argument_group(
-        "diagnostics", "Ignition's direct execution reproduces model-level faults without Helios. It is a"
-                       " diagnostic and qualification path, not production serving.")
+        "diagnostics",
+        "Ignition's direct execution reproduces model-level faults without Helios. It is a"
+        " diagnostic and qualification path, not production serving.",
+    )
     diagnostics.add_argument("--direct", action="store_true",
                              help="schedule and pack each step in Python and replay its captured graph on every"
                                   " rank, with no Helios scheduler or native server; non-streaming chat only")
@@ -89,6 +152,7 @@ def _parser(*, recipes=(), prog="ignition") -> argparse.ArgumentParser:
     diagnostics.add_argument("--graph-times", type=Path, metavar="PATH",
                              help="with --direct: graph replay saves its estimate of each graph's time here; with"
                                   " --eager, decode rounds are chosen from the times saved here")
+
     joining = command("join", serve.join, "run a peer rank for rank zero's rendezvous on another host")
     joining.add_argument("rendezvous", metavar="ADDR:PORT", help="rank zero's rendezvous address")
     joining.add_argument("--rank", type=int, required=True, metavar="R", help="this host's rank, 1 through N-1")
@@ -133,142 +197,171 @@ def _parser(*, recipes=(), prog="ignition") -> argparse.ArgumentParser:
     return parser
 
 
-def _preparation_arguments(running, *, model_default="defaults.model", recipes=(), prog="ignition"):
-    from .help import recipe_help
+def _subcommand_parser(parser: argparse.ArgumentParser, name: str) -> argparse.ArgumentParser:
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return action.choices[name]
+    raise RuntimeError(f"missing subcommand parser for {name}")
 
-    running.usage = "%(prog)s [MODEL] [options]"
-    running.epilog = recipe_help(recipes=recipes, prog=prog)
-    running.set_defaults(roce_ring=False, roce_chain=False)
-    running.add_argument("--official-source", metavar="URL", help="published checkpoint repository URL")
-    running.add_argument("model", nargs="?", metavar="MODEL",
-                         help=f"recipe alias, repository id, or checkpoint directory (default: {model_default})")
-    running.add_argument("--gpus", metavar="LIST",
-                         help="GPU indices relative to CUDA_VISIBLE_DEVICES when set, otherwise NVML indices;"
-                              " such as 0, 0,1, or 0-3;"
-                              " their count is the tensor-parallel size (default: first GPUs that fit)")
-    running.add_argument("--max-concurrency", type=int, metavar="N",
-                         help="maximum simultaneously active requests (default: defaults.max_concurrency,"
-                              " else the recipe default)")
-    running.add_argument("--verbose", action="store_true", help="per-phase detail on stderr")
-    running.add_argument("--image-concurrency", type=int, metavar="N",
-                         help="maximum active image requests; excess requests queue independently of text"
-                              " (default: smaller of 4 and max concurrency)")
-    capacity = running.add_argument_group("capacity and compression")
-    capacity.add_argument("--expert-scale-compression", choices=("csf", "native"), nargs="?", const="csf", metavar="MODE",
-                          help="losslessly compress routed-expert quantization scales to reduce GPU weight memory."
-                               " MODE: csf, a compressed scale encoding expanded during execution."
-                               " With no MODE, selects csf; native disables compression."
-                               " Omitted flag uses the recipe default."
-                               " See MODEL --help for recipe support and estimated savings")
-    capacity.add_argument("--prefill-chunk-size", type=int, metavar="N",
-                          help="most prompt tokens per prefill step; larger chunks reach a long prompt's first"
-                               " token sooner and pause other requests longer; a multiple of 64"
-                               " (default: see MODEL --help)")
-    capacity.add_argument("--prompt-logprobs", action="store_true",
-                          help="capture dedicated prefill graphs for raw prompt token logprobs")
-    capacity.add_argument("--mixed-prefill", action="store_true",
-                          help="capture graphs combining prompt prefill with decode or verification"
-                               " (Qwen only; default: disabled)")
-    speculative = running.add_argument_group("speculative decoding",
-        "MTP flags configure speculative decoding, including DSpark and DFlash.\n"
-        "Recipe defaults and limits: ignition export MODEL --help.")
-    speculative.add_argument("--speculative-method", choices=("mtp", "dspark", "dflash2"),
-                          help="learned proposal method; supported choices and the default depend on MODEL")
-    speculative.add_argument("--no-mtp", action="store_true",
-                          help="disable multi-token speculation: load no draft model and decode one token"
-                               " per step; cannot accompany other speculation flags")
-    speculative.add_argument("--mtp-only", action="store_true",
-                          help="omit MTP-disabled execution graphs; package requires speculation at runtime."
-                               " Requires positive draft depth and cannot accompany --no-mtp")
-    speculative.add_argument("--mtp-draft-tokens", type=int, metavar="N",
-                          help="most draft tokens verified per round; limits and defaults depend on MODEL."
-                               " 0 selects width-one rounds while retaining draft state; --no-mtp excludes it")
-    speculative.add_argument("--no-mtp-adaptive-verification", action="store_true",
-                          help="default to the maximum verification width where captured, otherwise width one")
-    speculative.add_argument("--speculative-token-capacity", type=int, metavar="N",
-                          help="maximum target-token rows in wider speculative graphs; width one covers every"
-                               " request batch. Rectangular graphs require batch * width <= N, where width is"
-                               " drafts + 1; packed rounds share N rows across request prefixes"
-                               " (default: see MODEL --help)")
-    speculative.add_argument("--speculative-graph-budget", type=int, metavar="N",
-                          help="maximum captured packed round graphs, independently of target-token rows;"
-                               " excludes mandatory width-one and ordinary graphs. Requires packed adaptive"
-                               " learned speculation (default: see MODEL --help)")
-    advanced = running.add_argument_group("advanced options")
-    advanced.add_argument("--force-moe-decode-a16", action=argparse.BooleanOptionalAction, default=None,
-                          help="use W4A16 target routed experts for decode and verification, with calibrated A4 prefill;"
-                               " requires Qwen3.8 Flash NVFP4 on SM120/121 and separate prefill graphs")
-    advanced.add_argument("--native-dense-activations", action="store_true",
-                          help="use quantized activations instead of auto precision for dense projections:"
-                               " A8 for FP8 weights and A4 for FP4 weights; explicit recipe precision is retained")
-    advanced.add_argument("--draft-body-quantization", choices=("mxfp8",),
-                          help="prepare eligible DFlash2 draft-body projections as MXFP8 independently of"
-                               " target and proposal-head precision (Kimi K3.1; default: checkpoint precision)")
-    advanced.add_argument("--draft-head-quantization", choices=("nvfp4", "mxfp8"),
-                          help="prepare a separate quantized vocabulary head for learned draft proposals;"
-                               " target verification retains its precision (NVFP4: DeepSeek V4/V4.1;"
-                               " MXFP8: DeepSeek V4.1; both: Qwen3.8 dense and Flash Next DFlash2 with a BF16 checkpoint head;"
-                               " default: checkpoint precision)")
-    advanced.add_argument("--markov-head-quantization", choices=("nvfp4", "fp8"),
-                          help="prepare the draft Markov transition projection as NVFP4"
-                               " or row-scaled E4M3 FP8 (FP8: DeepSeek V4.1; default: checkpoint precision)")
-    advanced.add_argument("--vocabulary-parallel-sampling", action="store_true",
-                          help="prepare vocabulary-sharded DSpark proposals and block rejection sampling"
-                               " (DeepSeek V4.1; default: full-vocabulary sampling)")
-    advanced.add_argument("--mla-compute-mode", choices=("auto", "bf16"),
-                          help="constrain MLA arithmetic while retaining packed KV storage and compatible"
-                               " kernel tuning (default: see MODEL --help)")
-    from .config import AUTOTUNE_EFFORTS
 
-    advanced.add_argument("--autotune-effort", choices=AUTOTUNE_EFFORTS,
-                          help="kernel search effort: off uses heuristics without races; default races"
-                               " the pruned candidate set; audit lifts the performance exclusions to"
-                               " check that pruning drops no winners (default: default)")
-    advanced.add_argument("--shard-hyperconnections", action="store_true",
-                          help="shard Qwen3.8 Flash hyperconnection bottlenecks across TP ranks with"
-                               " BF16 gate-logit reduction (default: replicated)")
-    advanced.add_argument("--row-shard-prefill", action="store_true",
-                          help="reduce eligible prefill branch outputs into one contiguous row shard per"
-                               " rank, run row-local residual mixing on that shard, and gather normalized"
-                               " branch inputs back to full rows (supported TP recipes; default: full-row"
-                               " all-reduce)")
-    advanced.add_argument("--row-shard-attention", action="store_true",
-                          help="also run eligible prefill attention layers on each rank's row shard using"
-                               " replicated attention projections and KV gathers; requires"
-                               " --row-shard-prefill (supported TP recipes; default: off)")
-    advanced.add_argument("--lock-gpu-clocks", action="store_true",
-                          help="lock each tuning GPU to its maximum supported graphics clock during"
-                               " autotuning; requires root or noninteractive sudo for nvidia-smi")
-    advanced.add_argument("--compile-workers", type=int, metavar="N",
-                          help="CPU compiler process budget per host, shared by local preparation ranks;"
-                               " bounded by available RAM and device memory (default: automatic)")
-    advanced.add_argument("--tuning-gpus", metavar="LIST",
-                          help="local GPUs for kernel tuning, starting with --gpus and followed by complete"
-                               " TP replicas; serving TP size is unchanged (default: serving GPUs)")
-    advanced.add_argument("--dcp-size", type=int, choices=(4, 8, 16), metavar="N",
-                          help="decode context-parallel ranks per group for Kimi K3.1 TP16: 4, 8 or 16"
-                               " (default: tensor-parallel size)")
-    advanced.add_argument("--no-context-parallel", action="store_true",
-                          help="keep each rank's attention context whole instead of sharding it across"
-                               " tensor-parallel ranks; fewer cached tokens (default: the recipe's)")
-    advanced.add_argument("--no-stream-overlap", action="store_true",
-                          help="run every concurrent branch (shared experts, projection chains, query chains)"
-                               " serially on the main stream, to diagnose scheduling-dependent faults; slower"
-                               " (default: overlap)")
-    advanced.add_argument("--no-compile", action="store_true",
-                          help="development: capture graphs without compiling forwards")
-    advanced.add_argument("--online-mxfp8", action="store_true",
-                          help="store the recipe's eligible BF16 projections as MXFP8 while loading"
-                               " (Kimi K3.1 target KDA inputs only; Kimi K3 KDA, MLA except batched key/value, shared"
-                               " experts, MoE latent projections, and DSpark draft context, outputs and MLPs;"
-                               " Qwen3.8 dense target attention/MLPs and DFlash2 context, attention and MLPs; Flash Next DFlash2 projections;"
-                               " default: checkpoint precision)")
-    advanced.add_argument("--online-mxfp8-scope", metavar="SCOPE",
-                          help="select the recipe's online MXFP8 conversion group; Kimi K3.1 supports all"
-                               " (every eligible target and DFlash2 projection) or kda-input (default: recipe scope)")
-    advanced.add_argument("--language-model-only", action="store_true",
-                          help="prepare no vision encoder and reject images; its weights and scratch become KV"
-                               " pages (recipes with a separable encoder; default: the recipe's image support)")
+def _parser_option_arities(subparser: argparse.ArgumentParser) -> dict[str, OptionArity]:
+    arities: dict[str, OptionArity] = {}
+    for action in subparser._actions:
+        if not action.option_strings:
+            continue
+        if action.nargs == 0:
+            arity = OptionArity(0, 0)
+        elif action.nargs == "?":
+            choices = frozenset(map(str, action.choices)) if action.choices else frozenset()
+            arity = OptionArity(0, 1, choices)
+        else:
+            arity = OptionArity(1, 1)
+        for flag in action.option_strings:
+            arities[flag] = arity
+    return arities
+
+
+def _all_recipe_option_arities(recipes: Sequence, *, include_multi_host: bool) -> dict[str, OptionArity]:
+    arities: dict[str, OptionArity] = {}
+    for recipe in recipes:
+        checkpoints = recipe.checkpoints or (None,)
+        for checkpoint in checkpoints:
+            ctx = ParameterContext(recipe=recipe, checkpoint=checkpoint, root=recipe.parameters, defaults=recipe.parameters)
+            arities.update(recipe.parameters.option_arities(ctx, include_multi_host=include_multi_host))
+    return arities
+
+
+def _prescan(tokens: Sequence[str], arities: Mapping[str, OptionArity]) -> tuple[bool, Path | None, str | None]:
+    """Scan subcommand tokens to detect `--help`, `--config`, and positional `MODEL`."""
+    wants_help = False
+    config_path: Path | None = None
+    raw_model: str | None = None
+    i = 0
+    n = len(tokens)
+    after_double_dash = False
+    while i < n:
+        tok = tokens[i]
+        if after_double_dash:
+            if raw_model is None:
+                raw_model = tok
+            i += 1
+            continue
+        if tok == "--":
+            after_double_dash = True
+            i += 1
+            continue
+        if tok in ("-h", "--help"):
+            wants_help = True
+            i += 1
+            continue
+        if tok.startswith("--"):
+            flag, eq, inline = tok.partition("=")
+            if flag == "--config":
+                if eq:
+                    config_path = Path(inline)
+                    i += 1
+                elif i + 1 < n:
+                    config_path = Path(tokens[i + 1])
+                    i += 2
+                else:
+                    i += 1
+                continue
+            arity = arities.get(flag)
+            if arity is not None:
+                if eq:
+                    i += 1
+                elif arity.min_args == 1:
+                    i += 2 if i + 1 < n else 1
+                elif arity.max_args == 1 and arity.optional_choices is not None:
+                    if i + 1 < n and not tokens[i + 1].startswith("-") and tokens[i + 1] in arity.optional_choices:
+                        i += 2
+                    else:
+                        i += 1
+                else:
+                    i += 1
+                continue
+            i += 1
+            continue
+        if tok.startswith("-") and tok != "-":
+            i += 1
+            continue
+        if raw_model is None:
+            raw_model = tok
+        i += 1
+    return wants_help, config_path, raw_model
+
+
+def _match_offline(model: str, recipes: Sequence):
+    """Match an alias or declared repository offline without touching config, disk, or network."""
+    repository, _, revision = model.partition("@")
+    for recipe in recipes:
+        for checkpoint in recipe.checkpoints:
+            if model == checkpoint.alias:
+                return recipe, checkpoint
+            matches = (
+                checkpoint.repository == repository
+                if Path(checkpoint.repository).is_absolute()
+                else checkpoint.repository.casefold() == repository.casefold()
+            )
+            if matches and revision in ("", checkpoint.revision):
+                return recipe, checkpoint
+    return None
+
+
+def parse_args(argv=None, *, recipes=(), prog="ignition"):
+    """Parse `ignition` CLI arguments with dynamic recipe-parameter registration and help."""
+    from ignition.registry import resolve
+    from .config import Configuration
+
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    recipes = tuple(recipes)
+    if not tokens or tokens[0] not in _PREPARATION_COMMANDS:
+        return _parser(recipes=recipes, prog=prog).parse_args(tokens)
+
+    command = tokens[0]
+    rest = tokens[1:]
+    include_multi_host = command in ("export", "debug-serve")
+
+    bare_root = _parser(recipes=recipes, prog=prog)
+    bare_sub = _subcommand_parser(bare_root, command)
+    base_arities = _parser_option_arities(bare_sub)
+    recipe_arities = _all_recipe_option_arities(recipes, include_multi_host=include_multi_host)
+    combined_arities = {**recipe_arities, **base_arities}
+
+    wants_help, config_path, raw_model = _prescan(rest, combined_arities)
+    if wants_help:
+        matched = _match_offline(raw_model, recipes) if raw_model is not None else None
+        if matched is not None:
+            recipe, checkpoint = matched
+            dynamic_root = _parser(recipes=recipes, prog=prog, recipe=recipe, checkpoint=checkpoint)
+            sub = _subcommand_parser(dynamic_root, command)
+            sub.print_help()
+            sub.exit(0)
+        bare_sub.print_help()
+        bare_sub.exit(0)
+
+    configuration = Configuration.load(config_path)
+    model_name = raw_model if raw_model is not None else configuration.model
+    if model_name is None:
+        return bare_root.parse_args(tokens)
+
+    matched = _match_offline(model_name, recipes)
+    if matched is not None:
+        recipe, checkpoint = matched
+    else:
+        resolved = resolve(model_name, configuration.directory("hub_cache"), recipes=recipes)
+        recipe, checkpoint = resolved.recipe, resolved.checkpoint
+    dynamic_root = _parser(recipes=recipes, prog=prog, recipe=recipe, checkpoint=checkpoint)
+    dynamic_sub = _subcommand_parser(dynamic_root, command)
+    args, unknown = dynamic_root.parse_known_args(tokens)
+    if unknown:
+        known_other_flags = (set(recipe_arities) | set(known_core_abi_flags())) - set(_parser_option_arities(dynamic_sub))
+        for token in unknown:
+            flag = token.partition("=")[0]
+            if flag in known_other_flags:
+                raise UsageError(f"{flag} is not supported by {checkpoint.alias}")
+        dynamic_sub.error(f"unrecognized arguments: {' '.join(unknown)}")
+    return args
 
 
 def main(argv=None, *, recipes=(), prog="ignition", source_roots=()) -> int:
@@ -276,9 +369,9 @@ def main(argv=None, *, recipes=(), prog="ignition", source_roots=()) -> int:
     from ignition.registry import active_recipes
 
     recipes = tuple(recipes)
-    args = _parser(recipes=recipes, prog=prog).parse_args(argv)
     try:
         with active_recipes(recipes), bind_source_roots(source_roots):
+            args = parse_args(argv, recipes=recipes, prog=prog)
             return args.handler(args) or 0
     except FlareError as error:
         from . import display

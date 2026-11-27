@@ -801,7 +801,7 @@ async fn l0_10_cancel_drains_and_staging_gauge() {
 async fn l0_12_round_robin_and_dead_client_cleanup() {
     let mut host = Host::with_storage(8 * 1024 * 1024, 64 * 1024 * 1024);
     host.run();
-    let mut a = host.client().await;
+    let a = host.client().await;
     let mut client = host.client().await;
     let mut previous = None;
     for index in 1..=160u64 {

@@ -159,6 +159,64 @@ def create_dma_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc
     return DmaAllReduce(exchange_group=group, device=device, max_bytes=max_tokens * hidden_size * element_bytes, ipc=ipc)
 
 
+def _blocked_operation(state, default_ranks):
+    for index in (5, 3, 4, 1):
+        value = state[index]
+        if value:
+            ranks = (getattr(value, "ranks", default_ranks) if index in (5, 3) else
+                     getattr(value[0], "ranks", default_ranks) if index == 4 else value[0][1])
+            return index, tuple(ranks)
+    return None, None
+
+
+def _rank_can_advance(states, all_ranks, rank, state):
+    operation, local_ranks = _blocked_operation(state, all_ranks)
+    if operation is None:
+        return not state[0]
+    if not local_ranks or rank not in local_ranks or any(peer not in all_ranks for peer in local_ranks):
+        return True
+    members = [peer_state for peer_state, peer_rank in zip(states, all_ranks, strict=True) if peer_rank in local_ranks]
+    if any(peer[0] for peer in members):
+        return True
+    if not all(peer[operation] for peer in members):
+        return False
+    if operation == 5:
+        return not any(peer[5] is None or getattr(peer[5], "key", None) != getattr(state[5], "key", None)
+                       or tuple(peer[5].ranks) != local_ranks for peer in members)
+    if operation == 3:
+        return not any(peer[3] is None or tuple(getattr(peer[3], "ranks", all_ranks)) != local_ranks
+                       for peer in members)
+    if operation == 4:
+        return not any({tuple(getattr(contribution, "ranks", all_ranks)) for contribution in peer[4]} != {local_ranks}
+                       for peer in members)
+    if any(tuple(ranks) != local_ranks for _, ranks in state[1]):
+        return True
+    return not any(peer[1] != state[1] for peer in members)
+
+
+def _describe_rank_state(state):
+    if state[0]:
+        return "done"
+    if state[5] is not None:
+        return (f"collective_tuning(key={getattr(state[5], 'key', None)!r}, "
+                f"step={getattr(state[5], 'step', None)!r}, ranks={getattr(state[5], 'ranks', None)!r})")
+    if state[3] is not None:
+        return f"cache(ranks={getattr(state[3], 'ranks', None)!r})"
+    if state[4]:
+        keys = [getattr(item, "key", None) for item in state[4][:3]]
+        return f"tuning(keys={keys!r}, count={len(state[4])}, ranks={getattr(state[4][0], 'ranks', None)!r})"
+    if state[1]:
+        return f"collective(pending={state[1]!r})"
+    return "running"
+
+
+def _format_deadlock(all_ranks, states):
+    grouped = {}
+    for rank, state in zip(all_ranks, states, strict=True):
+        grouped.setdefault(_describe_rank_state(state), []).append(rank)
+    return "; ".join(f"ranks {tuple(ranks)}: {label}" for label, ranks in grouped.items())
+
+
 def _tuning_results(contributions):
     """Select the fastest completed candidate for each sharded tuning race."""
     races = {}
@@ -452,66 +510,60 @@ class CollectivePreparation:
                     return job.result()
                 authorization = {"collective_key": None}
                 local = states[self._local_index()]
-                operation, local_ranks = None, None
-                for index in (5, 3, 4, 1):
-                    value = local[index]
-                    if value:
-                        operation = index
-                        local_ranks = (getattr(value, "ranks", self.ranks) if index in (5, 3) else
-                                       getattr(value[0], "ranks", self.ranks) if index == 4 else value[0][1])
-                        break
+                operation, local_ranks = _blocked_operation(local, self.ranks)
                 if operation is None:
                     if local[0]:
                         for item in states:
-                            for index in (5, 3, 4, 1):
-                                value = item[index]
-                                if value:
-                                    ranks = (getattr(value, "ranks", self.ranks) if index in (5, 3) else
-                                             getattr(value[0], "ranks", self.ranks) if index == 4 else value[0][1])
-                                    if self._global_rank() in ranks:
-                                        raise RuntimeError("a rank finished before its peer's collective declaration")
+                            peer_operation, ranks = _blocked_operation(item, self.ranks)
+                            if peer_operation is not None and self._global_rank() in ranks:
+                                raise RuntimeError("a rank finished before its peer's collective declaration")
+                        if not any(_rank_can_advance(states, self.ranks, rank, item)
+                                   for rank, item in zip(self.ranks, states, strict=True)):
+                            raise RuntimeError(
+                                f"collective preparation deadlocked across ranks: {_format_deadlock(self.ranks, states)}")
                     continue
                 members = self._members(states, local_ranks)
                 def busy(item):
                     return item[1] or item[3] is not None or item[4] or item[5] is not None
                 if any(item[0] for item in members) and any(busy(item) for item in members):
                     raise RuntimeError("a rank finished before its peer's collective declaration")
-                if not all(item[operation] for item in members):
-                    continue
-                if operation == 5:
-                    if any(item[5] is None or getattr(item[5], "key", None) != getattr(local[5], "key", None)
-                           or item[5].ranks != local_ranks for item in members):
-                        continue
-                    authorization = {"collective_tuning": tuple(item[5] for item in members)}
-                elif operation == 3:
-                    if any(item[3] is None or getattr(item[3], "ranks", self.ranks) != local_ranks for item in members):
-                        continue
-                    # Each operation reconciles its own group's cached selections, first rank first.
-                    authorization = {"cache": tuple(item[3] for item in members)}
-                elif operation == 4:
+                ready = all(item[operation] for item in members)
+                if ready and operation == 5:
+                    if not any(item[5] is None or getattr(item[5], "key", None) != getattr(local[5], "key", None)
+                               or tuple(item[5].ranks) != local_ranks for item in members):
+                        authorization = {"collective_tuning": tuple(item[5] for item in members)}
+                elif ready and operation == 3:
+                    if not any(item[3] is None or tuple(getattr(item[3], "ranks", self.ranks)) != local_ranks
+                               for item in members):
+                        # Each operation reconciles its own group's cached selections, first rank first.
+                        authorization = {"cache": tuple(item[3] for item in members)}
+                elif ready and operation == 4:
                     contributions = [item[4] for item in members]
-                    if any({getattr(contribution, "ranks", self.ranks) for contribution in group} != {local_ranks}
-                           for group in contributions):
-                        continue
-                    races = [sorted(contribution.key for contribution in group) for group in contributions]
-                    if any(keys != races[0] for keys in races[1:]):
-                        reference = set(races[0])
-                        counts = dict(zip(local_ranks, map(len, races), strict=True))
-                        differences = {}
-                        for rank, keys in zip(local_ranks[1:], races[1:], strict=True):
-                            missing, extra = reference - set(keys), set(keys) - reference
-                            if missing or extra:
-                                differences[rank] = {"missing": len(missing), "extra": len(extra),
-                                                     "examples": sorted(missing | extra)[:2]}
-                        raise RuntimeError(f"tuning races differ across ranks: counts={counts}, differences={differences}")
-                    results = _tuning_results(contribution for group in contributions for contribution in group)
-                    authorization = {"tuning": results[0] if len(results) == 1 else results}
-                else:
+                    if not any({tuple(getattr(contribution, "ranks", self.ranks)) for contribution in group} != {local_ranks}
+                               for group in contributions):
+                        races = [sorted(contribution.key for contribution in group) for group in contributions]
+                        if any(keys != races[0] for keys in races[1:]):
+                            reference = set(races[0])
+                            counts = dict(zip(local_ranks, map(len, races), strict=True))
+                            differences = {}
+                            for rank, keys in zip(local_ranks[1:], races[1:], strict=True):
+                                missing, extra = reference - set(keys), set(keys) - reference
+                                if missing or extra:
+                                    differences[rank] = {"missing": len(missing), "extra": len(extra),
+                                                         "examples": sorted(missing | extra)[:2]}
+                            raise RuntimeError(f"tuning races differ across ranks: counts={counts}, differences={differences}")
+                        results = _tuning_results(contribution for group in contributions for contribution in group)
+                        authorization = {"tuning": results[0] if len(results) == 1 else results}
+                elif ready:
                     if any(tuple(ranks) != local_ranks for _, ranks in local[1]):
                         raise ValueError("collective declaration mixes incompatible control groups")
-                    if any(item[1] != local[1] for item in members):
-                        continue
-                    authorization = {"collective_key": local[1][0][0]}
+                    if not any(item[1] != local[1] for item in members):
+                        authorization = {"collective_key": local[1][0][0]}
+                if authorization == {"collective_key": None} and not any(
+                        _rank_can_advance(states, self.ranks, rank, item)
+                        for rank, item in zip(self.ranks, states, strict=True)):
+                    raise RuntimeError(
+                        f"collective preparation deadlocked across ranks: {_format_deadlock(self.ranks, states)}")
         except BaseException as failure:
             try:
                 if job is not None:

@@ -4,10 +4,13 @@
 
 """Configuration file validation and precedence."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from ignition.cli.config import Configuration, Setting, parse_size
 from ignition.errors import UsageError
+from ignition.parameters import ParameterContext, RecipeParameters
 
 
 def load(tmp_path, text):
@@ -72,14 +75,12 @@ thinking_token_budget = 1536
 [defaults]
 model = "qwen3.8-flash"
 max_concurrency = 6
-speculative_token_capacity = 32
 
 [memory]
 reserve = "16G"
 
 [models."qwen3.8-flash"]
 max_concurrency = 2
-speculative_token_capacity = 8
 """)
     assert configuration.get("server.host") == Setting("0.0.0.0", "[server]")
     assert configuration.get("server.port") == Setting(9000, "[server]")
@@ -90,9 +91,6 @@ speculative_token_capacity = 8
     assert configuration.max_concurrency("qwen3.8-flash", 4) == Setting(2, '[models."qwen3.8-flash"]')
     assert configuration.max_concurrency("glm-5.3-flash", 4) == Setting(6, "[defaults]")
     assert configuration.max_concurrency("qwen3.8-flash", 4, 9) == Setting(9, "flag")
-    assert configuration.model_setting("qwen3.8-flash", "speculative_token_capacity", None).value == 8
-    assert configuration.model_setting("glm-5.3-flash", "speculative_token_capacity", None).value == 32
-    assert configuration.model_setting("qwen3.8-flash", "speculative_token_capacity", None, 16).value == 16
 
 
 def test_prefix_cache_settings_validate(tmp_path):
@@ -118,34 +116,36 @@ def test_recipe_supplies_concurrency_when_the_file_is_silent(tmp_path):
     assert configuration.max_concurrency("qwen3.8-flash", 4) == Setting(4, "recipe")
 
 
-def test_image_concurrency_configuration_is_scoped_to_vision_and_flags_win(tmp_path):
-    from types import SimpleNamespace
-    from ignition.cli.preparation import image_capacity_setting
-
-    config = load(tmp_path, '[defaults]\nimage_concurrency = 4\n[models."vision"]\nimage_concurrency = 2\n')
-    def model(alias, images):
-        return SimpleNamespace(checkpoint=SimpleNamespace(alias=alias), recipe=SimpleNamespace(max_images=images))
-    assert image_capacity_setting(config, model("vision", 4)) == 2
-    assert image_capacity_setting(config, model("vision", 4), 1) == 1
-    assert image_capacity_setting(config, model("another-vision", 4)) == 4
-    assert image_capacity_setting(config, model("text", 0)) is None
-    assert image_capacity_setting(config, model("text", 0), 1) == 1
-    with pytest.raises(UsageError, match="at least 1"):
-        load(tmp_path, '[defaults]\nimage_concurrency = 0\n')
-
-
 def test_compiler_worker_flag_overrides_configured_host_budget(tmp_path):
-    from ignition.cli.preparation import compiler_workers
-
+    base = RecipeParameters()
+    ctx = ParameterContext(root=base, defaults=base)
     config = load(tmp_path, "[preparation]\ncompile_workers = 24\n")
-    assert compiler_workers(config) == 24
-    assert compiler_workers(config, 32) == 32
-    assert compiler_workers(load(tmp_path, "")) is None
-    for value in (0, -1):
-        with pytest.raises(UsageError, match="positive integer"):
-            compiler_workers(config, value)
+    assert base.resolve(SimpleNamespace(), config, "m", ctx).compile_workers == 24
+    assert base.resolve(SimpleNamespace(compile_workers=32), config, "m", ctx).compile_workers == 32
+    assert base.resolve(SimpleNamespace(), load(tmp_path, ""), "m", ctx).compile_workers is None
+    with pytest.raises(UsageError, match="positive integer"):
+        base.resolve(SimpleNamespace(compile_workers=0), config, "m", ctx)
+    resolved_neg = base.resolve(SimpleNamespace(compile_workers=-1), config, "m", ctx)
+    with pytest.raises(UsageError, match="positive integer"):
+        resolved_neg.validate(ctx)
     with pytest.raises(UsageError, match="at least 1"):
         load(tmp_path, "[preparation]\ncompile_workers = 0\n")
+
+
+@pytest.mark.parametrize("text", [
+    '[preparation]\nforce_moe_decode_a16 = true\n',
+    '[defaults]\nimage_concurrency = 4\n',
+    '[defaults]\nspeculative_token_capacity = 32\n',
+    '[defaults]\nspeculative_graph_budget = 64\n',
+    '[defaults]\nspeculative_method = "dflash2"\n',
+    '[models."demo"]\nimage_concurrency = 2\n',
+    '[models."demo"]\nspeculative_token_capacity = 32\n',
+    '[models."demo"]\nspeculative_graph_budget = 32\n',
+    '[models."demo"]\nspeculative_method = "mtp"\n',
+])
+def test_export_recipe_parameter_keys_are_rejected_in_config_toml(tmp_path, text):
+    with pytest.raises(UsageError, match="unknown key"):
+        load(tmp_path, text)
 
 
 @pytest.mark.parametrize("text, message", [
@@ -161,10 +161,6 @@ def test_compiler_worker_flag_overrides_configured_host_budget(tmp_path):
     ("[server]\nthinking_token_budget = \"1536\"\n", "must be int"),
     ("[defaults]\nmax_concurrency = true\n", "must be int"),
     ("[defaults]\nmax_concurrency = 0\n", "at least 1"),
-    ("[defaults]\nspeculative_token_capacity = 0\n", "at least 1"),
-    ("[defaults]\nspeculative_graph_budget = 0\n", "at least 1"),
-    ("[defaults]\nspeculative_graph_budget = true\n", "must be int"),
-    ('[models."deepseek-v4.1-flash"]\nspeculative_graph_budget = -1\n', "at least 1"),
     ("[memory]\nconversation_cache = 16\n", "unknown key conversation_cache"),
     ("[memory]\nreserve = \"lots\"\n", "memory size"),
     ("[memory]\nreserve = 16\n", "must be str"),
@@ -198,13 +194,13 @@ def test_shard_size_is_not_a_publishing_setting(tmp_path):
 
 @pytest.mark.parametrize("effort", ["off", "default", "audit"])
 def test_autotune_effort_configuration_and_flag_precedence(tmp_path, effort):
-    from ignition.cli.preparation import tuning_effort
-
-    assert tuning_effort(load(tmp_path, "")) == "default"
+    base = RecipeParameters()
+    ctx = ParameterContext(root=base, defaults=base)
+    assert base.resolve(SimpleNamespace(), load(tmp_path, ""), "m", ctx).autotune_effort == "default"
     config = load(tmp_path, f'[preparation]\nautotune_effort = "{effort}"\n')
-    assert tuning_effort(config) == effort
-    assert tuning_effort(config, "off") == "off"
-    assert tuning_effort(config, "audit") == "audit"
+    assert base.resolve(SimpleNamespace(), config, "m", ctx).autotune_effort == effort
+    assert base.resolve(SimpleNamespace(autotune_effort="off"), config, "m", ctx).autotune_effort == "off"
+    assert base.resolve(SimpleNamespace(autotune_effort="audit"), config, "m", ctx).autotune_effort == "audit"
     for legacy in ("exhaustive", "medium", "max"):
         with pytest.raises(UsageError, match="autotune_effort"):
             load(tmp_path, f'[preparation]\nautotune_effort = "{legacy}"\n')

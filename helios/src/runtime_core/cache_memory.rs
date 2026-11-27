@@ -423,7 +423,7 @@ impl Layout {
         let mut covered = u32::MAX..0;
         for (planned, compact) in self.aliases.iter().zip(&mut aliases) {
             if planned.is_empty() {
-                if !compact.is_empty() {
+                if !Range::is_empty(compact) {
                     return None;
                 }
                 *compact = 0..0;
@@ -434,7 +434,7 @@ impl Layout {
             }
             covered.start = covered.start.min(planned.start);
             covered.end = covered.end.max(planned.end);
-            if compact.is_empty() || compact.start < planned.start || compact.end > covered.end {
+            if Range::is_empty(compact) || compact.start < planned.start || compact.end > covered.end {
                 return None;
             }
         }

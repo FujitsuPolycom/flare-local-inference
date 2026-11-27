@@ -16,10 +16,14 @@ Anthropic Messages, stateless Responses, authentication, and client configuratio
 
 - **Intent, not mechanism.** A parameter names a decision only the user can
   make: which GPUs, how many simultaneous requests, where to listen.
-- **The engine is the recipe.** Per-model knowledge lives in `ignition/recipes/`
-  as qualified code. A recipe declares its checkpoints, their pinned revisions,
-  supported tensor-parallel sizes, concurrency range, memory cost model, and
-  template defaults. The command line never needs to know which model it runs.
+- **The engine is the recipe.** Per-model knowledge lives in external recipe
+  packages (such as `hyperflare_recipes/recipes/`), never in core `ignition`.
+  A recipe declares its checkpoints, pinned revisions, supported tensor-parallel
+  sizes, memory cost model, sampling defaults, and a `RecipeParameters` instance
+  declaring its preparation parameters, defaults, bounds, choices, validation
+  rules, and manifest serialization. The command line generates each model's
+  flags and `--help` output from that declaration without embedding model-specific
+  names or flags in core `ignition`.
 - **Derive execution geometry.** Context length, page count, GPU prefix-cache
   size, snapshot slots, graph capacities, worker counts, and body limits follow
   the recipe, host, and selected capacities. Advanced flags override the recipe's
@@ -77,13 +81,16 @@ with no `MODEL`, `export` and `debug-serve` use `defaults.model` from the config
 fail with a usage error if it is unset.
 `bench` uses the explicit model, then `defaults.model`, then `qwen3.8-27b`.
 
-`ignition --help` and preparation-command help list every declared model alias,
-supported tensor-parallel size, and default/maximum draft count. Put an alias or
-declared checkpoint repository before `--help` for its defaults, limits, and
-optional features, for example `ignition export step5-preview-nvfp4 --help`.
-Help reads recipe declarations without loading model dependencies, probing GPUs,
-or downloading checkpoint files. Unknown model aliases suggest a close match
-when one exists.
+`ignition --help` and bare preparation-command help (`ignition export --help`,
+`ignition debug-serve --help`, `ignition bench --help`) show only the universal
+core options and list every declared model alias, supported tensor-parallel
+size, and default/maximum draft count. Put an alias or declared checkpoint
+repository before `--help`—for example `ignition export step5-preview-nvfp4 --help`—to
+dynamically generate that recipe's exact parameter groups, flags, defaults,
+bounds, and choices from its `RecipeParameters` declaration. Help reads recipe
+declarations offline without importing PyTorch, reading configuration files,
+probing GPUs, or downloading checkpoint files. Unknown model aliases suggest a
+close match when one exists.
 
 Ignition exposes preparation and development launch commands. It prints
 preparation progress without a banner. The Rust Flare executable displays the
@@ -409,7 +416,7 @@ serving. `export` accepts neither option, and `--direct` rejects history draftin
 | `--port N` | Listening port. `debug-serve` only. | `server.port`, else `8000` |
 | `--verbose` | Per-phase detail on stderr | off |
 | `--config PATH` | Configuration file | `~/.config/flare/config.toml` |
-| `--image-concurrency N` | Maximum active image requests, 1 through the concurrency limit; vision recipes only | `image_concurrency` in `[models."MODEL"]`, then `[defaults]`, else the smaller of 4 and the concurrency limit |
+| `--image-concurrency N` | Maximum active image requests, 1 through the concurrency limit; vision recipes declaring `VisionParameters` only | The smaller of 4 and `--max-concurrency` |
 | `--no-weights` | Export only when exact stored-data blobs are cached. `export` only. | Off |
 | `--reuse-weights` | Reuse the cached default version's weight hashes and mappings without reading live or cached weight payloads; requires matching checkpoint and prepared layouts. `export` only. | Off |
 | `--publisher-key PATH` | Public publisher profile authenticating the cached weight source; repeatable. `export` only. | Embedded profiles and the local development profile |
@@ -436,52 +443,47 @@ partitions. Their vocabulary map, hash parameters, table geometry, encoding,
 global scale, and shard partitions must match; buffer and event names follow
 the prepared graphs.
 
-Preparation flags are grouped by capacity/compression, speculative decoding,
-and advanced options in `--help`. Recipe values apply when flags are omitted;
-explicit flags take precedence.
+Preparation flags are declared on each recipe's `RecipeParameters` hierarchy and
+grouped in `MODEL --help` by capacity/compression, speculative decoding, and
+advanced options. Core `ignition` owns the universal `RecipeParameters` fields
+(`--max-concurrency`, `--prefill-chunk-size`, `--autotune-effort`,
+`--compile-workers`, `--lock-gpu-clocks`, `--no-compile`, `--roce-ring`,
+`--roce-chain`) and the four Helios `GraphOperation` ABI parameter groups
+(`SpeculationParameters`, `VisionParameters`, `PromptLogprobsParameters`, and
+`MixedPrefillParameters`). Recipes compose additional domain parameter groups
+and subclasses (such as `--expert-scale-compression`, `--online-mxfp8`,
+`--online-mxfp8-scope`, `--native-dense-activations`, `--no-stream-overlap`,
+`--no-context-parallel`, `--dcp-size`, `--draft-head-quantization`,
+`--draft-body-quantization`, `--markov-head-quantization`,
+`--mla-compute-mode`, `--vocabulary-parallel-sampling`, `--row-shard-prefill`,
+`--row-shard-attention`, `--force-moe-decode-a16`, and
+`--shard-hyperconnections`) directly in the recipe package. Passing a flag that
+the selected recipe does not declare fails with a usage error naming the flag
+and alias. Recipe values apply when flags are omitted; explicit flags take
+precedence.
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--prefill-chunk-size N` | Most prompt tokens processed in one prefill step, a multiple of 64. A larger chunk reaches a long prompt's first token sooner; while it runs, other active requests wait for their next token. Command line only. | The recipe's chunk |
-| `--mixed-prefill` | Capture mixed prompt/decode graphs alongside separate graphs. Supported by Qwen3.8 Flash with concurrency of at least two, with MTP speculation or without speculation; `--speculative-method dflash2` rejects it. Command line only; a core's catalog is fixed at export, so changing this flag requires re-export. | Disabled |
-| `--prompt-logprobs` | Capture separate scored prefill graphs for raw prompt token logprobs. See [the logprob contract](logprobs-design.md#prompt-scoring). Command line only. | Disabled |
-| `--expert-scale-compression [MODE]` | Losslessly compress routed-expert scales: DeepSeek V4.1 backbone and DSpark MXFP4 scales, Step-5 NVFP4 scales including BF16 experts converted to W4A16, or MiniMax M3.1 Flash NVFP4 scales. `csf` is a compressed scale encoding expanded during execution. Estimated resident GPU weight savings are 3% for DeepSeek V4.1 and 6% for Step-5; the MiniMax M3.1 Flash declaration estimates none. Actual savings depend on encoded scales. A bare flag selects `csf`; `native` disables compression. Retain compressed scales and share expansion scratch across serial layers. | Recipe default: `csf` for DeepSeek V4.1, native otherwise |
-| `--speculative-method {mtp,dflash2}` | Select the recipe's learned proposal method. Flash Next defaults to MTP and also supports its pinned DFlash2 checkpoint; Qwen3.8 dense uses DFlash2; Kimi K3.1 Pro defaults to its DSpark draft and also supports DFlash2. Overrides `[models."MODEL"] speculative_method`, then `[defaults] speculative_method`. The selection is recorded in preparation and rebuild metadata; native serving replays the exported graphs. | Recipe declaration |
-| `--no-mtp` | Disable multi-token speculation: load no draft model, keep no verification rows, and decode one token per step. | Speculation on |
+| `--prefill-chunk-size N` | Most prompt tokens processed in one prefill step, aligned to the recipe's chunk alignment. A larger chunk reaches a long prompt's first token sooner; while it runs, other active requests wait for their next token. Command line only. | The recipe's chunk |
+| `--mixed-prefill` | Capture mixed prompt/decode graphs alongside separate graphs. Available on recipes declaring `MixedPrefillParameters` with concurrency of at least two; `--speculative-method dflash2` rejects it. Command line only; a core's catalog is fixed at export, so changing this flag requires re-export. | Disabled |
+| `--prompt-logprobs` | Capture separate scored prefill graphs for raw prompt token logprobs. Available on recipes declaring `PromptLogprobsParameters`. See [the logprob contract](logprobs-design.md#prompt-scoring). Command line only. | Disabled |
+| `--speculative-method METHOD` | Select the recipe's learned proposal method from the choices declared on `SpeculationParameters.supported_methods`. Command line only. Recorded in `PreparationManifest`; native serving replays the exported graphs. | Recipe declaration |
+| `--no-mtp` | Disable multi-token speculation: load no draft model, keep no verification rows, and decode one token per step. Available on recipes declaring `SpeculationParameters`. | Speculation on |
 | `--mtp-only` | Omit MTP-disabled prefill, decode, maintenance, and mixed graphs during preparation. Retain width-one speculative rounds and vision graphs. Requires positive draft depth; rejects `--no-mtp`. The core cannot load with native `--mtp-draft-tokens 0`. | Capture both execution modes |
-| `--draft-body-quantization {mxfp8}` | Prepare eligible DFlash2 body context, attention latent/query/output, and MLP projections as MXFP8, independently of target conversion and proposal-head precision. Kimi K3.1 Pro requires `--speculative-method dflash2` and positive learned draft depth; DSpark and other recipes reject it. Normalization, convolution, candidate-selector, and absorbed key/value weights retain their precision. Omission preserves checkpoint precision or the existing `online_mxfp8_scope all` behavior. | No additional override |
-| `--draft-head-quantization {nvfp4,mxfp8}` | Prepare a separate proposal vocabulary head while retaining target-head precision. NVFP4 supports DeepSeek V4/V4.1; MXFP8 supports DeepSeek V4.1. Qwen3.8 dense supports both when the source checkpoint head is BF16, including `qwen3.8-27b-qad`; the packed NVIDIA head cannot be converted through this option. Flash Next supports both with `--speculative-method dflash2` and a BF16 target vocabulary head. Kimi K3.1 Pro supports both with `--speculative-method dflash2` only. This does not quantize the draft body. | Checkpoint precision |
-| `--markov-head-quantization {nvfp4,fp8}` | Prepare the draft Markov transition projection as NVFP4 or row-scaled E4M3 FP8. DeepSeek V4 supports NVFP4; DeepSeek V4.1 supports both. Requires positive draft depth. | Checkpoint precision |
-| `--vocabulary-parallel-sampling` | Prepare vocabulary-sharded DSpark proposals and block rejection sampling. DeepSeek V4.1 on four GPUs only; three-GPU preparation rejects it. Requires positive draft depth and recipe sampling defaults without top-k, top-p, or min-p filtering, and rejects `--markov-head-quantization nvfp4`. | Full-vocabulary sampling |
 | `--mtp-draft-tokens N` | Most draft tokens verified in one round; see `MODEL --help` for its limit. Verification capacities cover counts from 0 through `N` within the speculative token capacity. Each complete speculative program records its actual proposal depth independently of target width and aggregate rows. Prefix selection uses measured complete-program cost and completed acceptance or confidence. Zero retains draft state with width-one execution; `--no-mtp` excludes draft weights and state. | Recipe declaration |
-| `--speculative-token-capacity N` | Maximum physical target-token rows in wider speculative graphs; width one covers every request bucket. Applies to every speculative recipe. | Recipe declaration: 32 for Muse Spark and 128 for the other recipes that declare one. Gemma 4 declares none and derives it from concurrency and draft depth (6 at its defaults) |
-| `--speculative-graph-budget N` | Maximum packed round graphs to capture, independently of physical target-token rows. Excludes mandatory width-one and ordinary graphs; requires packed adaptive learned speculation at positive draft depth. Must cover both physical-row endpoints for every eligible request bucket. | 64 for packed recipes |
+| `--speculative-token-capacity N` | Maximum physical target-token rows in wider speculative graphs; width one covers every request bucket. Applies to every recipe declaring `SpeculationParameters`. Command line only. | Recipe declaration (or derived from concurrency and draft depth when omitted) |
+| `--speculative-graph-budget N` | Maximum packed round graphs to capture, independently of physical target-token rows. Excludes mandatory width-one and ordinary graphs; requires packed learned speculation at positive draft depth. Must cover both physical-row endpoints for every eligible request bucket. Command line only. | Recipe declaration (64 for packed recipes) |
 | `--no-mtp-adaptive-verification` | Default to fixed-width serving. Capture includes every smaller width within the speculative token capacity. GPU confidence allocation requires adaptive selection; host-allocated ragged programs support fixed selection. | Adaptive |
-| `--mla-compute-mode {auto,bf16}` | Constrain DeepSeek V4.1 MLA arithmetic while preserving packed KV storage and autotuning among compatible kernels. | Recipe default: `bf16` for DeepSeek V4.1, `auto` otherwise |
-| `--no-context-parallel` | Keep each rank's attention context whole instead of sharding each page's context across tensor-parallel ranks, which caches fewer tokens. Applies to recipes that declare context-parallel page costs (GLM 5.3, Kimi K3, and Kimi K3.1 Pro); other recipes reject it. | Context sharding where the recipe declares it |
-| `--no-stream-overlap` | Run every concurrent branch (shared experts, projection chains, query chains) serially on the main stream with the same kernels, to diagnose scheduling-dependent faults. Slower. Recipes that run no branches concurrently reject it. | Overlap |
+| `--language-model-only` | Prepare no vision encoder and serve text only, as vLLM's flag of the same name; requests with images are rejected and the encoder's weights, scratch, and graphs become KV pages. Available on recipes whose `VisionParameters` marks a separable encoder. | The recipe's image support |
 | `--autotune-effort off\|default\|audit` | Kernel search effort. Off uses heuristics without races; default races the candidates that pass each kernel family's performance exclusions; audit lifts those exclusions and races every legal candidate, to check that the default search prunes no winners. Overrides `[preparation] autotune_effort`. | Default |
-| `--shard-hyperconnections` | Partition Qwen3.8 Flash target and MTP hyperconnection bottlenecks across TP ranks and all-reduce BF16 gate logits before sigmoid. Requires TP2 or TP4. Command line only; changing it requires re-export. | off (replicated) |
-| `--row-shard-prefill` | Replace eligible tensor-parallel prefill all-reduces with reduce-scatters into each rank's contiguous row shard, run row-local residual mixing on that shard, and gather normalized branch inputs back to full rows. Preparation requires multi-host RoCE (proxy ABI 11 or later) or single-host PCIe `DmaAllReduce` row-shard surfaces and a tensor-parallel size declared in the recipe's `row_shard_prefill_world_sizes`; SM103 is refused, and layers or capacities whose row count or row-shard capacity do not fit keep the full-row all-reduce path. Command line only; changing it requires re-export. | off |
-| `--row-shard-attention` | Request recipe-declared row-sharded prefill attention alongside `--row-shard-prefill`: Ignition validates `--row-shard-prefill`, checks that the recipe declares `row_shard_prefill_world_sizes` and `replicated_attention_bytes`, adds that per-rank replicated weight charge to `weights_bytes` before sizing KV pages and GPUs, and records `row_shard_attention` in `PreparationManifest` (`SCOPE_DEPLOYMENT`) and `reproduction_args`. Core Ignition implements only this planning, CLI, and metadata plumbing; execution (loading replicated attention projections and gathering KV projections instead of attention inputs and outputs) lives in external recipes. Measured only on single-host SM120 PCIe (`DeepSeek-V4.1-Flash` TP4 export and native `flare run`; single-GPU SM120 real-checkpoint parity matched partitioned attention within `0.25%` relative RMS and `0.9999966` cosine); SM121, multi-host RoCE, SM103, and other recipes are unqualified (see `docs/TODO.txt`). Command line only; changing it requires re-export from live weights (`--reuse-weights` rejects the added replicated weight views). | off |
 | `--lock-gpu-clocks` | Lock each tuning GPU at its maximum supported graphics frequency during b12x and Inductor autotuning, then reset driver clock defaults. Frozen warmup, capture, and serving remain unlocked. Requires root or noninteractive sudo access to `nvidia-smi`. Command line only; inactive with `--autotune-effort off`. | off |
 | `--compile-workers N` | CPU compiler process budget per host, divided among local preparation ranks and bounded by available RAM and device memory. Applies to b12x kernel compilation and complete-forward compilation. Overrides `[preparation] compile_workers`. | Automatic |
 | `--tuning-gpus LIST` | Local kernel-tuning GPUs. Start with the serving GPU list, then append complete replicas of that TP group on matching hardware. Serving TP size stays fixed. Command line only; cannot be combined with multi-host `--ranks`. | Serving GPUs |
 | `--no-compile` | Development only: capture graphs without compiling forwards. A recipe never sets it. | off |
-| `--force-moe-decode-a16` / `--no-force-moe-decode-a16` | Prepare Qwen3.8 Flash NVFP4 target routed experts as one packed weight owner: decode and speculative verification use W4A16 at every token-row count, and separate prefill graphs use calibrated A4. Requires SM120/121, checkpoint activation scales, and rank-local expert intermediate width divisible by 64 (TP1/2). Mixed prefill and other recipes/precisions reject the flag. Shared experts and stored A16 MTP experts retain their precision. Overrides `[preparation] force_moe_decode_a16`; the resolved value is recorded in the plan and core rebuild metadata. | off |
-| `--native-dense-activations` | Replace dense projection `auto` precision with b12x `quantized`: A8 for FP8 weights and A4 for FP4 weights. Explicit recipe precision and routed MoE precision are retained. NVFP4 requires a checkpoint activation global scale; unsupported native paths fail preparation. | Recipe precision |
-| `--online-mxfp8` | Store eligible BF16 projections as MXFP8 while loading. Kimi K3.1 converts fused target KDA inputs by default; `--online-mxfp8-scope all` also converts eligible attention output/latent projections, shared experts, MoE latent projections, and DFlash2 draft projections. Kimi K3 converts KDA projections, MLA latent/gate, query and output projections, shared experts, MoE latent down/up projections, and DSpark context, outputs and MLPs; batched MLA key/value projections retain BF16. Qwen3.8 dense converts target attention/MLP projections and DFlash2 context, attention and MLP projections. Flash Next with `--speculative-method dflash2` converts only DFlash2 projections; target precision is retained. Existing packed weights, normalization, convolutions, selectors and target vocabulary weights retain their precision. Recipes that name no such projections reject it. | Checkpoint precision |
-| `--online-mxfp8-scope SCOPE` | Select a conversion group declared by the recipe. Kimi K3.1 supports `kda-input` and `all`; the broader group changes target as well as DFlash2 draft projection storage. Other recipes retain their declared conversion set. Command line only; requires `--online-mxfp8` for a non-default group. | Recipe scope |
-| `--language-model-only` | Prepare no vision encoder and serve text only, as vLLM's flag of the same name; requests with images are rejected and the encoder's weights, scratch, and graphs become KV pages. Recipes without a separable encoder reject it. | The recipe's image support |
 
-Speculative method, token capacity, and packed graph budget also accept
-configuration-file defaults and model overrides. The remaining speculation
-settings are command-line only. `--no-mtp` excludes explicit speculation flags and model-specific packed
-graph budgets. The `Select GPUs.` startup line states the settings in effect: `up to
-N draft tokens` while verification adapts, `exactly N draft tokens` when it is
-fixed, and `branches serialized` under `--no-stream-overlap`. That flag is also
-recorded in the plan and the exported graph catalog; it changes graph scheduling,
-not kernel selection, so its cores share tuned kernels with overlapped ones.
+Recipe-specific parameters (such as expert scale compression, online MXFP8 conversion, draft quantization, context parallelism, stream overlap, MLA arithmetic, vocabulary-parallel sampling, row-sharded prefill/attention, MoE decode precision, and sharded hyperconnections) are command-line only and documented in `ignition export MODEL --help` and [model preparation](model-preparation.md). Every resolved `RecipeParameters` value serializes directly into `PreparationManifest` (`parameters` and `reproduction_args`), emitting only parameters declared by the selected recipe.
+
+`--no-mtp` excludes explicit speculation flags and any recipe parameters marked `requires_speculation`. The `Select GPUs.` startup line summarizes the active settings emitted by each parameter group's `status_parts` hook (such as `up to N draft tokens`, `exactly N draft tokens`, `branches serialized`, or `expert scales csf`).
 
 Gemma 4 defaults to four concurrent requests and six speculative target-token
 rows, and Muse Spark to four concurrent requests and 32 target-token rows. Other
@@ -1326,12 +1328,12 @@ of the core filename and `--served-model-name`. Conflicting concurrency values
 for matching names are rejected unless `--max-concurrency` supplies the value.
 Configured concurrency must fit the core's prepared capacities.
 
-`[publishing]`, `[preparation]`, `defaults.model`, image concurrency, speculative
-graph preparation settings, and the checkpoint, kernel, staging, and toolkit paths
-are preparation settings that native serving does not read. `flare run` requires a core; it does not interpret
-an Ignition recipe alias as a prepared core. `paths.hub_cache` selects only
-the user Hugging Face cache that acquisition reads read-only; it does not select
-prepared-core transport staging or the model cache.
+`[publishing]`, `[preparation]`, `defaults.model`, and the checkpoint, kernel,
+staging, and toolkit paths are preparation settings that native serving does not
+read. `flare run` requires a core; it does not interpret an Ignition recipe
+alias as a prepared core. `paths.hub_cache` selects only the user Hugging Face
+cache that acquisition reads read-only; it does not select prepared-core
+transport staging or the model cache.
 
 Each Orbit node reads its own host configuration when its rank starts; saved group
 options and explicit flags take precedence. `--config` on the controller selects
@@ -1349,11 +1351,8 @@ api_key = ""                      # Empty: no authentication.
 [defaults]
 model = "qwen3.8-flash"
 max_concurrency = 4
-# image_concurrency = 4           # Active image requests; at most max_concurrency.
-# speculative_method = "mtp"      # Flash Next also supports dflash2.
 
 [preparation]
-# force_moe_decode_a16 = false    # Qwen Flash NVFP4: A16 decode/verify, calibrated A4 prefill.
 # compile_workers = 24           # Optional CPU process budget per host.
 # autotune_effort = "default"     # off, default, audit.
 # checkpoint_token_file = "~/.config/flare/agent.token"  # Shared token for multi-host preparation.
@@ -1380,24 +1379,18 @@ export_staging = ""               # Rank files an export assembles from; empty: 
 cuda = "/opt/cuda"                # Explicit CUDA toolkit directory for native builds.
 ```
 
-Ignition rejects any section or key outside its schema. Native Flare ignores
-keys it does not use, except in `[prefix_cache]`, where it accepts only `memory`,
-`disk_limit`, `drain_on_shutdown`, `max_age`, and `compression`.
+Ignition keeps the configuration file schema static and host-oriented, and
+rejects any section or key outside it. `[defaults]` accepts `model` and
+`max_concurrency`; `[models.<alias>]` accepts `max_concurrency`; `[preparation]`
+accepts `compile_workers`, `autotune_effort`, and `checkpoint_token_file`.
+Recipe preparation options—including image concurrency, speculation method,
+token capacity, graph budget, quantization, and layout flags—are controlled by
+the recipe's `RecipeParameters` defaults and explicit command-line flags rather
+than configuration-file keys. Native Flare ignores keys it does not use, except
+in `[prefix_cache]`, where it accepts only `memory`, `disk_limit`,
+`drain_on_shutdown`, `max_age`, and `compression`.
 
 `[models.<alias>]` overrides `[defaults]`; flags override both.
-Both sections accept `speculative_token_capacity`, overridden during preparation
-by `--speculative-token-capacity`. Omitting it uses the recipe declaration when
-supplied: Muse Spark declares 32 target rows, Inkling 2 Mini declares 64, and
-every other speculative recipe except Gemma 4 declares 128.
-Gemma 4 derives the larger of padded concurrency and draft count plus one,
-giving six rows at its defaults.
-Both sections also accept positive integer `speculative_graph_budget`, overridden
-by `--speculative-graph-budget`. Packed recipes declare 64 round graphs.
-The `[defaults]` graph budget applies only to active packed adaptive learned
-speculation; unsupported recipes, `--no-mtp`, and zero draft depth ignore it.
-An explicit flag or model-specific graph budget rejects those incompatible modes.
-Neither capacity setting changes the graphs in an already exported core;
-native exact and maximum verification budgets select only captured capacities.
 
 Default request parameters, meaning the values a request receives for fields
 it does not set, such as thinking, reasoning effort, sampling, and output
@@ -1437,7 +1430,7 @@ Configuration assigns each decision to one owner:
 | Checkpoint and revision | `MODEL`, including a local directory or `org/name@revision` |
 | GPUs and TP size | `--gpus`; rank count follows the selected list |
 | Concurrent requests | `--max-concurrency` |
-| Active image requests and feature slots | `--image-concurrency`, then model/default configuration, otherwise `min(4, max_concurrency)` for vision recipes |
+| Active image requests and feature slots | `--image-concurrency`, otherwise `min(4, max_concurrency)` for vision recipes |
 | Listener | Ignition and native Flare `--host` and `--port` |
 | Context limit | Checkpoint maximum; admission still requires sufficient shared cache capacity |
 | KV pages and GPU prefix-cache rows | Derived from available memory, graph cost, and concurrency |

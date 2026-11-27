@@ -104,6 +104,7 @@ impl Candidate {
 }
 
 impl RequestScheduler {
+    #[cfg(test)]
     pub(super) fn dominates_padding(&self, smaller: Candidate, larger: Candidate) -> bool {
         self.dominates_padding_with(&smaller, &larger,
             || self.candidate_round_lengths(&smaller), || self.candidate_round_lengths(&larger))

@@ -23,6 +23,7 @@ use super::{ExecutionManifest, GraphKind, DEFAULT_COMPLETION_TOKEN_CAPACITY, REQ
 /// over the same mapped host word. The event query in [`GraphExecutor::poll`] stays the only
 /// completion signal; the word can only end a wait early, best effort.
 struct CompletionWake {
+    #[cfg_attr(not(all(target_arch = "aarch64", target_os = "linux")), allow(dead_code))]
     word: PinnedHost,
     device: usize,
 }

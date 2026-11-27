@@ -13,12 +13,11 @@ from dataclasses import replace
 
 from ignition import planning
 from ignition.errors import CapacityError, FlareError, PreparationError, UsageError
+from ignition.parameters import explicit_flags_from_args
 
-from . import display, environment
-
-from .preparation import (Host, compiler_workers, context_parallel, derive, fetch, image_capacity_setting, resolve_model, speculation,
-                          stream_overlap, tuning_devices, tuning_effort)
+from . import environment
 from .config import Configuration
+from .preparation import Host, derive, fetch, resolve_model, resolve_parameters, tuning_devices
 
 # Request bytes allowed per context token: JSON-escaped text (a \uXXXX escape takes six bytes per
 # UTF-16 unit) and message structure stay well within this for prompts that fill the context.
@@ -176,8 +175,7 @@ def _export_hosts(args):
     model = resolve_model(configuration, args.model)
     if not model.cached(hub_cache):
         raise UsageError(f"{model.checkpoint.alias} is not cached; a single-host export downloads it")
-    concurrency = configuration.max_concurrency(model.checkpoint.alias, model.recipe.concurrency,
-                                                args.max_concurrency)
+    parameters = resolve_parameters(model, args, configuration, multi_host=True)
     host = Host.discover()
     selected = planning.parse_gpus(args.gpus or "0")
     if len(selected) != 1 or selected[0] >= len(host.gpus):
@@ -190,26 +188,16 @@ def _export_hosts(args):
     with phase(progress, "Wait for tensor-parallel hosts") as stage:
         topologies = rendezvous.accept(report=stage.update)
     gpus = tuple(topology_gpu(topology, index) for index, topology in enumerate(topologies))
-    plan = planning.plan(model.recipe, model.checkpoint, gpus, selected=tuple(range(len(gpus))),
-                         concurrency=concurrency.value, reserve_bytes=configuration.reserve_bytes,
-                         image_concurrency=image_capacity_setting(configuration, model, args.image_concurrency,
-                                                                  language_model_only=args.language_model_only),
-                         speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
-                         context_parallel=context_parallel(args, model), context_parallel_size=getattr(args, "dcp_size", None),
-                         stream_overlap=stream_overlap(args, model),
-                         roce_ring=args.roce_ring, roce_chain=args.roce_chain,
-                         mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
-                         expert_scale_compression=args.expert_scale_compression,
-                         online_mxfp8=args.online_mxfp8, online_mxfp8_scope=args.online_mxfp8_scope,
-                         language_model_only=args.language_model_only,
-                         mla_compute_mode=args.mla_compute_mode,
-                         row_shard_prefill=args.row_shard_prefill,
-                         row_shard_attention=args.row_shard_attention)
-    plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
-                   autotune_effort=tuning_effort(configuration, args.autotune_effort),
-                   lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
-                   force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", args.force_moe_decode_a16).value,
-                   shard_hyperconnections=args.shard_hyperconnections)
+    plan = planning.plan(
+        model.recipe,
+        model.checkpoint,
+        gpus,
+        selected=tuple(range(len(gpus))),
+        parameters=parameters,
+        reserve_bytes=configuration.reserve_bytes,
+        explicit_flags=explicit_flags_from_args(args),
+    )
+    plan = replace(plan, hub_cache=hub_cache)
     environment.apply(configuration, local, plan.recipe.b12x_environment)
     options = _server_options(configuration, model, plan)
     options.pop("api_key")
@@ -230,19 +218,18 @@ def _export_hosts(args):
             storage = CoreStorage(world=plan.world_size, local_ranks=1)
             with storage:
                 prepared = model.recipe.prepare(
-                    model.snapshot(hub_cache), plan, compile_forwards=not args.no_compile,
+                    model.snapshot(hub_cache), plan, compile_forwards=plan.parameters.compiled_forwards,
                     kernel_cache=configuration.directory("kernel_cache"), progress=progress,
                     retain_graphs=True, core_storage=storage, ranks=rendezvous)
         with prepared:
             with phase(progress, "Export native cores", live=False) as stage:
                 from ignition.preparation.rebuild_manifest import from_plan
 
-                options['preparation_manifest'] = from_plan(
-                    model, plan, compiled_forwards=not args.no_compile, multi_host=True)
+                options['preparation_manifest'] = from_plan(model, plan)
                 result = prepared.export(None, options=options, export_id=uuid.uuid4().hex, images=recorder,
-                                storage=storage, publisher=_publisher(configuration, args, model, hub_cache),
-                                staging=configuration.directory("export_staging"),
-                                progress=progress)
+                                         storage=storage, publisher=_publisher(configuration, args, model, hub_cache),
+                                         staging=configuration.directory("export_staging"),
+                                         progress=progress)
                 stage.update(f"{result.entry_path} ({plan.world_size} ranks)")
         for region in storage.host_regions:
             region.close()
@@ -269,55 +256,22 @@ def _prepare(args):
         cached = model.cached(hub_cache)
         stage.update(f"{model.checkpoint.alias} · {model.source} · {'cached' if cached else 'not cached'}")
     with phase(progress, "Select GPUs") as stage:
-        concurrency = configuration.max_concurrency(model.checkpoint.alias, model.recipe.concurrency,
-                                                    args.max_concurrency)
+        parameters = resolve_parameters(model, args, configuration, multi_host=False)
         host = Host.discover()
-        plan = derive(configuration, model, host, gpus=args.gpus, concurrency=concurrency,
-                      compile_workers=args.compile_workers, tuning_gpus=args.tuning_gpus, autotune_effort=args.autotune_effort,
-                      lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
-                      force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", args.force_moe_decode_a16).value,
-                      shard_hyperconnections=args.shard_hyperconnections,
-                      row_shard_prefill=args.row_shard_prefill,
-                      row_shard_attention=args.row_shard_attention,
-                      image_concurrency=args.image_concurrency,
-                      speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
-                      context_parallel=context_parallel(args, model), context_parallel_size=getattr(args, "dcp_size", None),
-                         stream_overlap=stream_overlap(args, model),
-                      roce_ring=args.roce_ring, roce_chain=args.roce_chain,
-                      mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
-                      expert_scale_compression=args.expert_scale_compression,
-                      online_mxfp8=args.online_mxfp8, online_mxfp8_scope=args.online_mxfp8_scope,
-                      language_model_only=args.language_model_only,
-                      mla_compute_mode=args.mla_compute_mode)
+        plan = derive(
+            configuration, model, host, gpus=args.gpus, parameters=parameters,
+            tuning_gpus=args.tuning_gpus, explicit_flags=explicit_flags_from_args(args),
+        )
         indices = planning.format_gpus(gpu.index for gpu in plan.gpus)
         # A caller's restriction changes which GPU each index names.
         restricted = "" if host.restriction is None else f" of CUDA_VISIBLE_DEVICES={host.restriction}"
-        serial = "" if plan.stream_overlap or not plan.recipe.stream_overlap else " · branches serialized"
-        capacity = "" if plan.speculation is None else f" · speculative token capacity {plan.speculative_token_capacity}"
-        if plan.speculation is not None and plan.speculation.graph_budget is not None:
-            capacity += f" · packed graph budget {plan.speculation.graph_budget}"
-        tuning = "" if not plan.tuning_gpus else " · tuning GPUs " + planning.format_gpus(gpu.index for gpu in plan.tuning_gpus)
-        if plan.roce_ring:
-            serial += " · experimental RoCE ring (native neighbor relays)"
-        if plan.roce_chain:
-            serial += " · experimental RoCE chain (native neighbor relays, open ends)"
-        stage.update(f"GPU{'s' if plan.world_size > 1 else ''} {indices}{restricted}"
-                     f" · concurrency {plan.concurrency} · images {plan.image_concurrency} · {display.speculation(plan.speculation, brief=True)}{capacity}{serial}"
-                     f" · prompt logprobs {'on' if plan.prompt_logprobs else 'off'}"
-                     f" · mixed prefill {'on' if plan.mixed_prefill else 'off'}"
-                     f" · expert scales {plan.expert_scale_compression or 'native'}"
-                     f"{(' · online MXFP8 ' + plan.online_mxfp8_scope) if plan.online_mxfp8 else ''}"
-                     f"{' · language model only' if plan.language_model_only else ''}"
-                     f" · compile workers {plan.compile_workers or 'auto'} per host{tuning}"
-                     f" · autotune effort {plan.autotune_effort}"
-                     f"{' · native dense activations' if plan.native_dense_activations else ''}"
-                     f"{' · MoE decode A16 / prefill A4' if plan.force_moe_decode_a16 else ''}"
-                     f"{' · DFlash2 proposals' if plan.speculation is not None and plan.speculation.method == 'dflash2' else ''}"
-                     f"{' · BF16 sharded hyperconnections' if plan.shard_hyperconnections else ''}"
-                     f"{' · row-sharded prefill' if plan.row_shard_prefill else ''}"
-                     f"{' · row-sharded attention' if plan.row_shard_attention else ''}")
+        parts = [f"GPU{'s' if plan.world_size > 1 else ''} {indices}{restricted}"]
+        parts.extend(plan.parameters.status_parts(plan.parameter_context))
+        if plan.tuning_gpus:
+            parts.append("tuning GPUs " + planning.format_gpus(gpu.index for gpu in plan.tuning_gpus))
+        stage.update(" · ".join(parts))
     if args.config is None and not configuration.exists:
-        configuration.write_initial(model.checkpoint.alias, concurrency.value)
+        configuration.write_initial(model.checkpoint.alias, plan.concurrency)
     if not cached:
         if model.directory is not None:
             raise UsageError(f"{model.directory} lacks tensor files named by its safetensors index")
@@ -346,8 +300,9 @@ def _prepare(args):
                 storage = CoreStorage(world=plan.world_size)
                 preparation_options["core_storage"] = storage
                 with storage:
-                    prepared = prepare_recipe(model.recipe.prepare,
-                        model.snapshot(hub_cache), plan, compile_forwards=not args.no_compile,
+                    prepared = prepare_recipe(
+                        model.recipe.prepare,
+                        model.snapshot(hub_cache), plan, compile_forwards=plan.parameters.compiled_forwards,
                         kernel_cache=configuration.directory("kernel_cache"), progress=progress,
                         **preparation_options)
         except FlareError:
@@ -371,10 +326,10 @@ def _prepare(args):
                     options.pop("api_key")
                     from ignition.preparation.rebuild_manifest import from_plan
 
-                    options['preparation_manifest'] = from_plan(model, plan, compiled_forwards=not args.no_compile)
+                    options['preparation_manifest'] = from_plan(model, plan)
                     result = export_core(prepared, recorder, storage, None, options=options, publisher=publisher,
-                                 progress=progress, console=progress.console,
-                                 staging=configuration.directory("export_staging"))
+                                         progress=progress, console=progress.console,
+                                         staging=configuration.directory("export_staging"))
                 except Exception as error:
                     if args.verbose:
                         traceback.print_exc()
@@ -433,8 +388,7 @@ def debug_serve(args) -> int:
     model = resolve_model(configuration, args.model)
     if not model.cached(hub_cache):
         raise UsageError(f"{model.checkpoint.alias} is not cached; ignition export downloads it")
-    concurrency = configuration.max_concurrency(model.checkpoint.alias, model.recipe.concurrency,
-                                                args.max_concurrency)
+    parameters = resolve_parameters(model, args, configuration, multi_host=(args.ranks > 1))
     host = Host.discover()
     bind = _address(configuration.get("server.host", args.host).value,
                     configuration.get("server.port", args.port).value)
@@ -458,26 +412,17 @@ def debug_serve(args) -> int:
         with phase(progress, "Wait for tensor-parallel hosts") as stage:
             topologies = rendezvous.accept(report=stage.update)
         gpus = tuple(topology_gpu(topology, index) for index, topology in enumerate(topologies))
-    plan = planning.plan(model.recipe, model.checkpoint, gpus,
-                         selected=None if args.ranks == 1 and args.gpus is None else tuple(range(len(gpus))),
-                         concurrency=concurrency.value, reserve_bytes=configuration.reserve_bytes,
-                         image_concurrency=image_capacity_setting(configuration, model, args.image_concurrency,
-                                                                  language_model_only=args.language_model_only),
-                         speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
-                         context_parallel=context_parallel(args, model), context_parallel_size=getattr(args, "dcp_size", None),
-                         stream_overlap=stream_overlap(args, model),
-                         roce_ring=args.roce_ring, roce_chain=args.roce_chain,
-                         cache_states=args.prefix_cache_states, mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
-                         expert_scale_compression=args.expert_scale_compression, online_mxfp8=args.online_mxfp8,
-                         online_mxfp8_scope=args.online_mxfp8_scope,
-                         language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode,
-                         row_shard_prefill=args.row_shard_prefill,
-                         row_shard_attention=args.row_shard_attention)
-    plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
-                   autotune_effort=tuning_effort(configuration, args.autotune_effort),
-                   lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
-                   force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", args.force_moe_decode_a16).value,
-                   shard_hyperconnections=args.shard_hyperconnections)
+    plan = planning.plan(
+        model.recipe,
+        model.checkpoint,
+        gpus,
+        selected=None if args.ranks == 1 and args.gpus is None else tuple(range(len(gpus))),
+        parameters=parameters,
+        reserve_bytes=configuration.reserve_bytes,
+        cache_states=args.prefix_cache_states,
+        explicit_flags=explicit_flags_from_args(args),
+    )
+    plan = replace(plan, hub_cache=hub_cache)
     if rendezvous is None:
         plan = tuning_devices(plan, host, args.tuning_gpus)
         local = plan.gpus
@@ -505,8 +450,9 @@ def debug_serve(args) -> int:
     from ignition.preparation.tuning_replicas import prepare_recipe
 
     with storage if storage is not None else nullcontext():
-        prepared = prepare_recipe(model.recipe.prepare,
-            model.snapshot(hub_cache), plan, compile_forwards=not args.no_compile,
+        prepared = prepare_recipe(
+            model.recipe.prepare,
+            model.snapshot(hub_cache), plan, compile_forwards=plan.parameters.compiled_forwards,
             kernel_cache=configuration.directory("kernel_cache"), progress=progress,
             **preparation_options)
     if plan.speculation is not None and plan.speculation.packed_verification:

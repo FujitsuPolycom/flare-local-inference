@@ -14,6 +14,7 @@ pub fn path(recipe: &str, name: &str) -> std::path::PathBuf {
         .join(format!("{name}.jinja"))
 }
 
+#[allow(dead_code)]
 pub fn template(recipe: &str, name: &str) -> String {
     std::fs::read_to_string(path(recipe, name)).expect("prepared test template must exist")
 }
