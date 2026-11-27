@@ -8,11 +8,38 @@ import json
 import pickle
 import struct
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
+
+
+@dataclass(frozen=True)
+class _CollectiveTuningHeader:
+    """Lightweight readiness descriptor exchanged during progress polling."""
+
+    key: object
+    ranks: tuple[int, ...]
+    step: object
+
+
+def _all_gather_pickled(group, value, packet, received):
+    data = pickle.dumps(value, protocol=pickle.DEFAULT_PROTOCOL)
+    outgoing = memoryview(packet.numpy())
+    incoming = [memoryview(buf.numpy()) for buf in received]
+    capacity = len(outgoing) - 8
+    struct.pack_into("<Q", outgoing, 0, len(data))
+    if len(data) <= capacity:
+        outgoing[8:8 + len(data)] = data
+    dist.all_gather(received, packet, group=group)
+    sizes = [struct.unpack_from("<Q", buf, 0)[0] for buf in incoming]
+    if any(size > capacity for size in sizes):
+        states = [None] * len(received)
+        dist.all_gather_object(states, value, group=group)
+        return states
+    return [pickle.loads(buf[8:8 + size]) for buf, size in zip(incoming, sizes, strict=True)]
 
 
 def host_identity():
@@ -181,8 +208,13 @@ def _rank_can_advance(states, all_ranks, rank, state):
     if not all(peer[operation] for peer in members):
         return False
     if operation == 5:
-        return not any(peer[5] is None or getattr(peer[5], "key", None) != getattr(state[5], "key", None)
-                       or tuple(peer[5].ranks) != local_ranks for peer in members)
+        return not any(
+            peer[5] is None
+            or getattr(peer[5], "key", None) != getattr(state[5], "key", None)
+            or getattr(peer[5], "step", None) != getattr(state[5], "step", None)
+            or tuple(peer[5].ranks) != local_ranks
+            for peer in members
+        )
     if operation == 3:
         return not any(peer[3] is None or tuple(getattr(peer[3], "ranks", all_ranks)) != local_ranks
                        for peer in members)
@@ -287,23 +319,38 @@ class CollectivePreparation:
         self.local_ranks = self.hosts.count(host_identity())
         self._progress_packet = torch.zeros(2048, dtype=torch.uint8, device="cpu")
         self._progress_received = list(torch.empty((len(self.ranks), 2048), dtype=torch.uint8, device="cpu").unbind())
+        self._subgroup_packets = {}
 
     def _exchange_progress(self, value):
-        data = pickle.dumps(value, protocol=pickle.DEFAULT_PROTOCOL)
-        outgoing = memoryview(self._progress_packet.numpy())
-        incoming = [memoryview(packet.numpy()) for packet in self._progress_received]
-        capacity = len(outgoing) - 8
-        struct.pack_into("<Q", outgoing, 0, len(data))
-        if len(data) <= capacity:
-            outgoing[8:8 + len(data)] = data
-        dist.all_gather(self._progress_received, self._progress_packet, group=self.group)
-        sizes = [struct.unpack_from("<Q", packet, 0)[0] for packet in incoming]
-        if any(size > capacity for size in sizes):
-            states = [None] * len(self.ranks)
-            dist.all_gather_object(states, value, group=self.group)
-            return states
-        return [pickle.loads(packet[8:8 + size])
-                for packet, size in zip(incoming, sizes, strict=True)]
+        return _all_gather_pickled(self.group, value, self._progress_packet, self._progress_received)
+
+    def _pack_collective_tuning(self, requirement):
+        if requirement is None:
+            return None
+        ranks = tuple(getattr(requirement, "ranks", ()))
+        control_groups = getattr(self, "control_groups", None)
+        if control_groups and ranks in control_groups:
+            return _CollectiveTuningHeader(
+                getattr(requirement, "key", None),
+                ranks,
+                getattr(requirement, "step", None),
+            )
+        return requirement
+
+    def _exchange_subgroup_payload(self, value, ranks):
+        group = self.control_groups[ranks]
+        packets = getattr(self, "_subgroup_packets", None)
+        if packets is None:
+            packets = {}
+            self._subgroup_packets = packets
+        buffers = packets.get(ranks)
+        if buffers is None:
+            packet = torch.zeros(2048, dtype=torch.uint8, device="cpu")
+            received = list(torch.empty((len(ranks), 2048), dtype=torch.uint8, device="cpu").unbind())
+            buffers = (packet, received)
+            packets[ranks] = buffers
+        packet, received = buffers
+        return tuple(_all_gather_pickled(group, value, packet, received))
 
     def register_group(self, ranks, group):
         """Retain a control subgroup used by hybrid TP/DCP collective barriers."""
@@ -452,18 +499,26 @@ class CollectivePreparation:
         if progress.ready_cache is not None or progress.ready_tuning:
             raise ValueError("collective preparation does not shard tuning candidates")
         pending = tuple((item.key, item.ranks) for item in progress.ready_collectives)
-        local = (pending, progress.ready_collective_tuning)
+        local_tuning = progress.ready_collective_tuning
+        local = (pending, self._pack_collective_tuning(local_tuning))
         states = self._exchange_progress(local)
         self._remember_operation_ranks(states)
         if not all(item[0] or item[1] is not None for item in states):
             return None
         if all(item[1] is not None for item in states):
-            local = states[self._local_index()][1]
-            members = self._members(states, local.ranks)
+            local_entry = states[self._local_index()][1]
+            local_ranks = tuple(local_entry.ranks)
+            members = self._members(states, local_ranks)
             values = tuple(item[1] for item in members)
-            if any(getattr(item, "key", None) != getattr(local, "key", None) or item.ranks != local.ranks
-                   for item in values):
+            if any(
+                getattr(item, "key", None) != getattr(local_entry, "key", None)
+                or getattr(item, "step", None) != getattr(local_entry, "step", None)
+                or tuple(item.ranks) != local_ranks
+                for item in values
+            ):
                 return None
+            if isinstance(local_entry, _CollectiveTuningHeader):
+                return self._exchange_subgroup_payload(local_tuning, local_ranks)
             return values
         local = states[self._local_index()][0]
         ranks = local[0][1]
@@ -497,10 +552,11 @@ class CollectivePreparation:
                 except Exception as exc:  # noqa: BLE001 - Every rank must receive preparation failures.
                     error = exc
                 pending = () if state is None else tuple((item.key, item.ranks) for item in state.ready_collectives)
+                local_tuning = None if state is None else state.ready_collective_tuning
                 local = (state is not None and state.done, pending,
                          None if error is None else f"{type(error).__name__}: {error}",
                          None if state is None else state.ready_cache, () if state is None else tuple(state.ready_tuning),
-                         None if state is None else state.ready_collective_tuning)
+                         self._pack_collective_tuning(local_tuning))
                 states = self._exchange_progress(local)
                 self._remember_operation_ranks(states)
                 failures = [(rank, item[2]) for rank, item in zip(self.ranks, states, strict=True) if item[2] is not None]
@@ -529,9 +585,19 @@ class CollectivePreparation:
                     raise RuntimeError("a rank finished before its peer's collective declaration")
                 ready = all(item[operation] for item in members)
                 if ready and operation == 5:
-                    if not any(item[5] is None or getattr(item[5], "key", None) != getattr(local[5], "key", None)
-                               or tuple(item[5].ranks) != local_ranks for item in members):
-                        authorization = {"collective_tuning": tuple(item[5] for item in members)}
+                    if not any(
+                        item[5] is None
+                        or getattr(item[5], "key", None) != getattr(local[5], "key", None)
+                        or getattr(item[5], "step", None) != getattr(local[5], "step", None)
+                        or tuple(item[5].ranks) != local_ranks
+                        for item in members
+                    ):
+                        if isinstance(local[5], _CollectiveTuningHeader):
+                            authorization = {
+                                "collective_tuning": self._exchange_subgroup_payload(local_tuning, local_ranks)
+                            }
+                        else:
+                            authorization = {"collective_tuning": tuple(item[5] for item in members)}
                 elif ready and operation == 3:
                     if not any(item[3] is None or tuple(getattr(item[3], "ranks", self.ranks)) != local_ranks
                                for item in members):
