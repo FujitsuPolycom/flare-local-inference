@@ -381,8 +381,10 @@ per-request share of snapshot rows. The global allocator accounts for snapshot
 aliases, guards a later anchor against earlier optional captures, and reclaims
 unused guards for mandatory execution. Only obtainable capture destinations
 introduce prefill cuts. See [checkpoint ownership](../docs/core-design.md#exact-endpoint-capture). `prefill_chunk_size` must be 64-aligned, at least 64, and within the
-context capacity. Batched graphs use power-of-two capacities up to the selected
-concurrency rounded up to a power of two.
+context capacity. Batched graphs use supported capacities from `BATCH_CAPACITIES`
+(`1, 2, 4, 6, 8, 12, 16, 24, 32, 64`) up to the selected concurrency rounded up
+to a power of two; only the power-of-two subset `REQUIRED_BATCH_CAPACITIES` is
+required of a compatible core.
 Prefill, decode cohorts, speculative widths, mixed graphs, and prerequisite
 stages compete in that one selection. Full prompt cache hits restore state and
 resume sampling from saved hidden state without replaying prompt tokens. See

@@ -36,23 +36,29 @@
     helios/proto/runtime_core.proto. Validate their original captured graphs
     through native serving without re-export or re-signing.
 
-[ ] Review threaded-rank rejection state in helios/src/execution/threaded.rs
-    and helios/src/execution/threaded/protocol.rs. Duplicate rank-zero completions
-    overwrite stored payloads before rejection; frames leave the queue before
-    agreement and timing validation. Verify ownership and poison handling through
-    poll_ranks and close, beyond the existing bookkeeping-helper tests.
+[ ] Add TLA+ formal-model and observed-edge coverage for ThreadedExecutor's
+    lock-free DispatchRing (Prepare/Ready/Commit-or-Cancel barrier, parity-slot
+    reuse, and completion retirement in helios/src/execution/threaded.rs).
+    RankProtocol.tla, RankDispatch.tla, and helios/src/execution/threaded/protocol.rs
+    cover only the socket coordinator's two-phase bookkeeping. Close when a TLA+
+    model checks DispatchRing transitions and rejection/poison handling through
+    coordinate_step, poll_ranks, and close.
 
 [ ] Qualify actual threaded executor completion and shutdown on assigned CUDA
-    devices after partial Prepare/Commit dispatch, failure after local enqueue,
-    cancellation, and poison. Verify completion/drain signals cover every
-    participating rank and protect graph/cache/input-frame storage through its
-    final use. Extend helios/src/execution/threaded/cuda_tests.rs; see
-    verification/helios-lifecycle/README.md#assumptions-and-limits.
+    devices after peer validation failure, local backpressure cancel, failure
+    after local enqueue, cancellation, and poison. Verify completion/drain
+    signals cover every participating rank and protect graph/cache/input-frame
+    storage through its final use. Extend helios/src/execution/threaded/cuda_tests.rs;
+    see verification/helios-lifecycle/README.md#assumptions-and-limits.
 
-[ ] Check socket rank coordination in helios/src/execution/parallel.rs against
-    readiness, completion identity/order, partial dispatch, and drain/release
-    invariants. TLA+ correspondence covers the threaded helpers; extend coverage
-    to the socket coordinator and peer control loop.
+[ ] Check socket rank coordination in helios/src/execution/parallel.rs beyond its
+    extracted protocol.rs bookkeeping helpers: cover the socket I/O and peer
+    control loop against readiness, completion identity/order, partial dispatch,
+    and drain/release invariants.
+
+[ ] Qualify x86_64 WAITPKG (UMONITOR/UMWAIT) completion and dispatch waits in
+    helios/src/execution/transport.rs on a WAITPKG-capable x86_64 CPU. Close
+    when host_wait tests and live flare run serving pass with WAITPKG active.
 
 [ ] Qualify measured-work checkpoint selection and history-rewrite reuse through
     Qwen, GLM, DeepSeek, MiMo, Step, and Nemotron services with warm timing

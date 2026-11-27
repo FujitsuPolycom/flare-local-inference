@@ -194,13 +194,13 @@ def main():
                  "unconfirmed drain accepted resource release"),
             ])
             check_mutations(cargo, ROOT / "helios/src/execution/threaded/protocol.rs", RANK_TEST, [
-                ("partial readiness", "frame.ready.iter().all(|ready| *ready)",
-                 "frame.ready.iter().any(|ready| *ready)", "commit must wait for every peer readiness"),
-                ("partial completion", "frame.completions.iter().all(Option::is_some)",
-                 "frame.completions.iter().any(Option::is_some)",
+                ("partial readiness", "frame.ready().iter().all(|ready| *ready)",
+                 "frame.ready().iter().any(|ready| *ready)", "commit must wait for every peer readiness"),
+                ("partial completion", "frame.completions().iter().all(Option::is_some)",
+                 "frame.completions().iter().any(Option::is_some)",
                  "publish must wait for every rank completion at the queue front"),
-                ("ignored dispatch failure", "peer.send(Command::Commit(fence, graph))?;",
-                 "let _ = peer.send(Command::Commit(fence, graph));",
+                ("ignored dispatch failure", "send(peer)?;",
+                 "let _ = send(peer);",
                  "partial commit dispatch must report disconnected peer"),
             ])
             check_mutations(cargo, ROOT / "helios/src/cache.rs", CHECKS[3][1], [

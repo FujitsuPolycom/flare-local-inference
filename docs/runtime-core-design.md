@@ -670,7 +670,9 @@ compiled cubins; missing native GPU code fails instead of compiling PTX.
 
 `LoadOptions` selects runtime concurrency, maximum actual MTP draft count, and
 adaptive or fixed prefix selection before CUDA initialization. Every required
-power-of-two request bucket has width-one execution. Wider programs fit the
+power-of-two request bucket (`REQUIRED_BATCH_CAPACITIES`) has width-one
+execution, and cores may also carry optional intermediate buckets (`6, 12, 24`)
+from `BATCH_CAPACITIES`. Wider programs fit the
 prepared aggregate target envelope. A core must include its configured
 maximum prefill chunk; intermediate prefill capacities are optional.
 

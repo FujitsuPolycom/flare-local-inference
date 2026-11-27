@@ -488,7 +488,6 @@ def test_concurrent_row_shard_validation_and_scratch_checks(
     concurrent = wrapper(dma_op, workspace=arena, session=object(),
                          parallel_plans=(local_plan,), send_buffer=send_buf)
     assert concurrent.stream_handle == 17
-    assert concurrent.copy_input is True
     assert dma_op.concurrent_input is send_buf
     assert arena._parallel_plans == [(dma_op.plan, local_plan)]
     assert finalizers == [concurrent.validate_scratch]
@@ -622,10 +621,9 @@ def test_concurrent_all_to_all_validation_and_scratch_checks(monkeypatch, prepar
     send_buf = source.clone()
     concurrent = ConcurrentAllToAll(
         dma_op, workspace=arena, session=object(), parallel_plans=(local_plan,),
-        send_buffer=send_buf, copy_input=False,
+        send_buffer=send_buf,
     )
     assert concurrent.stream_handle == 29
-    assert concurrent.copy_input is False
     assert dma_op.concurrent_input is send_buf
     assert arena._parallel_plans == [(dma_op.plan, local_plan)]
     assert finalizers == [concurrent.validate_scratch]
@@ -634,6 +632,16 @@ def test_concurrent_all_to_all_validation_and_scratch_checks(monkeypatch, prepar
     dma_op.plan.scratch_nbytes = 128
     with pytest.raises(ValueError, match="requires a plan without caller scratch"):
         concurrent.validate_scratch()
+
+    # Verify clone=True (default) vs clone=False matches ConcurrentReduceScatter/RowToColAllToAll.
+    dma_op.concurrent_input = None
+    started = []
+    monkeypatch.setattr(collectives, "_start_all_to_all", lambda send, *args: started.append(send))
+    p_clone = concurrent.start(source)
+    p_direct = concurrent.start(source, clone=False)
+    assert p_clone.source is not source
+    assert p_direct.source is source
+    assert started == [p_clone.source, source]
 
 
 def test_concurrent_start_skips_send_buffer_copy_when_pointers_match(monkeypatch, prepared_dma):

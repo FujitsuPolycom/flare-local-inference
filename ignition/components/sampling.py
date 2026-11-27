@@ -97,7 +97,7 @@ class DeviceRequestState:
         def zeros(shape, dtype=torch.int64):
             return torch.zeros(shape, dtype=dtype, device=device)
         if capacity not in BATCH_CAPACITIES:
-            raise ValueError("request capacity must be a power of two through 64")
+            raise ValueError(f"request capacity must be in {BATCH_CAPACITIES}")
         consumed = zeros(capacity) if consumed_tokens is None else consumed_tokens
         actual_device = torch.empty(0, device=device).device
         _check_tensor(consumed, (capacity,), torch.int64, actual_device, "consumed_tokens", contiguous=False)
@@ -190,7 +190,7 @@ class AdmissionBuffers:
         if type(vocab_size) is not int or not 1 <= vocab_size <= 2**31 - 1:
             raise ValueError("vocab_size must be a positive int32 value")
         if capacity not in BATCH_CAPACITIES:
-            raise ValueError("admission capacity must be a power of two through 64")
+            raise ValueError(f"admission capacity must be in {BATCH_CAPACITIES}")
         def zeros(shape, dtype=torch.int32):
             return torch.zeros(shape, dtype=dtype, device=device)
         return cls(zeros(1), torch.full((capacity,), -1, dtype=torch.int32, device=device),

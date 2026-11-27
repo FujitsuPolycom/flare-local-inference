@@ -52,7 +52,7 @@ class GraphSignature:
             raise ValueError("graph capacities must be positive integers")
         if self.kind == "speculative" and (
                 self.batch_capacity not in BATCH_CAPACITIES or not 1 <= self.token_capacity < 1 << 31):
-            raise ValueError("speculative graphs require power-of-two batch capacities through 64 and positive Int32 verification widths")
+            raise ValueError(f"speculative graphs require batch capacities in {BATCH_CAPACITIES} and positive Int32 verification widths")
         if type(self.prefill_capacity) is not int or self.prefill_capacity < 0:
             raise ValueError("prefill capacity must be a nonnegative integer")
         if self.kind == "mixed":

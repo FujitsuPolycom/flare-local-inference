@@ -43,7 +43,7 @@ class StateCommands:
     @classmethod
     def allocate(cls, device, *, capacity=4):
         if capacity not in BATCH_CAPACITIES:
-            raise ValueError("state command capacity must be a power of two through 64")
+            raise ValueError(f"state command capacity must be in {BATCH_CAPACITIES}")
         return cls(torch.full((capacity,), -1, dtype=torch.int64, device=device),
                    torch.full((capacity,), -1, dtype=torch.int64, device=device),
                    torch.full((capacity,), -1, dtype=torch.int64, device=device),

@@ -140,8 +140,6 @@ pub(super) mod host_wait {
     const WAITPKG_ECX_BIT: u32 = 1 << 5;
     /// C0.1 state for UMWAIT: shallow power-saving state with sub-microsecond store wakeup.
     const UMWAIT_C01: u32 = 1;
-    /// Bounded PAUSE spin window when hardware WAITPKG is unavailable.
-    const PAUSE_SPIN_US: u64 = 25;
     /// Iterations between monotonic clock checks inside the PAUSE spin loop.
     const CLOCK_CHECK_STRIDE: u32 = 32;
 
@@ -161,11 +159,7 @@ pub(super) mod host_wait {
     }
 
     pub(super) fn mode_label() -> &'static str {
-        if waitpkg_available() {
-            "UMONITOR/UMWAIT"
-        } else {
-            "PAUSE spin"
-        }
+        if waitpkg_available() { "UMONITOR/UMWAIT" } else { "PAUSE spin" }
     }
 
     fn tsc_ticks_per_us() -> u64 {
@@ -185,121 +179,97 @@ pub(super) mod host_wait {
         })
     }
 
-    /// Arm UMONITOR on `word`, re-check its 32-bit value against `old`, and execute UMWAIT
-    /// in C0.1 until a store touches the cache line or TSC reaches `deadline`.
-    ///
-    /// # Safety
-    /// `word` must point to a live, 4-byte aligned u32 and WAITPKG must be available.
-    unsafe fn umwait_u32(word: *const u32, old: u32, deadline: u64) {
-        let lo = deadline as u32;
-        let hi = (deadline >> 32) as u32;
-        unsafe {
-            std::arch::asm!(
-                ".byte 0xf3, 0x0f, 0xae, 0xf0", // umonitor rax
-                "mov {tmp:e}, dword ptr [rax]",
-                "cmp {tmp:e}, {old:e}",
-                "jne 2f",
-                "mov eax, {lo:e}",
-                ".byte 0xf2, 0x0f, 0xae, 0xf1", // umwait ecx
-                "2:",
-                inout("rax") word => _,
-                in("ecx") UMWAIT_C01,
-                in("edx") hi,
-                lo = in(reg) lo,
-                old = in(reg) old,
-                tmp = out(reg) _,
-                options(nostack),
-            );
-        }
+    macro_rules! define_umwait {
+        ($name:ident, $ty:ty, $mov:literal, $cmp:literal) => {
+            /// Arm UMONITOR on `word`, re-check its value against `old`, and execute UMWAIT
+            /// in C0.1 until a store touches the cache line or TSC reaches `deadline`.
+            ///
+            /// # Safety
+            /// `word` must point to a live, naturally aligned value and WAITPKG must be available.
+            unsafe fn $name(word: *const $ty, old: $ty, deadline: u64) {
+                let lo = deadline as u32;
+                let hi = (deadline >> 32) as u32;
+                unsafe {
+                    std::arch::asm!(
+                        ".byte 0xf3, 0x0f, 0xae, 0xf0", // umonitor rax
+                        $mov,
+                        $cmp,
+                        "jne 2f",
+                        "mov eax, {lo:e}",
+                        ".byte 0xf2, 0x0f, 0xae, 0xf1", // umwait ecx
+                        "2:",
+                        inout("rax") word => _,
+                        in("ecx") UMWAIT_C01,
+                        in("edx") hi,
+                        lo = in(reg) lo,
+                        old = in(reg) old,
+                        tmp = out(reg) _,
+                        options(nostack),
+                    );
+                }
+            }
+        };
     }
 
-    /// Arm UMONITOR on `word`, re-check its 64-bit value against `old`, and execute UMWAIT
-    /// in C0.1 until a store touches the cache line or TSC reaches `deadline`.
-    ///
-    /// # Safety
-    /// `word` must point to a live, 8-byte aligned u64 and WAITPKG must be available.
-    unsafe fn umwait_u64(word: *const u64, old: u64, deadline: u64) {
-        let lo = deadline as u32;
-        let hi = (deadline >> 32) as u32;
-        unsafe {
-            std::arch::asm!(
-                ".byte 0xf3, 0x0f, 0xae, 0xf0", // umonitor rax
-                "mov {tmp}, qword ptr [rax]",
-                "cmp {tmp}, {old}",
-                "jne 2f",
-                "mov eax, {lo:e}",
-                ".byte 0xf2, 0x0f, 0xae, 0xf1", // umwait ecx
-                "2:",
-                inout("rax") word => _,
-                in("ecx") UMWAIT_C01,
-                in("edx") hi,
-                lo = in(reg) lo,
-                old = in(reg) old,
-                tmp = out(reg) _,
-                options(nostack),
-            );
-        }
-    }
+    define_umwait!(umwait_u32, u32, "mov {tmp:e}, dword ptr [rax]", "cmp {tmp:e}, {old:e}");
+    define_umwait!(umwait_u64, u64, "mov {tmp}, qword ptr [rax]", "cmp {tmp}, {old}");
 
-    /// Wait up to `limit_us` microseconds (capped to `PAUSE_SPIN_US` without WAITPKG) for
-    /// `word` to differ from `old`. Returns `true` if `word` changed, `false` on timeout.
-    ///
-    /// # Safety
-    /// `word` must point to a live, 4-byte aligned u32 in coherent memory.
-    pub(super) unsafe fn wait_u32_change(word: *const u32, old: u32, limit_us: u64) -> bool {
-        // SAFETY: Caller guarantees `word` is live, 4-byte aligned, and valid for atomic reads.
-        let atomic = unsafe { AtomicU32::from_ptr(word as *mut u32) };
-        if atomic.load(Ordering::Acquire) != old {
+    fn wait_change<T: Copy + Eq>(
+        load: impl Fn() -> T,
+        old: T,
+        limit_us: u64,
+        umwait: impl FnOnce(u64),
+    ) -> bool {
+        if load() != old {
             return true;
         }
         if waitpkg_available() {
             // SAFETY: RDTSC is always available on x86_64; WAITPKG checked above.
             let deadline = unsafe { core::arch::x86_64::_rdtsc() }
                 .wrapping_add(tsc_ticks_per_us().saturating_mul(limit_us));
-            unsafe { umwait_u32(word, old, deadline) };
-            return atomic.load(Ordering::Acquire) != old;
+            umwait(deadline);
+            return load() != old;
         }
-        let budget = Duration::from_micros(limit_us.min(PAUSE_SPIN_US));
+        let budget = Duration::from_micros(limit_us);
         let started = Instant::now();
         let mut iter = 0u32;
         loop {
-            if atomic.load(Ordering::Acquire) != old {
+            if load() != old {
                 return true;
             }
             core::hint::spin_loop();
             iter = iter.wrapping_add(1);
             if iter % CLOCK_CHECK_STRIDE == 0 && started.elapsed() >= budget {
-                return atomic.load(Ordering::Acquire) != old;
+                return load() != old;
             }
         }
     }
 
     /// Wait up to `limit_us` microseconds for `word` to differ from `old`.
     /// Returns `true` if `word` changed, `false` on timeout.
+    ///
+    /// # Safety
+    /// `word` must point to a live, 4-byte aligned u32 in coherent memory.
+    pub(super) unsafe fn wait_u32_change(word: *const u32, old: u32, limit_us: u64) -> bool {
+        // SAFETY: Caller guarantees `word` is live, 4-byte aligned, and valid for atomic reads.
+        let atomic = unsafe { AtomicU32::from_ptr(word as *mut u32) };
+        wait_change(
+            || atomic.load(Ordering::Acquire),
+            old,
+            limit_us,
+            |deadline| unsafe { umwait_u32(word, old, deadline) },
+        )
+    }
+
+    /// Wait up to `limit_us` microseconds for `word` to differ from `old`.
+    /// Returns `true` if `word` changed, `false` on timeout.
     pub(in crate::execution) fn wait_u64_change(word: &AtomicU64, old: u64, limit_us: u64) -> bool {
-        if word.load(Ordering::Acquire) != old {
-            return true;
-        }
-        if waitpkg_available() {
-            // SAFETY: RDTSC is always available on x86_64; `word` is live and 8-byte aligned.
-            let deadline = unsafe { core::arch::x86_64::_rdtsc() }
-                .wrapping_add(tsc_ticks_per_us().saturating_mul(limit_us));
-            unsafe { umwait_u64(word.as_ptr() as *const u64, old, deadline) };
-            return word.load(Ordering::Acquire) != old;
-        }
-        let budget = Duration::from_micros(limit_us.min(PAUSE_SPIN_US));
-        let started = Instant::now();
-        let mut iter = 0u32;
-        loop {
-            if word.load(Ordering::Acquire) != old {
-                return true;
-            }
-            core::hint::spin_loop();
-            iter = iter.wrapping_add(1);
-            if iter % CLOCK_CHECK_STRIDE == 0 && started.elapsed() >= budget {
-                return word.load(Ordering::Acquire) != old;
-            }
-        }
+        wait_change(
+            || word.load(Ordering::Acquire),
+            old,
+            limit_us,
+            |deadline| unsafe { umwait_u64(word.as_ptr() as *const u64, old, deadline) },
+        )
     }
 }
 
@@ -309,10 +279,10 @@ pub(super) mod host_wait {
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 const PARK_LIMIT_US: u64 = 100;
 
-/// Longest intentional wait per park on x86_64 (`UMWAIT` C0.1 uses this cap; the `PAUSE` fallback
-/// caps itself to `PAUSE_SPIN_US`).
+/// Longest intentional wait per park on x86_64 for both `UMONITOR`/`UMWAIT` (when WAITPKG is
+/// present) and the bounded `PAUSE` spin fallback.
 #[cfg(target_arch = "x86_64")]
-const PARK_LIMIT_US: u64 = 50;
+const PARK_LIMIT_US: u64 = 25;
 
 pub struct Upload<'a> {
     pub buffer: &'a str,
@@ -931,9 +901,12 @@ impl GraphExecutor {
     }
     /// Wait briefly for the oldest pending frame's mapped wake word instead of yielding the CPU.
     /// Returns `true` when the wake word already reached the oldest pending fence or changed
-    /// during the bounded wait (the caller should re-poll immediately without `yield_now`), and
-    /// `false` when no frame is pending, the wake word is unsupported, or the bounded wait timed
-    /// out without observing a change.
+    /// during the bounded wait (`PARK_LIMIT_US` microseconds), signaling the caller to re-poll
+    /// immediately without `thread::yield_now()`. Returns `false` when no frame is pending, the
+    /// wake word is unsupported, or the bounded wait timed out without observing a change; callers
+    /// should yield before parking again so long-running steps do not spin a CPU core continuously.
+    /// On x86_64 without hardware WAITPKG, each call executes a bounded `PAUSE` spin for
+    /// `PARK_LIMIT_US` microseconds before returning `false` so the caller yields.
     pub fn park(&self) -> bool {
         #[cfg(any(all(target_arch = "aarch64", target_os = "linux"), target_arch = "x86_64"))]
         {

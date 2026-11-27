@@ -407,9 +407,10 @@ affect preparation's memory policy.
 Before compilation and capture, preparation prints a persistent graph catalog
 with counts, batch and prefill capacities, logical widths, physical target rows,
 and draft depths, including when `--verbose` is omitted.
-Ignition captures power-of-two
-batch capacities through the concurrency limit
-and width one at every bucket. Rectangular speculative and verification shapes
+Ignition captures supported batch capacities from `BATCH_CAPACITIES`
+(`1, 2, 4, 6, 8, 12, 16, 24, 32, 64`) through the padded concurrency limit
+and width one at every bucket; compatible cores are required by Helios to carry
+only the power-of-two subset `REQUIRED_BATCH_CAPACITIES`. Rectangular speculative and verification shapes
 require `batch * width <= speculative_token_capacity`; the preparation flag
 `--speculative-token-capacity` defaults to 128 physical target rows except for
 Gemma 4's derived capacity and Muse Spark's 32 rows. Packed recipes use the

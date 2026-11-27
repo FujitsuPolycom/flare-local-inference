@@ -4,7 +4,10 @@
  */
 
 use super::*;
-use crate::runtime_core::{NativeResources, driver::Driver, test_support};
+use crate::{
+    execution::OwnedUpload,
+    runtime_core::{NativeResources, driver::Driver, test_support},
+};
 
 fn uploads(limits: [i32; 4], confidence: f32, reset: bool, terminal: bool, slots: [i32; 4]) -> Vec<OwnedUpload> {
     let mut values = vec![

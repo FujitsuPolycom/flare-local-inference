@@ -294,10 +294,11 @@ compact recurrence requires complete-round measurements.
 
 ## Graph catalog, control and scheduling
 
-The chain catalog has request capacities `B` at each power of two from one
-through the padded concurrency limit (`batch_capacities` in
-`ignition/components/capacity.py`) and integer verification
-widths `1 <= W <= K_max + 1`, where `K=W-1`.
+The chain catalog has request capacities `B` from the supported set
+`BATCH_CAPACITIES` (`1, 2, 4, 6, 8, 12, 16, 24, 32, 64`) through the padded
+concurrency limit (`batch_capacities` in `ignition/components/capacity.py`;
+Helios requires only the power-of-two subset `REQUIRED_BATCH_CAPACITIES` of a
+loaded core) and integer verification widths `1 <= W <= K_max + 1`, where `K=W-1`.
 Each recipe's `PreparationConfig.speculative_widths` lists the prepared widths; its largest entry is
 `K_max + 1`, and its default gives five drafts for Qwen and GLM.
 `speculative_shapes` in the same module selects the captured shapes: width one

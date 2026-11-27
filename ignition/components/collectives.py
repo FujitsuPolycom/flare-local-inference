@@ -141,17 +141,9 @@ class PendingAllReduce:
 
 
 class ConcurrentAllReduce:
-    """Overlap a prepared PCIe all-reduce with local compute on an auxiliary stream.
+    """Overlap a prepared PCIe all-reduce with local compute on an auxiliary stream."""
 
-    When `copy_input=True` (the default) and `send_buffer` is omitted, `start()` clones
-    `source` so subsequent main-stream writes cannot mutate the asynchronous send operand.
-    Set `copy_input=False` only when `source` is a fresh unaliased functional tensor or
-    buffer that is not mutated on the main stream before `finish()` joins the auxiliary stream.
-    """
-
-    copy_input = True
-
-    def __init__(self, reduce, *, workspace, session, parallel_plans, send_buffer=None, copy_input=True):
+    def __init__(self, reduce, *, workspace, session, parallel_plans, send_buffer=None):
         from ignition.preparation.scratch import ScratchArena
 
         plans = tuple(parallel_plans)
@@ -161,7 +153,6 @@ class ConcurrentAllReduce:
             raise ValueError("concurrent all-reduce requires an overlap arena and local plans")
         self.reduce = reduce
         self.reduce.concurrent_input = send_buffer
-        self.copy_input = bool(copy_input)
         self.stream = workspace.auxiliary_stream
         self.stream_handle = self.stream.cuda_stream
         for plan in plans:
@@ -182,7 +173,7 @@ class ConcurrentAllReduce:
         if output is None:
             shape, stride, dtype = self.reduce.output_layout
             output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
-        send = source.clone() if (self.copy_input and self.reduce.concurrent_input is None) else source
+        send = source.clone() if self.reduce.concurrent_input is None else source
         deps = list(dependencies)
         _start_all_reduce(send, output, deps, self.reduce.handle, self.stream_handle)
         return PendingAllReduce(send, output, deps)
@@ -441,17 +432,9 @@ class PendingReduceScatter:
 
 
 class ConcurrentReduceScatter:
-    """Overlap a prepared PCIe DMA reduce-scatter with local compute on an auxiliary stream.
+    """Overlap a prepared PCIe DMA reduce-scatter with local compute on an auxiliary stream."""
 
-    When `copy_input=True` (the default) and `send_buffer` is omitted, `start()` clones
-    `source` so subsequent main-stream writes cannot mutate the asynchronous send operand.
-    Set `copy_input=False` only when `source` is a fresh unaliased functional tensor or
-    buffer that is not mutated on the main stream before `finish()` joins the auxiliary stream.
-    """
-
-    copy_input = True
-
-    def __init__(self, reduce_scatter, *, workspace, session, parallel_plans, send_buffer=None, copy_input=True):
+    def __init__(self, reduce_scatter, *, workspace, session, parallel_plans, send_buffer=None):
         from ignition.preparation.scratch import ScratchArena
 
         plans = tuple(parallel_plans)
@@ -461,7 +444,6 @@ class ConcurrentReduceScatter:
             raise ValueError("concurrent reduce-scatter requires an overlap arena and local plans")
         self.reduce = reduce_scatter
         self.reduce.concurrent_input = send_buffer
-        self.copy_input = bool(copy_input)
         self.stream = workspace.auxiliary_stream
         self.stream_handle = self.stream.cuda_stream
         for plan in plans:
@@ -482,7 +464,7 @@ class ConcurrentReduceScatter:
         if output is None:
             shape, stride, dtype = self.reduce.output_layout
             output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
-        send = source.clone() if (clone and self.copy_input and self.reduce.concurrent_input is None) else source
+        send = source.clone() if (clone and self.reduce.concurrent_input is None) else source
         deps = list(dependencies)
         _start_reduce_scatter(send, output, deps, self.reduce.handle, self.stream_handle)
         return PendingReduceScatter(send, output, deps)
@@ -673,17 +655,9 @@ class PendingGatherShards:
 
 
 class ConcurrentGatherShards:
-    """Overlap a prepared PCIe DMA row-shard gather with local compute on an auxiliary stream.
+    """Overlap a prepared PCIe DMA row-shard gather with local compute on an auxiliary stream."""
 
-    When `copy_input=True` (the default) and `send_buffer` is omitted, `start()` clones
-    `source` so subsequent main-stream writes cannot mutate the asynchronous send operand.
-    Set `copy_input=False` only when `source` is a fresh unaliased functional tensor or
-    buffer that is not mutated on the main stream before `finish()` joins the auxiliary stream.
-    """
-
-    copy_input = True
-
-    def __init__(self, gather, *, workspace, session, parallel_plans, send_buffer=None, copy_input=True):
+    def __init__(self, gather, *, workspace, session, parallel_plans, send_buffer=None):
         from ignition.preparation.scratch import ScratchArena
 
         plans = tuple(parallel_plans)
@@ -693,7 +667,6 @@ class ConcurrentGatherShards:
             raise ValueError("concurrent shard gather requires an overlap arena and local plans")
         self.gather = gather
         self.gather.concurrent_input = send_buffer
-        self.copy_input = bool(copy_input)
         self.stream = workspace.auxiliary_stream
         self.stream_handle = self.stream.cuda_stream
         for plan in plans:
@@ -714,7 +687,7 @@ class ConcurrentGatherShards:
         if output is None:
             shape, stride, dtype = self.gather.output_layout
             output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
-        send = source.clone() if (clone and self.copy_input and self.gather.concurrent_input is None) else source
+        send = source.clone() if (clone and self.gather.concurrent_input is None) else source
         deps = list(dependencies)
         _start_gather_shards(send, output, deps, self.gather.handle, self.stream_handle)
         return PendingGatherShards(send, output, deps)
@@ -976,17 +949,9 @@ class PendingAllToAll:
 
 
 class ConcurrentAllToAll:
-    """Overlap a prepared PCIe DMA all-to-all with local compute on an auxiliary stream.
+    """Overlap a prepared PCIe DMA all-to-all with local compute on an auxiliary stream."""
 
-    When `copy_input=True` (the default) and `send_buffer` is omitted, `start()` clones
-    `source` so subsequent main-stream writes cannot mutate the asynchronous send operand.
-    Set `copy_input=False` only when `source` is a fresh unaliased functional tensor or
-    buffer that is not mutated on the main stream before `finish()` joins the auxiliary stream.
-    """
-
-    copy_input = True
-
-    def __init__(self, all_to_all, *, workspace, session, parallel_plans, send_buffer=None, copy_input=True):
+    def __init__(self, all_to_all, *, workspace, session, parallel_plans, send_buffer=None):
         from ignition.preparation.scratch import ScratchArena
 
         plans = tuple(parallel_plans)
@@ -996,7 +961,6 @@ class ConcurrentAllToAll:
             raise ValueError("concurrent all-to-all requires an overlap arena and local plans")
         self.all_to_all = all_to_all
         self.all_to_all.concurrent_input = send_buffer
-        self.copy_input = bool(copy_input)
         self.stream = workspace.auxiliary_stream
         self.stream_handle = self.stream.cuda_stream
         for plan in plans:
@@ -1011,13 +975,13 @@ class ConcurrentAllToAll:
         self.all_to_all.functional(session=session)
         return self
 
-    def start(self, source, output=None, *, dependencies=()):
+    def start(self, source, output=None, *, dependencies=(), clone=True):
         if output is None:
             output = self.all_to_all.output
         if output is None:
             shape, stride, dtype = self.all_to_all.output_layout
             output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
-        send = source.clone() if (self.copy_input and self.all_to_all.concurrent_input is None) else source
+        send = source.clone() if (clone and self.all_to_all.concurrent_input is None) else source
         deps = list(dependencies)
         _start_all_to_all(send, output, deps, self.all_to_all.handle, self.stream_handle)
         return PendingAllToAll(send, output, deps)
@@ -1147,7 +1111,8 @@ def _start_row_to_col_all_to_all(source: torch.Tensor, output: torch.Tensor, dep
     owner = _OWNERS[handle]
     if owner.concurrent_input is not None:
         send = owner.concurrent_input
-        send.copy_(source)
+        if send.data_ptr() != source.data_ptr():
+            send.copy_(source)
     else:
         send = source
     auxiliary = torch.cuda.ExternalStream(stream, device=source.device)
@@ -1644,15 +1609,9 @@ class ConcurrentAllGather:
     The join retains the source through its asynchronous read and follows a local
     output dependency. A subsequent collective must read the joined output as a
     dependency, keeping communication serialized through compilation.
-
-    When `send_buffer` is omitted, `copy_input=False` (the default) passes `source`
-    directly and relies on the join retaining the unaliased functional SSA tensor;
-    set `copy_input=True` to clone `source` on the main stream before launching.
     """
 
-    copy_input = False
-
-    def __init__(self, gather, *, workspace, session, parallel_plans, send_buffer=None, copy_input=False):
+    def __init__(self, gather, *, workspace, session, parallel_plans, send_buffer=None):
         from ignition.preparation.scratch import ScratchArena
 
         plans = tuple(parallel_plans)
@@ -1664,7 +1623,6 @@ class ConcurrentAllGather:
         # The channel retains the send buffer for all captured replays.
         # Operations sharing it join before the next write.
         self.gather.concurrent_input = send_buffer
-        self.copy_input = bool(copy_input)
         self.stream = workspace.auxiliary_stream
         self.stream_handle = self.stream.cuda_stream
         for plan in plans:
@@ -1685,10 +1643,9 @@ class ConcurrentAllGather:
         if output is None:
             shape, stride, dtype = self.gather.output_layout
             output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
-        send = source.clone() if (self.copy_input and self.gather.concurrent_input is None) else source
         dependencies = [*self.gather.dependencies, *dependencies]
-        _start_all_gather(send, output, dependencies, self.gather.handle, self.stream_handle)
-        return PendingAllGather(send, output, dependencies)
+        _start_all_gather(source, output, dependencies, self.gather.handle, self.stream_handle)
+        return PendingAllGather(source, output, dependencies)
 
     def finish(self, pending, dependency):
         _join_all_gather(pending.source, pending.output, pending.dependencies, dependency, self.stream_handle)

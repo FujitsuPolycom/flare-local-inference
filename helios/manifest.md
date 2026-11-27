@@ -177,7 +177,11 @@ manifest but must remain in the resource owner.
 
 Graph kinds are `init`, `restore`, `snapshot`, `prefill`, `terminal_prefill`,
 `scored_prefill`, `decode`, `speculative`, `mixed`, `resume`, and `vision`. Decode and speculative
-batch capacities are powers of two through 64. Decode has one token per lane.
+batch capacities come from the supported set `BATCH_CAPACITIES`
+(`1, 2, 4, 6, 8, 12, 16, 24, 32, 64`). Compatible cores are required to include
+only the power-of-two subset `REQUIRED_BATCH_CAPACITIES` (`1, 2, 4, 8, 16, 32, 64`)
+through the padded concurrency limit; intermediate buckets (`6, 12, 24`) are
+optional. Decode has one token per lane.
 A speculative graph performs complete proposal, optional confidence/allocation,
 verification, and commit work. It declares B/D/W/P explicitly: request capacity,
 captured proposal depth, per-request target capacity, and aggregate target rows.
@@ -188,7 +192,7 @@ to B × W for speculative graphs, so a core without that field loads as a
 rectangular catalog. `ExecutionManifest::validate` requires the resolved value.
 Width-one speculative graphs have D = 0 and maintain draft context. No standalone
 proposal, verification, or packed-speculative graph kind exists.
-A mixed graph has a power-of-two batch capacity from 2 through the request
+A mixed graph has a batch capacity in `BATCH_CAPACITIES` from 2 through the request
 storage capacity, W from 1 through T, and a `prefill_capacity` that is a positive
 multiple of 64. It binds the `int32[1]` `prefill_row` input. Every other kind
 sets `prefill_capacity` to zero.
@@ -197,7 +201,8 @@ Prefill, terminal prefill, and scored prefill have batch capacity 1. Their token
 catalog for its `prefill_chunk_size`; transport validation does not infer a
 scheduling policy or substitute a missing graph.
 State operations
-and resume use power-of-two batch capacities through 64. Vision batch capacity is 1, and its
+and resume use batch capacities from `BATCH_CAPACITIES` (`1, 2, 4, 6, 8, 12, 16, 24, 32, 64`),
+with only `REQUIRED_BATCH_CAPACITIES` required of a compatible core. Vision batch capacity is 1, and its
 token capacity is a positive patch count. The model contract's
 `vision.patch_capacities` lists the captured vision capacities in increasing
 order, each a multiple of `patches_per_feature`. Batch capacity can

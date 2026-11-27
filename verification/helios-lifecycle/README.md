@@ -139,14 +139,23 @@ fail the corresponding Rust assertion or TLA+ admission invariant.
 
 ## Rank coordination
 
+`RankProtocol.tla`, `RankDispatch.tla`, and the helpers in
+`helios/src/execution/threaded/protocol.rs` cover the two-phase
+`Prepare`/`Ready`/`Commit` bookkeeping used by the socket coordinator
+(`TensorParallelExecutor` in `helios/src/execution/parallel.rs`). They do not
+model the lock-free `DispatchRing` used by same-process `ThreadedExecutor`
+(`helios/src/execution/threaded.rs`), which has separate multi-threaded CPU
+tests and an open formal-model item in `docs/TODO.txt`.
+
 `RankProtocol.tla` checks two submissions, two graph identities, and three ranks.
 Readiness is tracked for both peers; completion is tracked for every rank.
 Preparing frames occupy execution-window slots. A second reservation requires
 the preceding frame to be committed. Feedback-dependent frames occupy the window
 exclusively. Queue removal requires every rank's completion for the oldest frame.
 
-The Rust tests call the private helpers in
-`helios/src/execution/threaded/protocol.rs` used by `ThreadedExecutor`.
+The Rust tests in `helios/src/execution/threaded/protocol_tests.rs` call the
+helpers in `helios/src/execution/threaded/protocol.rs` used by
+`TensorParallelExecutor`.
 The 15-integer projection contains submission/removal counts and each pending
 frame's fence, graph, barrier, readiness mask, commitment marker, and completion
 mask. TLC checks observed helper transitions against `RankProtocol.AllowedEdge`.
@@ -171,8 +180,9 @@ release assumes the runtime's external drain contract.
 Failure can also follow local enqueue; a failed submission does not imply that
 rank zero queued no work.
 
-The concrete channel test calls the production `dispatch_commit` helper with
-three real `mpsc` receivers. It checks success and disconnection at every send
+The concrete channel test calls the production `dispatch_commit` helper (used by
+`TensorParallelExecutor` to send `COMMIT` across peer channels) with three real
+`mpsc` senders and receivers. It checks success and disconnection at every send
 position, including the exact accepted prefix, propagated error, and absence of
 later sends. This is a channel-contract test; the dispatch model is not a
 refinement proof of the complete executor.
@@ -296,11 +306,12 @@ completion fences and truthful drain confirmation. This check verifies how the
 scheduler consumes those signals; it does not verify their CUDA or rank-thread
 implementation.
 
-The rank-helper checks cover the extracted bookkeeping predicates. They do not
-execute `poll_ranks`, `rank_loop`, poison handling, or `close` against CUDA, and
-do not establish all-rank drain or collective progress. The socket coordinator
-in `execution/parallel.rs` is a separate implementation that these checks do not
-cover.
+The rank-helper checks cover the extracted two-phase bookkeeping predicates
+shared with the socket coordinator (`execution/parallel.rs`). They do not
+execute its socket I/O loop, `poll_ranks`, `rank_loop`, poison handling, or
+`close` against CUDA, do not establish all-rank drain or collective progress,
+and do not model `ThreadedExecutor`'s lock-free `DispatchRing`
+(`execution/threaded.rs`).
 
 The model permits any nonempty live cohort with a compatible feedback barrier.
 It does not prove scheduling-policy choices or fairness. It checks safety only;

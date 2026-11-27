@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use super::{Command, ExecutionManifest, Fence, FrameCompletion, Peer, Result, VecDeque, invalid};
+use super::{ExecutionManifest, Fence, FrameCompletion, Result, VecDeque, invalid};
 use crate::execution::GraphKind;
 
 pub(crate) trait PendingFrame {
@@ -93,9 +93,12 @@ pub(crate) fn ready_to_commit<P: PendingFrame>(frame: &P) -> bool {
     !frame.committed() && frame.ready().iter().all(|ready| *ready)
 }
 
-pub(super) fn dispatch_commit(peers: &[Peer], fence: Fence, graph: usize) -> Result<()> {
+pub(crate) fn dispatch_commit<P>(
+    peers: &mut [P],
+    mut send: impl FnMut(&mut P) -> Result<()>,
+) -> Result<()> {
     for peer in peers {
-        peer.send(Command::Commit(fence, graph))?;
+        send(peer)?;
     }
     Ok(())
 }

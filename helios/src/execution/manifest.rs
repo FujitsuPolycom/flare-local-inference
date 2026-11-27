@@ -30,20 +30,8 @@ pub const BATCH_CAPACITIES: [usize; 10] = [1, 2, 4, 6, 8, 12, 16, 24, 32, 64];
 
 /// Dense index of a supported batch capacity within [`BATCH_CAPACITIES`].
 #[inline]
-pub const fn batch_capacity_index(batch: usize) -> Option<usize> {
-    match batch {
-        1 => Some(0),
-        2 => Some(1),
-        4 => Some(2),
-        6 => Some(3),
-        8 => Some(4),
-        12 => Some(5),
-        16 => Some(6),
-        24 => Some(7),
-        32 => Some(8),
-        64 => Some(9),
-        _ => None,
-    }
+pub fn batch_capacity_index(batch: usize) -> Option<usize> {
+    BATCH_CAPACITIES.iter().position(|&value| value == batch)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

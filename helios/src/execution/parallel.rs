@@ -347,9 +347,8 @@ impl TensorParallelExecutor {
             if self.local.validate_submission(frame.graph, &uploads, frame.grammar)? != Some(frame.fence) {
                 return Err(invalid("rank-zero reservation changed before commit"));
             }
-            for peer in &mut self.peers {
-                peer.channel.send(COMMIT, &identity(frame.fence, frame.graph))?;
-            }
+            let payload = identity(frame.fence, frame.graph);
+            protocol::dispatch_commit(&mut self.peers, |peer| peer.channel.send(COMMIT, &payload))?;
             if self.local.submit(frame.graph, &uploads, frame.grammar)? != Some(frame.fence) {
                 return Err(invalid("rank-zero submission changed after coordinated validation"));
             }
