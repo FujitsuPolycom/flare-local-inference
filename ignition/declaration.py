@@ -11,6 +11,7 @@ PyTorch.
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, fields, replace
 import math
+from pathlib import Path
 from types import MappingProxyType
 
 from ignition.components.capacity import request_capacity
@@ -168,6 +169,11 @@ class Recipe:
     `b12x_environment` holds the b12x settings the recipe prepares with. b12x
     reads them only from its environment, so Ignition sets them for the
     preparing process.
+    `inspect_replacement`, when provided, is called as
+    `inspect_replacement(metadata_dir, replacement)` during resolution of an
+    unregistered checkpoint directory or Hugging Face repository so the recipe
+    can inspect alternate weight container metadata and return an adjusted
+    `Checkpoint` (or `None` to keep the default scaled estimate).
     """
 
     name: str
@@ -194,10 +200,13 @@ class Recipe:
     speculation_study: bool = False
     # Whether standalone benchmark preparation prepares text-only graphs without a vision encoder.
     benchmark_language_model_only: bool = False
+    inspect_replacement: Callable[[Path, Checkpoint], Checkpoint | None] | None = None
 
     def __post_init__(self):
         if not isinstance(self.parameters, RecipeParameters):
             raise TypeError("recipe parameters must be a RecipeParameters instance")
+        if self.inspect_replacement is not None and not callable(self.inspect_replacement):
+            raise TypeError("recipe inspect_replacement must be callable")
         if self.export_repository:
             import re
             if (not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*', self.export_repository)

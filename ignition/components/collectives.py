@@ -182,6 +182,71 @@ class ConcurrentAllReduce:
         return pending.output
 
 
+class ConcurrentChunkedAllReduce:
+    """Overlap a contiguous range of PCIe all-reduce chunks with local compute on an auxiliary stream."""
+
+    def __init__(self, parts, bounds, *, workspace, session, parallel_plans, send_buffer=None):
+        if not parts or len(parts) != len(bounds):
+            raise ValueError("concurrent chunked all-reduce requires matching non-empty parts and bounds")
+        if any(begin >= end for begin, end in bounds) or any(
+            bounds[i][1] != bounds[i + 1][0] for i in range(len(bounds) - 1)
+        ):
+            raise ValueError("concurrent chunked all-reduce requires non-empty contiguous bounds")
+        base = bounds[0][0]
+        self.bounds = tuple((b - base, e - base) for b, e in bounds)
+        self.rows = self.bounds[-1][1]
+        if send_buffer is not None and send_buffer.shape[0] < self.rows:
+            raise ValueError("send_buffer must cover all rows of the chunked reduction")
+        self.parts = tuple(
+            ConcurrentAllReduce(
+                part,
+                workspace=workspace,
+                session=session,
+                parallel_plans=parallel_plans,
+                send_buffer=None if send_buffer is None else send_buffer[lo:hi],
+            )
+            for part, (lo, hi) in zip(parts, self.bounds, strict=True)
+        )
+        self.has_send_buffer = send_buffer is not None
+        self.stream = workspace.auxiliary_stream
+        self.stream_handle = self.stream.cuda_stream
+        self.output_layout = None
+
+    def validate_scratch(self):
+        for part in self.parts:
+            part.validate_scratch()
+
+    def functional(self, *, session):
+        for part in self.parts:
+            part.functional(session=session)
+        shape, stride, dtype = self.parts[0].reduce.output_layout
+        self.output_layout = ((self.rows, *shape[1:]), stride, dtype)
+        return self
+
+    def start(self, source, output=None, *, dependencies=()):
+        if source.shape[0] != self.rows:
+            raise ValueError(f"source has {source.shape[0]} rows, expected {self.rows}")
+        if output is None:
+            if self.output_layout is not None:
+                shape, stride, dtype = self.output_layout
+                output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+            else:
+                output = torch.empty_like(source)
+        send = source if self.has_send_buffer else source.clone()
+        deps = list(dependencies)
+        prev = None
+        for part, (begin, end) in zip(self.parts, self.bounds, strict=True):
+            chunk_deps = deps if prev is None else [*deps, prev]
+            _start_all_reduce(send[begin:end], output[begin:end], chunk_deps, part.reduce.handle, part.stream_handle)
+            prev = output[begin:end]
+        join_deps = deps if prev is None else [*deps, prev]
+        return PendingAllReduce(send, output, join_deps)
+
+    def finish(self, pending, dependency):
+        _join_all_reduce(pending.source, pending.output, pending.dependencies, dependency, self.stream_handle)
+        return pending.output
+
+
 class PreparedAllReduce:
     """One fixed-shape reduction through an established b12x PCIe runtime.
 
@@ -1142,13 +1207,35 @@ class PreparedChunkedAllReduce:
                 part.functional(session=session)
         return self
 
-    def __call__(self, source):
-        output = self.output
+    def __call__(self, source, output=None, *, parts=None, dependencies=()):
+        if parts is None:
+            start_part, end_part = 0, len(self.parts)
+        else:
+            start_part, end_part = parts
+            if not (0 <= start_part < end_part <= len(self.parts)):
+                raise ValueError(f"chunk range {parts!r} out of bounds for {len(self.parts)} parts")
+        base = self.bounds[start_part][0]
+        rows = self.bounds[end_part - 1][1] - base
+        if source.shape[0] != rows:
+            raise ValueError(f"source has {source.shape[0]} rows, expected {rows} for parts {(start_part, end_part)}")
         if output is None:
-            shape, stride, dtype = self.output_layout
-            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
-        for (begin, end), part in zip(self.bounds, self.parts, strict=True):
-            part(source[begin:end], output[begin:end])
+            if parts is None and self.output is not None:
+                output = self.output
+            elif self.output is not None:
+                output = self.output[base:base + rows]
+            else:
+                shape, stride, dtype = self.output_layout
+                output = torch.empty_strided((rows, *shape[1:]), stride, dtype=dtype, device=source.device)
+        prev = None
+        for idx in range(start_part, end_part):
+            begin, end = self.bounds[idx]
+            lo, hi = begin - base, end - base
+            deps = dependencies if prev is None else (*dependencies, prev)
+            if deps:
+                self.parts[idx](source[lo:hi], output[lo:hi], dependencies=deps)
+            else:
+                self.parts[idx](source[lo:hi], output[lo:hi])
+            prev = output[lo:hi]
         return output
 
 

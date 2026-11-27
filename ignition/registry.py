@@ -188,6 +188,25 @@ def _replacement(qualified: Checkpoint, repository: str, revision: str, stored_b
                    expansion_bytes=round(qualified.expansion_bytes * scale))
 
 
+def _resolve_replacement(recipe: Recipe, qualified: Checkpoint, metadata: Path, repository: str,
+                         revision: str, stored_bytes: int, source: str) -> Checkpoint:
+    """Describe an unregistered checkpoint, letting the recipe inspect alternate weight containers."""
+    replacement = _replacement(qualified, repository, revision, stored_bytes)
+    if recipe.inspect_replacement is None:
+        return replacement
+    try:
+        inspected = recipe.inspect_replacement(metadata, replacement)
+    except UsageError:
+        raise
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise UsageError(f"{source} has unreadable checkpoint metadata: {error}") from error
+    if inspected is None:
+        return replacement
+    if not isinstance(inspected, Checkpoint):
+        raise UsageError(f"{source}: recipe replacement inspection returned {type(inspected).__name__}")
+    return inspected
+
+
 def _hub_metadata(repository: str, revision: str | None, hub_cache: Path | None,
                   recipes: Sequence[Recipe]) -> tuple[Path, Path]:
     """Fetch a repository's config and safetensors index, which name its commit, without its tensors."""
@@ -233,7 +252,8 @@ def resolve(model: str, hub_cache: Path | None = None, *, recipes: Sequence[Reci
         stored = (_csf_stored_bytes(container, directory) if container is not None else
                   _stored_bytes(index, str(directory)) if index.exists() else
                   single.stat().st_size if single.is_file() else qualified.stored_bytes)
-        return ResolvedModel(recipe, _replacement(qualified, str(directory), revision, stored), directory)
+        replacement = _resolve_replacement(recipe, qualified, metadata, str(directory), revision, stored, str(directory))
+        return ResolvedModel(recipe, replacement, directory)
     repository, _, revision = model.partition("@")
     if "/" not in repository:
         for recipe in recipes:
@@ -257,5 +277,6 @@ def resolve(model: str, hub_cache: Path | None = None, *, recipes: Sequence[Reci
     config_path, index_path = _hub_metadata(repository, revision or None, hub_cache, recipes)
     recipe, qualified = _supporting(config_path, model, recipes)
     # The hub cache stores each file under its commit hash.
-    replacement = _replacement(qualified, repository, config_path.parent.name, _stored_bytes(index_path, model))
+    replacement = _resolve_replacement(recipe, qualified, config_path.parent, repository, config_path.parent.name,
+                                       _stored_bytes(index_path, model), model)
     return ResolvedModel(recipe, replacement)
