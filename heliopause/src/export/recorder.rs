@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, c_char, c_void};
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::ThreadId;
 
 #[repr(C)]
@@ -113,6 +113,8 @@ struct State {
     graphs: BTreeMap<usize, Arc<super::capture::RecordedGraph>>,
     templates: BTreeMap<usize, Arc<super::capture::RecordedGraph>>,
     template_sequence: usize,
+    function_layouts: HashMap<usize, HashMap<usize, Vec<(usize, usize)>>>,
+    unload_generation: u64,
     error: Option<String>,
 }
 struct CallbackState {
@@ -192,7 +194,12 @@ impl State {
         bucket.push(Arc::downgrade(&cubin));
         cubin
     }
+    fn invalidate_layouts(&mut self) {
+        self.unload_generation = self.unload_generation.wrapping_add(1);
+        self.function_layouts.clear();
+    }
     fn drop_module(&mut self, context: usize, module_id: u32) {
+        self.invalidate_layouts();
         let image = self.images.remove(&(context, module_id));
         if let Some(image) = image {
             self.modules.retain(|_, binding| {
@@ -263,6 +270,7 @@ impl State {
     unsafe fn resource(&mut self, callback: u32, data: *const c_void) -> ExportResult<()> {
         let resource = unsafe { &*data.cast::<Resource>() };
         if callback == 2 {
+            self.invalidate_layouts();
             let keys: Vec<_> = self
                 .images
                 .keys()
@@ -348,6 +356,9 @@ impl State {
             if stack.is_empty() {
                 self.pending.remove(&thread);
             }
+        }
+        if call.site == 0 && matches!(name, "cuModuleUnload" | "cuLibraryUnload") {
+            self.invalidate_layouts();
         }
         if call.site != 1 {
             return Ok(());
@@ -435,9 +446,11 @@ impl State {
                 self.graphs.remove(&value(0));
             }
             "cuModuleUnload" => {
+                self.invalidate_layouts();
                 self.modules.remove(&value(0));
             }
             "cuLibraryUnload" => {
+                self.invalidate_layouts();
                 self.drop_library(value(0));
             }
             "cuMemAlloc_v2"
@@ -586,10 +599,26 @@ type Subscribe = unsafe extern "C" fn(
 ) -> i32;
 type Enable = unsafe extern "C" fn(u32, usize, i32, u32) -> i32;
 type Unsubscribe = unsafe extern "C" fn(usize) -> i32;
+type GetGraphNodeId = unsafe extern "C" fn(usize, *mut u64) -> i32;
+type DriverGet = unsafe extern "C" fn(*mut usize, usize) -> i32;
+type DriverName = unsafe extern "C" fn(*mut *const c_char, usize) -> i32;
+type DriverCurrent = unsafe extern "C" fn(*mut usize) -> i32;
+
+struct DriverApi {
+    func_get_module: DriverGet,
+    kernel_get_function: DriverGet,
+    library_get_module: DriverGet,
+    ctx_get_current: DriverCurrent,
+    func_get_name: DriverName,
+}
+
 pub(crate) struct Recorder {
     library: Option<Library>,
     state: Option<Box<CallbackState>>,
     subscriber: usize,
+    graph_node_id: OnceLock<GetGraphNodeId>,
+    cuda: OnceLock<super::capture::Cuda>,
+    driver: OnceLock<DriverApi>,
 }
 impl Recorder {
     pub(crate) fn new(path: &str) -> ExportResult<Self> {
@@ -597,10 +626,68 @@ impl Recorder {
             library: Some(unsafe { Library::new(path) }?),
             state: Some(Box::new(CallbackState::new())),
             subscriber: 0,
+            graph_node_id: OnceLock::new(),
+            cuda: OnceLock::new(),
+            driver: OnceLock::new(),
         })
     }
     fn state(&self) -> &CallbackState {
         self.state.as_deref().unwrap()
+    }
+    pub(crate) fn cuda(&self) -> ExportResult<&super::capture::Cuda> {
+        if let Some(cuda) = self.cuda.get() {
+            return Ok(cuda);
+        }
+        let loaded = super::capture::Cuda::new()?;
+        let _ = self.cuda.set(loaded);
+        Ok(self.cuda.get().unwrap())
+    }
+    fn driver(&self) -> ExportResult<&DriverApi> {
+        if let Some(driver) = self.driver.get() {
+            return Ok(driver);
+        }
+        let cuda = self.cuda()?;
+        let loaded = DriverApi {
+            func_get_module: unsafe { cuda.symbol(b"cuFuncGetModule\0")? },
+            kernel_get_function: unsafe { cuda.symbol(b"cuKernelGetFunction\0")? },
+            library_get_module: unsafe { cuda.symbol(b"cuLibraryGetModule\0")? },
+            ctx_get_current: unsafe { cuda.symbol(b"cuCtxGetCurrent\0")? },
+            func_get_name: unsafe { cuda.symbol(b"cuFuncGetName\0")? },
+        };
+        let _ = self.driver.set(loaded);
+        Ok(self.driver.get().unwrap())
+    }
+    pub(crate) fn cached_function_layouts(
+        &self,
+        context: usize,
+    ) -> Option<(u64, HashMap<usize, Vec<(usize, usize)>>)> {
+        if self.subscriber == 0 {
+            return None;
+        }
+        let state = self.state().state.lock().unwrap_or_else(|e| e.into_inner());
+        Some((
+            state.unload_generation,
+            state.function_layouts.get(&context).cloned().unwrap_or_default(),
+        ))
+    }
+    pub(crate) fn store_function_layouts(
+        &self,
+        context: usize,
+        generation: u64,
+        layouts: &BTreeMap<usize, Vec<(usize, usize)>>,
+    ) -> bool {
+        if self.subscriber == 0 {
+            return false;
+        }
+        let mut state = self.state().state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.unload_generation != generation {
+            return false;
+        }
+        let cached = state.function_layouts.entry(context).or_default();
+        for (&function, layout) in layouts {
+            cached.entry(function).or_insert_with(|| layout.clone());
+        }
+        true
     }
     fn check(&self, name: &str, status: i32) -> ExportResult<()> {
         if status == 0 {
@@ -611,9 +698,7 @@ impl Recorder {
         let description = unsafe {
             self.library
                 .as_ref()
-                .unwrap()
-                .get::<GetString>(b"cuptiGetResultString\0")
-                .ok()
+                .and_then(|library| library.get::<GetString>(b"cuptiGetResultString\0").ok())
                 .and_then(|f| {
                     if f(status, &mut message) == 0 && !message.is_null() {
                         Some(CStr::from_ptr(message).to_string_lossy().into_owned())
@@ -631,7 +716,15 @@ impl Recorder {
         if self.subscriber != 0 {
             return Err(invalid("module image recorder is already active"));
         }
-        let library = self.library.as_ref().unwrap();
+        self.state()
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .invalidate_layouts();
+        let library = self
+            .library
+            .as_ref()
+            .ok_or_else(|| invalid("CUPTI library is not loaded"))?;
         let subscribe = unsafe { *library.get::<Subscribe>(b"cuptiSubscribe\0")? };
         let enable = unsafe { *library.get::<Enable>(b"cuptiEnableCallback\0")? };
         let user = self.state.as_deref_mut().unwrap() as *mut CallbackState;
@@ -665,7 +758,7 @@ impl Recorder {
                 *self
                     .library
                     .as_ref()
-                    .unwrap()
+                    .ok_or_else(|| invalid("CUPTI library is not loaded"))?
                     .get::<Unsubscribe>(b"cuptiUnsubscribe\0")?
             };
             self.check("cuptiUnsubscribe", unsafe { unsubscribe(self.subscriber) })?;
@@ -675,6 +768,11 @@ impl Recorder {
             while *count > 0 {
                 count = state.drained.wait(count).unwrap_or_else(|e| e.into_inner());
             }
+            state
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .invalidate_layouts();
         }
         self.check_error()
     }
@@ -705,13 +803,17 @@ impl Recorder {
     }
     pub(crate) fn graph_node_id(&self, node: usize) -> ExportResult<u64> {
         self.check_error()?;
-        type GetId = unsafe extern "C" fn(usize, *mut u64) -> i32;
-        let get = unsafe {
-            *self
-                .library
-                .as_ref()
-                .unwrap()
-                .get::<GetId>(b"cuptiGetGraphNodeId\0")?
+        let get = match self.graph_node_id.get() {
+            Some(&get) => get,
+            None => {
+                let library = self
+                    .library
+                    .as_ref()
+                    .ok_or_else(|| invalid("graph node ordering requires CUPTI"))?;
+                let resolved = unsafe { *library.get::<GetGraphNodeId>(b"cuptiGetGraphNodeId\0")? };
+                let _ = self.graph_node_id.set(resolved);
+                resolved
+            }
         };
         let mut id = 0;
         self.check("cuptiGetGraphNodeId", unsafe { get(node, &mut id) })?;
@@ -779,18 +881,7 @@ impl Recorder {
 
     pub(crate) fn image_for(&self, function: usize) -> ExportResult<Arc<[u8]>> {
         self.check_error()?;
-        #[cfg(windows)]
-        let library: Library =
-            unsafe { libloading::os::windows::Library::load_with_flags("nvcuda.dll", 0x800)? }
-                .into();
-        #[cfg(not(windows))]
-        let library = unsafe { Library::new("libcuda.so.1") }?;
-        type Get = unsafe extern "C" fn(*mut usize, usize) -> i32;
-        type Name = unsafe extern "C" fn(*mut *const c_char, usize) -> i32;
-        type Current = unsafe extern "C" fn(*mut usize) -> i32;
-        let get = unsafe { *library.get::<Get>(b"cuFuncGetModule\0")? };
-        let kernel_get = unsafe { *library.get::<Get>(b"cuKernelGetFunction\0")? };
-        let library_get = unsafe { *library.get::<Get>(b"cuLibraryGetModule\0")? };
+        let driver = self.driver()?;
         let check = |name: &str, status: i32| -> ExportResult<()> {
             if status == 0 {
                 Ok(())
@@ -799,10 +890,13 @@ impl Recorder {
             }
         };
         let mut context = 0;
-        let current = unsafe { *library.get::<Current>(b"cuCtxGetCurrent\0")? };
-        check("cuCtxGetCurrent", unsafe { current(&mut context) })?;
+        check("cuCtxGetCurrent", unsafe {
+            (driver.ctx_get_current)(&mut context)
+        })?;
         let mut module = 0;
-        check("cuFuncGetModule", unsafe { get(&mut module, function) })?;
+        check("cuFuncGetModule", unsafe {
+            (driver.func_get_module)(&mut module, function)
+        })?;
         {
             let state = self.state().state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(image) = state.modules.get(&module) {
@@ -820,20 +914,22 @@ impl Recorder {
         for (kernel, image) in kernels {
             let mut handle = 0;
             check("cuKernelGetFunction", unsafe {
-                kernel_get(&mut handle, kernel)
+                (driver.kernel_get_function)(&mut handle, kernel)
             })?;
             functions.insert(handle, image);
         }
         let mut resolved = Vec::new();
         for (handle, image) in functions {
             let mut parent = 0;
-            let status = unsafe { get(&mut parent, handle) };
+            let status = unsafe { (driver.func_get_module)(&mut parent, handle) };
             if status == 400 {
                 let mut function = 0;
                 check("cuKernelGetFunction", unsafe {
-                    kernel_get(&mut function, handle)
+                    (driver.kernel_get_function)(&mut function, handle)
                 })?;
-                check("cuFuncGetModule", unsafe { get(&mut parent, function) })?;
+                check("cuFuncGetModule", unsafe {
+                    (driver.func_get_module)(&mut parent, function)
+                })?;
             } else {
                 check("cuFuncGetModule", status)?;
             }
@@ -842,7 +938,7 @@ impl Recorder {
         for (handle, image) in libraries {
             let mut parent = 0;
             check("cuLibraryGetModule", unsafe {
-                library_get(&mut parent, handle)
+                (driver.library_get_module)(&mut parent, handle)
             })?;
             resolved.push((parent, image.in_context(context)));
         }
@@ -867,8 +963,9 @@ impl Recorder {
             }
         }
         let mut name = std::ptr::null();
-        let get_name = unsafe { *library.get::<Name>(b"cuFuncGetName\0")? };
-        check("cuFuncGetName", unsafe { get_name(&mut name, function) })?;
+        check("cuFuncGetName", unsafe {
+            (driver.func_get_name)(&mut name, function)
+        })?;
         if name.is_null() {
             return Err(invalid("CUDA returned a kernel without its name"));
         }
@@ -900,7 +997,12 @@ impl Recorder {
 }
 impl Drop for Recorder {
     fn drop(&mut self) {
-        self.state().state.lock().unwrap_or_else(|e| e.into_inner()).graphs.clear();
+        {
+            let mut state = self.state().state.lock().unwrap_or_else(|e| e.into_inner());
+            state.graphs.clear();
+            state.templates.clear();
+            state.invalidate_layouts();
+        }
         if self.stop().is_err() && self.subscriber != 0 {
             // Failed unsubscription leaves CUDA free to invoke the retained callback state.
             if let Some(state) = self.state.take() {
@@ -1084,6 +1186,9 @@ mod tests {
             library: None,
             state: Some(Box::new(CallbackState::new())),
             subscriber: 0,
+            graph_node_id: OnceLock::new(),
+            cuda: OnceLock::new(),
+            driver: OnceLock::new(),
         }
     }
 
@@ -1629,5 +1734,78 @@ mod tests {
         assert!(unsafe { elf_image(short_ptx.as_ptr()) }.unwrap().is_none());
         let partial_magic = b"\x7fELF\x01\0";
         assert!(unsafe { elf_image(partial_magic.as_ptr()) }.unwrap().is_none());
+    }
+
+    #[test]
+    fn function_layout_cache_tracks_active_subscription_and_invalidates_on_unload() {
+        let mut recorder = graph_recorder();
+        let layouts = BTreeMap::from([(0x11, vec![(0, 8), (8, 4)])]);
+        assert!(recorder.cached_function_layouts(0x1000).is_none());
+        assert!(!recorder.store_function_layouts(0x1000, 0, &layouts));
+
+        recorder.subscriber = 1;
+        let (generation, initial) = recorder.cached_function_layouts(0x1000).unwrap();
+        assert!(initial.is_empty());
+        assert!(recorder.store_function_layouts(0x1000, generation, &layouts));
+        assert!(
+            recorder
+                .cached_function_layouts(0x2000)
+                .unwrap()
+                .1
+                .is_empty()
+        );
+        assert_eq!(
+            recorder.cached_function_layouts(0x1000).unwrap().1[&0x11],
+            vec![(0, 8), (8, 4)]
+        );
+
+        // Module unload resource, context destruction, and driver unload entry sites
+        // must each invalidate cached layouts and reject stale generations.
+        let triggers: &[fn(&CallbackState)] = &[
+            |owner| resource(owner, 0x1000, 7, 7, &[]),
+            |owner| resource(owner, 0x1000, 0, 2, &[]),
+            |owner| call(owner, "cuModuleUnload", 0, &[0x100], 0, 0x1000),
+            |owner| call(owner, "cuLibraryUnload", 0, &[0x10], 0, 0x1000),
+        ];
+        for trigger in triggers {
+            let (before, _) = recorder.cached_function_layouts(0x1000).unwrap();
+            assert!(recorder.store_function_layouts(0x1000, before, &layouts));
+            trigger(recorder.state());
+            let (after, cleared) = recorder.cached_function_layouts(0x1000).unwrap();
+            assert!(after > before);
+            assert!(cleared.is_empty());
+            assert!(!recorder.store_function_layouts(
+                0x1000,
+                before,
+                &BTreeMap::from([(0x11, vec![(0, 16)])]),
+            ));
+            assert!(
+                recorder
+                    .cached_function_layouts(0x1000)
+                    .unwrap()
+                    .1
+                    .is_empty()
+            );
+        }
+        recorder.subscriber = 0;
+    }
+
+    #[test]
+    fn graph_node_id_invokes_cached_cupti_function_pointer() {
+        unsafe extern "C" fn stub_node_id(node: usize, out: *mut u64) -> i32 {
+            if node == 0 {
+                return 99;
+            }
+            unsafe {
+                *out = (node as u64) ^ 0xA5A5_0000;
+            }
+            0
+        }
+        let recorder = graph_recorder();
+        assert!(recorder.graph_node_id(1).is_err());
+        recorder.graph_node_id.set(stub_node_id).unwrap();
+        assert_eq!(recorder.graph_node_id(0x42).unwrap(), 0xA5A5_0042);
+        assert_eq!(recorder.graph_node_id(0x99).unwrap(), 0xA5A5_0099);
+        assert!(recorder.graph_node_id(0).is_err());
     }
 }
