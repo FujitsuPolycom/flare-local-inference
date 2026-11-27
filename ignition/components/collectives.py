@@ -101,19 +101,30 @@ def _fake_all_reduce_addend_dep(source, addend, output, dependencies, handle):
     pass
 
 
-@torch.library.custom_op("flare::start_all_reduce", mutates_args=("output",))
-def _start_all_reduce(source: torch.Tensor, output: torch.Tensor, dependencies: list[torch.Tensor],
-                      handle: int, stream: int) -> None:
+def _launch_auxiliary(source: torch.Tensor, output: torch.Tensor, handle: int, stream: int, execute) -> None:
+    # A compiled forward may reuse the input's storage on its main stream as
+    # soon as start returns. Copy into the persistent send buffer before
+    # recording the auxiliary wait unless the caller already wrote into it.
     owner = _OWNERS[handle]
     if owner.concurrent_input is not None:
         send = owner.concurrent_input
-        send.copy_(source)
+        if send.data_ptr() != source.data_ptr():
+            send.copy_(source)
     else:
         send = source
     auxiliary = torch.cuda.ExternalStream(stream, device=source.device)
     auxiliary.wait_stream(torch.cuda.current_stream(source.device))
     with torch.cuda.stream(auxiliary):
-        owner.runtime.all_reduce(send, out=output, plan=owner.plan)
+        execute(owner, send, output)
+
+
+@torch.library.custom_op("flare::start_all_reduce", mutates_args=("output",))
+def _start_all_reduce(source: torch.Tensor, output: torch.Tensor, dependencies: list[torch.Tensor],
+                      handle: int, stream: int) -> None:
+    _launch_auxiliary(
+        source, output, handle, stream,
+        lambda owner, send, out: owner.runtime.all_reduce(send, out=out, plan=owner.plan),
+    )
 
 
 @_start_all_reduce.register_fake
@@ -262,6 +273,7 @@ class PreparedAllReduce:
 
         self.runtime, self.output = runtime, output
         self.fused_addend = False
+        self.concurrent_input = None
         # Traced forwards test this flag, never the runtime: compile workers see a runtime that
         # owns RDMA or IPC resources only as a placeholder.
         self.single = runtime is None
@@ -458,16 +470,7 @@ def _fake_pcie_reduce_scatter_dep(source, output, dependencies, handle):
 @torch.library.custom_op("flare::start_reduce_scatter", mutates_args=("output",))
 def _start_reduce_scatter(source: torch.Tensor, output: torch.Tensor, dependencies: list[torch.Tensor],
                           handle: int, stream: int) -> None:
-    owner = _OWNERS[handle]
-    if owner.concurrent_input is not None:
-        send = owner.concurrent_input
-        send.copy_(source)
-    else:
-        send = source
-    auxiliary = torch.cuda.ExternalStream(stream, device=source.device)
-    auxiliary.wait_stream(torch.cuda.current_stream(source.device))
-    with torch.cuda.stream(auxiliary):
-        _dma_reduce_scatter_exec(owner, send, output)
+    _launch_auxiliary(source, output, handle, stream, _dma_reduce_scatter_exec)
 
 
 @_start_reduce_scatter.register_fake
@@ -680,16 +683,7 @@ def _fake_pcie_gather_shards_dep(source, output, dependencies, handle):
 @torch.library.custom_op("flare::start_gather_shards", mutates_args=("output",))
 def _start_gather_shards(source: torch.Tensor, output: torch.Tensor, dependencies: list[torch.Tensor],
                          handle: int, stream: int) -> None:
-    owner = _OWNERS[handle]
-    if owner.concurrent_input is not None:
-        send = owner.concurrent_input
-        send.copy_(source)
-    else:
-        send = source
-    auxiliary = torch.cuda.ExternalStream(stream, device=source.device)
-    auxiliary.wait_stream(torch.cuda.current_stream(source.device))
-    with torch.cuda.stream(auxiliary):
-        _dma_gather_shards_exec(owner, send, output)
+    _launch_auxiliary(source, output, handle, stream, _dma_gather_shards_exec)
 
 
 @_start_gather_shards.register_fake
@@ -944,6 +938,61 @@ class PreparedChunkedGatherShards:
         return output
 
 
+def _dma_all_to_all_exec(owner, source, output):
+    owner.runtime.all_to_all(source, out=output, plan=owner.plan)
+
+
+@torch.library.custom_op("flare::pcie_all_to_all", mutates_args=("output",))
+def _pcie_all_to_all(source: torch.Tensor, output: torch.Tensor, handle: int) -> None:
+    _dma_all_to_all_exec(_OWNERS[handle], source, output)
+
+
+@_pcie_all_to_all.register_fake
+def _fake_pcie_all_to_all(source, output, handle):
+    pass
+
+
+# `dependencies` is an unread graph-ordering operand that orders preceding writes before the collective.
+@torch.library.custom_op("flare::pcie_all_to_all_dep", mutates_args=("output",))
+def _pcie_all_to_all_dep(source: torch.Tensor, output: torch.Tensor,
+                         dependencies: list[torch.Tensor], handle: int) -> None:
+    _dma_all_to_all_exec(_OWNERS[handle], source, output)
+
+
+@_pcie_all_to_all_dep.register_fake
+def _fake_pcie_all_to_all_dep(source, output, dependencies, handle):
+    pass
+
+
+@torch.library.custom_op("flare::start_all_to_all", mutates_args=("output",))
+def _start_all_to_all(source: torch.Tensor, output: torch.Tensor, dependencies: list[torch.Tensor],
+                      handle: int, stream: int) -> None:
+    _launch_auxiliary(source, output, handle, stream, _dma_all_to_all_exec)
+
+
+@_start_all_to_all.register_fake
+def _fake_start_all_to_all(source, output, dependencies, handle, stream):
+    pass
+
+
+@torch.library.custom_op("flare::join_all_to_all", mutates_args=("output",))
+def _join_all_to_all(source: torch.Tensor, output: torch.Tensor, dependencies: list[torch.Tensor],
+                     dependency: torch.Tensor, stream: int) -> None:
+    torch.cuda.current_stream(source.device).wait_stream(torch.cuda.ExternalStream(stream, device=source.device))
+
+
+@_join_all_to_all.register_fake
+def _fake_join_all_to_all(source, output, dependencies, dependency, stream):
+    pass
+
+
+@dataclass(frozen=True)
+class PendingAllToAll:
+    source: torch.Tensor
+    output: torch.Tensor
+    dependencies: list[torch.Tensor]
+
+
 def _pcie_row_to_col_all_to_all_exec(owner, source, output):
     owner.runtime.row_to_col_all_to_all(source, out=output, plan=owner.plan)
 
@@ -973,16 +1022,7 @@ def _fake_pcie_row_to_col_all_to_all_dep(source, output, dependencies, handle):
 @torch.library.custom_op("flare::start_row_to_col_all_to_all", mutates_args=("output",))
 def _start_row_to_col_all_to_all(source: torch.Tensor, output: torch.Tensor, dependencies: list[torch.Tensor],
                                  handle: int, stream: int) -> None:
-    owner = _OWNERS[handle]
-    if owner.concurrent_input is not None:
-        send = owner.concurrent_input
-        send.copy_(source)
-    else:
-        send = source
-    auxiliary = torch.cuda.ExternalStream(stream, device=source.device)
-    auxiliary.wait_stream(torch.cuda.current_stream(source.device))
-    with torch.cuda.stream(auxiliary):
-        _pcie_row_to_col_all_to_all_exec(owner, send, output)
+    _launch_auxiliary(source, output, handle, stream, _pcie_row_to_col_all_to_all_exec)
 
 
 @_start_row_to_col_all_to_all.register_fake
@@ -1008,17 +1048,21 @@ class PendingRowToColAllToAll:
     dependencies: list[torch.Tensor]
 
 
-class ConcurrentRowToColAllToAll:
-    """Overlap a prepared PCIe row-to-column all-to-all with local compute on an auxiliary stream."""
+class _ConcurrentAllToAll:
+    """Shared overlap wrapper for PCIe all-to-all collectives on an auxiliary stream."""
+
+    _channel_attr: str
+    _label: str
+    _pending_cls: type
 
     def __init__(self, all_to_all, *, workspace, session, parallel_plans, send_buffer=None):
         from ignition.preparation.scratch import ScratchArena
 
         plans = tuple(parallel_plans)
-        if all_to_all.single or not all_to_all.pcie:
-            raise ValueError("concurrent row-to-column all-to-all requires a prepared PCIe DMA channel")
+        if all_to_all.single or not getattr(all_to_all, self._channel_attr, False):
+            raise ValueError(f"{self._label} requires a prepared PCIe DMA channel")
         if not isinstance(workspace, ScratchArena) or not workspace.overlap or not plans:
-            raise ValueError("concurrent row-to-column all-to-all requires an overlap arena and local plans")
+            raise ValueError(f"{self._label} requires an overlap arena and local plans")
         self.all_to_all = all_to_all
         self.all_to_all.concurrent_input = send_buffer
         self.stream = workspace.auxiliary_stream
@@ -1029,7 +1073,7 @@ class ConcurrentRowToColAllToAll:
 
     def validate_scratch(self):
         if self.all_to_all.plan.memory_requirements().scratch_nbytes:
-            raise ValueError("concurrent row-to-column all-to-all requires a plan without caller scratch")
+            raise ValueError(f"{self._label} requires a plan without caller scratch")
 
     def functional(self, *, session):
         self.all_to_all.functional(session=session)
@@ -1043,12 +1087,128 @@ class ConcurrentRowToColAllToAll:
             output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
         send = source.clone() if (clone and self.all_to_all.concurrent_input is None) else source
         deps = list(dependencies)
-        _start_row_to_col_all_to_all(send, output, deps, self.all_to_all.handle, self.stream_handle)
-        return PendingRowToColAllToAll(send, output, deps)
+        self._launch_start(send, output, deps)
+        return self._pending_cls(send, output, deps)
 
     def finish(self, pending, dependency):
-        _join_row_to_col_all_to_all(pending.source, pending.output, pending.dependencies, dependency, self.stream_handle)
+        self._launch_join(pending.source, pending.output, pending.dependencies, dependency)
         return pending.output
+
+
+class ConcurrentAllToAll(_ConcurrentAllToAll):
+    """Overlap a prepared PCIe DMA all-to-all with local compute on an auxiliary stream."""
+
+    _channel_attr = "dma"
+    _label = "concurrent all-to-all"
+    _pending_cls = PendingAllToAll
+
+    def _launch_start(self, send, output, deps):
+        _start_all_to_all(send, output, deps, self.all_to_all.handle, self.stream_handle)
+
+    def _launch_join(self, source, output, deps, dependency):
+        _join_all_to_all(source, output, deps, dependency, self.stream_handle)
+
+
+class PreparedAllToAll:
+    """One fixed-shape peer-targeted exchange `[world_size, *slice] -> [world_size, *slice]` via PCIe DMA.
+
+    Each rank sends `source[peer]` to `peer` and receives `peer`'s slice for this rank in
+    `output[peer]` without arithmetic. The bootstrap owns the runtime, exchange group, and
+    coordinator; every participating rank declares the same operation name and enters
+    preparation together.
+    """
+
+    def __init__(self, source, output, *, runtime, session, coordinator, name):
+        import torch.distributed as dist
+        from b12x.comm import pcie
+        from b12x.comm.pcie._dma_preparation import query_from_metadata
+
+        self.runtime, self.output = runtime, output
+        self.dma = False
+        self.concurrent_input = None
+        # Traced forwards test this flag, never the runtime: compile workers see a runtime that
+        # owns RDMA or IPC resources only as a placeholder.
+        self.single = runtime is None
+        if runtime is None:
+            if source.shape != output.shape or source.dtype != output.dtype:
+                raise ValueError("a single-rank all-to-all copies its source into a matching output")
+            return
+        if not self.fits(runtime, source, output):
+            raise ValueError("PCIe DMA all-to-all requires contiguous 16-byte-aligned "
+                             "[world_size, *slice] tensors within runtime capacity")
+        self.dma = True
+        if (source.dtype in (torch.bfloat16, torch.float16, torch.float32)
+                and source.numel() % (runtime.world_size * 8) == 0):
+            meta_shape, meta_dtype = tuple(source.shape), source.dtype
+        else:
+            # All-to-all transfers raw 16-byte-aligned bytes; express the byte footprint in BF16
+            # for the DMA metadata query without changing the executed tensor dtype.
+            slice_bytes = source.numel() * source.element_size() // runtime.world_size
+            meta_shape, meta_dtype = (runtime.world_size, slice_bytes // 2), torch.bfloat16
+        self.plan = pcie.plan(query_from_metadata(runtime, shape=meta_shape, dtype=meta_dtype),
+                              runtime=runtime)
+        ranks = tuple(dist.get_process_group_ranks(runtime.group))
+
+        def prepare(state):
+            return PreparedCall(run=lambda: state.run_all_to_all(source, out=output), output=output,
+                                owners=(runtime,))
+
+        declare(session, (self.plan.request(name=name, prepare_call=prepare,
+            collective=CollectiveRequirement(key=name, ranks=ranks)),), coordinator=coordinator)
+        self.handle = next(_HANDLES)
+        _OWNERS[self.handle] = self
+
+    @staticmethod
+    def fits(runtime, source, output):
+        """True when this PCIe DMA runtime can exchange `source[peer]` into `output[src]`."""
+        if runtime is None or not _dma(runtime) or not hasattr(runtime, "should_all_to_all"):
+            return False
+        if source.ndim < 2 or source.shape[0] != runtime.world_size:
+            return False
+        slice_bytes = source.numel() // runtime.world_size * source.element_size()
+        return (tuple(output.shape) == tuple(source.shape)
+                and output.dtype is source.dtype
+                and output.device == source.device
+                and source.is_contiguous() and output.is_contiguous()
+                and slice_bytes > 0 and slice_bytes % 16 == 0
+                and source.numel() * source.element_size() <= runtime.max_bytes
+                and runtime.should_all_to_all(source))
+
+    def functional(self, *, session):
+        """Allocate this rank's all-to-all destination inside the traced forward."""
+        if self.output is not None:
+            self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
+            self.output = None
+        return self
+
+    def __call__(self, source, output=None, *, dependencies=()):
+        if output is None:
+            output = self.output
+        if output is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+        if self.single:
+            if output is not source:
+                output.copy_(source)
+        elif dependencies:
+            _pcie_all_to_all_dep(source, output, list(dependencies), self.handle)
+        else:
+            _pcie_all_to_all(source, output, self.handle)
+        return output
+
+
+class ConcurrentRowToColAllToAll(_ConcurrentAllToAll):
+    """Overlap a prepared PCIe row-to-column all-to-all with local compute on an auxiliary stream."""
+
+    _channel_attr = "pcie"
+    _label = "concurrent row-to-column all-to-all"
+    _pending_cls = PendingRowToColAllToAll
+
+    def _launch_start(self, send, output, deps):
+        _start_row_to_col_all_to_all(send, output, deps, self.all_to_all.handle, self.stream_handle)
+
+    def _launch_join(self, source, output, deps, dependency):
+        _join_row_to_col_all_to_all(source, output, deps, dependency, self.stream_handle)
 
 
 class PreparedRowToColAllToAll:
@@ -1450,19 +1610,10 @@ def _fake_all_gather_gated(source, gate, output, dependencies, handle):
 @torch.library.custom_op("flare::start_all_gather", mutates_args=("output",))
 def _start_all_gather(source: torch.Tensor, output: torch.Tensor, dependencies: list[torch.Tensor],
                       handle: int, stream: int) -> None:
-    # A compiled forward may reuse the input's storage on its main stream as
-    # soon as this call returns. Stage it before recording the auxiliary wait
-    # unless the caller already supplies a graph-owned unaliased send tensor.
-    owner = _OWNERS[handle]
-    if owner.concurrent_input is not None:
-        send = owner.concurrent_input
-        send.copy_(source)
-    else:
-        send = source
-    auxiliary = torch.cuda.ExternalStream(stream, device=source.device)
-    auxiliary.wait_stream(torch.cuda.current_stream(source.device))
-    with torch.cuda.stream(auxiliary):
-        _gather_columns(send, output, handle)
+    _launch_auxiliary(
+        source, output, handle, stream,
+        lambda _owner, send, out: _gather_columns(send, out, handle),
+    )
 
 
 @_start_all_gather.register_fake

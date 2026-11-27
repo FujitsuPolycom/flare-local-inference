@@ -10,9 +10,10 @@ import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 
 from ignition.components.collectives import (
-    ConcurrentAllGather, ConcurrentGatherShards, ConcurrentReduceScatter,
-    PreparedAllGather, PreparedAllReduce, PreparedChunkedAllGather,
-    PreparedGatherShards, PreparedReduceScatter,
+    ConcurrentAllGather, ConcurrentAllToAll, ConcurrentGatherShards,
+    ConcurrentReduceScatter, PreparedAllGather, PreparedAllReduce,
+    PreparedAllToAll, PreparedChunkedAllGather, PreparedGatherShards,
+    PreparedReduceScatter,
 )
 
 
@@ -136,3 +137,27 @@ def test_functional_all_reduce_fused_addend_with_dependencies():
     assert call.args[2].target == torch.ops.aten.empty_strided.default
     assert call.args[3][0].op == "placeholder"
     assert not any(node.target == torch.ops.aten.add.Tensor for node in graph.nodes)
+
+
+def test_concurrent_all_to_all_trace_retains_pending_operands_until_join():
+    source = torch.ones((4, 2, 8), dtype=torch.bfloat16)
+    a2a = PreparedAllToAll(
+        source, torch.empty_like(source), runtime=None, session=None, coordinator=None, name="a2a"
+    )
+    a2a.single, a2a.dma, a2a.handle, a2a.concurrent_input = False, True, 2, None
+    ca2a = object.__new__(ConcurrentAllToAll)
+    ca2a.all_to_all, ca2a.stream_handle = a2a, 1
+    ca2a.functional(session=None)
+
+    def forward(value, dep):
+        pending = ca2a.start(value, dependencies=(dep,))
+        local = value + 1
+        return ca2a.finish(pending, local) + local
+
+    graph = make_fx(forward, tracing_mode="fake")(source, torch.ones(1)).graph
+    start, = [n for n in graph.nodes if n.target == torch.ops.flare.start_all_to_all.default]
+    join, = [n for n in graph.nodes if n.target == torch.ops.flare.join_all_to_all.default]
+    assert join.args[:3] == start.args[:3]
+    assert join.args[3].target == torch.ops.aten.add.Tensor
+    assert start.args[1].target == torch.ops.aten.empty_strided.default
+    assert start.args[2][0].op == "placeholder"
