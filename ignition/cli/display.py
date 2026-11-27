@@ -34,5 +34,5 @@ def speculation(settings, *, brief: bool = False) -> str:
     catalog = " · MTP-only graphs" if settings.mtp_only else ""
     if brief:
         return depth + selection + catalog
-    source = "DFlash2" if settings.method == "dflash2" else "MTP module"
+    source = {"dflash2": "DFlash2", "dfly2": "DFly2"}.get(settings.method, "MTP module")
     return f"{depth} per round · {source}" + selection + catalog

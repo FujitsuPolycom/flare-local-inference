@@ -209,7 +209,7 @@ class Recipe:
         if self.parameters.speculation is not None and set(self.plain_ranks) != set(self.ranks):
             raise ValueError("a recipe that speculates declares its costs without speculation for every rank count")
         for name, method in self.speculative_methods.items():
-            if name not in ("mtp", "dspark", "dflash2") or set(method.ranks) != set(self.ranks):
+            if name not in ("mtp", "dspark", "dflash2", "dfly2") or set(method.ranks) != set(self.ranks):
                 raise ValueError("speculative methods require known names and every declared tensor-parallel size")
             if method.draft_bytes is not None and method.draft_bytes <= 0:
                 raise ValueError("speculative draft bytes must be positive")

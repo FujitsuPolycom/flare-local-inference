@@ -348,3 +348,67 @@ def test_pure_manifest_emission_and_reproduction_args_round_trip(monkeypatch):
         reparsed_plan = planning.plan(recipe, recipe.checkpoints[0], (_gpu(0),), selected=(0,), parameters=reparsed_params)
         repro_manifest = rebuild_manifest.from_plan(SimpleNamespace(directory=None), reparsed_plan)
         assert repro_manifest["parameters"] == manifest["parameters"]
+
+
+def test_dfly2_speculative_method_declaration_cli_display_and_planning():
+    from ignition.cli import display
+    from ignition.declaration import SamplingDefaults, SpeculativeMethod
+
+    spec = SpeculationParameters(
+        draft_tokens=5,
+        max_draft_tokens=7,
+        token_capacity=64,
+        method="dspark",
+        supported_methods=("dspark", "dfly2"),
+    )
+    params = BetaParameters(
+        max_concurrency=8,
+        speculation=spec,
+        mixed_prefill=MixedPrefillParameters(),
+    )
+    recipe = Recipe(
+        name="dfly2_test",
+        served_model_name="DFly2-Test",
+        prepare=lambda *a, **k: None,
+        usage=lambda *a, **k: (),
+        sampling_defaults=SamplingDefaults(temperature=1.0, top_p=1.0, top_k=-1),
+        checkpoints=(
+            Checkpoint(
+                alias="dfly2-1b",
+                repository="example/dfly2-1b",
+                revision="deadbeef",
+                architecture="DFly2ForCausalLM",
+                stored_bytes=1 << 30,
+                device_bytes=2 << 30,
+                draft_bytes=512 << 20,
+            ),
+        ),
+        context=4096,
+        page_tokens=16,
+        parameters=params,
+        ranks=MappingProxyType({1: RankCosts(1 << 20, 64 << 10, 1 << 28)}),
+        plain_ranks=MappingProxyType({1: RankCosts(1 << 20, 64 << 10, 1 << 28)}),
+        speculative_methods=MappingProxyType({
+            "dfly2": SpeculativeMethod(
+                MappingProxyType({1: RankCosts(512 << 10, 64 << 10, 1 << 28)}),
+                draft_bytes=256 << 20,
+            ),
+        }),
+    )
+    model = SimpleNamespace(recipe=recipe, checkpoint=recipe.checkpoints[0], alias="dfly2-1b")
+
+    # --speculative-method dfly2 parses, resolves, formats, and plans cleanly.
+    args = parse_args(["export", "dfly2-1b", "--speculative-method", "dfly2"], recipes=(recipe,))
+    resolved = preparation.resolve_parameters(model, args)
+    assert resolved.speculation is not None
+    assert resolved.speculation.method == "dfly2"
+    assert "DFly2" in display.speculation(resolved.speculation)
+    ctx = ParameterContext(recipe=recipe, checkpoint=recipe.checkpoints[0], root=resolved)
+    assert "DFly2 proposals" in resolved.speculation.status_parts(ctx)
+    plan = planning.plan(recipe, recipe.checkpoints[0], (_gpu(0),), selected=(0,), parameters=resolved)
+    assert plan.speculation is not None and plan.speculation.method == "dfly2"
+
+    # --mixed-prefill rejects --speculative-method dfly2.
+    bad = parse_args(["export", "dfly2-1b", "--mixed-prefill", "--speculative-method", "dfly2"], recipes=(recipe,))
+    with pytest.raises(UsageError, match="separate prefill and verification graphs"):
+        preparation.resolve_parameters(model, bad)

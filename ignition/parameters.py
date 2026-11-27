@@ -799,8 +799,8 @@ class SpeculationParameters(ParameterGroup):
             object.__setattr__(self, "max_draft_tokens", self.draft_tokens)
         if self.mtp_only and self.draft_tokens < 1:
             raise ValueError("--mtp-only requires positive learned draft depth")
-        if self.method not in (None, "mtp", "dspark", "dflash2"):
-            raise ValueError("speculative method must be omitted, mtp, dspark or dflash2")
+        if self.method not in (None, "mtp", "dspark", "dflash2", "dfly2"):
+            raise ValueError("speculative method must be omitted, mtp, dspark, dflash2 or dfly2")
         if self.graph_budget is not None:
             if type(self.graph_budget) is not int or self.graph_budget < 1:
                 raise ValueError("speculative graph budget must be a positive integer")
@@ -1034,6 +1034,8 @@ class SpeculationParameters(ParameterGroup):
             parts.append(f"packed graph budget {self.graph_budget}")
         if self.method == "dflash2":
             parts.append("DFlash2 proposals")
+        elif self.method == "dfly2":
+            parts.append("DFly2 proposals")
         return parts
 
     def capacity_relief_options(self, attempt: Callable[[RecipeParameters], Any],
@@ -1231,8 +1233,11 @@ class MixedPrefillParameters(ParameterGroup):
 
     def validate(self, context: ParameterContext) -> None:
         if self.enabled and context.root is not None and context.root.speculation is not None:
-            if context.root.speculation.method == "dflash2":
-                raise UsageError("--speculative-method dflash2 requires separate prefill and verification graphs")
+            if context.root.speculation.method in ("dflash2", "dfly2"):
+                raise UsageError(
+                    f"--speculative-method {context.root.speculation.method}"
+                    " requires separate prefill and verification graphs"
+                )
 
     def adjust_headroom_bytes(self, headroom_bytes: int, context: ParameterContext) -> int:
         if not self.enabled or context.root is None:
