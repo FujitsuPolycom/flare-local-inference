@@ -102,7 +102,8 @@ before committing; a design acknowledgment cannot authorize them.
     against other runtimes must use exported cores with `flare run`;
     `ignition debug-serve` timings are diagnostic only. Correctness
     failures block performance claims; keep raw measurements and disclose unrun
-    checks and material limitations.
+    checks and material limitations. Satisfy every applicable layer of the
+    [testing hierarchy](#testing-hierarchy).
 13. **Preserve model core compatibility.** Every engine version must load
     models supported by previous engine versions without re-export, re-signing,
     or graph changes. Execution ABI numbers are descriptive metadata, not loading
@@ -158,11 +159,86 @@ before committing; a design acknowledgment cannot authorize them.
     Follow
     [contact on PRs and issues](../AGENTS.md#contact-on-prs-and-issues).
 
+## Testing hierarchy
+
+Software verification progresses through three layers, each establishing a
+distinct property. Every layer affected by a change is mandatory, and passing a
+lower layer never substitutes for a higher layer's requirement. Select the
+required checks from the properties at risk, following
+[verification guidance](verification.md). Hardware execution, core
+compatibility, and serving benchmarks remain governed by principles 12 and 13.
+
+1. **Crate unit and contract tests (CPU).** Run `cargo test --locked --release`
+   on every affected Rust crate (`eos`, `selene`, `selene-manager`, `helios`
+   with `--features runtime-core,server`, `flare`, `flare-cli`, and
+   `heliopause`, matching
+   [the native-serving workflow](../.github/workflows/native-serving.yml)) and
+   `pytest` on affected Python suites (`tests/cli`, `tests/preparation`, and
+   component and scheduler tests). `cargo check` does not substitute for
+   `cargo test`. Tests must exercise the actual production entry points,
+   validate rejection without partial mutation, and avoid mocks or source-text
+   checks that bypass runtime behavior.
+2. **Scheduling simulator and mathematical references.** Changes to graph
+   selection, service pricing, timing estimation, refresh or exploration
+   budgets, or cohort algorithms must be evaluated against the Python simulator
+   and reference solvers in `scripts/scheduling_sim/`
+   ([scheduling theory](scheduling-theory.md),
+   [scheduling utility](scheduling-utility.md), and
+   [the scheduling oracle](scheduling-oracle.md)). Changes to timing
+   estimation or funded refresh require running the screening and 64-seed
+   validation catalog in `scripts/scheduling_sim/learning.py` (stationary
+   workloads, idle transients, poisoned observations, missing timings, and
+   recovery fixtures). Do not diverge Helios from the simulator's qualified
+   policy without updating and validating the rule across that catalog.
+   Simulator results do not establish native runtime behavior or GPU
+   performance.
+3. **Formal lifecycle conformance, sequential proofs, and mutation testing.**
+   Follow [Helios lifecycle verification](../verification/helios-lifecycle/README.md):
+   - Run the TLA+ models and Rust trace-conformance suite
+     (`python3 verification/helios-lifecycle/check.py`) whenever changing
+     admission, fences, generations, cancellation, speculation accounting,
+     cache compaction, snapshot aliases, response buffering or ownership,
+     offload aggregation, readiness, or rank coordination.
+   - Run the Kani sequential proofs
+     (`cargo kani --manifest-path helios/Cargo.toml --lib`) whenever changing
+     completion-vector validation, prepared completion contracts, state-view
+     extent arithmetic, or sequential validators whose safety must hold over
+     an input domain.
+   - Run mutation testing (`check.py --mutations` or `cargo-mutants`) when
+     adding or changing safety guards to verify that the checks detect
+     plausible implementation faults.
+   Formal checks do not establish CUDA ordering, kernel arithmetic, or thread
+   interleavings outside their modeled domain.
+
+**Mandatory enforcement and non-substitution:**
+
+- **Never touch covered code without running and updating its simulator and
+  formal checks.** Modifying the Helios scheduler, admission, speculation,
+  cancellation, cache ownership, completion validation, readiness, or rank
+  coordination without running—and updating when behavior, transitions, or
+  supported bounds change—the applicable TLA+ models, Rust conformance
+  fixtures, Kani harnesses, and scheduling simulator is a blocking design
+  failure, regardless of whether CPU unit tests pass.
+- **Keep formal bounds aligned with runtime capabilities.** When a change adds
+  protocol states or extends supported runtime geometries beyond an existing
+  model's or harness's bounds (for example, wider speculative verification
+  widths or additional lifecycle transitions), update the model, conformance
+  fixture, or Kani harness to cover the added domain rather than leaving it
+  unverified.
+- **Disclosure does not excuse skipping runnable CPU checks.** All three layers
+  run without a GPU or model checkpoint. Leaving an applicable crate test,
+  simulator sweep, TLA+ conformance run, or Kani proof unrun blocks commit and
+  PR acceptance; noting it as a limitation does not make the omission
+  acceptable.
+- Pure documentation and formatting edits require inspection and applicable
+  existing checks; they do not require simulator, formal, or GPU runs.
+
 ## Review and acknowledgment
 
 1. Inspect `git diff --cached`. Apply every relevant principle, fix violations,
    and obtain any required graph-family approval before committing. Validation
-   requirements apply to the affected behavior. Documentation changes do not
+   requirements apply to the affected behavior, following the
+   [testing hierarchy](#testing-hierarchy). Documentation changes do not
    require GPU tests.
 2. Read the staged checklist with `git show :docs/design-review.md`. When changing
    this document, stage the intended version before reviewing and acknowledging it.
