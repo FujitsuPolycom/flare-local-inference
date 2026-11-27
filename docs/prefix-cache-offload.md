@@ -415,8 +415,37 @@ hosts, by `shard::Sharded` (section 2.14):
   independent transfer handle and the disk thread. `store` streams checkpoints
   through intake windows into record files; `fetch` streams them back to the GPU.
   With warm zero and disk enabled, the pool contains only intake slots.
-  `write_from(key, metadata, buffers)` and `read_into(key, buffers)` move records
-  between files and caller-owned registered slots for the composite.
+  `write_from(id, header, temporary, path, pages, row, sums)` and
+  `read_into(id, path, expected, first_page, pages, row)` move raw records
+  between files and caller-owned registered slot addresses for the composite
+  store, and `write_packed(id, header, temporary, path, units, spans, row)` and
+  `read_into_packed(id, path, expected, row)` move v4 packed payloads between
+  files and composite host storage.
+  - Concurrent device `fetch` jobs whose segment path and expected header match
+    share one open file handle and coalesce windows aligned to `WINDOW_PAGES`
+    (64-page) file boundaries across both raw v1–v3 staging slots and v4 packed
+    `ReadPacked` buffers. Each attached restore submits its own GPU upload (or
+    codec decode and upload) from the shared window, and staging slots or packed
+    buffers release only after the disk read and every attached upload finish.
+    Caller-owned `read_into` and `read_into_packed` reads run on a separate
+    private path.
+  - Sharing relies on committed record files being immutable and pinned in
+    `DiskStore`'s index while any attached restore runs; the last user of a
+    shared segment waits for the disk-thread close to settle before reporting
+    `Fetched`, so no disk read outlives the caller's pin. When multiple device
+    restores run concurrently, window selection prefers windows demanded by
+    sibling restores before reading private tails, relaxing strict arrival-order
+    scheduling.
+  - Limits and failure scope: sharing covers only windows still live in staging
+    (`Reading` or `Read`), so a window released before a later restore attaches
+    is read from disk again; aligning segments to `WINDOW_PAGES` file boundaries
+    adds at most one extra partial window per segment when
+    `skip_pages % WINDOW_PAGES != 0`. An open, read, or packed-payload content
+    error (`record_read`) on a shared segment or window fails every restore
+    attached to it after in-flight disk and transfer jobs drain, whereas an
+    error on a private child segment or a follower's transient GPU upload fails
+    only that restore. See section 4 for `StoreStats.bytes_in` and
+    `StoreStats.inbound_rate` accounting under coalesced restores.
 Section 2.6 specifies a second transport, `Direct`, which is not implemented.
 
 `CompositeStore` owns a `MemoryStore` and a `DiskStore` and implements the
@@ -1579,6 +1608,13 @@ python3 -m qualify.host_cache_isolation --core /path/to/core.safetensors \
 | Speculative round time | the first workload | round GPU time from `/metrics` | within noise |
 | Inbound latency | 8K, 32K, and 100K token prefixes, through each store and transport | admission to `Restore` submission | reported beside the prefill time of the same prefix |
 | Copy-out bandwidth | per rank, each transport | bytes per second from store counters | reported |
+
+On `DiskStore`, `StoreStats.bytes_in` counts logical bytes restored across
+completed fetches, while `StoreStats.inbound_rate` samples rank-0 physical
+disk-thread window reads (excluding slot queueing and GPU upload) so coalesced
+follower restores do not overstate device read bandwidth. `CompositeStore`
+maintains a separate end-to-end `disk_inbound_rate` over `read_into` and
+`read_into_packed` completions.
 
 The `Direct` transport design adds two measurements when it is implemented:
 inbound latency against the staged transport on the same prefixes, and fabric

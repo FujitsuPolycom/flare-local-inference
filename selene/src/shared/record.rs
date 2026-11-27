@@ -93,7 +93,7 @@ const SUFFIX: &str = ".ckpt";
 /// Bytes of the fixed header fields that precede the rank entries.
 const FIXED_FIELD_BYTES: usize = 177;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RankSizes {
     pub planes: Vec<u64>,
     pub row_bytes: u64,
@@ -161,6 +161,45 @@ impl PartialEq for Header {
 }
 
 impl Eq for Header {}
+
+impl std::hash::Hash for Header {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Exhaustive destructure so adding a field to Header forces keeping
+        // Hash in lockstep with PartialEq above; `version` is omitted because
+        // PartialEq ignores encoding version.
+        let Self {
+            version: _,
+            packed,
+            identity,
+            fingerprint,
+            flags,
+            key,
+            parent,
+            bucket,
+            page_tokens,
+            tail_pages,
+            ranks,
+            page_segment,
+            row_segment,
+            row_checksum,
+            created,
+        } = self;
+        packed.hash(state);
+        identity.hash(state);
+        fingerprint.hash(state);
+        flags.hash(state);
+        key.hash(state);
+        parent.hash(state);
+        bucket.hash(state);
+        page_tokens.hash(state);
+        tail_pages.hash(state);
+        ranks.hash(state);
+        page_segment.hash(state);
+        row_segment.hash(state);
+        row_checksum.hash(state);
+        created.hash(state);
+    }
+}
 
 impl crate::CaptureRole {
     pub fn merge(self, other: Self) -> Self {
@@ -2184,5 +2223,84 @@ mod tests {
         }
         assert!(!identical(&layout, &[], Some(&addresses)).row);
         pool.release(slots);
+    }
+
+    #[test]
+    fn header_eq_implies_same_hash() {
+        use crate::shared::wire::{
+            PackedOffer, PackedUnit,
+            packed_unit::{Kind, Representation},
+        };
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        fn digest(header: &Header) -> u64 {
+            let mut hasher = DefaultHasher::new();
+            header.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        let geometry = geometries().remove(0);
+        let a = header(&geometry, 512, Some(256));
+        let mut b = a.clone();
+        b.version = if a.version == VERSION {
+            LEGACY_VERSION
+        } else {
+            VERSION
+        };
+        assert_eq!(a, b);
+        assert_eq!(digest(&a), digest(&b));
+
+        let mut c = a.clone();
+        c.created += 1;
+        assert_ne!(a, c);
+        assert_ne!(digest(&a), digest(&c));
+
+        let first_page = a.parent.unwrap().consumed_tokens / a.page_tokens;
+        let mut units = Vec::new();
+        for p in 0..a.tail_pages {
+            for (rank_idx, rank_sizes) in a.ranks.iter().enumerate() {
+                units.push(PackedUnit {
+                    kind: Kind::Page as i32,
+                    logical_index: first_page + u64::from(p),
+                    stored_rank: rank_idx as u32,
+                    representation: Representation::Packet as i32,
+                    profile: vec![0x42; 32],
+                    original_length: rank_sizes.page_record_bytes(),
+                    stored_length: 128,
+                    replicas: Vec::new(),
+                    stored_crc: 11 + p,
+                    original_crc: 22 + p,
+                    raw_xxh3: 0,
+                });
+            }
+        }
+        for (rank_idx, rank_sizes) in a.ranks.iter().enumerate() {
+            units.push(PackedUnit {
+                kind: Kind::Row as i32,
+                logical_index: 0,
+                stored_rank: rank_idx as u32,
+                representation: Representation::Packet as i32,
+                profile: vec![0x42; 32],
+                original_length: rank_sizes.row_record_bytes(),
+                stored_length: 256,
+                replicas: Vec::new(),
+                stored_crc: 33,
+                original_crc: 44,
+                raw_xxh3: 0,
+            });
+        }
+        let packed_layout =
+            packed::Layout::new(PackedOffer { first_page, units }, &a.ranks, first_page, a.tail_pages)
+                .unwrap();
+        let mut d = a.clone();
+        d.packed = Some(Arc::new(packed_layout.clone()));
+        assert_ne!(a, d);
+        assert_ne!(digest(&a), digest(&d));
+
+        let mut e = a.clone();
+        e.packed = Some(Arc::new(packed_layout));
+        assert_eq!(d, e);
+        assert_eq!(digest(&d), digest(&e));
     }
 }

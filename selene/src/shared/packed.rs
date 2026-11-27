@@ -96,6 +96,50 @@ pub struct Layout {
     pages: Vec<usize>,
 }
 
+impl Eq for Layout {}
+
+impl std::hash::Hash for Layout {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Exhaustive destructures keep Hash aligned with PartialEq whenever
+        // fields are added to Layout, PackedOffer, or PackedUnit.
+        let Self {
+            offer: PackedOffer { first_page, units },
+            offsets,
+            pages,
+        } = self;
+        first_page.hash(state);
+        units.len().hash(state);
+        for PackedUnit {
+            kind,
+            logical_index,
+            stored_rank,
+            representation,
+            profile,
+            original_length,
+            stored_length,
+            replicas,
+            stored_crc,
+            original_crc,
+            raw_xxh3,
+        } in units
+        {
+            kind.hash(state);
+            logical_index.hash(state);
+            stored_rank.hash(state);
+            representation.hash(state);
+            profile.hash(state);
+            original_length.hash(state);
+            stored_length.hash(state);
+            replicas.hash(state);
+            stored_crc.hash(state);
+            original_crc.hash(state);
+            raw_xxh3.hash(state);
+        }
+        offsets.hash(state);
+        pages.hash(state);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Span {
     pub first: u32,

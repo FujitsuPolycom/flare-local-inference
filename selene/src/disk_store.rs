@@ -13,12 +13,19 @@
 //! file at the row segment. Every byte movement goes through a [`DiskTransport`].
 //! [`Staged`] streams records between GPU ids and files through a registered
 //! shared slot pool, the shared transfer threads, and the disk thread, in windows of
-//! at most [`WINDOW_PAGES`] pages with at most [`WINDOWS_IN_FLIGHT`] windows of
-//! one record staged at a time. It also moves records between files and
-//! caller-owned registered buffers retained by the composite's memory tier.
-//! Nothing here waits: `store`, `fetch`, `truncate`, and `unlink`
-//! enqueue, and `poll` advances every pipeline as far as free slots and queue
-//! space allow before reporting completions.
+//! at most [`WINDOW_PAGES`] pages. Outbound and caller-buffer pipelines stage at
+//! most [`WINDOWS_IN_FLIGHT`] windows per record. Each device `fetch` holds at
+//! most [`WINDOWS_IN_FLIGHT`] active window credits and runs plans out of order:
+//! concurrent fetches reading the same record file share one open handle and
+//! attach as followers to [`WINDOW_PAGES`]-aligned windows (staging raw v1–v3
+//! records in shared slots or v4 packed records in shared `ReadPacked` buffers)
+//! while those windows remain referenced, submitting one GPU upload per follower.
+//! It also moves records between files and caller-owned host buffers retained by
+//! the composite's memory tier. Submissions never block the caller (`store`,
+//! `fetch`, `truncate`, and `unlink` enqueue work, and `poll` advances every
+//! pipeline as free slots and queue space allow); the last user of a shared
+//! segment holds its [`TransportEvent::Fetched`] event until the file close
+//! settles on the disk thread so no disk read outlives the caller's index pin.
 
 #[cfg(test)]
 use crate::store::TierStore;
@@ -53,7 +60,7 @@ use super::{
     slab::{SlabPool, Slot, WINDOW_PAGES},
 };
 
-/// Windows of one record the staged transport keeps in staging at a time.
+/// Active staging window credits per outbound record, host read, or device fetch.
 pub const WINDOWS_IN_FLIGHT: usize = crate::shared::WINDOW_CREDITS as usize;
 /// Records per direction a disk store keeps in flight. Further `store` calls
 /// are skipped and further `fetch` calls refused until one completes, so GPU
@@ -139,6 +146,8 @@ pub trait DiskTransport {
     /// them: a job it accepted may still run, so the caller must stop rather
     /// than reuse the ids that job holds.
     fn poll(&mut self, events: &mut Vec<TransportEvent>) -> Result<()>;
+    /// Drain physical inbound window read samples `(bytes, elapsed)` for rate tracking.
+    fn drain_inbound_samples(&mut self, _samples: &mut Vec<(u64, Duration)>) {}
     fn close(&mut self) -> Result<()>;
     fn staged(&self) -> Option<&Staged> {
         None
@@ -193,6 +202,15 @@ struct Resources {
     /// Disk jobs submitted whose replies have not been polled.
     disk_outstanding: usize,
     next_disk: u64,
+    /// Physical `disk::Job::Open` calls submitted by this transport.
+    #[cfg(any(test, feature = "test-support"))]
+    disk_opens: u64,
+    /// Physical disk window reads submitted by this transport.
+    #[cfg(any(test, feature = "test-support"))]
+    disk_window_reads: u64,
+    /// Logical device-fetch windows satisfied by attaching to an in-flight shared window.
+    #[cfg(any(test, feature = "test-support"))]
+    coalesced_windows: u64,
 }
 
 impl Resources {
@@ -224,6 +242,11 @@ impl Resources {
         lock(&self.transfers).codec_profile().is_some()
     }
 
+    /// Free slots in the shared pool; zero when this transport has no pool.
+    fn free_slots(&self) -> usize {
+        self.pool.as_ref().map_or(0, SlabPool::free_slots)
+    }
+
     /// Slots for `pages` page records and, when `row`, all row pieces;
     /// `None` leaves the pool unchanged when it cannot supply all of them.
     fn allocate(&mut self, pages: usize, row: bool) -> Option<Buffers> {
@@ -250,7 +273,8 @@ impl Resources {
 #[derive(Clone, Copy)]
 enum Owner {
     Outbound(JobId),
-    Inbound(JobId, usize),
+    HostInbound(JobId, usize),
+    SharedSegment(SharedSegmentId),
     Truncate(JobId),
     Unlink(JobId),
 }
@@ -951,20 +975,15 @@ impl OutboundRecord {
     }
 }
 
-/// Where an inbound record's bytes go.
-enum Destination {
-    /// The ticket's GPU ids and state slot, through the pool.
-    Device {
-        pages: Vec<PageId>,
-        slot: StateSlotId,
-    },
+/// Where a private host-buffer inbound read's bytes go.
+enum HostDestination {
     /// Caller-owned registered buffers.
-    Host {
+    Slots {
         pages: Vec<usize>,
         row: Option<Vec<usize>>,
     },
     /// Contiguous packed payload for a single v4 record, handed back to the caller.
-    HostPacked,
+    Packed,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1003,60 +1022,54 @@ struct WindowPlan {
     row: bool,
 }
 
-/// Split segments of `(first page, page count, row)` into windows.
-fn plan_windows(segments: impl IntoIterator<Item = (u32, usize, bool)>) -> Vec<WindowPlan> {
+/// Split segments of `(first page, page count, row)` into staging windows.
+/// Caller-owned `read_into` keeps `align_to_window = false` so each host read packs
+/// segment-relative windows without splitting an unaligned suffix into an extra job.
+fn plan_windows(
+    segments: impl IntoIterator<Item = (u32, usize, bool)>,
+    align_to_window: bool,
+) -> Vec<WindowPlan> {
     let mut plans = Vec::new();
     let mut offset = 0;
     for (segment, (first, pages, row)) in segments.into_iter().enumerate() {
-        let windows = if pages == 0 {
-            usize::from(row)
-        } else {
-            pages.div_ceil(WINDOW_PAGES)
-        };
-        for window in 0..windows {
-            let start = window * WINDOW_PAGES;
+        if pages == 0 {
+            if row {
+                plans.push(WindowPlan {
+                    segment,
+                    index: plans.len() as u32,
+                    first,
+                    count: 0,
+                    offset,
+                    row: true,
+                });
+            }
+            continue;
+        }
+        let mut cursor = first as usize;
+        let end = cursor + pages;
+        let mut dst_offset = offset;
+        while cursor < end {
+            let limit = if align_to_window {
+                ((cursor / WINDOW_PAGES) + 1) * WINDOW_PAGES
+            } else {
+                cursor + WINDOW_PAGES
+            };
+            let chunk_end = end.min(limit);
+            let count = chunk_end - cursor;
             plans.push(WindowPlan {
                 segment,
                 index: plans.len() as u32,
-                first: first + start as u32,
-                count: (pages - start).min(WINDOW_PAGES),
-                offset: offset + start,
-                row: row && window + 1 == windows,
+                first: cursor as u32,
+                count,
+                offset: dst_offset,
+                row: row && chunk_end == end,
             });
+            cursor = chunk_end;
+            dst_offset += count;
         }
         offset += pages;
     }
     plans
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum InPhase {
-    Reading,
-    Read,
-    Uploading,
-}
-
-struct InWindow {
-    plan: WindowPlan,
-    buffers: Buffers,
-    packed_buf: Option<Arc<Vec<u8>>>,
-    phase: InPhase,
-    pages_submitted: bool,
-    row_submitted: bool,
-    referenced: usize,
-}
-
-struct InboundRecord {
-    segments: Vec<Segment>,
-    destination: Destination,
-    plans: Vec<WindowPlan>,
-    next_window: usize,
-    active: Vec<InWindow>,
-    done: usize,
-    outstanding: usize,
-    bytes: u64,
-    completed_packed: Option<(Header, Arc<Vec<u8>>)>,
-    error: Option<Error>,
 }
 
 fn is_packed_content_error(error: &Error) -> bool {
@@ -1070,8 +1083,43 @@ fn is_packed_content_error(error: &Error) -> bool {
     })
 }
 
-impl InboundRecord {
-    fn new(segments: Vec<Segment>, destination: Destination, plans: Vec<WindowPlan>) -> Self {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostInPhase {
+    Reading,
+    Read,
+}
+
+struct HostWindow {
+    plan: WindowPlan,
+    pages: Vec<usize>,
+    row: Option<Vec<usize>>,
+    packed_buf: Option<Arc<Vec<u8>>>,
+    phase: HostInPhase,
+    pages_submitted: bool,
+    row_submitted: bool,
+    #[cfg(any(test, feature = "test-support"))]
+    disk_read_counted: bool,
+    referenced: usize,
+}
+
+/// An isolated host-buffer inbound read (`Staged::read_into` or
+/// `Staged::read_into_packed`) targeting caller-owned buffers rather than the
+/// shared device staging pool.
+struct HostInbound {
+    segments: Vec<Segment>,
+    destination: HostDestination,
+    plans: Vec<WindowPlan>,
+    next_window: usize,
+    active: Vec<HostWindow>,
+    done: usize,
+    outstanding: usize,
+    bytes: u64,
+    completed_packed: Option<(Header, Arc<Vec<u8>>)>,
+    error: Option<Error>,
+}
+
+impl HostInbound {
+    fn new(segments: Vec<Segment>, destination: HostDestination, plans: Vec<WindowPlan>) -> Self {
         Self {
             segments,
             destination,
@@ -1114,12 +1162,12 @@ impl InboundRecord {
                 if let Some(window) = window {
                     window.referenced = window.referenced.saturating_sub(1);
                     window.packed_buf = reply.payload;
-                    if window.phase == InPhase::Reading
+                    if window.phase == HostInPhase::Reading
                         && window.pages_submitted
                         && window.row_submitted
                         && window.referenced == 0
                     {
-                        window.phase = InPhase::Read;
+                        window.phase = HostInPhase::Read;
                         finished = true;
                     }
                 }
@@ -1143,12 +1191,12 @@ impl InboundRecord {
                 let mut finished = false;
                 if let Some(window) = window {
                     window.referenced = window.referenced.saturating_sub(1);
-                    if window.phase == InPhase::Reading
+                    if window.phase == HostInPhase::Reading
                         && window.pages_submitted
                         && window.row_submitted
                         && window.referenced == 0
                     {
-                        window.phase = InPhase::Read;
+                        window.phase = HostInPhase::Read;
                         finished = true;
                     }
                 }
@@ -1165,47 +1213,20 @@ impl InboundRecord {
         }
     }
 
-    fn apply_transfer(&mut self, reply: copier::Reply) {
-        self.outstanding = self.outstanding.saturating_sub(1);
-        let Some(window) = self
-            .active
-            .iter_mut()
-            .find(|window| window.plan.index == reply.window)
-        else {
-            return;
-        };
-        window.referenced = window.referenced.saturating_sub(1);
-        if let Err(error) = reply.result {
-            let error = if window.packed_buf.is_some() && is_packed_content_error(&error) {
-                error.with_record_read()
-            } else {
-                error
-            };
-            self.fail(error);
-        }
-    }
-
-    fn pump(&mut self, id: JobId, resources: &mut Resources) -> Option<Result<u64>> {
+    fn pump(&mut self, resources: &mut Resources) -> Option<Result<u64>> {
         if self.error.is_some() {
             return self.unwind(resources);
         }
         let mut index = 0;
         while index < self.active.len() {
-            let window = &self.active[index];
-            let complete = match (&self.destination, window.phase) {
-                (Destination::Device { .. }, InPhase::Uploading) => window.referenced == 0,
-                (Destination::Host { .. } | Destination::HostPacked, InPhase::Read) => true,
-                _ => false,
-            };
-            if complete {
+            if self.active[index].phase == HostInPhase::Read {
                 let mut window = self.active.remove(index);
-                if matches!(self.destination, Destination::HostPacked)
+                if matches!(self.destination, HostDestination::Packed)
                     && let Some(buf) = window.packed_buf.take()
                 {
                     let header = self.segments[window.plan.segment].expected.clone();
                     self.completed_packed = Some((header, buf));
                 }
-                resources.release(&mut window.buffers);
                 self.done += 1;
             } else {
                 index += 1;
@@ -1222,12 +1243,9 @@ impl InboundRecord {
             }
         }
         for index in 0..self.active.len() {
-            let outcome = match self.active[index].phase {
-                InPhase::Reading => self.submit_reads(index, resources),
-                InPhase::Read => self.submit_upload(id, index, resources),
-                InPhase::Uploading => Ok(()),
-            };
-            if let Err(error) = outcome {
+            if self.active[index].phase == HostInPhase::Reading
+                && let Err(error) = self.submit_reads(index, resources)
+            {
                 self.fail(error);
                 return self.unwind(resources);
             }
@@ -1267,41 +1285,34 @@ impl InboundRecord {
                 path: segment.path.clone(),
                 expected: segment.expected.clone(),
             })?;
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                resources.disk_opens += 1;
+            }
             segment.state = FileState::Opened;
             self.outstanding += 1;
         }
-        let packed = segment.expected.packed.is_some();
-        let buffers = if packed {
-            Buffers {
-                pages: Vec::new(),
-                row: None,
-                slots: None,
-            }
+        let (pages, row) = if segment.expected.packed.is_some() {
+            (Vec::new(), None)
         } else {
             match &self.destination {
-                Destination::Device { .. } => match resources.allocate(plan.count, plan.row) {
-                    Some(buffers) => buffers,
-                    None => return Ok(false),
-                },
-                Destination::Host { pages, row } => Buffers {
-                    pages: pages[plan.offset..plan.offset + plan.count].to_vec(),
-                    row: if plan.row { row.clone() } else { None },
-                    slots: None,
-                },
-                Destination::HostPacked => Buffers {
-                    pages: Vec::new(),
-                    row: None,
-                    slots: None,
-                },
+                HostDestination::Slots { pages, row } => (
+                    pages[plan.offset..plan.offset + plan.count].to_vec(),
+                    if plan.row { row.clone() } else { None },
+                ),
+                HostDestination::Packed => (Vec::new(), None),
             }
         };
-        self.active.push(InWindow {
+        self.active.push(HostWindow {
             plan,
-            buffers,
+            pages,
+            row,
             packed_buf: None,
-            phase: InPhase::Reading,
+            phase: HostInPhase::Reading,
             pages_submitted: false,
             row_submitted: false,
+            #[cfg(any(test, feature = "test-support"))]
+            disk_read_counted: false,
             referenced: 0,
         });
         self.next_window += 1;
@@ -1338,6 +1349,11 @@ impl InboundRecord {
                     offset,
                     length,
                 })?;
+                #[cfg(any(test, feature = "test-support"))]
+                if !window.disk_read_counted {
+                    window.disk_read_counted = true;
+                    resources.disk_window_reads += 1;
+                }
                 window.pages_submitted = true;
                 window.row_submitted = true;
                 window.referenced += 1;
@@ -1346,7 +1362,7 @@ impl InboundRecord {
             return Ok(());
         }
         if !window.pages_submitted {
-            if window.buffers.pages.is_empty() {
+            if window.pages.is_empty() {
                 window.pages_submitted = true;
             } else {
                 if !resources.disk_space() {
@@ -1356,21 +1372,31 @@ impl InboundRecord {
                     id: disk,
                     window: window.plan.index,
                     first: window.plan.first,
-                    buffers: window.buffers.pages.clone(),
+                    buffers: window.pages.clone(),
                 })?;
+                #[cfg(any(test, feature = "test-support"))]
+                if !window.disk_read_counted {
+                    window.disk_read_counted = true;
+                    resources.disk_window_reads += 1;
+                }
                 window.pages_submitted = true;
                 window.referenced += 1;
                 self.outstanding += 1;
             }
         }
         if !window.row_submitted {
-            match window.buffers.row.clone() {
+            match window.row.clone() {
                 None => window.row_submitted = true,
                 Some(buffers) => {
                     if !resources.disk_space() {
                         return Ok(());
                     }
                     resources.submit_disk(disk::Job::ReadRow { id: disk, buffers })?;
+                    #[cfg(any(test, feature = "test-support"))]
+                    if !window.disk_read_counted {
+                        window.disk_read_counted = true;
+                        resources.disk_window_reads += 1;
+                    }
                     window.row_submitted = true;
                     window.referenced += 1;
                     self.outstanding += 1;
@@ -1380,90 +1406,10 @@ impl InboundRecord {
         Ok(())
     }
 
-    fn submit_upload(&mut self, id: JobId, index: usize, resources: &mut Resources) -> Result<()> {
-        let Destination::Device { pages, slot } = &self.destination else {
-            return Ok(());
-        };
-        let window = &mut self.active[index];
-        if !resources.transfer_space() {
-            return Ok(());
-        }
-        let plan = window.plan;
-        if let Some(layout) = &self.segments[plan.segment].expected.packed {
-            let buf = window
-                .packed_buf
-                .as_ref()
-                .ok_or_else(|| invalid("packed window missing disk payload"))?;
-            let units = layout
-                .units(plan.first as usize, plan.count, plan.row)
-                .ok_or_else(|| invalid("packed window out of layout range"))?;
-            let base = buf.as_ptr() as usize;
-            let mut cursor = 0usize;
-            let mut packets = Vec::with_capacity(units.len());
-            for unit in units {
-                let len = usize::try_from(unit.stored_length)
-                    .map_err(|_| invalid("packed unit length overflow"))?;
-                if cursor + len > buf.len() {
-                    return Err(invalid("packed disk payload truncated"));
-                }
-                packets.push(crate::codec_copy::PinnedPacket {
-                    unit: unit.clone(),
-                    spans: vec![(base + cursor, len)],
-                });
-                cursor += len;
-            }
-            let first_logical = layout.offer().first_page + plan.first as u64;
-            resources.submit_transfer(copier::Job {
-                codec: Some(crate::codec_copy::Window::restore_pinned(
-                    first_logical,
-                    packets,
-                )),
-                replication: Default::default(),
-                id,
-                window: plan.index,
-                direction: Direction::In,
-                pages: pages[plan.offset..plan.offset + plan.count]
-                    .iter()
-                    .copied()
-                    .map(|p| (p, 0))
-                    .collect(),
-                row: plan.row.then_some((*slot, vec![0])),
-            })?;
-            window.phase = InPhase::Uploading;
-            window.referenced += 1;
-            self.outstanding += 1;
-            return Ok(());
-        }
-        resources.submit_transfer(copier::Job {
-            codec: None,
-            replication: Default::default(),
-            id,
-            window: plan.index,
-            direction: Direction::In,
-            pages: pages[plan.offset..plan.offset + plan.count]
-                .iter()
-                .copied()
-                .zip(window.buffers.pages.iter().copied())
-                .collect(),
-            row: window.buffers.row.clone().map(|address| (*slot, address)),
-        })?;
-        window.phase = InPhase::Uploading;
-        window.referenced += 1;
-        self.outstanding += 1;
-        Ok(())
-    }
-
-    /// Release every window no job references, close every opened file, and
+    /// Wait for every referenced window reply, close every opened file, and
     /// report the failure once every reply has arrived.
     fn unwind(&mut self, resources: &mut Resources) -> Option<Result<u64>> {
-        self.active.retain_mut(|window| {
-            if window.referenced == 0 {
-                resources.release(&mut window.buffers);
-                false
-            } else {
-                true
-            }
-        });
+        self.active.retain(|window| window.referenced > 0);
         for segment in &mut self.segments {
             if segment.state == FileState::Opened && resources.disk_space() {
                 match resources.submit_disk(disk::Job::Close { id: segment.disk }) {
@@ -1485,6 +1431,212 @@ impl InboundRecord {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct SharedSegmentId(u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct SharedWindowId(u64);
+
+/// Reference-counted record header wrapper with pointer-equality fast path.
+#[derive(Clone, Debug)]
+struct HeaderIdentity(Arc<Header>);
+
+impl PartialEq for HeaderIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || *self.0 == *other.0
+    }
+}
+
+impl Eq for HeaderIdentity {}
+
+impl std::hash::Hash for HeaderIdentity {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SegmentKey {
+    path: Arc<Path>,
+    expected: HeaderIdentity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct WindowKey {
+    segment: SegmentKey,
+    first: u32,
+    count: usize,
+    row: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SharedFileState {
+    /// No `disk::Job::Open` has been submitted yet.
+    Unopened,
+    /// `disk::Job::Open` is in flight; pipelined reads may already be submitted.
+    Opening,
+    /// `disk::Job::Open` succeeded and the record file stays open on the disk thread.
+    Opened,
+    /// `disk::Job::Close` is in flight; no new followers or reads may attach.
+    Closing,
+    /// Closed cleanly, or `Open` failed before creating a disk-thread reader entry.
+    Closed,
+}
+
+/// A record file opened once and shared across concurrent device fetches whose
+/// path and expected header match exactly.
+struct SharedSegment {
+    disk: Option<JobId>,
+    key: SegmentKey,
+    state: SharedFileState,
+    /// Submitted disk jobs (`Open`, `ReadPages`, `ReadRow`, `ReadPacked`, `Close`) awaiting replies.
+    disk_outstanding: usize,
+    next_disk_window: u32,
+    pending_page_reads: HashMap<u32, SharedWindowId>,
+    pending_packed_reads: HashMap<u32, SharedWindowId>,
+    /// `disk::Job::ReadRow` carries no window id; replies arrive in FIFO order on `disk`.
+    pending_row_reads: VecDeque<SharedWindowId>,
+    open_error: Option<Error>,
+    users: HashSet<JobId>,
+}
+
+impl SharedSegment {
+    fn reusable(&self) -> bool {
+        self.open_error.is_none()
+            && matches!(
+                self.state,
+                SharedFileState::Unopened | SharedFileState::Opening | SharedFileState::Opened
+            )
+    }
+
+    fn disk_settled(&self) -> bool {
+        self.state == SharedFileState::Unopened
+            || (self.state == SharedFileState::Closed && self.disk_outstanding == 0)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SharedWindowPhase {
+    Reading,
+    Read,
+    Failed,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct WindowFollower {
+    record: JobId,
+    plan_index: usize,
+}
+
+impl WindowFollower {
+    fn matches(self, record: JobId, plan_index: usize) -> bool {
+        self.record == record && self.plan_index == plan_index
+    }
+}
+
+/// One staged read window shared across concurrent device fetches.
+///
+/// Its `SlabPool` slots or v4 `packed_buf` remain retained until every
+/// in-flight disk read and every attached follower's GPU upload have completed
+/// (`followers.is_empty() && disk_referenced == 0 && upload_referenced == 0`).
+struct SharedWindow {
+    segment: SharedSegmentId,
+    key: WindowKey,
+    buffers: Buffers,
+    packed_buf: Option<Arc<Vec<u8>>>,
+    phase: SharedWindowPhase,
+    error: Option<Error>,
+    pages_submitted: bool,
+    row_submitted: bool,
+    #[cfg(any(test, feature = "test-support"))]
+    disk_read_counted: bool,
+    /// Cumulative disk-thread execution time across this window's read jobs.
+    read_elapsed: Duration,
+    /// In-flight `ReadPages`, `ReadRow`, or `ReadPacked` jobs populating this window.
+    disk_referenced: usize,
+    /// In-flight `copier::Job` uploads reading from `buffers` or `packed_buf`.
+    upload_referenced: usize,
+    /// Bytes read from disk for this window, credited to each follower.
+    read_bytes: u64,
+    followers: Vec<WindowFollower>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DeviceActiveWindow {
+    plan_index: usize,
+    shared: SharedWindowId,
+    upload_submitted: bool,
+    upload_done: bool,
+}
+
+struct DeviceSegmentRef {
+    segment: SegmentKey,
+    /// `None` for zero-window segments that contribute neither pages nor a row.
+    shared: Option<SharedSegmentId>,
+}
+
+/// One device fetch (`Staged::fetch`) executing aligned windows out of order
+/// over shared open segments and shared staging windows.
+struct DeviceInbound {
+    segments: Vec<DeviceSegmentRef>,
+    pages: Vec<PageId>,
+    slot: StateSlotId,
+    plans: Vec<WindowPlan>,
+    started: Vec<bool>,
+    active: Vec<DeviceActiveWindow>,
+    done: usize,
+    bytes: u64,
+    error: Option<Error>,
+}
+
+impl DeviceInbound {
+    fn new(
+        segments: Vec<DeviceSegmentRef>,
+        pages: Vec<PageId>,
+        slot: StateSlotId,
+        plans: Vec<WindowPlan>,
+    ) -> Self {
+        let started = vec![false; plans.len()];
+        Self {
+            segments,
+            pages,
+            slot,
+            plans,
+            started,
+            active: Vec::with_capacity(WINDOWS_IN_FLIGHT),
+            done: 0,
+            bytes: 0,
+            error: None,
+        }
+    }
+
+    fn window_key(&self, plan_index: usize) -> WindowKey {
+        let plan = self.plans[plan_index];
+        WindowKey {
+            segment: self.segments[plan.segment].segment.clone(),
+            first: plan.first,
+            count: plan.count,
+            row: plan.row,
+        }
+    }
+
+    fn has_unstarted_packed(&self) -> bool {
+        self.plans.iter().enumerate().any(|(idx, plan)| {
+            !self.started[idx]
+                && self.segments[plan.segment]
+                    .segment
+                    .expected
+                    .0
+                    .packed
+                    .is_some()
+        })
+    }
+
+    fn fail(&mut self, error: Error) {
+        self.error.get_or_insert(error);
+    }
+}
+
 /// The staged transport: record files move through a shared slot
 /// pool and the shared transfer threads. It also moves records between files
 /// and caller-owned registered buffers for the composite store.
@@ -1494,13 +1646,21 @@ impl InboundRecord {
 pub struct Staged {
     resources: Resources,
     outbound: HashMap<JobId, OutboundRecord>,
-    inbound: HashMap<JobId, InboundRecord>,
+    host_inbound: HashMap<JobId, HostInbound>,
+    device_inbound: HashMap<JobId, DeviceInbound>,
     completed_packed_reads: HashMap<JobId, (Header, Arc<Vec<u8>>)>,
-    /// Disk job ids to the store job each belongs to.
+    shared_segments: HashMap<SharedSegmentId, SharedSegment>,
+    shared_windows: HashMap<SharedWindowId, SharedWindow>,
+    window_index: HashMap<WindowKey, SharedWindowId>,
+    next_shared_segment: u64,
+    next_shared_window: u64,
+    /// Disk job ids to the store job or shared segment each belongs to.
     owners: HashMap<JobId, Owner>,
     /// Truncate and unlink jobs awaiting disk queue space.
     maintenance: VecDeque<(JobId, disk::Job)>,
     events: Vec<TransportEvent>,
+    /// Physical shared-window read samples `(bytes, elapsed)` drained out of band.
+    inbound_samples: Vec<(u64, Duration)>,
     closed: bool,
 }
 
@@ -1508,18 +1668,31 @@ impl Staged {
     pub fn new(pool: Option<SlabPool>, transfers: SharedCopier, disk: DiskThread) -> Self {
         Self {
             resources: Resources {
+                disk,
                 pool,
                 transfers,
-                disk,
                 disk_outstanding: 0,
                 next_disk: 1,
+                #[cfg(any(test, feature = "test-support"))]
+                disk_opens: 0,
+                #[cfg(any(test, feature = "test-support"))]
+                disk_window_reads: 0,
+                #[cfg(any(test, feature = "test-support"))]
+                coalesced_windows: 0,
             },
             outbound: HashMap::new(),
-            inbound: HashMap::new(),
+            host_inbound: HashMap::new(),
+            device_inbound: HashMap::new(),
             completed_packed_reads: HashMap::new(),
+            shared_segments: HashMap::new(),
+            shared_windows: HashMap::new(),
+            window_index: HashMap::new(),
+            next_shared_segment: 1,
+            next_shared_window: 1,
             owners: HashMap::new(),
             maintenance: VecDeque::new(),
             events: Vec::new(),
+            inbound_samples: Vec::new(),
             closed: false,
         }
     }
@@ -1532,9 +1705,30 @@ impl Staged {
         self.resources.pool.as_ref()
     }
 
+    /// Physical `disk::Job::Open` calls submitted by this transport.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn disk_opens(&self) -> u64 {
+        self.resources.disk_opens
+    }
+
+    /// Physical disk window reads submitted by this transport.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn disk_window_reads(&self) -> u64 {
+        self.resources.disk_window_reads
+    }
+
+    /// Logical device-fetch windows satisfied by attaching to an in-flight shared window.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn coalesced_windows(&self) -> u64 {
+        self.resources.coalesced_windows
+    }
+
     /// Records of each direction whose pipelines have not finished.
     pub fn in_flight(&self) -> (usize, usize) {
-        (self.outbound.len(), self.inbound.len())
+        (
+            self.outbound.len(),
+            self.host_inbound.len() + self.device_inbound.len(),
+        )
     }
 
     /// Write a record whose page and row bytes already sit in caller-owned
@@ -1617,7 +1811,7 @@ impl Staged {
             row,
         };
         let disk = self.resources.disk_id();
-        self.owners.insert(disk, Owner::Inbound(id, 0));
+        self.owners.insert(disk, Owner::HostInbound(id, 0));
         let segment = Segment {
             disk,
             path,
@@ -1625,11 +1819,11 @@ impl Staged {
             state: FileState::Unopened,
             reads_left: 1,
         };
-        self.inbound.insert(
+        self.host_inbound.insert(
             id,
-            InboundRecord::new(vec![segment], Destination::HostPacked, vec![plan]),
+            HostInbound::new(vec![segment], HostDestination::Packed, vec![plan]),
         );
-        self.pump_inbound(id);
+        self.pump_host_inbound(id);
         Ok(())
     }
 
@@ -1654,9 +1848,9 @@ impl Staged {
                 "a record read must name page buffers or the row buffer",
             ));
         }
-        let plans = plan_windows([(first_page, pages.len(), row.is_some())]);
+        let plans = plan_windows([(first_page, pages.len(), row.is_some())], false);
         let disk = self.resources.disk_id();
-        self.owners.insert(disk, Owner::Inbound(id, 0));
+        self.owners.insert(disk, Owner::HostInbound(id, 0));
         let segment = Segment {
             disk,
             path,
@@ -1664,11 +1858,15 @@ impl Staged {
             state: FileState::Unopened,
             reads_left: plans.len(),
         };
-        self.inbound.insert(
+        self.host_inbound.insert(
             id,
-            InboundRecord::new(vec![segment], Destination::Host { pages, row }, plans),
+            HostInbound::new(
+                vec![segment],
+                HostDestination::Slots { pages, row },
+                plans,
+            ),
         );
-        self.pump_inbound(id);
+        self.pump_host_inbound(id);
         Ok(())
     }
 
@@ -1711,13 +1909,64 @@ impl Staged {
         if self.closed {
             return Err(invalid("the staged transport is closed"));
         }
-        if self.outbound.contains_key(&id) || self.inbound.contains_key(&id) {
+        if self.outbound.contains_key(&id)
+            || self.host_inbound.contains_key(&id)
+            || self.device_inbound.contains_key(&id)
+        {
             return Err(invalid(format!(
                 "disk transport job {} is already in flight",
                 id.0
             )));
         }
         Ok(())
+    }
+
+    fn next_shared_segment_id(&mut self) -> SharedSegmentId {
+        let id = SharedSegmentId(self.next_shared_segment);
+        self.next_shared_segment += 1;
+        id
+    }
+
+    fn next_shared_window_id(&mut self) -> SharedWindowId {
+        let id = SharedWindowId(self.next_shared_window);
+        self.next_shared_window += 1;
+        id
+    }
+
+    fn acquire_shared_segment(&mut self, user: JobId, key: SegmentKey) -> (SharedSegmentId, SegmentKey) {
+        let existing = self
+            .shared_segments
+            .iter()
+            .filter(|(_, seg)| seg.reusable() && seg.key == key)
+            .min_by_key(|&(&id, _)| id)
+            .map(|(&id, seg)| (id, seg.key.clone()));
+        if let Some((seg_id, shared_key)) = existing {
+            self.shared_segments
+                .get_mut(&seg_id)
+                .unwrap()
+                .users
+                .insert(user);
+            return (seg_id, shared_key);
+        }
+        let seg_id = self.next_shared_segment_id();
+        let mut users = HashSet::new();
+        users.insert(user);
+        self.shared_segments.insert(
+            seg_id,
+            SharedSegment {
+                disk: None,
+                key: key.clone(),
+                state: SharedFileState::Unopened,
+                disk_outstanding: 0,
+                next_disk_window: 0,
+                pending_page_reads: HashMap::new(),
+                pending_packed_reads: HashMap::new(),
+                pending_row_reads: VecDeque::new(),
+                open_error: None,
+                users,
+            },
+        );
+        (seg_id, key)
     }
 
     fn start_outbound(
@@ -1760,12 +2009,12 @@ impl Staged {
         }
     }
 
-    fn pump_inbound(&mut self, id: JobId) {
-        let Some(record) = self.inbound.get_mut(&id) else {
+    fn pump_host_inbound(&mut self, id: JobId) {
+        let Some(record) = self.host_inbound.get_mut(&id) else {
             return;
         };
-        if let Some(result) = record.pump(id, &mut self.resources) {
-            let mut record = self.inbound.remove(&id).unwrap();
+        if let Some(result) = record.pump(&mut self.resources) {
+            let mut record = self.host_inbound.remove(&id).unwrap();
             for segment in &record.segments {
                 self.owners.remove(&segment.disk);
             }
@@ -1775,6 +2024,933 @@ impl Staged {
                 self.completed_packed_reads.insert(id, packed);
             }
             self.events.push(TransportEvent::Fetched { id, result });
+        }
+    }
+
+    fn unindex_window(
+        window_index: &mut HashMap<WindowKey, SharedWindowId>,
+        key: &WindowKey,
+        id: SharedWindowId,
+    ) {
+        if window_index.get(key) == Some(&id) {
+            window_index.remove(key);
+        }
+    }
+
+    fn fail_segment_users(&mut self, seg_id: SharedSegmentId, error: &Error) {
+        let users: Vec<JobId> = self
+            .shared_segments
+            .get(&seg_id)
+            .map(|seg| seg.users.iter().copied().collect())
+            .unwrap_or_default();
+        for user in users {
+            if let Some(record) = self.device_inbound.get_mut(&user) {
+                record.fail(error.clone());
+            }
+        }
+        let mut window_followers = Vec::new();
+        for (&win_id, win) in &mut self.shared_windows {
+            if win.segment == seg_id && win.phase == SharedWindowPhase::Reading {
+                win.phase = SharedWindowPhase::Failed;
+                win.error.get_or_insert_with(|| error.clone());
+                Self::unindex_window(&mut self.window_index, &win.key, win_id);
+                window_followers.extend(win.followers.iter().map(|f| f.record));
+            }
+        }
+        for record_id in window_followers {
+            if let Some(record) = self.device_inbound.get_mut(&record_id) {
+                record.fail(error.clone());
+            }
+        }
+    }
+
+    fn fail_window(&mut self, win_id: SharedWindowId, error: Error) {
+        let Some(win) = self.shared_windows.get_mut(&win_id) else {
+            return;
+        };
+        win.phase = SharedWindowPhase::Failed;
+        Self::unindex_window(&mut self.window_index, &win.key, win_id);
+        let err = win.error.get_or_insert(error).clone();
+        let followers: Vec<JobId> = win.followers.iter().map(|f| f.record).collect();
+        for record_id in followers {
+            if let Some(record) = self.device_inbound.get_mut(&record_id) {
+                record.fail(err.clone());
+            }
+        }
+    }
+
+    fn apply_shared_disk(&mut self, seg_id: SharedSegmentId, reply: disk::Reply) {
+        let target_window = {
+            let Some(seg) = self.shared_segments.get_mut(&seg_id) else {
+                return;
+            };
+            seg.disk_outstanding = seg.disk_outstanding.saturating_sub(1);
+            match reply.operation {
+                Operation::Open => {
+                    match reply.result {
+                        Ok(()) => {
+                            seg.state = SharedFileState::Opened;
+                            return;
+                        }
+                        Err(error) => {
+                            let err = error.with_record_read();
+                            seg.state = SharedFileState::Closed;
+                            let err = seg.open_error.get_or_insert(err).clone();
+                            self.fail_segment_users(seg_id, &err);
+                            return;
+                        }
+                    }
+                }
+                Operation::ReadPages => seg.pending_page_reads.remove(&reply.window),
+                Operation::ReadPacked => seg.pending_packed_reads.remove(&reply.window),
+                Operation::ReadRow => seg.pending_row_reads.pop_front(),
+                Operation::Close => {
+                    seg.state = SharedFileState::Closed;
+                    return;
+                }
+                _ => return,
+            }
+        };
+        let Some(win_id) = target_window else {
+            return;
+        };
+        let mut sample = None;
+        let failed = {
+            let Some(win) = self.shared_windows.get_mut(&win_id) else {
+                return;
+            };
+            win.disk_referenced = win.disk_referenced.saturating_sub(1);
+            if reply.operation == Operation::ReadPacked {
+                win.packed_buf = reply.payload;
+            }
+            match reply.result {
+                Ok(()) => {
+                    win.read_bytes += reply.bytes;
+                    win.read_elapsed += reply.elapsed;
+                    if win.phase == SharedWindowPhase::Reading
+                        && win.pages_submitted
+                        && win.row_submitted
+                        && win.disk_referenced == 0
+                    {
+                        win.phase = SharedWindowPhase::Read;
+                        if win.read_bytes > 0 {
+                            sample = Some((
+                                win.read_bytes,
+                                win.read_elapsed.max(Duration::from_nanos(1)),
+                            ));
+                        }
+                    }
+                    None
+                }
+                Err(error) => Some(error.with_record_read()),
+            }
+        };
+        if let Some((bytes, elapsed)) = sample {
+            self.inbound_samples.push((bytes, elapsed));
+        }
+        if let Some(err) = failed {
+            self.fail_window(win_id, err);
+        }
+    }
+
+    fn apply_device_transfer(&mut self, reply: copier::Reply) {
+        let Some(record) = self.device_inbound.get_mut(&reply.id) else {
+            return;
+        };
+        let Some(active) = record
+            .active
+            .iter_mut()
+            .find(|active| active.plan_index as u32 == reply.window)
+        else {
+            return;
+        };
+        active.upload_done = true;
+        let shared_id = active.shared;
+        let mut packed_has_buf = false;
+        if let Some(win) = self.shared_windows.get_mut(&shared_id) {
+            win.upload_referenced = win.upload_referenced.saturating_sub(1);
+            packed_has_buf = win.packed_buf.is_some();
+        }
+        if let Err(error) = reply.result {
+            if packed_has_buf && is_packed_content_error(&error) {
+                let err = error.with_record_read();
+                record.fail(err.clone());
+                self.fail_window(shared_id, err);
+            } else {
+                record.fail(error);
+            }
+        }
+    }
+
+    fn find_reusable_window(&self, key: &WindowKey) -> Option<(SharedWindowId, SharedWindowPhase)> {
+        let &win_id = self.window_index.get(key)?;
+        let win = self.shared_windows.get(&win_id)?;
+        let reusable = match win.phase {
+            SharedWindowPhase::Read => true,
+            SharedWindowPhase::Reading => {
+                self.shared_segments.get(&win.segment).is_some_and(|seg| {
+                    seg.open_error.is_none()
+                        && matches!(
+                            seg.state,
+                            SharedFileState::Opening | SharedFileState::Opened
+                        )
+                })
+            }
+            SharedWindowPhase::Failed => false,
+        };
+        reusable.then_some((win_id, win.phase))
+    }
+
+    fn find_best_existing_window_for(&self, id: JobId) -> Option<(usize, SharedWindowId)> {
+        let record = self.device_inbound.get(&id)?;
+        let mut best: Option<(bool, usize, SharedWindowId)> = None;
+        for plan_index in 0..record.plans.len() {
+            if record.started[plan_index] {
+                continue;
+            }
+            let key = record.window_key(plan_index);
+            if let Some((win_id, phase)) = self.find_reusable_window(&key) {
+                let candidate = (phase != SharedWindowPhase::Read, plan_index, win_id);
+                if best.is_none_or(|current| candidate < current) {
+                    best = Some(candidate);
+                }
+            }
+        }
+        best.map(|(_, plan_index, win_id)| (plan_index, win_id))
+    }
+
+    fn has_window_credit(&self, id: JobId) -> bool {
+        self.device_inbound
+            .get(&id)
+            .is_some_and(|record| record.error.is_none() && record.active.len() < WINDOWS_IN_FLIGHT)
+    }
+
+    fn attach_existing_window(&mut self, id: JobId, plan_index: usize, win_id: SharedWindowId) {
+        if let Some(win) = self.shared_windows.get_mut(&win_id) {
+            win.followers.push(WindowFollower {
+                record: id,
+                plan_index,
+            });
+        }
+        if let Some(record) = self.device_inbound.get_mut(&id) {
+            record.started[plan_index] = true;
+            record.active.push(DeviceActiveWindow {
+                plan_index,
+                shared: win_id,
+                upload_submitted: false,
+                upload_done: false,
+            });
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.resources.coalesced_windows += 1;
+        }
+    }
+
+    fn attach_pending(
+        &mut self,
+        id: JobId,
+        demand: Option<&mut HashMap<WindowKey, usize>>,
+    ) -> bool {
+        if !self.has_window_credit(id) {
+            return false;
+        }
+        let Some((plan_index, win_id)) = self.find_best_existing_window_for(id) else {
+            return false;
+        };
+        if let Some(demand_map) = demand {
+            let key = self.device_inbound[&id].window_key(plan_index);
+            if let Some(count) = demand_map.get_mut(&key) {
+                *count = count.saturating_sub(1);
+            }
+        }
+        self.attach_existing_window(id, plan_index, win_id);
+        true
+    }
+
+    /// Build a per-window demand table across healthy fetches so Pass 4 selects
+    /// shared ancestor windows in linear time without per-plan path allocations.
+    fn build_pending_demand(&self) -> HashMap<WindowKey, usize> {
+        let mut demand = HashMap::new();
+        if self.device_inbound.len() <= 1 {
+            return demand;
+        }
+        for record in self.device_inbound.values() {
+            if record.error.is_some() {
+                continue;
+            }
+            let mut seen_in_record: HashSet<(usize, u32, usize, bool)> = HashSet::new();
+            for (idx, plan) in record.plans.iter().enumerate() {
+                if record.started[idx] {
+                    continue;
+                }
+                if !seen_in_record.insert((plan.segment, plan.first, plan.count, plan.row)) {
+                    continue;
+                }
+                *demand.entry(record.window_key(idx)).or_insert(0) += 1;
+            }
+        }
+        demand
+    }
+
+    /// Choose the next unstarted window for `id`, preferring windows also
+    /// pending in sibling concurrent fetches so they stay synchronized on
+    /// shared ancestors before fanning out to private segments.
+    fn pick_next_pending_plan(
+        &self,
+        id: JobId,
+        demand: &HashMap<WindowKey, usize>,
+    ) -> Option<usize> {
+        let record = self.device_inbound.get(&id)?;
+        self.resources.pool.as_ref()?;
+        let free = self.resources.free_slots();
+        let transfers = lock(&self.resources.transfers);
+        let layout = transfers.layout();
+        let mut best: Option<(usize, usize)> = None;
+        for (plan_index, plan) in record.plans.iter().enumerate() {
+            if record.started[plan_index] {
+                continue;
+            }
+            let packed = record.segments[plan.segment]
+                .segment
+                .expected
+                .0
+                .packed
+                .is_some();
+            if !packed && layout.record_slots(plan.count, plan.row) > free {
+                continue;
+            }
+            let peer_demand = demand
+                .get(&record.window_key(plan_index))
+                .map_or(0, |total| total.saturating_sub(1));
+            if best.is_none_or(|(best_demand, _)| peer_demand > best_demand) {
+                best = Some((peer_demand, plan_index));
+            }
+        }
+        best.map(|(_, plan_index)| plan_index)
+    }
+
+    fn detach_unwinding_windows(&mut self, ids: &[JobId]) {
+        for &id in ids {
+            let Some(record) = self.device_inbound.get_mut(&id) else {
+                continue;
+            };
+            if record.error.is_none() {
+                continue;
+            }
+            let mut index = 0;
+            while index < record.active.len() {
+                let active = record.active[index];
+                let upload_busy = active.upload_submitted && !active.upload_done;
+                let can_detach = !upload_busy
+                    && self.shared_windows.get(&active.shared).is_none_or(|win| {
+                        win.followers.iter().any(|f| f.record != id) || win.disk_referenced == 0
+                    });
+                if can_detach {
+                    let active = record.active.remove(index);
+                    if let Some(win) = self.shared_windows.get_mut(&active.shared) {
+                        win.followers.retain(|f| !f.matches(id, active.plan_index));
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+        }
+    }
+
+    fn sweep_shared_windows(&mut self) {
+        let dead: Vec<SharedWindowId> = self
+            .shared_windows
+            .iter()
+            .filter(|(_, win)| {
+                win.followers.is_empty()
+                    && win.disk_referenced == 0
+                    && win.upload_referenced == 0
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for win_id in dead {
+            if let Some(mut win) = self.shared_windows.remove(&win_id) {
+                Self::unindex_window(&mut self.window_index, &win.key, win_id);
+                self.resources.release(&mut win.buffers);
+            }
+        }
+    }
+
+    fn segment_needs_disk_reads(&self, seg_id: SharedSegmentId) -> bool {
+        let Some(seg) = self.shared_segments.get(&seg_id) else {
+            return false;
+        };
+        if seg.disk_outstanding > 0 {
+            return true;
+        }
+        if self.shared_windows.values().any(|win| {
+            win.segment == seg_id
+                && (win.disk_referenced > 0
+                    || (win.phase == SharedWindowPhase::Reading
+                        && win.followers.iter().any(|f| {
+                            self.device_inbound
+                                .get(&f.record)
+                                .is_some_and(|record| record.error.is_none())
+                        })))
+        }) {
+            return true;
+        }
+        seg.users.iter().any(|user_id| {
+            self.device_inbound.get(user_id).is_some_and(|record| {
+                record.error.is_none()
+                    && record.plans.iter().enumerate().any(|(plan_index, plan)| {
+                        !record.started[plan_index]
+                            && record.segments[plan.segment].shared == Some(seg_id)
+                    })
+            })
+        })
+    }
+
+    fn remove_shared_segment(&mut self, seg_id: SharedSegmentId) {
+        if let Some(seg) = self.shared_segments.remove(&seg_id)
+            && let Some(disk) = seg.disk
+        {
+            self.owners.remove(&disk);
+        }
+    }
+
+    fn pump_device_inbound(&mut self) {
+        let mut ids: Vec<JobId> = self.device_inbound.keys().copied().collect();
+        ids.sort_unstable();
+
+        // Pass 1: reap completed uploads on healthy records and detach finished
+        // or shared windows from unwinding records.
+        for &id in &ids {
+            let Some(record) = self.device_inbound.get_mut(&id) else {
+                continue;
+            };
+            if record.error.is_some() {
+                continue;
+            }
+            let mut index = 0;
+            while index < record.active.len() {
+                if record.active[index].upload_done {
+                    let active = record.active.remove(index);
+                    if let Some(win) = self.shared_windows.get_mut(&active.shared) {
+                        record.bytes += win.read_bytes;
+                        win.followers.retain(|f| !f.matches(id, active.plan_index));
+                    }
+                    record.done += 1;
+                } else {
+                    index += 1;
+                }
+            }
+        }
+        self.detach_unwinding_windows(&ids);
+
+        // Pass 2: attach healthy records with free window credit to already
+        // in-flight shared windows before sweeping finished buffers or starting
+        // new disk reads.
+        for &id in &ids {
+            while self.attach_pending(id, None) {}
+        }
+
+        // Pass 3: release staging slots for shared windows no follower or job
+        // still references.
+        self.sweep_shared_windows();
+
+        // Pass 4: start new shared windows (or attach to one started by an
+        // earlier record in this pass) as slots and disk queue depth allow.
+        let any_packed = self
+            .device_inbound
+            .values()
+            .any(|record| record.error.is_none() && record.has_unstarted_packed());
+        let mut demand = if self.resources.free_slots() > 0 || any_packed {
+            Some(self.build_pending_demand())
+        } else {
+            None
+        };
+        for &id in &ids {
+            while self.has_window_credit(id) {
+                if self.attach_pending(id, demand.as_mut()) {
+                    continue;
+                }
+                if self.resources.free_slots() == 0
+                    && !self.device_inbound[&id].has_unstarted_packed()
+                {
+                    break;
+                }
+                let demand_ref = demand.get_or_insert_with(|| self.build_pending_demand());
+                let Some(plan_index) = self.pick_next_pending_plan(id, demand_ref) else {
+                    break;
+                };
+                let (plan, seg_id, key) = {
+                    let record = &self.device_inbound[&id];
+                    let plan = record.plans[plan_index];
+                    let seg_ref = &record.segments[plan.segment];
+                    (plan, seg_ref.shared.unwrap(), record.window_key(plan_index))
+                };
+                let seg_state = self.shared_segments[&seg_id].state;
+                debug_assert!(matches!(
+                    seg_state,
+                    SharedFileState::Unopened
+                        | SharedFileState::Opening
+                        | SharedFileState::Opened
+                ));
+                if seg_state == SharedFileState::Unopened {
+                    if !self.resources.disk_space() {
+                        break;
+                    }
+                    let disk = self.resources.disk_id();
+                    let job = disk::Job::Open {
+                        id: disk,
+                        path: key.segment.path.as_ref().to_path_buf(),
+                        expected: (*key.segment.expected.0).clone(),
+                    };
+                    match self.resources.submit_disk(job) {
+                        Ok(()) => {
+                            self.owners.insert(disk, Owner::SharedSegment(seg_id));
+                            let seg = self.shared_segments.get_mut(&seg_id).unwrap();
+                            seg.disk = Some(disk);
+                            seg.state = SharedFileState::Opening;
+                            seg.disk_outstanding += 1;
+                            #[cfg(any(test, feature = "test-support"))]
+                            {
+                                self.resources.disk_opens += 1;
+                            }
+                        }
+                        Err(error) => {
+                            let seg = self.shared_segments.get_mut(&seg_id).unwrap();
+                            seg.state = SharedFileState::Closed;
+                            let err = seg.open_error.get_or_insert(error).clone();
+                            self.fail_segment_users(seg_id, &err);
+                            break;
+                        }
+                    }
+                }
+                let packed = key.segment.expected.0.packed.is_some();
+                let buffers = if packed {
+                    Buffers {
+                        pages: Vec::new(),
+                        row: None,
+                        slots: None,
+                    }
+                } else {
+                    let Some(buffers) = self.resources.allocate(plan.count, plan.row) else {
+                        break;
+                    };
+                    buffers
+                };
+                let win_id = self.next_shared_window_id();
+                if let Some(demand_map) = demand.as_mut()
+                    && let Some(count) = demand_map.get_mut(&key)
+                {
+                    *count = count.saturating_sub(1);
+                }
+                self.window_index.insert(key.clone(), win_id);
+                self.shared_windows.insert(
+                    win_id,
+                    SharedWindow {
+                        segment: seg_id,
+                        key,
+                        buffers,
+                        packed_buf: None,
+                        phase: SharedWindowPhase::Reading,
+                        error: None,
+                        pages_submitted: !packed && plan.count == 0,
+                        row_submitted: !packed && !plan.row,
+                        #[cfg(any(test, feature = "test-support"))]
+                        disk_read_counted: false,
+                        read_elapsed: Duration::ZERO,
+                        disk_referenced: 0,
+                        upload_referenced: 0,
+                        read_bytes: 0,
+                        followers: vec![WindowFollower {
+                            record: id,
+                            plan_index,
+                        }],
+                    },
+                );
+                let record = self.device_inbound.get_mut(&id).unwrap();
+                record.started[plan_index] = true;
+                record.active.push(DeviceActiveWindow {
+                    plan_index,
+                    shared: win_id,
+                    upload_submitted: false,
+                    upload_done: false,
+                });
+            }
+        }
+
+        // Pass 5a: submit pending disk reads for shared windows with at least
+        // one healthy follower.
+        let mut win_ids: Vec<SharedWindowId> = self.shared_windows.keys().copied().collect();
+        win_ids.sort_unstable();
+        for win_id in win_ids {
+            let has_healthy_follower = self.shared_windows.get(&win_id).is_some_and(|win| {
+                win.phase == SharedWindowPhase::Reading
+                    && win.followers.iter().any(|f| {
+                        self.device_inbound
+                            .get(&f.record)
+                            .is_some_and(|record| record.error.is_none())
+                    })
+            });
+            if !has_healthy_follower {
+                continue;
+            }
+            let (
+                seg_id,
+                pages_needed,
+                row_needed,
+                first,
+                count,
+                row,
+                page_segment,
+                packed_layout,
+                page_buffers,
+                row_buffers,
+            ) = {
+                let win = &self.shared_windows[&win_id];
+                let expected = &win.key.segment.expected.0;
+                (
+                    win.segment,
+                    !win.pages_submitted,
+                    !win.row_submitted,
+                    win.key.first,
+                    win.key.count,
+                    win.key.row,
+                    expected.page_segment,
+                    expected.packed.clone(),
+                    if !win.pages_submitted && expected.packed.is_none() {
+                        Some(win.buffers.pages.clone())
+                    } else {
+                        None
+                    },
+                    if !win.row_submitted && expected.packed.is_none() {
+                        win.buffers.row.clone()
+                    } else {
+                        None
+                    },
+                )
+            };
+            let Some(disk) = self
+                .shared_segments
+                .get(&seg_id)
+                .filter(|seg| {
+                    seg.open_error.is_none()
+                        && matches!(seg.state, SharedFileState::Opening | SharedFileState::Opened)
+                })
+                .and_then(|seg| seg.disk)
+            else {
+                continue;
+            };
+            if let Some(layout) = packed_layout {
+                if !pages_needed {
+                    continue;
+                }
+                if !self.resources.disk_space() {
+                    continue;
+                }
+                let start_rel = if count == 0 && row {
+                    layout.page_offset(layout.page_count())
+                } else {
+                    layout.page_offset(first as usize)
+                };
+                let end_rel = if row {
+                    layout.physical_bytes()
+                } else {
+                    layout.page_offset(first as usize + count)
+                };
+                let offset = page_segment + start_rel;
+                let length = match usize::try_from(end_rel - start_rel) {
+                    Ok(len) => len,
+                    Err(_) => {
+                        self.fail_window(win_id, invalid("packed window length overflow"));
+                        continue;
+                    }
+                };
+                let token = {
+                    let seg = self.shared_segments.get_mut(&seg_id).unwrap();
+                    let token = seg.next_disk_window;
+                    seg.next_disk_window = seg.next_disk_window.wrapping_add(1);
+                    token
+                };
+                let job = disk::Job::ReadPacked {
+                    id: disk,
+                    window: token,
+                    offset,
+                    length,
+                };
+                match self.resources.submit_disk(job) {
+                    Ok(()) => {
+                        let seg = self.shared_segments.get_mut(&seg_id).unwrap();
+                        seg.pending_packed_reads.insert(token, win_id);
+                        seg.disk_outstanding += 1;
+                        let win = self.shared_windows.get_mut(&win_id).unwrap();
+                        win.pages_submitted = true;
+                        win.row_submitted = true;
+                        win.disk_referenced += 1;
+                        #[cfg(any(test, feature = "test-support"))]
+                        if !win.disk_read_counted {
+                            win.disk_read_counted = true;
+                            self.resources.disk_window_reads += 1;
+                        }
+                    }
+                    Err(error) => {
+                        self.fail_window(win_id, error);
+                    }
+                }
+                continue;
+            }
+            if pages_needed {
+                if !self.resources.disk_space() {
+                    continue;
+                }
+                let token = {
+                    let seg = self.shared_segments.get_mut(&seg_id).unwrap();
+                    let token = seg.next_disk_window;
+                    seg.next_disk_window = seg.next_disk_window.wrapping_add(1);
+                    token
+                };
+                let job = disk::Job::ReadPages {
+                    id: disk,
+                    window: token,
+                    first,
+                    buffers: page_buffers.unwrap(),
+                };
+                match self.resources.submit_disk(job) {
+                    Ok(()) => {
+                        let seg = self.shared_segments.get_mut(&seg_id).unwrap();
+                        seg.pending_page_reads.insert(token, win_id);
+                        seg.disk_outstanding += 1;
+                        let win = self.shared_windows.get_mut(&win_id).unwrap();
+                        win.pages_submitted = true;
+                        win.disk_referenced += 1;
+                        #[cfg(any(test, feature = "test-support"))]
+                        if !win.disk_read_counted {
+                            win.disk_read_counted = true;
+                            self.resources.disk_window_reads += 1;
+                        }
+                    }
+                    Err(error) => {
+                        self.fail_window(win_id, error);
+                        continue;
+                    }
+                }
+            }
+            if row_needed {
+                if !self.resources.disk_space() {
+                    continue;
+                }
+                let job = disk::Job::ReadRow {
+                    id: disk,
+                    buffers: row_buffers.unwrap(),
+                };
+                match self.resources.submit_disk(job) {
+                    Ok(()) => {
+                        let seg = self.shared_segments.get_mut(&seg_id).unwrap();
+                        seg.pending_row_reads.push_back(win_id);
+                        seg.disk_outstanding += 1;
+                        let win = self.shared_windows.get_mut(&win_id).unwrap();
+                        win.row_submitted = true;
+                        win.disk_referenced += 1;
+                        #[cfg(any(test, feature = "test-support"))]
+                        if !win.disk_read_counted {
+                            win.disk_read_counted = true;
+                            self.resources.disk_window_reads += 1;
+                        }
+                    }
+                    Err(error) => {
+                        self.fail_window(win_id, error);
+                    }
+                }
+            }
+        }
+
+        // Pass 5b: submit per-follower GPU uploads for shared windows whose
+        // disk reads have completed.
+        for &id in &ids {
+            let active_len = match self.device_inbound.get(&id) {
+                Some(record) if record.error.is_none() => record.active.len(),
+                _ => continue,
+            };
+            for index in 0..active_len {
+                let active = self.device_inbound[&id].active[index];
+                if active.upload_submitted {
+                    continue;
+                }
+                let ready = self
+                    .shared_windows
+                    .get(&active.shared)
+                    .is_some_and(|win| win.phase == SharedWindowPhase::Read);
+                if !ready {
+                    continue;
+                }
+                if !self.resources.transfer_space() {
+                    break;
+                }
+                let job_result: Result<copier::Job> = (|| {
+                    let record = &self.device_inbound[&id];
+                    let plan = record.plans[active.plan_index];
+                    let win = &self.shared_windows[&active.shared];
+                    if let Some(layout) = &win.key.segment.expected.0.packed {
+                        let buf = win
+                            .packed_buf
+                            .as_ref()
+                            .ok_or_else(|| invalid("packed window missing disk payload"))?;
+                        let units = layout
+                            .units(plan.first as usize, plan.count, plan.row)
+                            .ok_or_else(|| invalid("packed window out of layout range"))?;
+                        let base = buf.as_ptr() as usize;
+                        let mut cursor = 0usize;
+                        let mut packets = Vec::with_capacity(units.len());
+                        for unit in units {
+                            let len = usize::try_from(unit.stored_length)
+                                .map_err(|_| invalid("packed unit length overflow"))?;
+                            if cursor + len > buf.len() {
+                                return Err(invalid("packed disk payload truncated"));
+                            }
+                            packets.push(crate::codec_copy::PinnedPacket {
+                                unit: unit.clone(),
+                                spans: vec![(base + cursor, len)],
+                            });
+                            cursor += len;
+                        }
+                        let first_logical = layout.offer().first_page + plan.first as u64;
+                        return Ok(copier::Job {
+                            codec: Some(crate::codec_copy::Window::restore_pinned(
+                                first_logical,
+                                packets,
+                            )),
+                            replication: Default::default(),
+                            id,
+                            window: plan.index,
+                            direction: Direction::In,
+                            pages: record.pages[plan.offset..plan.offset + plan.count]
+                                .iter()
+                                .copied()
+                                .map(|p| (p, 0))
+                                .collect(),
+                            row: plan.row.then_some((record.slot, vec![0])),
+                        });
+                    }
+                    Ok(copier::Job {
+                        codec: None,
+                        replication: Default::default(),
+                        id,
+                        window: plan.index,
+                        direction: Direction::In,
+                        pages: record.pages[plan.offset..plan.offset + plan.count]
+                            .iter()
+                            .copied()
+                            .zip(win.buffers.pages.iter().copied())
+                            .collect(),
+                        row: win.buffers.row.clone().map(|addrs| (record.slot, addrs)),
+                    })
+                })();
+                match job_result.and_then(|job| self.resources.submit_transfer(job)) {
+                    Ok(()) => {
+                        self.device_inbound.get_mut(&id).unwrap().active[index].upload_submitted =
+                            true;
+                        self.shared_windows
+                            .get_mut(&active.shared)
+                            .unwrap()
+                            .upload_referenced += 1;
+                    }
+                    Err(error) => {
+                        self.device_inbound.get_mut(&id).unwrap().fail(error);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Pass 5c: detach and release windows for any record that failed during
+        // read or transfer submission in this step.
+        self.detach_unwinding_windows(&ids);
+        self.sweep_shared_windows();
+
+        // Pass 5d: close open shared segments that no longer need disk reads.
+        let mut seg_ids: Vec<SharedSegmentId> = self.shared_segments.keys().copied().collect();
+        seg_ids.sort_unstable();
+        for seg_id in seg_ids {
+            let should_close = self
+                .shared_segments
+                .get(&seg_id)
+                .is_some_and(|seg| seg.state == SharedFileState::Opened)
+                && !self.segment_needs_disk_reads(seg_id);
+            if should_close && self.resources.disk_space() {
+                let disk = self.shared_segments[&seg_id].disk.unwrap();
+                match self.resources.submit_disk(disk::Job::Close { id: disk }) {
+                    Ok(()) => {
+                        let seg = self.shared_segments.get_mut(&seg_id).unwrap();
+                        seg.state = SharedFileState::Closing;
+                        seg.disk_outstanding += 1;
+                    }
+                    Err(_) => {
+                        let seg = self.shared_segments.get_mut(&seg_id).unwrap();
+                        seg.state = SharedFileState::Closed;
+                    }
+                }
+            }
+        }
+
+        // Pass 5e: complete finished or fully unwound device fetches. The last
+        // user of a shared segment waits for it to settle before completing so
+        // no disk I/O outlives the caller's index pin on that file.
+        for &id in &ids {
+            let outcome = {
+                let Some(record) = self.device_inbound.get(&id) else {
+                    continue;
+                };
+                let windows_done = if record.error.is_some() {
+                    record.active.is_empty()
+                } else {
+                    record.done == record.plans.len() && record.active.is_empty()
+                };
+                if !windows_done {
+                    continue;
+                }
+                let segments_ready = record
+                    .segments
+                    .iter()
+                    .filter_map(|seg_ref| seg_ref.shared)
+                    .all(|seg_id| {
+                        self.shared_segments.get(&seg_id).is_none_or(|seg| {
+                            seg.users.iter().any(|&other| other != id) || seg.disk_settled()
+                        })
+                    });
+                if !segments_ready {
+                    continue;
+                }
+                match &record.error {
+                    Some(error) => Err(error.clone()),
+                    None => Ok(record.bytes),
+                }
+            };
+            let record = self.device_inbound.remove(&id).unwrap();
+            for seg_id in record.segments.iter().filter_map(|seg_ref| seg_ref.shared) {
+                let remove = match self.shared_segments.get_mut(&seg_id) {
+                    Some(seg) => {
+                        seg.users.remove(&id);
+                        seg.users.is_empty() && seg.disk_settled()
+                    }
+                    None => false,
+                };
+                if remove {
+                    self.remove_shared_segment(seg_id);
+                }
+            }
+            self.events.push(TransportEvent::Fetched {
+                id,
+                result: outcome,
+            });
+        }
+
+        let empty_segments: Vec<SharedSegmentId> = self
+            .shared_segments
+            .iter()
+            .filter(|(_, seg)| seg.users.is_empty() && seg.disk_settled())
+            .map(|(&seg_id, _)| seg_id)
+            .collect();
+        for seg_id in empty_segments {
+            self.remove_shared_segment(seg_id);
         }
     }
 
@@ -1793,11 +2969,12 @@ impl Staged {
         for id in ids {
             self.pump_outbound(id);
         }
-        let mut ids: Vec<JobId> = self.inbound.keys().copied().collect();
+        let mut ids: Vec<JobId> = self.host_inbound.keys().copied().collect();
         ids.sort_unstable();
         for id in ids {
-            self.pump_inbound(id);
+            self.pump_host_inbound(id);
         }
+        self.pump_device_inbound();
     }
 
     fn finish_maintenance(&mut self, disk: JobId, result: Result<()>) {
@@ -1820,10 +2997,13 @@ impl Staged {
                         record.apply_disk(reply);
                     }
                 }
-                Some(Owner::Inbound(id, segment)) => {
-                    if let Some(record) = self.inbound.get_mut(&id) {
+                Some(Owner::HostInbound(id, segment)) => {
+                    if let Some(record) = self.host_inbound.get_mut(&id) {
                         record.apply_disk(segment, reply);
                     }
+                }
+                Some(Owner::SharedSegment(seg_id)) => {
+                    self.apply_shared_disk(seg_id, reply);
                 }
                 Some(Owner::Truncate(_) | Owner::Unlink(_)) => {
                     self.finish_maintenance(reply.id, reply.result);
@@ -1842,9 +3022,7 @@ impl Staged {
                         }
                     }
                     Direction::In => {
-                        if let Some(record) = self.inbound.get_mut(&reply.id) {
-                            record.apply_transfer(reply);
-                        }
+                        self.apply_device_transfer(reply);
                     }
                 }
             }
@@ -1853,7 +3031,12 @@ impl Staged {
     }
 
     fn busy(&self) -> bool {
-        !self.outbound.is_empty() || !self.inbound.is_empty() || !self.owners.is_empty()
+        !self.outbound.is_empty()
+            || !self.host_inbound.is_empty()
+            || !self.device_inbound.is_empty()
+            || !self.shared_segments.is_empty()
+            || !self.shared_windows.is_empty()
+            || !self.owners.is_empty()
     }
 }
 
@@ -1918,26 +3101,28 @@ impl DiskTransport for Staged {
         let plans = plan_windows(
             plan.iter()
                 .map(|segment| (segment.first_page, segment.pages as usize, segment.row)),
+            true,
         );
         let mut segments = Vec::with_capacity(plan.len());
         for (index, segment) in plan.into_iter().enumerate() {
-            let disk = self.resources.disk_id();
-            self.owners.insert(disk, Owner::Inbound(id, index));
-            segments.push(Segment {
-                disk,
-                path: segment.path,
-                expected: segment.header,
-                state: FileState::Unopened,
-                reads_left: plans.iter().filter(|plan| plan.segment == index).count(),
-            });
+            let key = SegmentKey {
+                path: Arc::from(segment.path),
+                expected: HeaderIdentity(Arc::new(segment.header)),
+            };
+            let has_windows = plans.iter().any(|window| window.segment == index);
+            let (shared, segment) = if has_windows {
+                let (seg_id, shared_key) = self.acquire_shared_segment(id, key);
+                (Some(seg_id), shared_key)
+            } else {
+                (None, key)
+            };
+            segments.push(DeviceSegmentRef { segment, shared });
         }
-        let destination = Destination::Device {
-            pages: ticket.pages.clone(),
-            slot: ticket.slot,
-        };
-        self.inbound
-            .insert(id, InboundRecord::new(segments, destination, plans));
-        self.pump_inbound(id);
+        self.device_inbound.insert(
+            id,
+            DeviceInbound::new(segments, ticket.pages.clone(), ticket.slot, plans),
+        );
+        self.pump_device_inbound();
         Ok(())
     }
 
@@ -1977,6 +3162,10 @@ impl DiskTransport for Staged {
         Ok(())
     }
 
+    fn drain_inbound_samples(&mut self, samples: &mut Vec<(u64, Duration)>) {
+        samples.append(&mut self.inbound_samples);
+    }
+
     /// Finish outstanding pipelines within [`copier::CLOSE_TIMEOUT`], then
     /// stop the disk thread and, when this transport owns the slot pool,
     /// the transfer threads. Completions reached before the deadline remain
@@ -1991,7 +3180,19 @@ impl DiskTransport for Staged {
             std::thread::sleep(Duration::from_millis(1));
         }
         self.closed = true;
-        let abandoned = self.owners.len();
+        let maintenance_jobs = self
+            .owners
+            .values()
+            .filter(|owner| matches!(owner, Owner::Truncate(_) | Owner::Unlink(_)))
+            .count();
+        let store_jobs = self.outbound.len()
+            + self.host_inbound.len()
+            + self.device_inbound.len()
+            + maintenance_jobs;
+        let abandoned_jobs = store_jobs
+            .max(self.owners.len())
+            .max(self.maintenance.len());
+        let leaked_shared = self.shared_segments.len() + self.shared_windows.len();
         let disk = self.resources.disk.close();
         let transfers = match self.resources.pool {
             Some(_) => lock(&self.resources.transfers).close(),
@@ -2002,10 +3203,23 @@ impl DiskTransport for Staged {
         {
             pool.leak();
         }
+        if transfers.is_err() {
+            for win in self.shared_windows.values_mut() {
+                if win.upload_referenced > 0 {
+                    std::mem::forget(win.packed_buf.take());
+                }
+            }
+        }
         disk.and(transfers)?;
-        if abandoned > 0 {
+        if abandoned_jobs > 0 {
             return Err(invalid(format!(
-                "{abandoned} disk transport jobs did not complete within {:?}",
+                "{abandoned_jobs} disk transport jobs did not complete within {:?}",
+                copier::CLOSE_TIMEOUT
+            )));
+        }
+        if leaked_shared > 0 {
+            return Err(invalid(format!(
+                "{leaked_shared} shared staging entries remained after close within {:?}",
                 copier::CLOSE_TIMEOUT
             )));
         }
@@ -2036,7 +3250,6 @@ struct Inbound {
     nodes: Vec<PrefixKey>,
     /// Tokens the restore saves over prefill.
     tokens: u64,
-    started: Instant,
 }
 
 /// Bytes charged until the unlink or truncate succeeds.
@@ -2433,11 +3646,21 @@ impl DiskStore {
         std::mem::take(&mut self.evicted)
     }
 
+    fn observe_inbound_samples(&mut self) {
+        let mut samples = Vec::new();
+        self.transport.drain_inbound_samples(&mut samples);
+        for (bytes, elapsed) in samples {
+            self.inbound_rate.observe(bytes, elapsed);
+        }
+    }
+
     /// Drain the transport's completions without applying them, for a
     /// composite store that drives the transport directly.
     pub fn poll_transport(&mut self, events: &mut Vec<TransportEvent>) -> Result<()> {
         self.reclaim_inputs();
-        self.transport.poll(events)
+        let polled = self.transport.poll(events);
+        self.observe_inbound_samples();
+        polled
     }
 
     fn accepts_children(&self, key: &PrefixKey) -> bool {
@@ -3218,7 +4441,6 @@ impl DiskStore {
                         self.stats.restores_by_tier[crate::Tier::Nvme as usize] += 1;
                         self.stats.bytes_in += bytes;
                         self.stats.reused_tokens += job.tokens;
-                        self.inbound_rate.observe(*bytes, job.started.elapsed());
                     }
                     Err(error) => {
                         self.stats.fetch_failed += 1;
@@ -3403,7 +4625,6 @@ impl HostStore for DiskStore {
                 key: hit.key,
                 nodes: chain.nodes,
                 tokens: chain.consumed_tokens.saturating_sub(chain.resident_tokens),
-                started: Instant::now(),
             },
         );
         Ok(())
@@ -3416,6 +4637,7 @@ impl HostStore for DiskStore {
         self.reclaim_inputs();
         let mut completed = Vec::new();
         let polled = self.transport.poll(&mut completed);
+        self.observe_inbound_samples();
         for event in completed {
             self.apply(event, events);
         }
@@ -3453,6 +4675,7 @@ impl HostStore for DiskStore {
         let closed = self.transport.close();
         let mut completed = Vec::new();
         let _ = self.transport.poll(&mut completed);
+        self.observe_inbound_samples();
         let mut events = Vec::new();
         for event in completed {
             self.apply(event, &mut events);
@@ -5847,7 +7070,7 @@ mod tests {
 
     #[test]
     fn windows_split_segments_at_the_window_size_and_carry_the_row_last() {
-        let plans = plan_windows([(5u32, 3usize, false), (0, 0, false), (2, 130, true)]);
+        let plans = plan_windows([(5u32, 3usize, false), (0, 0, false), (2, 130, true)], false);
         let summary: Vec<_> = plans
             .iter()
             .map(|plan| {
@@ -5870,14 +7093,14 @@ mod tests {
                 (2, 3, 130, 2, 131, true),
             ]
         );
-        let row_only = plan_windows([(0, 0, true)]);
+        let row_only = plan_windows([(0, 0, true)], false);
         assert_eq!(row_only.len(), 1);
         assert_eq!((row_only[0].count, row_only[0].row), (0, true));
-        let exact = plan_windows([(0, 64, true)]);
+        let exact = plan_windows([(0, 64, true)], false);
         assert_eq!(exact.len(), 1);
         assert_eq!((exact[0].count, exact[0].row), (64, true));
-        assert!(plan_windows([]).is_empty());
-        assert!(plan_windows([(0, 0, false)]).is_empty());
+        assert!(plan_windows([], false).is_empty());
+        assert!(plan_windows([(0, 0, false)], false).is_empty());
     }
 
     fn stopped_transfers() -> SharedCopier {
@@ -5931,12 +7154,16 @@ mod tests {
         events
     }
 
-    /// Nothing in flight, no disk job owned, and no disk reply awaited.
+    /// Nothing in flight, no disk job owned, no shared segment or window held,
+    /// and no disk reply awaited.
     fn settled(staged: &Staged) -> bool {
         staged.in_flight() == (0, 0)
             && staged.owners.is_empty()
             && staged.resources.disk_outstanding == 0
             && staged.maintenance.is_empty()
+            && staged.shared_segments.is_empty()
+            && staged.shared_windows.is_empty()
+            && staged.window_index.is_empty()
     }
 
     fn corrupt(path: &Path, offset: u64) {
@@ -8009,5 +9236,1621 @@ mod tests {
         assert!(is_packed_content_error(&stored_bad));
         assert!(is_packed_content_error(&orig_bad));
         assert!(is_packed_content_error(&corrupt_pkt));
+    }
+
+    /// Wraps a `PageCopier` so tests can hold `Direction::In` replies or fail a
+    /// chosen job id without affecting sibling coalesced followers.
+    struct GatedCopier {
+        inner: SharedCopier,
+        layout: Layout,
+        hold_in: Arc<Mutex<bool>>,
+        held_in: Arc<Mutex<VecDeque<copier::Reply>>>,
+        fail_job: Arc<Mutex<Option<JobId>>>,
+        reply_error: Arc<Mutex<Option<(JobId, Error)>>>,
+    }
+
+    struct GatedCopierHandles {
+        copier: SharedCopier,
+        hold_in: Arc<Mutex<bool>>,
+        held_in: Arc<Mutex<VecDeque<copier::Reply>>>,
+        fail_job: Arc<Mutex<Option<JobId>>>,
+        reply_error: Arc<Mutex<Option<(JobId, Error)>>>,
+    }
+
+    impl GatedCopier {
+        fn wrap(inner: SharedCopier, layout: Layout, hold_in: bool) -> GatedCopierHandles {
+            let hold = Arc::new(Mutex::new(hold_in));
+            let held = Arc::new(Mutex::new(VecDeque::new()));
+            let fail = Arc::new(Mutex::new(None));
+            let reply_err = Arc::new(Mutex::new(None));
+            let copier = Arc::new(Mutex::new(Self {
+                inner,
+                layout,
+                hold_in: hold.clone(),
+                held_in: held.clone(),
+                fail_job: fail.clone(),
+                reply_error: reply_err.clone(),
+            }));
+            GatedCopierHandles {
+                copier,
+                hold_in: hold,
+                held_in: held,
+                fail_job: fail,
+                reply_error: reply_err,
+            }
+        }
+    }
+
+    impl PageCopier for GatedCopier {
+        fn layout(&self) -> &Layout {
+            &self.layout
+        }
+
+        fn decode_counters(&self) -> Option<crate::codec_copy::DecodeCounters> {
+            lock(&self.inner).decode_counters()
+        }
+
+        fn codec_profile(&self) -> Option<[u8; 32]> {
+            lock(&self.inner).codec_profile()
+        }
+
+        fn codec_receive_profiles(&self) -> Vec<[u8; 32]> {
+            lock(&self.inner).codec_receive_profiles()
+        }
+
+        #[cfg(feature = "codec")]
+        fn async_host_codec(&self) -> Option<crate::codec_copy::HostEncoder> {
+            lock(&self.inner).async_host_codec()
+        }
+
+        fn submit(&mut self, job: copier::Job) -> Result<()> {
+            if job.direction == Direction::In
+                && *self.fail_job.lock().unwrap() == Some(job.id)
+            {
+                return Err(invalid("injected private transfer failure"));
+            }
+            lock(&self.inner).submit(job)
+        }
+
+        fn poll(&mut self, replies: &mut Vec<copier::Reply>) {
+            let mut incoming = Vec::new();
+            lock(&self.inner).poll(&mut incoming);
+            let hold = *self.hold_in.lock().unwrap();
+            let mut held = self.held_in.lock().unwrap();
+            let mut injected = self.reply_error.lock().unwrap();
+            for mut reply in incoming {
+                if reply.direction == Direction::In
+                    && injected.as_ref().is_some_and(|(id, _)| *id == reply.id)
+                {
+                    let (_, err) = injected.take().unwrap();
+                    reply.result = Err(err);
+                }
+                if hold && reply.direction == Direction::In {
+                    held.push_back(reply);
+                } else {
+                    replies.push(reply);
+                }
+            }
+            if !hold {
+                while let Some(reply) = held.pop_front() {
+                    replies.push(reply);
+                }
+            }
+        }
+
+        fn in_flight(&self) -> usize {
+            lock(&self.inner).in_flight() + self.held_in.lock().unwrap().len()
+        }
+
+        fn close(&mut self) -> Result<()> {
+            *self.hold_in.lock().unwrap() = false;
+            self.held_in.lock().unwrap().clear();
+            lock(&self.inner).close()
+        }
+    }
+
+    type ChildBranch = (PrefixHistory, Header, Vec<Vec<u8>>, Vec<u8>);
+
+    struct AncestorBranchFixture {
+        parent_header: Header,
+        parent_pages: Vec<Vec<u8>>,
+        children: Vec<ChildBranch>,
+    }
+
+    /// Write one multi-window parent record and `branch_count` distinct child
+    /// records under it so each child shares the parent's full page chain.
+    fn write_shared_ancestor_tree(
+        directory: &Path,
+        geometry: &[CacheGeometry],
+        parent_pages_count: usize,
+        child_pages_count: usize,
+        branch_count: usize,
+    ) -> AncestorBranchFixture {
+        let parent_tokens = parent_pages_count as u64 * PAGE_TOKENS;
+        let base_history = history(parent_tokens);
+        let mut parent_header = header(geometry, &base_history, parent_tokens, None);
+        let (parent_pages, _) = write_record(directory, &mut parent_header, 11);
+        let mut children = Vec::with_capacity(branch_count);
+        for branch in 0..branch_count {
+            let mut child_history = base_history.clone();
+            let extra_tokens: Vec<u32> = (0..(child_pages_count as u32 * PAGE_TOKENS as u32 + 5))
+                .map(|i| i.wrapping_mul(17) ^ (branch as u32 + 1).wrapping_mul(0x9e37_79b9))
+                .collect();
+            child_history.append(&extra_tokens, &[]).unwrap();
+            let child_consumed = child_history.token_count();
+            let mut child_header = header(
+                geometry,
+                &child_history,
+                child_consumed,
+                Some(parent_tokens),
+            );
+            let (child_pages, child_row) =
+                write_record(directory, &mut child_header, 30 + branch as u8);
+            children.push((child_history, child_header, child_pages, child_row));
+        }
+        AncestorBranchFixture {
+            parent_header,
+            parent_pages,
+            children,
+        }
+    }
+
+    fn poll_all_fetches(
+        store: &mut DiskStore,
+        expected: usize,
+        deadline: Instant,
+    ) -> Vec<StoreEvent> {
+        let mut events = Vec::new();
+        while events.len() < expected {
+            assert!(
+                Instant::now() < deadline,
+                "received {} of {expected} fetch events: {events:?}",
+                events.len()
+            );
+            store.poll(&mut events).unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(events.len(), expected);
+        events
+    }
+
+    #[test]
+    fn aligned_windows_align_to_window_boundaries_for_device_coalescing() {
+        let from_zero = plan_windows([(0u32, 130usize, false)], true);
+        let from_ten = plan_windows([(10u32, 120usize, false)], true);
+        let summarize = |plans: &[WindowPlan]| -> Vec<_> {
+            plans
+                .iter()
+                .map(|p| (p.segment, p.index, p.first, p.count, p.offset, p.row))
+                .collect()
+        };
+        assert_eq!(
+            summarize(&from_zero),
+            [
+                (0, 0, 0, 64, 0, false),
+                (0, 1, 64, 64, 64, false),
+                (0, 2, 128, 2, 128, false),
+            ]
+        );
+        assert_eq!(
+            summarize(&from_ten),
+            [
+                (0, 0, 10, 54, 0, false),
+                (0, 1, 64, 64, 54, false),
+                (0, 2, 128, 2, 118, false),
+            ]
+        );
+        // Suffix windows from boundary 64 onward share exact `(first, count, row)`.
+        assert_eq!(
+            (from_zero[1].first, from_zero[1].count, from_zero[1].row),
+            (from_ten[1].first, from_ten[1].count, from_ten[1].row)
+        );
+        assert_eq!(
+            (from_zero[2].first, from_zero[2].count, from_zero[2].row),
+            (from_ten[2].first, from_ten[2].count, from_ten[2].row)
+        );
+        assert_eq!(
+            summarize(&plan_windows(
+                [(5, 3, false), (0, 0, false), (10, 120, true)],
+                true,
+            )),
+            [
+                (0, 0, 5, 3, 0, false),
+                (2, 1, 10, 54, 3, false),
+                (2, 2, 64, 64, 57, false),
+                (2, 3, 128, 2, 121, true),
+            ]
+        );
+        assert_eq!(
+            summarize(&plan_windows([(0, 0, true)], true)),
+            [(0, 0, 0, 0, 0, true)]
+        );
+        assert_eq!(
+            summarize(&plan_windows([(64, 64, true)], true)),
+            [(0, 0, 64, 64, 0, true)]
+        );
+        assert!(plan_windows([], true).is_empty());
+        assert!(plan_windows([(0, 0, false)], true).is_empty());
+    }
+
+    #[test]
+    fn concurrent_burst_coalesces_shared_ancestor_opens_and_window_reads() {
+        use crate::testing::SimulatedGpu;
+        let Some(directory) = test_directory("disk-store", "coalesce-burst") else {
+            return;
+        };
+        const PARENT_PAGES: usize = 3 * WINDOW_PAGES + 5; // 4 aligned windows
+        const CHILD_PAGES: usize = 3; // 1 window each
+        const BRANCHES: usize = 6;
+        let geometry = geometry();
+        let layout = Layout::new(&geometry).unwrap();
+        let fixture =
+            write_shared_ancestor_tree(&directory, &geometry, PARENT_PAGES, CHILD_PAGES, BRANCHES);
+        let mut records = vec![scanned(&directory, fixture.parent_header.clone(), 0, true)];
+        for (i, (_, child_header, _, _)) in fixture.children.iter().enumerate() {
+            records.push(scanned(&directory, child_header.clone(), i as u64 + 1, true));
+        }
+        // Size the pool to minimal intake (two windows), proving six concurrent
+        // restores share staging slots on the common ancestor without inflating
+        // staging capacity.
+        let intake = crate::offload::intake_slots(&layout, 1);
+        let pool = SlabPool::new(layout.page_record_bytes, intake, intake).unwrap();
+        let (copier, gpu) = SimulatedGpu::shared_mapped(&geometry).unwrap();
+        let mut store = DiskStore::new(
+            record::DirectoryLock::acquire(&directory).unwrap(),
+            IDENTITY,
+            FINGERPRINT,
+            1 << 30,
+            geometry,
+            records,
+            Box::new(Staged::new(
+                Some(pool.clone()),
+                copier,
+                DiskThread::start("coalesce-burst").unwrap(),
+            )),
+        )
+        .unwrap();
+
+        let total_pages = (PARENT_PAGES + CHILD_PAGES) as u32;
+        let mut tickets = Vec::with_capacity(BRANCHES);
+        for (branch, (child_history, child_header, _, _)) in fixture.children.iter().enumerate() {
+            let hit = store.lookup(child_history, 0, u64::MAX).unwrap();
+            assert_eq!(hit.key, child_header.key);
+            assert_eq!(hit.pages, total_pages as usize);
+            let base = (branch as u32 + 1) * 1000;
+            let ticket = InboundTicket {
+                key: child_header.key,
+                pages: pages(base..base + total_pages),
+                slot: StateSlotId(branch as u32 + 1),
+            };
+            store.fetch(hit, ticket.clone()).unwrap();
+            tickets.push(ticket);
+        }
+
+        let events =
+            poll_all_fetches(&mut store, BRANCHES, Instant::now() + Duration::from_secs(30));
+        let expected_bytes = (PARENT_PAGES + CHILD_PAGES) as u64 * PAGE_RECORD + ROW_RECORD;
+        for event in &events {
+            match event {
+                StoreEvent::Fetched {
+                    result: Ok(bytes), ..
+                } => {
+                    assert_eq!(*bytes, expected_bytes);
+                }
+                other => panic!("unexpected fetch event: {other:?}"),
+            }
+        }
+
+        let staged = store.transport_mut().staged().unwrap();
+        assert!(settled(staged));
+        // Parent is opened once and each of its four windows is read once;
+        // each of the six distinct child files is opened and read once.
+        assert_eq!(staged.disk_opens(), 1 + BRANCHES as u64);
+        assert_eq!(staged.disk_window_reads(), 4 + BRANCHES as u64);
+        assert_eq!(staged.coalesced_windows(), 4 * (BRANCHES as u64 - 1));
+        assert_eq!(pool.free_slots(), pool.slot_count());
+        assert!(store.index().nodes().all(|node| !node.pinned()));
+
+        let gpu_pages = gpu.pages.lock().unwrap();
+        let gpu_rows = gpu.rows.lock().unwrap();
+        for (branch, (_, _, child_pages, child_row)) in fixture.children.iter().enumerate() {
+            let ticket = &tickets[branch];
+            for (index, expected) in fixture.parent_pages.iter().enumerate() {
+                assert_eq!(&gpu_pages[&ticket.pages[index].0], expected);
+            }
+            for (index, expected) in child_pages.iter().enumerate() {
+                assert_eq!(&gpu_pages[&ticket.pages[PARENT_PAGES + index].0], expected);
+            }
+            assert_eq!(&gpu_rows[&ticket.slot.0], child_row);
+        }
+
+        store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn staggered_arrival_attaches_out_of_order_to_in_flight_windows() {
+        use crate::testing::SimulatedGpu;
+        let Some(directory) = test_directory("disk-store", "coalesce-staggered") else {
+            return;
+        };
+        const PARENT_PAGES: usize = 4 * WINDOW_PAGES; // 4 aligned windows: W0, W1, W2, W3
+        const CHILD_PAGES: usize = 4;
+        let geometry = geometry();
+        let layout = Layout::new(&geometry).unwrap();
+        let fixture =
+            write_shared_ancestor_tree(&directory, &geometry, PARENT_PAGES, CHILD_PAGES, 2);
+        let records = vec![
+            scanned(&directory, fixture.parent_header.clone(), 0, true),
+            scanned(&directory, fixture.children[0].1.clone(), 1, true),
+            scanned(&directory, fixture.children[1].1.clone(), 2, true),
+        ];
+        let intake = crate::offload::intake_slots(&layout, 1);
+        let pool = SlabPool::new(layout.page_record_bytes, intake, intake).unwrap();
+        let (inner, gpu) = SimulatedGpu::shared_mapped(&geometry).unwrap();
+        let gates = GatedCopier::wrap(inner, layout.clone(), true);
+        let mut store = DiskStore::new(
+            record::DirectoryLock::acquire(&directory).unwrap(),
+            IDENTITY,
+            FINGERPRINT,
+            1 << 30,
+            geometry,
+            records,
+            Box::new(Staged::new(
+                Some(pool.clone()),
+                gates.copier,
+                DiskThread::start("coalesce-staggered").unwrap(),
+            )),
+        )
+        .unwrap();
+
+        let total_pages = (PARENT_PAGES + CHILD_PAGES) as u32;
+        let hit_a = store.lookup(&fixture.children[0].0, 0, u64::MAX).unwrap();
+        let ticket_a = InboundTicket {
+            key: hit_a.key,
+            pages: pages(1000..1000 + total_pages),
+            slot: StateSlotId(1),
+        };
+        store.fetch(hit_a, ticket_a.clone()).unwrap();
+
+        // Advance request 1 until W0 and W1 have both completed disk reads and
+        // are held in the copier queue.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut events = Vec::new();
+        while gates.held_in.lock().unwrap().len() < 2 {
+            assert!(Instant::now() < deadline);
+            store.poll(&mut events).unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Release W0 so W0 completes and is swept while W1 remains active and
+        // W2 enters flight.
+        {
+            let w0 = gates.held_in.lock().unwrap().pop_front().unwrap();
+            assert_eq!(w0.window, 0);
+            store
+                .transport_mut()
+                .staged_mut()
+                .unwrap()
+                .apply_device_transfer(w0);
+        }
+        // Pump until W2's disk read lands and its upload is held alongside W1.
+        while gates.held_in.lock().unwrap().len() < 2 {
+            assert!(Instant::now() < deadline);
+            store.poll(&mut events).unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(events.is_empty());
+
+        // Start request 2 midway through the parent (W0 is gone; W1 and W2 are
+        // live in shared staging). Request 2 must piggyback on W1 and W2
+        // immediately out of order without allocating extra staging windows.
+        let hit_b = store.lookup(&fixture.children[1].0, 0, u64::MAX).unwrap();
+        let ticket_b = InboundTicket {
+            key: hit_b.key,
+            pages: pages(2000..2000 + total_pages),
+            slot: StateSlotId(2),
+        };
+        store.fetch(hit_b, ticket_b.clone()).unwrap();
+        assert_eq!(
+            store.transport_mut().staged().unwrap().coalesced_windows(),
+            2
+        );
+
+        // Release the copier gate and complete both requests.
+        *gates.hold_in.lock().unwrap() = false;
+        let done = poll_all_fetches(&mut store, 2, deadline);
+        assert!(
+            done.iter()
+                .all(|e| matches!(e, StoreEvent::Fetched { result: Ok(_), .. }))
+        );
+
+        let staged = store.transport_mut().staged().unwrap();
+        assert!(settled(staged));
+        assert_eq!(staged.disk_opens(), 3);
+        assert!(staged.coalesced_windows() >= 2);
+        assert_eq!(staged.disk_window_reads() + staged.coalesced_windows(), 10);
+        assert_eq!(pool.free_slots(), pool.slot_count());
+
+        let gpu_pages = gpu.pages.lock().unwrap();
+        let gpu_rows = gpu.rows.lock().unwrap();
+        for (ticket, (_, _, child_pages, child_row)) in
+            [(&ticket_a, &fixture.children[0]), (&ticket_b, &fixture.children[1])]
+        {
+            for (index, expected) in fixture.parent_pages.iter().enumerate() {
+                assert_eq!(&gpu_pages[&ticket.pages[index].0], expected);
+            }
+            for (index, expected) in child_pages.iter().enumerate() {
+                assert_eq!(&gpu_pages[&ticket.pages[PARENT_PAGES + index].0], expected);
+            }
+            assert_eq!(&gpu_rows[&ticket.slot.0], child_row);
+        }
+
+        store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn different_skip_pages_coalesce_aligned_windows_to_exact_gpu_pages() {
+        use crate::testing::SimulatedGpu;
+        let Some(directory) = test_directory("disk-store", "coalesce-skip-pages") else {
+            return;
+        };
+        const PARENT_PAGES: usize = 3 * WINDOW_PAGES + 7; // 199 pages: [0..64), [64..128), [128..192), [192..199)
+        const CHILD_PAGES: usize = 5;
+        const SKIP_PAGES: usize = 10;
+        let geometry = geometry();
+        let layout = Layout::new(&geometry).unwrap();
+        let fixture =
+            write_shared_ancestor_tree(&directory, &geometry, PARENT_PAGES, CHILD_PAGES, 2);
+        let records = vec![
+            scanned(&directory, fixture.parent_header.clone(), 0, true),
+            scanned(&directory, fixture.children[0].1.clone(), 1, true),
+            scanned(&directory, fixture.children[1].1.clone(), 2, true),
+        ];
+        let intake = crate::offload::intake_slots(&layout, 2);
+        let pool = SlabPool::new(layout.page_record_bytes, intake, intake).unwrap();
+        let (inner, gpu) = SimulatedGpu::shared_mapped(&geometry).unwrap();
+        let gates = GatedCopier::wrap(inner, layout.clone(), true);
+        let mut store = DiskStore::new(
+            record::DirectoryLock::acquire(&directory).unwrap(),
+            IDENTITY,
+            FINGERPRINT,
+            1 << 30,
+            geometry,
+            records,
+            Box::new(Staged::new(
+                Some(pool.clone()),
+                gates.copier,
+                DiskThread::start("coalesce-skip").unwrap(),
+            )),
+        )
+        .unwrap();
+
+        // Request 1 starts at skip_pages = 0; request 2 starts at skip_pages = 10.
+        let hit_a = store.lookup(&fixture.children[0].0, 0, u64::MAX).unwrap();
+        let hit_b = store
+            .lookup(
+                &fixture.children[1].0,
+                SKIP_PAGES as u64 * PAGE_TOKENS,
+                u64::MAX,
+            )
+            .unwrap();
+        assert_eq!(hit_a.chain.skip_pages, 0);
+        assert_eq!(hit_b.chain.skip_pages, SKIP_PAGES);
+        assert_eq!(hit_a.pages, PARENT_PAGES + CHILD_PAGES);
+        assert_eq!(hit_b.pages, PARENT_PAGES - SKIP_PAGES + CHILD_PAGES);
+
+        let ticket_a = InboundTicket {
+            key: hit_a.key,
+            pages: pages(1000..1000 + hit_a.pages as u32),
+            slot: StateSlotId(1),
+        };
+        let ticket_b = InboundTicket {
+            key: hit_b.key,
+            pages: pages(2000..2000 + hit_b.pages as u32),
+            slot: StateSlotId(2),
+        };
+        store.fetch(hit_a, ticket_a.clone()).unwrap();
+        store.fetch(hit_b, ticket_b.clone()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut events = Vec::new();
+        while gates.held_in.lock().unwrap().len() < 2 {
+            assert!(Instant::now() < deadline);
+            store.poll(&mut events).unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        *gates.hold_in.lock().unwrap() = false;
+        let done = poll_all_fetches(&mut store, 2, deadline);
+        assert!(
+            done.iter()
+                .all(|e| matches!(e, StoreEvent::Fetched { result: Ok(_), .. }))
+        );
+
+        let staged = store.transport_mut().staged().unwrap();
+        assert!(settled(staged));
+        assert_eq!(staged.disk_opens(), 3);
+        assert_eq!(staged.coalesced_windows(), 3);
+        assert_eq!(staged.disk_window_reads(), 7);
+        assert_eq!(pool.free_slots(), pool.slot_count());
+
+        let gpu_pages = gpu.pages.lock().unwrap();
+        let gpu_rows = gpu.rows.lock().unwrap();
+        for (index, expected) in fixture.parent_pages.iter().enumerate() {
+            assert_eq!(&gpu_pages[&ticket_a.pages[index].0], expected);
+        }
+        for (index, expected) in fixture.children[0].2.iter().enumerate() {
+            assert_eq!(&gpu_pages[&ticket_a.pages[PARENT_PAGES + index].0], expected);
+        }
+        assert_eq!(&gpu_rows[&ticket_a.slot.0], &fixture.children[0].3);
+
+        for (index, expected) in fixture.parent_pages[SKIP_PAGES..].iter().enumerate() {
+            assert_eq!(&gpu_pages[&ticket_b.pages[index].0], expected);
+        }
+        for (index, expected) in fixture.children[1].2.iter().enumerate() {
+            assert_eq!(
+                &gpu_pages[&ticket_b.pages[PARENT_PAGES - SKIP_PAGES + index].0],
+                expected
+            );
+        }
+        assert_eq!(&gpu_rows[&ticket_b.slot.0], &fixture.children[1].3);
+
+        store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn private_failure_isolation_preserves_sibling_sharing_ancestor() {
+        use crate::testing::SimulatedGpu;
+        for inject_transfer_failure in [false, true] {
+            let Some(directory) = test_directory(
+                "disk-store",
+                &format!("coalesce-private-fail-{inject_transfer_failure}"),
+            ) else {
+                return;
+            };
+            const PARENT_PAGES: usize = 2 * WINDOW_PAGES + 4; // 3 aligned windows
+            const CHILD_PAGES: usize = 3;
+            let geometry = geometry();
+            let layout = Layout::new(&geometry).unwrap();
+            let fixture =
+                write_shared_ancestor_tree(&directory, &geometry, PARENT_PAGES, CHILD_PAGES, 2);
+            if !inject_transfer_failure {
+                // Corrupt a byte in child 0's private page segment.
+                let bad_child_path = directory.join(record::file_name(&fixture.children[0].1.key));
+                corrupt(&bad_child_path, fixture.children[0].1.page_segment + 64);
+            }
+            let records = vec![
+                scanned(&directory, fixture.parent_header.clone(), 0, true),
+                scanned(&directory, fixture.children[0].1.clone(), 1, true),
+                scanned(&directory, fixture.children[1].1.clone(), 2, true),
+            ];
+            let intake = crate::offload::intake_slots(&layout, 1);
+            let pool = SlabPool::new(layout.page_record_bytes, intake, intake).unwrap();
+            let (inner, gpu) = SimulatedGpu::shared_mapped(&geometry).unwrap();
+            let gates = GatedCopier::wrap(inner, layout.clone(), false);
+            if inject_transfer_failure {
+                // First `DiskStore::fetch` allocates `JobId(1)`.
+                *gates.fail_job.lock().unwrap() = Some(JobId(1));
+            }
+            let mut store = DiskStore::new(
+                record::DirectoryLock::acquire(&directory).unwrap(),
+                IDENTITY,
+                FINGERPRINT,
+                1 << 30,
+                geometry,
+                records,
+                Box::new(Staged::new(
+                    Some(pool.clone()),
+                    gates.copier,
+                    DiskThread::start("coalesce-private-fail").unwrap(),
+                )),
+            )
+            .unwrap();
+
+            let total_pages = (PARENT_PAGES + CHILD_PAGES) as u32;
+            let hit_bad = store.lookup(&fixture.children[0].0, 0, u64::MAX).unwrap();
+            let hit_good = store.lookup(&fixture.children[1].0, 0, u64::MAX).unwrap();
+            let ticket_bad = InboundTicket {
+                key: hit_bad.key,
+                pages: pages(1000..1000 + total_pages),
+                slot: StateSlotId(1),
+            };
+            let ticket_good = InboundTicket {
+                key: hit_good.key,
+                pages: pages(2000..2000 + total_pages),
+                slot: StateSlotId(2),
+            };
+            store.fetch(hit_bad, ticket_bad).unwrap();
+            store.fetch(hit_good, ticket_good.clone()).unwrap();
+
+            let events =
+                poll_all_fetches(&mut store, 2, Instant::now() + Duration::from_secs(30));
+            let mut saw_bad = false;
+            let mut saw_good = false;
+            for event in events {
+                match event {
+                    StoreEvent::Fetched { key, result } if key == fixture.children[0].1.key => {
+                        let error = result.unwrap_err();
+                        assert_eq!(error.is_record_read(), !inject_transfer_failure);
+                        saw_bad = true;
+                    }
+                    StoreEvent::Fetched { key, result } if key == fixture.children[1].1.key => {
+                        let expected_bytes =
+                            (PARENT_PAGES + CHILD_PAGES) as u64 * PAGE_RECORD + ROW_RECORD;
+                        assert_eq!(result.unwrap(), expected_bytes);
+                        saw_good = true;
+                    }
+                    other => panic!("unexpected event: {other:?}"),
+                }
+            }
+            assert!(saw_bad && saw_good);
+
+            let staged = store.transport_mut().staged().unwrap();
+            assert!(settled(staged));
+            assert!(staged.coalesced_windows() >= 1);
+            assert_eq!(pool.free_slots(), pool.slot_count());
+            assert!(store.index().nodes().all(|node| !node.pinned()));
+
+            let gpu_pages = gpu.pages.lock().unwrap();
+            let gpu_rows = gpu.rows.lock().unwrap();
+            for (index, expected) in fixture.parent_pages.iter().enumerate() {
+                assert_eq!(&gpu_pages[&ticket_good.pages[index].0], expected);
+            }
+            for (index, expected) in fixture.children[1].2.iter().enumerate() {
+                assert_eq!(
+                    &gpu_pages[&ticket_good.pages[PARENT_PAGES + index].0],
+                    expected
+                );
+            }
+            assert_eq!(&gpu_rows[&ticket_good.slot.0], &fixture.children[1].3);
+
+            store.close().unwrap();
+            drop(store);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn shared_ancestor_failure_propagates_to_all_followers_without_leaks() {
+        use crate::testing::SimulatedGpu;
+        for corrupt_header in [false, true] {
+            let Some(directory) = test_directory(
+                "disk-store",
+                &format!("coalesce-shared-fail-{corrupt_header}"),
+            ) else {
+                return;
+            };
+            const PARENT_PAGES: usize = 2 * WINDOW_PAGES + 4;
+            const CHILD_PAGES: usize = 3;
+            const BRANCHES: usize = 4;
+            let geometry = geometry();
+            let layout = Layout::new(&geometry).unwrap();
+            let fixture = write_shared_ancestor_tree(
+                &directory,
+                &geometry,
+                PARENT_PAGES,
+                CHILD_PAGES,
+                BRANCHES,
+            );
+            let parent_path = directory.join(record::file_name(&fixture.parent_header.key));
+            if corrupt_header {
+                // Flip a byte inside the magic field so `disk::Job::Open` fails.
+                corrupt(&parent_path, 0);
+            } else {
+                // Flip a byte inside page 0 so `disk::Job::ReadPages` fails checksum verification.
+                corrupt(&parent_path, fixture.parent_header.page_segment + 128);
+            }
+            let mut records = vec![scanned(&directory, fixture.parent_header.clone(), 0, true)];
+            for (i, (_, child_header, _, _)) in fixture.children.iter().enumerate() {
+                records.push(scanned(&directory, child_header.clone(), i as u64 + 1, true));
+            }
+            let intake = crate::offload::intake_slots(&layout, 1);
+            let pool = SlabPool::new(layout.page_record_bytes, intake, intake).unwrap();
+            let (copier, _) = SimulatedGpu::shared_mapped(&geometry).unwrap();
+            let mut store = DiskStore::new(
+                record::DirectoryLock::acquire(&directory).unwrap(),
+                IDENTITY,
+                FINGERPRINT,
+                1 << 30,
+                geometry,
+                records,
+                Box::new(Staged::new(
+                    Some(pool.clone()),
+                    copier,
+                    DiskThread::start("coalesce-shared-fail").unwrap(),
+                )),
+            )
+            .unwrap();
+
+            let total_pages = (PARENT_PAGES + CHILD_PAGES) as u32;
+            for (branch, (child_history, child_header, _, _)) in fixture.children.iter().enumerate()
+            {
+                let hit = store.lookup(child_history, 0, u64::MAX).unwrap();
+                let base = (branch as u32 + 1) * 1000;
+                store
+                    .fetch(
+                        hit,
+                        InboundTicket {
+                            key: child_header.key,
+                            pages: pages(base..base + total_pages),
+                            slot: StateSlotId(branch as u32 + 1),
+                        },
+                    )
+                    .unwrap();
+            }
+
+            let events =
+                poll_all_fetches(&mut store, BRANCHES, Instant::now() + Duration::from_secs(30));
+            for event in events {
+                match event {
+                    StoreEvent::Fetched {
+                        result: Err(error), ..
+                    } => {
+                        assert!(
+                            error.is_record_read(),
+                            "corrupt_header={corrupt_header}: expected record_read error, got {error}"
+                        );
+                    }
+                    other => panic!("corrupt_header={corrupt_header}: unexpected event {other:?}"),
+                }
+            }
+
+            let staged = store.transport_mut().staged().unwrap();
+            assert!(settled(staged));
+            assert_eq!(staged.disk_opens(), 1);
+            assert_eq!(pool.free_slots(), pool.slot_count());
+            assert!(store.index().nodes().all(|node| !node.pinned()));
+
+            store.close().unwrap();
+            drop(store);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn staged_close_drains_active_coalesced_fetches_cleanly() {
+        use crate::testing::SimulatedGpu;
+        let Some(directory) = test_directory("disk-store", "coalesce-close-drain") else {
+            return;
+        };
+        const PARENT_PAGES: usize = 3 * WINDOW_PAGES; // 3 aligned windows
+        const CHILD_PAGES: usize = 4;
+        const BRANCHES: usize = 4;
+        let geometry = geometry();
+        let layout = Layout::new(&geometry).unwrap();
+        let fixture =
+            write_shared_ancestor_tree(&directory, &geometry, PARENT_PAGES, CHILD_PAGES, BRANCHES);
+        let mut records = vec![scanned(&directory, fixture.parent_header.clone(), 0, true)];
+        for (i, (_, child_header, _, _)) in fixture.children.iter().enumerate() {
+            records.push(scanned(&directory, child_header.clone(), i as u64 + 1, true));
+        }
+        let intake = crate::offload::intake_slots(&layout, 1);
+        let pool = SlabPool::new(layout.page_record_bytes, intake, intake).unwrap();
+        let (copier, gpu) = SimulatedGpu::shared_mapped(&geometry).unwrap();
+        let mut store = DiskStore::new(
+            record::DirectoryLock::acquire(&directory).unwrap(),
+            IDENTITY,
+            FINGERPRINT,
+            1 << 30,
+            geometry,
+            records,
+            Box::new(Staged::new(
+                Some(pool.clone()),
+                copier,
+                DiskThread::start("coalesce-close-drain").unwrap(),
+            )),
+        )
+        .unwrap();
+
+        let total_pages = (PARENT_PAGES + CHILD_PAGES) as u32;
+        let mut tickets = Vec::with_capacity(BRANCHES);
+        for (branch, (child_history, child_header, _, _)) in fixture.children.iter().enumerate() {
+            let hit = store.lookup(child_history, 0, u64::MAX).unwrap();
+            let base = (branch as u32 + 1) * 1000;
+            let ticket = InboundTicket {
+                key: child_header.key,
+                pages: pages(base..base + total_pages),
+                slot: StateSlotId(branch as u32 + 1),
+            };
+            store.fetch(hit, ticket.clone()).unwrap();
+            tickets.push(ticket);
+        }
+
+        // Close immediately while coalesced fetches are actively in flight.
+        assert_eq!(store.transport_mut().staged().unwrap().in_flight().1, BRANCHES);
+        store.close().unwrap();
+
+        let staged = store.transport_mut().staged().unwrap();
+        assert!(settled(staged));
+        assert_eq!(staged.disk_opens(), 1 + BRANCHES as u64);
+        assert_eq!(staged.coalesced_windows(), 3 * (BRANCHES as u64 - 1));
+        assert_eq!(pool.free_slots(), pool.slot_count());
+        assert!(store.index().nodes().all(|node| !node.pinned()));
+        assert_eq!(store.stats().fetched, BRANCHES as u64);
+
+        let gpu_pages = gpu.pages.lock().unwrap();
+        let gpu_rows = gpu.rows.lock().unwrap();
+        for (branch, (_, _, child_pages, child_row)) in fixture.children.iter().enumerate() {
+            let ticket = &tickets[branch];
+            for (index, expected) in fixture.parent_pages.iter().enumerate() {
+                assert_eq!(&gpu_pages[&ticket.pages[index].0], expected);
+            }
+            for (index, expected) in child_pages.iter().enumerate() {
+                assert_eq!(&gpu_pages[&ticket.pages[PARENT_PAGES + index].0], expected);
+            }
+            assert_eq!(&gpu_rows[&ticket.slot.0], child_row);
+        }
+
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn misaligned_follower_attaching_to_shared_partial_tail_and_row_matches_private_restore() {
+        use crate::testing::SimulatedGpu;
+        let Some(directory) = test_directory("disk-store", "coalesce-misaligned-follower-row")
+        else {
+            return;
+        };
+        const PARENT_PAGES: usize = WINDOW_PAGES + 7; // 71 pages: [0..64) and partial [64..71)
+        const LEAF_PAGES: usize = 19; // partial < 64 trailing chunk carrying row = true
+        const SKIP_PAGES: usize = 13; // non-64-multiple resident prefix
+        let geometry = geometry();
+        let layout = Layout::new(&geometry).unwrap();
+        let fixture =
+            write_shared_ancestor_tree(&directory, &geometry, PARENT_PAGES, LEAF_PAGES, 1);
+        let (ref leaf_history, ref leaf_header, ref leaf_pages, ref leaf_row) = fixture.children[0];
+        let records = vec![
+            scanned(&directory, fixture.parent_header.clone(), 0, true),
+            scanned(&directory, leaf_header.clone(), 1, true),
+        ];
+
+        // Baseline: run restore B (`skip_pages = 13`) privately on an isolated store.
+        let private_dir = directory.join("private-lock");
+        fs::create_dir_all(&private_dir).unwrap();
+        let intake = crate::offload::intake_slots(&layout, 2);
+        let private_pool = SlabPool::new(layout.page_record_bytes, intake, intake).unwrap();
+        let (private_copier, private_gpu) = SimulatedGpu::shared_mapped(&geometry).unwrap();
+        let mut private_store = DiskStore::new(
+            record::DirectoryLock::acquire(&private_dir).unwrap(),
+            IDENTITY,
+            FINGERPRINT,
+            1 << 30,
+            geometry.clone(),
+            records.clone(),
+            Box::new(Staged::new(
+                Some(private_pool),
+                private_copier,
+                DiskThread::start("private-baseline").unwrap(),
+            )),
+        )
+        .unwrap();
+        let hit_private = private_store
+            .lookup(leaf_history, SKIP_PAGES as u64 * PAGE_TOKENS, u64::MAX)
+            .unwrap();
+        assert_eq!(hit_private.chain.skip_pages, SKIP_PAGES);
+        assert_eq!(hit_private.pages, PARENT_PAGES - SKIP_PAGES + LEAF_PAGES);
+        let ticket_private = InboundTicket {
+            key: hit_private.key,
+            pages: pages(3000..3000 + hit_private.pages as u32),
+            slot: StateSlotId(5),
+        };
+        private_store
+            .fetch(hit_private, ticket_private.clone())
+            .unwrap();
+        let private_done = poll_all_fetches(
+            &mut private_store,
+            1,
+            Instant::now() + Duration::from_secs(30),
+        );
+        assert!(matches!(
+            private_done.as_slice(),
+            [StoreEvent::Fetched { result: Ok(_), .. }]
+        ));
+        assert_eq!(
+            private_store
+                .transport_mut()
+                .staged()
+                .unwrap()
+                .coalesced_windows(),
+            0
+        );
+
+        // Coalesced run: restore A (`skip_pages = 0`) creates the shared windows first,
+        // then restore B (`skip_pages = 13`) attaches as a follower to both the partial
+        // ancestor tail `[64..71)` and the final partial chunk `[0..19)` carrying `row = true`.
+        let pool = SlabPool::new(layout.page_record_bytes, intake, intake).unwrap();
+        let (inner, gpu) = SimulatedGpu::shared_mapped(&geometry).unwrap();
+        let gates = GatedCopier::wrap(inner, layout, true);
+        let mut store = DiskStore::new(
+            record::DirectoryLock::acquire(&directory).unwrap(),
+            IDENTITY,
+            FINGERPRINT,
+            1 << 30,
+            geometry,
+            records,
+            Box::new(Staged::new(
+                Some(pool.clone()),
+                gates.copier,
+                DiskThread::start("coalesce-misaligned-follower").unwrap(),
+            )),
+        )
+        .unwrap();
+
+        let hit_a = store.lookup(leaf_history, 0, u64::MAX).unwrap();
+        let ticket_a = InboundTicket {
+            key: hit_a.key,
+            pages: pages(1000..1000 + (PARENT_PAGES + LEAF_PAGES) as u32),
+            slot: StateSlotId(1),
+        };
+        store.fetch(hit_a, ticket_a.clone()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut events = Vec::new();
+        while gates.held_in.lock().unwrap().len() < 2 {
+            assert!(Instant::now() < deadline);
+            store.poll(&mut events).unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        {
+            let w0 = gates.held_in.lock().unwrap().pop_front().unwrap();
+            assert_eq!(w0.window, 0);
+            store
+                .transport_mut()
+                .staged_mut()
+                .unwrap()
+                .apply_device_transfer(w0);
+        }
+        while gates.held_in.lock().unwrap().len() < 2 {
+            assert!(Instant::now() < deadline);
+            store.poll(&mut events).unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(events.is_empty());
+
+        let hit_b = store
+            .lookup(leaf_history, SKIP_PAGES as u64 * PAGE_TOKENS, u64::MAX)
+            .unwrap();
+        assert_eq!(hit_b.chain.skip_pages, SKIP_PAGES);
+        let ticket_b = InboundTicket {
+            key: hit_b.key,
+            pages: pages(2000..2000 + hit_b.pages as u32),
+            slot: StateSlotId(2),
+        };
+        store.fetch(hit_b, ticket_b.clone()).unwrap();
+        assert_eq!(
+            store.transport_mut().staged().unwrap().coalesced_windows(),
+            2
+        );
+
+        *gates.hold_in.lock().unwrap() = false;
+        let done = poll_all_fetches(&mut store, 2, deadline);
+        assert!(
+            done.iter()
+                .all(|e| matches!(e, StoreEvent::Fetched { result: Ok(_), .. }))
+        );
+
+        let staged = store.transport_mut().staged().unwrap();
+        assert!(settled(staged));
+        assert_eq!(staged.disk_opens(), 3);
+        assert_eq!(staged.disk_window_reads(), 4);
+        assert_eq!(staged.coalesced_windows(), 2);
+        assert_eq!(pool.free_slots(), pool.slot_count());
+
+        let gpu_pages = gpu.pages.lock().unwrap();
+        let gpu_rows = gpu.rows.lock().unwrap();
+        let baseline_pages = private_gpu.pages.lock().unwrap();
+        let baseline_rows = private_gpu.rows.lock().unwrap();
+
+        assert_eq!(ticket_b.pages.len(), ticket_private.pages.len());
+        for (coalesced_id, private_id) in ticket_b.pages.iter().zip(&ticket_private.pages) {
+            assert_eq!(&gpu_pages[&coalesced_id.0], &baseline_pages[&private_id.0]);
+        }
+        assert_eq!(
+            &gpu_rows[&ticket_b.slot.0],
+            &baseline_rows[&ticket_private.slot.0]
+        );
+        for (index, expected) in fixture.parent_pages[SKIP_PAGES..]
+            .iter()
+            .chain(leaf_pages.iter())
+            .enumerate()
+        {
+            assert_eq!(&gpu_pages[&ticket_b.pages[index].0], expected);
+        }
+        assert_eq!(&gpu_rows[&ticket_b.slot.0], leaf_row);
+
+        for (index, expected) in fixture
+            .parent_pages
+            .iter()
+            .chain(leaf_pages.iter())
+            .enumerate()
+        {
+            assert_eq!(&gpu_pages[&ticket_a.pages[index].0], expected);
+        }
+        assert_eq!(&gpu_rows[&ticket_a.slot.0], leaf_row);
+
+        drop(gpu_pages);
+        drop(gpu_rows);
+        drop(baseline_pages);
+        drop(baseline_rows);
+        private_store.close().unwrap();
+        store.close().unwrap();
+        drop(private_store);
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn coalesced_restores_keep_inbound_rate_physical_and_bytes_in_logical() {
+        use crate::testing::SimulatedGpu;
+        struct ObservedTransport {
+            inner: Staged,
+            samples: Arc<Mutex<Vec<(u64, Duration)>>>,
+        }
+        impl DiskTransport for ObservedTransport {
+            fn store(
+                &mut self,
+                id: JobId,
+                header: Header,
+                temporary: PathBuf,
+                path: PathBuf,
+                checkpoint: &PublishedCheckpoint,
+                detect: bool,
+            ) -> Result<()> {
+                self.inner
+                    .store(id, header, temporary, path, checkpoint, detect)
+            }
+            fn fetch(
+                &mut self,
+                id: JobId,
+                plan: Vec<FetchSegment>,
+                ticket: &InboundTicket,
+            ) -> Result<()> {
+                self.inner.fetch(id, plan, ticket)
+            }
+            fn truncate(&mut self, id: JobId, path: PathBuf, length: u64) -> Result<()> {
+                self.inner.truncate(id, path, length)
+            }
+            fn unlink(&mut self, id: JobId, path: PathBuf) -> Result<()> {
+                self.inner.unlink(id, path)
+            }
+            fn poll(&mut self, events: &mut Vec<TransportEvent>) -> Result<()> {
+                self.inner.poll(events)
+            }
+            fn drain_inbound_samples(&mut self, samples: &mut Vec<(u64, Duration)>) {
+                let start = samples.len();
+                self.inner.drain_inbound_samples(samples);
+                self.samples
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(&samples[start..]);
+            }
+            fn close(&mut self) -> Result<()> {
+                self.inner.close()
+            }
+            fn staged(&self) -> Option<&Staged> {
+                Some(&self.inner)
+            }
+            fn staged_mut(&mut self) -> Option<&mut Staged> {
+                Some(&mut self.inner)
+            }
+            fn codec_receive_profiles(&self) -> Vec<[u8; 32]> {
+                self.inner.codec_receive_profiles()
+            }
+            fn decode_counters(&self) -> Option<crate::codec_copy::DecodeCounters> {
+                self.inner.decode_counters()
+            }
+        }
+
+        let Some(directory) = test_directory("disk-store", "coalesce-inbound-rate") else {
+            return;
+        };
+        const PAGES: usize = 2 * WINDOW_PAGES; // 2 aligned windows
+        const CONCURRENT: usize = RECORDS_IN_FLIGHT; // 8 restores of the same ancestor
+        const POLL_DELAY: Duration = Duration::from_millis(20);
+        let geometry = geometry();
+        let layout = Layout::new(&geometry).unwrap();
+        let full = history(PAGES as u64 * PAGE_TOKENS);
+        let mut record_header = header(&geometry, &full, PAGES as u64 * PAGE_TOKENS, None);
+        write_record(&directory, &mut record_header, 21);
+        let scanned_records = vec![scanned(&directory, record_header.clone(), 0, true)];
+        let expected_logical_bytes = PAGES as u64 * PAGE_RECORD + ROW_RECORD;
+
+        let single_samples = Arc::new(Mutex::new(Vec::new()));
+        let single_stats = {
+            let lock_dir = directory.join("single-lock");
+            fs::create_dir_all(&lock_dir).unwrap();
+            let intake = crate::offload::intake_slots(&layout, 1);
+            let pool = SlabPool::new(layout.page_record_bytes, intake, intake).unwrap();
+            let (copier, _) = SimulatedGpu::shared_mapped(&geometry).unwrap();
+            let mut store = DiskStore::new(
+                record::DirectoryLock::acquire(&lock_dir).unwrap(),
+                IDENTITY,
+                FINGERPRINT,
+                1 << 30,
+                geometry.clone(),
+                scanned_records.clone(),
+                Box::new(ObservedTransport {
+                    inner: Staged::new(
+                        Some(pool),
+                        copier,
+                        DiskThread::start("rate-single").unwrap(),
+                    ),
+                    samples: Arc::clone(&single_samples),
+                }),
+            )
+            .unwrap();
+            let hit = store.lookup(&full, 0, u64::MAX).unwrap();
+            store
+                .fetch(
+                    hit,
+                    InboundTicket {
+                        key: record_header.key,
+                        pages: pages(100..100 + PAGES as u32),
+                        slot: StateSlotId(1),
+                    },
+                )
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut events = Vec::new();
+            while events.is_empty() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(POLL_DELAY);
+                store.poll(&mut events).unwrap();
+            }
+            let stats = store.stats();
+            store.close().unwrap();
+            stats
+        };
+
+        assert_eq!(single_stats.fetched, 1);
+        assert_eq!(single_stats.progress, 1);
+        assert_eq!(single_stats.bytes_in, expected_logical_bytes);
+        assert_eq!(single_samples.lock().unwrap().len(), 2);
+
+        for staggered in [false, true] {
+            let lock_dir = directory.join(format!("coalesced-lock-{staggered}"));
+            fs::create_dir_all(&lock_dir).unwrap();
+            let intake = crate::offload::intake_slots(&layout, 1);
+            let pool = SlabPool::new(layout.page_record_bytes, intake, intake).unwrap();
+            let (inner, _) = SimulatedGpu::shared_mapped(&geometry).unwrap();
+            let gates = GatedCopier::wrap(inner, layout.clone(), staggered);
+            let recorded_samples = Arc::new(Mutex::new(Vec::new()));
+            let mut store = DiskStore::new(
+                record::DirectoryLock::acquire(&lock_dir).unwrap(),
+                IDENTITY,
+                FINGERPRINT,
+                1 << 30,
+                geometry.clone(),
+                scanned_records.clone(),
+                Box::new(ObservedTransport {
+                    inner: Staged::new(
+                        Some(pool),
+                        gates.copier,
+                        DiskThread::start("rate-coalesced").unwrap(),
+                    ),
+                    samples: Arc::clone(&recorded_samples),
+                }),
+            )
+            .unwrap();
+
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let submit_count = if staggered { 1 } else { CONCURRENT };
+            for i in 0..submit_count {
+                let hit = store.lookup(&full, 0, u64::MAX).unwrap();
+                let base = (i as u32 + 1) * 1000;
+                store
+                    .fetch(
+                        hit,
+                        InboundTicket {
+                            key: record_header.key,
+                            pages: pages(base..base + PAGES as u32),
+                            slot: StateSlotId(i as u32 + 1),
+                        },
+                    )
+                    .unwrap();
+            }
+
+            let mut events = Vec::new();
+            let mut rate_after_physical_reads = None;
+            if staggered {
+                while gates.held_in.lock().unwrap().len() < 2 {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(POLL_DELAY);
+                    store.poll(&mut events).unwrap();
+                }
+                rate_after_physical_reads = Some(store.stats().inbound_rate);
+                for i in 1..CONCURRENT {
+                    let hit = store.lookup(&full, 0, u64::MAX).unwrap();
+                    let base = (i as u32 + 1) * 1000;
+                    store
+                        .fetch(
+                            hit,
+                            InboundTicket {
+                                key: record_header.key,
+                                pages: pages(base..base + PAGES as u32),
+                                slot: StateSlotId(i as u32 + 1),
+                            },
+                        )
+                        .unwrap();
+                }
+                *gates.hold_in.lock().unwrap() = false;
+            }
+
+            while events.len() < CONCURRENT {
+                assert!(Instant::now() < deadline);
+                if !staggered {
+                    std::thread::sleep(POLL_DELAY);
+                } else {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                store.poll(&mut events).unwrap();
+            }
+
+            let staged = store.transport_mut().staged().unwrap();
+            assert!(settled(staged));
+            assert_eq!(staged.disk_window_reads(), 2);
+            assert_eq!(staged.coalesced_windows(), 2 * (CONCURRENT as u64 - 1));
+
+            let samples = recorded_samples.lock().unwrap().clone();
+            assert_eq!(
+                samples.len(),
+                2,
+                "staggered={staggered}: expected 2 physical window rate samples, got {}",
+                samples.len()
+            );
+            assert_eq!(
+                samples.iter().map(|(bytes, _)| *bytes).sum::<u64>(),
+                expected_logical_bytes
+            );
+            let mut expected_rate = Rate::new(INITIAL_STAGED_DISK_RATE);
+            for &(bytes, elapsed) in &samples {
+                expected_rate.observe(bytes, elapsed);
+            }
+            let expected_bps = expected_rate.get();
+
+            let coalesced_stats = store.stats();
+            assert_eq!(coalesced_stats.fetched, CONCURRENT as u64);
+            assert_eq!(coalesced_stats.progress, CONCURRENT as u64);
+            assert_eq!(
+                coalesced_stats.bytes_in,
+                CONCURRENT as u64 * single_stats.bytes_in
+            );
+            if let Some(before_followers) = rate_after_physical_reads {
+                assert!(
+                    (coalesced_stats.inbound_rate - before_followers).abs()
+                        < 0.05 * before_followers,
+                    "follower completions changed inbound_rate from {before_followers} to {}",
+                    coalesced_stats.inbound_rate
+                );
+            }
+            assert!(
+                (coalesced_stats.inbound_rate - expected_bps).abs() <= 0.05 * expected_bps,
+                "staggered={staggered}: DiskStore inbound_rate ({}) diverged from physical window median ({expected_bps})",
+                coalesced_stats.inbound_rate
+            );
+
+            store.close().unwrap();
+        }
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "codec")]
+    #[test]
+    fn concurrent_packed_fetches_coalesce_opens_and_read_packed_windows() {
+        use crate::shared::{codec::Plan, packed::Checksum};
+        use crate::testing::{CodecCopier, GpuMemory};
+        let Some(directory) = test_directory("disk-store", "coalesce-packed-v4") else {
+            return;
+        };
+        const PARENT_PAGES: usize = 2 * WINDOW_PAGES + 5; // 133 pages -> 3 aligned ReadPacked windows
+        const CHILD_PAGES: usize = 3; // 1 ReadPacked window + row per branch
+        const BRANCHES: usize = 4;
+        let geometry = geometry();
+        let layout = Layout::new(&geometry).unwrap();
+        let profile = [0xCC; 32];
+        let page_plan = Arc::new(Plan::new(layout.page_record_bytes as usize, &[]).unwrap());
+        let row_plan = Arc::new(Plan::new(layout.row_record_bytes as usize, &[]).unwrap());
+
+        let write_gpu = GpuMemory::default();
+        let parent_pages_expected: Vec<Vec<u8>> = (0..PARENT_PAGES)
+            .map(|p| {
+                (0..layout.page_record_bytes as usize)
+                    .map(|j| ((j / 32 + p) % 7) as u8)
+                    .collect()
+            })
+            .collect();
+        for (i, bytes) in parent_pages_expected.iter().enumerate() {
+            write_gpu.pages.lock().unwrap().insert(i as u32, bytes.clone());
+        }
+        write_gpu
+            .rows
+            .lock()
+            .unwrap()
+            .insert(0, vec![0x51; layout.row_record_bytes as usize]);
+
+        let mut ids = Ids::new();
+        let parent_tokens = PARENT_PAGES as u64 * PAGE_TOKENS;
+        let base_history = history(parent_tokens);
+        let parent_cp = checkpoint(
+            &mut ids,
+            &base_history,
+            parent_tokens,
+            None,
+            pages(0..PARENT_PAGES as u32),
+            PARENT_PAGES,
+            StateSlotId(0),
+        );
+
+        let mut branches = Vec::with_capacity(BRANCHES);
+        for branch in 0..BRANCHES {
+            let mut branch_history = base_history.clone();
+            let extra_tokens: Vec<u32> = (0..(CHILD_PAGES as u32 * PAGE_TOKENS as u32 + 5))
+                .map(|i| i.wrapping_mul(23) ^ (branch as u32 + 1).wrapping_mul(0x85eb_ca6b))
+                .collect();
+            branch_history.append(&extra_tokens, &[]).unwrap();
+            let consumed = branch_history.token_count();
+            let base_id = 500 + (branch as u32) * 10;
+            let child_pages_expected: Vec<Vec<u8>> = (0..CHILD_PAGES)
+                .map(|p| {
+                    (0..layout.page_record_bytes as usize)
+                        .map(|j| ((j / 16 + p + branch * 3) % 6) as u8)
+                        .collect()
+                })
+                .collect();
+            for (i, bytes) in child_pages_expected.iter().enumerate() {
+                write_gpu
+                    .pages
+                    .lock()
+                    .unwrap()
+                    .insert(base_id + i as u32, bytes.clone());
+            }
+            let child_row_expected: Vec<u8> = (0..layout.row_record_bytes as usize)
+                .map(|j| ((j / 16 + branch + 1) % 5) as u8)
+                .collect();
+            let slot_id = StateSlotId(10 + branch as u32);
+            write_gpu
+                .rows
+                .lock()
+                .unwrap()
+                .insert(slot_id.0, child_row_expected.clone());
+            let mut chain_ids = pages(0..PARENT_PAGES as u32);
+            chain_ids.extend(pages(base_id..base_id + CHILD_PAGES as u32));
+            let cp = checkpoint(
+                &mut ids,
+                &branch_history,
+                consumed,
+                Some(parent_tokens),
+                chain_ids,
+                CHILD_PAGES,
+                slot_id,
+            );
+            branches.push((branch_history, cp, child_pages_expected, child_row_expected));
+        }
+
+        // Write v4 packed parent and 4 v4 packed children to disk.
+        {
+            let guard = crate::testing::directory_lock(&directory).unwrap();
+            let pool = SlabPool::new(layout.page_record_bytes, 4, 0).unwrap();
+            let copier = CodecCopier::new(
+                layout.clone(),
+                profile,
+                page_plan.clone(),
+                row_plan.clone(),
+                write_gpu,
+            )
+            .with_receive(vec![profile])
+            .shared();
+            let mut writer = DiskStore::new(
+                guard,
+                IDENTITY,
+                FINGERPRINT,
+                1 << 30,
+                geometry.clone(),
+                Vec::new(),
+                Box::new(Staged::new(
+                    Some(pool),
+                    copier,
+                    DiskThread::start("coalesce-packed-write").unwrap(),
+                )),
+            )
+            .unwrap();
+            assert_eq!(writer.store(&parent_cp).unwrap(), StoreOutcome::Queued);
+            assert!(matches!(
+                &poll_until(&mut writer, Instant::now() + Duration::from_secs(30), |e| {
+                    matches!(e, StoreEvent::Stored { .. })
+                })[..],
+                [StoreEvent::Stored { result: Ok(_), .. }]
+            ));
+            assert!(writer.record(&parent_cp.key).unwrap().header.packed.is_some());
+            for (_, cp, _, _) in &branches {
+                assert_eq!(writer.store(cp).unwrap(), StoreOutcome::Queued);
+                assert!(matches!(
+                    &poll_until(&mut writer, Instant::now() + Duration::from_secs(30), |e| {
+                        matches!(e, StoreEvent::Stored { .. })
+                    })[..],
+                    [StoreEvent::Stored { result: Ok(_), .. }]
+                ));
+                assert!(writer.record(&cp.key).unwrap().header.packed.is_some());
+            }
+            writer.close().unwrap();
+        }
+
+        // Reopen with a 1-slot SlabPool (packed windows need 0 SlabPool slots) and
+        // execute 4 concurrent branch fetches sharing the 3-window v4 ancestor.
+        {
+            let guard = crate::testing::directory_lock(&directory).unwrap();
+            let scanned_records = record::scan(
+                &guard,
+                &IDENTITY,
+                &FINGERPRINT,
+                PAGE_TOKENS,
+                &record::rank_sizes(&geometry),
+            )
+            .unwrap();
+            assert_eq!(scanned_records.len(), 1 + BRANCHES);
+            assert!(scanned_records.iter().all(|r| r.header.packed.is_some()));
+
+            let pool = SlabPool::new(layout.page_record_bytes, 1, 1).unwrap();
+            let read_gpu = GpuMemory::default();
+            let inner = CodecCopier::new(
+                layout.clone(),
+                profile,
+                page_plan.clone(),
+                row_plan.clone(),
+                read_gpu.clone(),
+            )
+            .with_receive(vec![profile])
+            .shared();
+            let mut store = DiskStore::new(
+                guard,
+                IDENTITY,
+                FINGERPRINT,
+                1 << 30,
+                geometry.clone(),
+                scanned_records,
+                Box::new(Staged::new(
+                    Some(pool.clone()),
+                    inner,
+                    DiskThread::start("coalesce-packed-read").unwrap(),
+                )),
+            )
+            .unwrap();
+
+            let total_pages = (PARENT_PAGES + CHILD_PAGES) as u32;
+            let mut tickets = Vec::with_capacity(BRANCHES);
+            for (branch, (branch_history, cp, _, _)) in branches.iter().enumerate() {
+                let hit = store.lookup(branch_history, 0, u64::MAX).unwrap();
+                assert_eq!(hit.key, cp.key);
+                assert_eq!(hit.pages, total_pages as usize);
+                let base = (branch as u32 + 1) * 1000;
+                let ticket = InboundTicket {
+                    key: cp.key,
+                    pages: pages(base..base + total_pages),
+                    slot: StateSlotId(branch as u32 + 1),
+                };
+                store.fetch(hit, ticket.clone()).unwrap();
+                tickets.push(ticket);
+            }
+
+            let events =
+                poll_all_fetches(&mut store, BRANCHES, Instant::now() + Duration::from_secs(30));
+            for event in &events {
+                assert!(
+                    matches!(event, StoreEvent::Fetched { result: Ok(bytes), .. } if *bytes > 0),
+                    "unexpected fetch event: {event:?}"
+                );
+            }
+
+            let staged = store.transport_mut().staged().unwrap();
+            assert!(settled(staged));
+            assert_eq!(staged.disk_opens(), 1 + BRANCHES as u64);
+            assert_eq!(staged.disk_window_reads(), 3 + BRANCHES as u64);
+            assert_eq!(staged.coalesced_windows(), 3 * (BRANCHES as u64 - 1));
+            assert_eq!(pool.free_slots(), pool.slot_count());
+            assert!(store.index().nodes().all(|node| !node.pinned()));
+
+            let gpu_pages = read_gpu.pages.lock().unwrap();
+            let gpu_rows = read_gpu.rows.lock().unwrap();
+            for (branch, (_, _, child_pages_expected, child_row_expected)) in
+                branches.iter().enumerate()
+            {
+                let ticket = &tickets[branch];
+                for (index, expected) in parent_pages_expected.iter().enumerate() {
+                    assert_eq!(&gpu_pages[&ticket.pages[index].0], expected);
+                }
+                for (index, expected) in child_pages_expected.iter().enumerate() {
+                    assert_eq!(&gpu_pages[&ticket.pages[PARENT_PAGES + index].0], expected);
+                }
+                assert_eq!(&gpu_rows[&ticket.slot.0], child_row_expected);
+            }
+            drop(gpu_pages);
+            drop(gpu_rows);
+            store.close().unwrap();
+        }
+
+        // Verify a packed content checksum error on a shared ReadPacked window marks
+        // `is_record_read()`, fails all attached followers, and drops their lookup rows.
+        {
+            let guard = crate::testing::directory_lock(&directory).unwrap();
+            let scanned_records = record::scan(
+                &guard,
+                &IDENTITY,
+                &FINGERPRINT,
+                PAGE_TOKENS,
+                &record::rank_sizes(&geometry),
+            )
+            .unwrap();
+            let pool = SlabPool::new(layout.page_record_bytes, 1, 1).unwrap();
+            let read_gpu = GpuMemory::default();
+            let inner = CodecCopier::new(
+                layout.clone(),
+                profile,
+                page_plan,
+                row_plan,
+                read_gpu,
+            )
+            .with_receive(vec![profile])
+            .shared();
+            let gates = GatedCopier::wrap(inner, layout, false);
+            *gates.reply_error.lock().unwrap() =
+                Some((JobId(1), Error::carrying(Checksum::Stored)));
+            let mut store = DiskStore::new(
+                guard,
+                IDENTITY,
+                FINGERPRINT,
+                1 << 30,
+                geometry,
+                scanned_records,
+                Box::new(Staged::new(
+                    Some(pool.clone()),
+                    gates.copier,
+                    DiskThread::start("coalesce-packed-corrupt").unwrap(),
+                )),
+            )
+            .unwrap();
+
+            let total_pages = (PARENT_PAGES + CHILD_PAGES) as u32;
+            for (branch, (branch_history, cp, _, _)) in branches[..2].iter().enumerate() {
+                let hit = store.lookup(branch_history, 0, u64::MAX).unwrap();
+                let base = (branch as u32 + 1) * 1000;
+                store
+                    .fetch(
+                        hit,
+                        InboundTicket {
+                            key: cp.key,
+                            pages: pages(base..base + total_pages),
+                            slot: StateSlotId(branch as u32 + 1),
+                        },
+                    )
+                    .unwrap();
+            }
+
+            let events = poll_all_fetches(&mut store, 2, Instant::now() + Duration::from_secs(30));
+            for event in events {
+                match event {
+                    StoreEvent::Fetched {
+                        key,
+                        result: Err(error),
+                    } => {
+                        assert!(error.is_record_read());
+                        assert!(!store.index().node(&key).unwrap().row);
+                    }
+                    other => panic!("expected record_read error, got {other:?}"),
+                }
+            }
+            let staged = store.transport_mut().staged().unwrap();
+            assert!(settled(staged));
+            assert_eq!(pool.free_slots(), pool.slot_count());
+            assert!(store.index().nodes().all(|node| !node.pinned()));
+            store.close().unwrap();
+        }
+
+        fs::remove_dir_all(directory).unwrap();
     }
 }

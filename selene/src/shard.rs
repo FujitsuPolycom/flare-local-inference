@@ -1002,6 +1002,15 @@ impl DiskTransport for Sharded {
         Ok(())
     }
 
+    fn drain_inbound_samples(&mut self, samples: &mut Vec<(u64, std::time::Duration)>) {
+        if self.poison.is_some() {
+            let mut discard = Vec::new();
+            self.local.drain_inbound_samples(&mut discard);
+            return;
+        }
+        self.local.drain_inbound_samples(samples);
+    }
+
     /// Close every peer's transport and rank zero's, collecting the completions each reaches.
     fn close(&mut self) -> Result<()> {
         if self.closed {
@@ -1201,6 +1210,8 @@ impl Peer {
     fn forward(&mut self) -> Result<()> {
         let mut events = Vec::new();
         self.staged.poll(&mut events)?;
+        let mut discard = Vec::new();
+        self.staged.drain_inbound_samples(&mut discard);
         for event in &events {
             let (kind, id, result) = Kind::of(event);
             self.link.send(&encode_event(kind, id, &result))?;
