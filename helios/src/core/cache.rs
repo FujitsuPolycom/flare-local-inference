@@ -46,8 +46,15 @@ thread_local! {
 use crate::Result;
 use crate::core::container::{
     ALIGNMENT, COMPANION_TENSOR, Container, PAYLOAD_FORMAT, Slice, Source, Writer,
-    companion_prefix, link_companion, open_relative, validate_relative_path, write_companion,
+    companion_prefix as container_companion_prefix, link_companion, open_relative,
+    validate_relative_path, write_companion,
 };
+
+/// Deterministic header prefix preceding the payload bytes of a single-tensor
+/// companion container holding `length` payload bytes.
+pub fn companion_prefix(length: u64) -> Result<Vec<u8>> {
+    container_companion_prefix(length)
+}
 
 const MAX_NAME: usize = 128;
 const STREAMING_CAPTURE_BUFFER: usize = 4 << 20;
@@ -1953,6 +1960,135 @@ impl Root {
             return cached;
         }
         self.publish_payload(&transaction, &staged, declared, slice.len()).map(Some)
+    }
+
+    /// Adopt a synced companion wrapper file whose payload bytes at the
+    /// canonical prefix offset were already hashed against `declared` on the
+    /// exact `(device, inode)` pair `expected_dev_ino`.
+    ///
+    /// Returns `Ok(None)` when `partial` does not carry the canonical wrapper
+    /// length or header, or when the filesystem refuses a hard link into
+    /// staging, so the caller can fall back to slice verification and storage.
+    /// Rejects a file whose `(device, inode)` differs from `expected_dev_ino`.
+    /// Pre-existing cache hits and concurrent publication races still verify
+    /// the stored object bytes before returning.
+    pub fn adopt_verified_companion(
+        &self,
+        declared: PayloadId,
+        length: u64,
+        partial: &Path,
+        expected_dev_ino: (u64, u64),
+    ) -> Result<Option<PayloadObject>> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+            use std::os::unix::io::AsRawFd;
+
+            let transaction = Transaction::begin(self)?;
+            let staged = transaction.staging_file("wrapped")?;
+            let prefix = companion_prefix(length)?;
+            let wrapper_len = (prefix.len() as u64)
+                .checked_add(length)
+                .ok_or_else(|| invalid("companion wrapper length overflow"))?;
+            {
+                let source = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(partial)
+                    .map_err(failure)?;
+                let metadata = source.metadata().map_err(failure)?;
+                if !metadata.is_file() {
+                    return Err(invalid("verified companion source is not a regular file"));
+                }
+                if (metadata.dev(), metadata.ino()) != expected_dev_ino {
+                    return Err(invalid(
+                        "verified companion source does not match the verified inode",
+                    ));
+                }
+                if metadata.len() != wrapper_len {
+                    return Ok(None);
+                }
+                let mut header = vec![0u8; prefix.len()];
+                FileExt::read_exact_at(&source, &mut header, 0).map_err(failure)?;
+                if header != prefix {
+                    return Ok(None);
+                }
+                if let Some(parent) = staged.parent() {
+                    fs::create_dir_all(parent).map_err(failure)?;
+                }
+                let from = std::ffi::CString::new(format!("/proc/self/fd/{}", source.as_raw_fd()))
+                    .map_err(|_| invalid("payload source descriptor path"))?;
+                let destination = std::ffi::CString::new(staged.as_os_str().as_bytes())
+                    .map_err(|_| invalid("staged payload path contains NUL"))?;
+                // SAFETY: Both arguments are NUL-terminated paths that outlive the call.
+                let status = unsafe {
+                    libc::linkat(
+                        libc::AT_FDCWD,
+                        from.as_ptr(),
+                        libc::AT_FDCWD,
+                        destination.as_ptr(),
+                        libc::AT_SYMLINK_FOLLOW,
+                    )
+                };
+                if status != 0 {
+                    let error = io::Error::last_os_error();
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(
+                            libc::EXDEV
+                                | libc::EMLINK
+                                | libc::EPERM
+                                | libc::EOPNOTSUPP
+                                | libc::ENOSYS
+                                | libc::EINVAL
+                                | libc::ENOENT
+                        )
+                    ) {
+                        return Ok(None);
+                    }
+                    return Err(failure(error));
+                }
+            }
+            let linked_check = (|| -> Result<()> {
+                let linked = File::open(&staged).map_err(failure)?;
+                let linked_meta = linked.metadata().map_err(failure)?;
+                if (linked_meta.dev(), linked_meta.ino()) != expected_dev_ino
+                    || linked_meta.len() != wrapper_len
+                {
+                    return Err(invalid(
+                        "linked companion does not match the verified wrapper",
+                    ));
+                }
+                let mut header = vec![0u8; prefix.len()];
+                FileExt::read_exact_at(&linked, &mut header, 0).map_err(failure)?;
+                if header != prefix {
+                    return Err(invalid("linked companion is not the canonical wrapper"));
+                }
+                Ok(())
+            })();
+            if let Err(error) = linked_check {
+                let _ = remove_file(&staged);
+                return Err(error);
+            }
+            let cached = self.cached_slice(declared, length);
+            if !matches!(cached, Ok(None)) {
+                let _ = remove_file(&staged);
+                return cached;
+            }
+            self.publish_verified_payload(&transaction, &staged, declared, length)
+                .map(Some)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = expected_dev_ino;
+            let container = Container::open(partial)?;
+            let slice = container.tensor(COMPANION_TENSOR)?;
+            if slice.len() != length {
+                return Ok(None);
+            }
+            self.adopt_companion(declared, &slice, &partial.display().to_string())
+        }
     }
 
     /// A cached object for `id`, verified, when one is already installed.
@@ -5497,6 +5633,131 @@ mod tests {
         // Both handles stay live and both still read their payload.
         assert_eq!(first.length(), bytes.len() as u64);
         assert_eq!(second.length(), bytes.len() as u64);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn adopt_verified_companion_links_without_payload_readback_and_rejects_mismatches() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temporary = Temporary::new();
+        let root = temporary.root();
+
+        let payload: Vec<u8> = (0..65_536u32).map(|i| (i % 251) as u8).collect();
+        let id = PayloadId::of(&payload);
+        let mut canonical = companion_prefix(payload.len() as u64).unwrap();
+        canonical.extend_from_slice(&payload);
+        let partial = temporary.0.join("verified-canonical.safetensors");
+        {
+            let mut file = File::create(&partial).unwrap();
+            io::Write::write_all(&mut file, &canonical).unwrap();
+            file.sync_all().unwrap();
+        }
+        let meta = fs::metadata(&partial).unwrap();
+        let dev_ino = (meta.dev(), meta.ino());
+        let (adopted, bytes_read) =
+            crate::core::container::count_payload_reads(&[partial.clone()], || {
+                root.adopt_verified_companion(id, payload.len() as u64, &partial, dev_ino)
+            });
+        let object = adopted.unwrap().expect("canonical wrapper must be adopted");
+        assert_eq!(bytes_read, 0, "verified adoption must not re-read payload bytes");
+        let installed_meta = fs::metadata(object.path()).unwrap();
+        assert_eq!((installed_meta.dev(), installed_meta.ino()), dev_ino);
+        assert!(installed_meta.permissions().readonly());
+        assert_eq!(staged(&root), 0);
+        assert_eq!(object.slice().digest().unwrap(), id);
+
+        let mismatch_payload: Vec<u8> = (0..4096u32).map(|i| (i % 199) as u8).collect();
+        let mismatch_id = PayloadId::of(&mismatch_payload);
+        let mut mismatch_wrapper = companion_prefix(mismatch_payload.len() as u64).unwrap();
+        mismatch_wrapper.extend_from_slice(&mismatch_payload);
+        let mismatch_path = temporary.0.join("verified-wrong-inode.safetensors");
+        fs::write(&mismatch_path, &mismatch_wrapper).unwrap();
+        let mismatch_meta = fs::metadata(&mismatch_path).unwrap();
+        assert!(
+            root.adopt_verified_companion(
+                mismatch_id,
+                mismatch_payload.len() as u64,
+                &mismatch_path,
+                (mismatch_meta.dev(), mismatch_meta.ino().wrapping_add(1)),
+            )
+            .is_err(),
+            "mismatched device/inode pair must be rejected"
+        );
+        assert!(root.payload(mismatch_id).unwrap().is_none());
+        assert_eq!(staged(&root), 0);
+
+        let framed = temporary.0.join("verified-non-canonical.safetensors");
+        let mut writer =
+            Writer::new(File::create(&framed).unwrap(), PAYLOAD_FORMAT).unwrap();
+        writer
+            .add(
+                COMPANION_TENSOR,
+                mismatch_payload.len() as u64,
+                Source::Bytes(mismatch_payload.clone()),
+            )
+            .unwrap();
+        writer
+            .add("extra.tail", 4, Source::Bytes(vec![1, 2, 3, 4]))
+            .unwrap();
+        writer.finish().unwrap();
+        let framed_meta = fs::metadata(&framed).unwrap();
+        assert!(
+            root.adopt_verified_companion(
+                mismatch_id,
+                mismatch_payload.len() as u64,
+                &framed,
+                (framed_meta.dev(), framed_meta.ino()),
+            )
+            .unwrap()
+            .is_none(),
+            "non-canonical wrapper must return Ok(None) for slice fallback"
+        );
+        assert_eq!(staged(&root), 0);
+
+        // Cross-filesystem source (e.g. /dev/shm -> /tmp) returns Ok(None) so callers
+        // copy through store_slice, whereas destination staging errors (EACCES on
+        // staging/wrapped) propagate immediately instead of masking a broken cache.
+        let shm = Path::new("/dev/shm");
+        if shm.is_dir()
+            && fs::metadata(shm).map(|m| m.dev()).ok()
+                != fs::metadata(&temporary.0).map(|m| m.dev()).ok()
+        {
+            let shm_path = shm.join(format!("flare-adopt-exdev-{}", token()));
+            fs::write(&shm_path, &mismatch_wrapper).unwrap();
+            let shm_meta = fs::metadata(&shm_path).unwrap();
+            let exdev = root.adopt_verified_companion(
+                mismatch_id,
+                mismatch_payload.len() as u64,
+                &shm_path,
+                (shm_meta.dev(), shm_meta.ino()),
+            );
+            let _ = fs::remove_file(&shm_path);
+            assert!(
+                exdev.unwrap().is_none(),
+                "EXDEV must return Ok(None) for cross-filesystem copy fallback"
+            );
+            assert_eq!(staged(&root), 0);
+        }
+
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            let wrapped_dir = root.path().join("staging/wrapped");
+            fs::create_dir_all(&wrapped_dir).unwrap();
+            fs::set_permissions(&wrapped_dir, fs::Permissions::from_mode(0o555)).unwrap();
+            let unwritable = root.adopt_verified_companion(
+                mismatch_id,
+                mismatch_payload.len() as u64,
+                &mismatch_path,
+                (mismatch_meta.dev(), mismatch_meta.ino()),
+            );
+            fs::set_permissions(&wrapped_dir, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(
+                unwritable.is_err(),
+                "destination staging directory failure must return Err instead of Ok(None)"
+            );
+            assert_eq!(staged(&root), 0);
+        }
     }
 
     #[test]

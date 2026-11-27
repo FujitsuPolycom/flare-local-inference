@@ -139,10 +139,10 @@ class FabricSource:
         for reader in self.readers.values():
             reader.join()
 
-    def close(self):
+    def close(self, *, check=True):
         self.stopping.set()
         try:
-            self.transport.close()
+            self.transport.close(check=check)
         finally:
             self.thread.join()
             for reader in self.readers.values():

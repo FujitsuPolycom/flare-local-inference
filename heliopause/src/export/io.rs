@@ -290,17 +290,17 @@ impl IoBudget {
         prefix: &[u8],
         mut fill: impl FnMut(u64, &mut [u8]) -> Result<()>,
     ) -> Result<[u8; 32]> {
-        use sha2::{Digest, Sha256};
+        use ring::digest::{Context, SHA256};
         std::thread::scope(|scope| {
             let (sender, receiver) =
                 std::sync::mpsc::sync_channel::<(Buffer<'_>, usize)>(self.depth);
-            let hasher = scope.spawn(move || {
-                let mut digest = Sha256::new();
+            let hasher = scope.spawn(move || -> [u8; 32] {
+                let mut digest = Context::new(&SHA256);
                 digest.update(prefix);
                 while let Ok((buffer, count)) = receiver.recv() {
                     digest.update(&buffer.bytes()[..count]);
                 }
-                <[u8; 32]>::from(digest.finalize())
+                digest.finish().as_ref().try_into().unwrap()
             });
             let filled: Result<()> = (|| {
                 let mut offset = 0;
@@ -359,8 +359,8 @@ impl IoBudget {
             let (receiver, hasher) = if let Some(prefix) = prefix {
                 let (sender, receiver) = std::sync::mpsc::sync_channel(self.depth);
                 let hasher = scope.spawn(move || -> Result<[u8; 32]> {
-                    use sha2::{Digest, Sha256};
-                    let mut digest = Sha256::new();
+                    use ring::digest::{Context, SHA256};
+                    let mut digest = Context::new(&SHA256);
                     digest.update(prefix);
                     while let Ok((buffer, position, count)) = filled_receiver.recv() {
                         digest.update(&buffer.bytes()[..count]);
@@ -368,7 +368,7 @@ impl IoBudget {
                             .send((buffer, position, count))
                             .map_err(|_| "export disk writer stopped")?;
                     }
-                    Ok(digest.finalize().into())
+                    Ok(digest.finish().as_ref().try_into().unwrap())
                 });
                 (receiver, Some(hasher))
             } else {

@@ -329,3 +329,418 @@ def test_host_export_without_configured_cache_fails_before_peer_commands(tmp_pat
             group, None, options={}, export_id='export', images=None,
             storage=SimpleNamespace(host_regions=[]), publisher=object())
     assert side_effects == [], f"peer or workspace side effects: {side_effects}"
+
+
+def test_host_export_overlaps_local_export_with_peer_receive_and_aborts_sockets_on_failure(tmp_path, monkeypatch):
+    import contextlib
+    import json
+    from pathlib import Path
+    import socket
+    import struct
+    import threading
+    import time
+    from types import SimpleNamespace
+
+    import flare_heliopause
+    from ignition.preparation import checkpoint_source, core_file, host_ranks, memory_inventory, runtime_core
+    from ignition.preparation.core_snapshot import export_options
+
+    # Verify RootSource pre-indexes safetensors header extents and preserves single-row and strided reads.
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    st_header = json.dumps({"w": {"dtype": "U8", "shape": [2, 4], "data_offsets": [0, 8]}}).encode()
+    (snap / "model.safetensors").write_bytes(struct.pack("<Q", len(st_header)) + st_header + bytes(range(8)))
+    (snap / "config.json").write_text("{}")
+    root_src = checkpoint_source.RootSource(snap, SimpleNamespace(repository=str(snap), revision="r0"))
+    try:
+        start = 8 + len(st_header)
+        assert root_src._header_bytes == {"config.json": None, "model.safetensors": start}
+        assert root_src.read("model.safetensors", start, 8) == bytes(range(8))
+        assert root_src.read("model.safetensors", start, 4, rows=2, stride=4) == bytes(range(8))
+        assert root_src.read("model.safetensors", start + 1, 2, rows=2, stride=4) == bytes((1, 2, 5, 6))
+    finally:
+        root_src.close()
+
+    class Stage:
+        def __init__(self, destination, staging, cache):
+            (tmp_path / "ws").mkdir(exist_ok=True)
+
+        def rank_path(self, rank):
+            return str(tmp_path / "ws" / f"rank-{rank}.json")
+
+        def retain_sources(self, paths):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(flare_heliopause, "NativeExportStage", Stage)
+    monkeypatch.setattr(host_ranks, "send_object", lambda control, value: None)
+    monkeypatch.setattr(host_ranks, "_export_channels", lambda channels: [])
+    monkeypatch.setattr(memory_inventory, "print_inventory", lambda *args, **kwargs: None)
+    monkeypatch.setattr(core_file, "combine", lambda *args, **kwargs: SimpleNamespace(ok=True))
+
+    # 1. Prove concurrent overlap: export_model and export_receive_ranks synchronize on a 2-party barrier.
+    overlap_barrier = threading.Barrier(2, timeout=5.0)
+    fabric_closed = []
+
+    def overlapping_export_model(model, images, storage, path, **kwargs):
+        overlap_barrier.wait()
+        Path(path).write_text("{}")
+        return SimpleNamespace(memory_inventory={"rank": 0})
+
+    def overlapping_receive_ranks(requests, cache, no_weights, owners, stage):
+        overlap_barrier.wait()
+        return json.dumps([{
+            "inventory": {"rank": 1},
+            "channels": [{"sent": 3, "received": 4}],
+            "stats": {
+                "payload_bytes": 1024,
+                "payload_seconds": 0.01,
+                "payload_gbps": 1.0,
+                "streams": 1,
+                "transport": "fabric-tcp",
+            },
+        }])
+
+    monkeypatch.setattr(runtime_core, "export_model", overlapping_export_model)
+    monkeypatch.setattr(flare_heliopause, "export_receive_ranks", overlapping_receive_ranks)
+
+    group = object.__new__(host_ranks.HostRankGroup)
+    control = SimpleNamespace(fileno=lambda: 7)
+    channel = SimpleNamespace(sent=0, received=0)
+    group.rendezvous = SimpleNamespace(world=2, peers={1: SimpleNamespace(control=control)}, stopping=threading.Event())
+    group.model = object()
+    group.checkpoint_fabric = SimpleNamespace(
+        readers={(1, 0): SimpleNamespace(channel=channel)},
+        streams=1,
+        close=lambda: fabric_closed.append(True),
+    )
+    group._started = False
+    group._closed = False
+    group.close = lambda: None
+
+    with export_options(tmp_path / "cache"):
+        result = host_ranks.HostRankGroup.export(
+            group,
+            None,
+            options={},
+            export_id="exp-overlap",
+            images=None,
+            storage=SimpleNamespace(host_regions=[]),
+            publisher=object(),
+        )
+    assert result.ok is True
+    assert (channel.sent, channel.received) == (3, 4)
+    assert fabric_closed == [True]
+
+    # 2. Prove fast socket abort when export_model fails while export_receive_ranks is blocked on peer I/O,
+    # with real _watch_until_closed and real HostRankGroup.close().
+    ctrl_root, ctrl_peer = socket.socketpair()
+    chan_root, chan_peer = socket.socketpair()
+    exec_root, exec_peer = socket.socketpair()
+    ctrl_peer.settimeout(5.0)
+    chan_peer.settimeout(5.0)
+    receive_started = threading.Event()
+    restored_channels = []
+    monkeypatch.setattr(host_ranks, "_restore_export_channels", lambda *args: restored_channels.append(args))
+
+    def blocking_receive_ranks(requests, cache, no_weights, owners, stage):
+        receive_started.set()
+        # Blocks until coordinator shuts down ctrl_root and chan_root on export_model failure.
+        assert ctrl_peer.recv(1) == b""
+        assert chan_peer.recv(1) == b""
+        raise ConnectionError("peer export socket shut down")
+
+    def failing_export_model(model, images, storage, path, **kwargs):
+        assert receive_started.wait(5.0)
+        raise RuntimeError("rank zero local export failed")
+
+    monkeypatch.setattr(flare_heliopause, "export_receive_ranks", blocking_receive_ranks)
+    monkeypatch.setattr(runtime_core, "export_model", failing_export_model)
+
+    abort_group = object.__new__(host_ranks.HostRankGroup)
+    abort_channel = SimpleNamespace(connection=chan_root, sent=1, received=2)
+    stopping_event = threading.Event()
+    suppress_event = threading.Event()
+    abort_group.rendezvous = SimpleNamespace(
+        world=2,
+        peers={1: SimpleNamespace(control=ctrl_root, executor=exec_root)},
+        stopping=stopping_event,
+        suppress_watch=suppress_event,
+        store=object(),
+    )
+    model_closed = []
+    abort_group.model = SimpleNamespace(close=lambda: model_closed.append(True))
+    abort_closed = []
+    abort_group.checkpoint_fabric = SimpleNamespace(
+        readers={(1, 0): SimpleNamespace(channel=abort_channel)},
+        streams=1,
+        close=lambda: abort_closed.append(True),
+    )
+    abort_group._started = False
+    abort_group._closed = False
+    abort_group._aborted = False
+    watcher = host_ranks._watch_until_closed(
+        [ctrl_root], stopping_event, "peer disconnected", suppress=suppress_event)
+
+    try:
+        with export_options(tmp_path / "cache"):
+            with pytest.raises(RuntimeError, match="rank zero local export failed") as caught:
+                with abort_group:
+                    host_ranks.HostRankGroup.export(
+                        abort_group,
+                        None,
+                        options={},
+                        export_id="exp-abort",
+                        images=None,
+                        storage=SimpleNamespace(host_regions=[]),
+                        publisher=object(),
+                    )
+        watcher.join(timeout=2.0)
+        assert not watcher.is_alive()
+        assert stopping_event.is_set()
+        assert abort_group._aborted is True
+        assert abort_group._closed is True
+        assert model_closed == [True]
+        assert abort_closed == [True]
+        assert restored_channels == []
+        assert any("peer export receive aborted" in note for note in getattr(caught.value, "__notes__", ()))
+    finally:
+        stopping_event.set()
+        for sock in (ctrl_root, ctrl_peer, chan_root, chan_peer, exec_root, exec_peer):
+            with contextlib.suppress(OSError):
+                sock.close()
+
+    # 3. Prove _watch_until_closed and HostRankGroup.close() survive when export_receive_ranks fails and shuts
+    # down control sockets >200ms before export_model finishes.
+    ctrl_root2, ctrl_peer2 = socket.socketpair()
+    chan_root2, chan_peer2 = socket.socketpair()
+    exec_root2, exec_peer2 = socket.socketpair()
+    peer_failed = threading.Event()
+
+    def failing_receive_ranks(requests, cache, no_weights, owners, stage):
+        ctrl_root2.shutdown(socket.SHUT_RDWR)
+        peer_failed.set()
+        raise RuntimeError("peer export stream failed")
+
+    def slow_export_model(model, images, storage, path, **kwargs):
+        assert peer_failed.wait(5.0)
+        # Exceed _watch_until_closed's 200ms poll window while control has POLLHUP.
+        time.sleep(0.35)
+        Path(path).write_text("{}")
+        return SimpleNamespace(memory_inventory={"rank": 0})
+
+    monkeypatch.setattr(flare_heliopause, "export_receive_ranks", failing_receive_ranks)
+    monkeypatch.setattr(runtime_core, "export_model", slow_export_model)
+
+    recv_fail_group = object.__new__(host_ranks.HostRankGroup)
+    stopping_event2 = threading.Event()
+    suppress_event2 = threading.Event()
+    recv_fail_group.rendezvous = SimpleNamespace(
+        world=2,
+        peers={1: SimpleNamespace(control=ctrl_root2, executor=exec_root2)},
+        stopping=stopping_event2,
+        suppress_watch=suppress_event2,
+        store=object(),
+    )
+    model_closed2 = []
+    recv_fail_group.model = SimpleNamespace(close=lambda: model_closed2.append(True))
+    recv_fail_group.checkpoint_fabric = SimpleNamespace(
+        readers={(1, 0): SimpleNamespace(channel=SimpleNamespace(connection=chan_root2, sent=0, received=0))},
+        streams=1,
+        close=lambda: None,
+    )
+    recv_fail_group._started = False
+    recv_fail_group._closed = False
+    recv_fail_group._aborted = False
+    watcher2 = host_ranks._watch_until_closed(
+        [ctrl_root2], stopping_event2, "peer disconnected", suppress=suppress_event2)
+
+    try:
+        with export_options(tmp_path / "cache"):
+            with pytest.raises(RuntimeError, match="peer export stream failed"):
+                with recv_fail_group:
+                    host_ranks.HostRankGroup.export(
+                        recv_fail_group,
+                        None,
+                        options={},
+                        export_id="exp-recv-fail",
+                        images=None,
+                        storage=SimpleNamespace(host_regions=[]),
+                        publisher=object(),
+                    )
+        watcher2.join(timeout=2.0)
+        assert not watcher2.is_alive()
+        assert recv_fail_group._aborted is True
+        assert recv_fail_group._closed is True
+        assert model_closed2 == [True]
+    finally:
+        stopping_event2.set()
+        for sock in (ctrl_root2, ctrl_peer2, chan_root2, chan_peer2, exec_root2, exec_peer2):
+            with contextlib.suppress(OSError):
+                sock.close()
+
+
+def test_export_suppresses_broken_pipe_teardown_on_abort_and_checks_clean_exit(tmp_path, monkeypatch):
+    import contextlib
+    import json
+    import socket
+    import threading
+    from types import SimpleNamespace
+    import flare_heliopause
+    from ignition.preparation import checkpoint_fabric, host_ranks, memory_inventory, runtime_core
+    from ignition.preparation.core_snapshot import export_options
+
+    # 1. FabricSource.close forwards check=False to its underlying FabricTransport.
+    seen_checks = []
+    fake_source = object.__new__(checkpoint_fabric.FabricSource)
+    fake_source.stopping = threading.Event()
+    fake_source.transport = SimpleNamespace(close=lambda *, check=True: seen_checks.append(check))
+    fake_source.thread = SimpleNamespace(join=lambda: None)
+    fake_source.readers = {}
+    fake_source.close(check=False)
+    fake_source.close(check=True)
+    assert seen_checks == [False, True]
+
+    class FakeNativeStage:
+        def __init__(self, destination, staging, cache):
+            self.dir = tmp_path / f"stage-{id(self)}"
+            self.dir.mkdir(parents=True, exist_ok=True)
+
+        def rank_path(self, rank):
+            return str(self.dir / f"rank-{rank}.json")
+
+        def retain_sources(self, paths):
+            return len(paths)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(flare_heliopause, "NativeExportStage", FakeNativeStage)
+    monkeypatch.setattr(host_ranks, "send_object", lambda sock, value: None)
+    monkeypatch.setattr(host_ranks, "_export_channels", lambda channels: [{"fd": 9}])
+    monkeypatch.setattr(memory_inventory, "print_inventory", lambda *args, **kwargs: None)
+    monkeypatch.setattr("ignition.preparation.core_file.combine", lambda *args, **kwargs: SimpleNamespace(ok=True))
+
+    def make_group(*, broken_pipe_on_checked_close=True):
+        ctrl_root, ctrl_peer = socket.socketpair()
+        chan_root, chan_peer = socket.socketpair()
+        exec_root, exec_peer = socket.socketpair()
+        close_calls = []
+
+        def close_fabric(*, check=True):
+            close_calls.append(check)
+            if check and broken_pipe_on_checked_close:
+                raise RuntimeError("checkpoint fabric helper failed (1): Error: Broken pipe (os error 32)")
+
+        group = object.__new__(host_ranks.HostRankGroup)
+        group.rendezvous = SimpleNamespace(
+            world=2,
+            peers={1: SimpleNamespace(control=ctrl_root, executor=exec_root)},
+            stopping=threading.Event(),
+            suppress_watch=threading.Event(),
+            store=object(),
+        )
+        group.model = SimpleNamespace(close=lambda: None)
+        group.checkpoint_fabric = SimpleNamespace(
+            readers={(1, 0): SimpleNamespace(channel=SimpleNamespace(connection=chan_root, sent=0, received=0))},
+            streams=1,
+            close=close_fabric,
+        )
+        group._started = False
+        group._closed = False
+        group._aborted = False
+        sockets = (ctrl_root, ctrl_peer, chan_root, chan_peer, exec_root, exec_peer)
+        return group, close_calls, sockets
+
+    # 2. export_receive_ranks ENOSPC failure propagates cleanly without secondary Broken pipe chaining.
+    monkeypatch.setattr(
+        flare_heliopause,
+        "export_receive_ranks",
+        lambda *args: (_ for _ in ()).throw(OSError(28, "No space left on device")),
+    )
+    monkeypatch.setattr(
+        runtime_core,
+        "export_model",
+        lambda model, images, storage, path, **kw: SimpleNamespace(memory_inventory={"rank": 0}),
+    )
+    group_recv, calls_recv, socks_recv = make_group()
+    try:
+        with export_options(tmp_path / "cache"):
+            with pytest.raises(OSError, match="No space left on device") as caught:
+                with group_recv:
+                    host_ranks.HostRankGroup.export(
+                        group_recv, None, options={}, export_id="exp-enospc",
+                        images=None, storage=SimpleNamespace(host_regions=[]), publisher=object(),
+                    )
+        assert caught.value.__context__ is None
+        assert group_recv._aborted is True
+        assert calls_recv == [False]
+    finally:
+        for sock in socks_recv:
+            with contextlib.suppress(OSError):
+                sock.close()
+
+    # 3. Pre-thread failure (_export_channels raising before receiver_thread starts) sets _aborted and suppresses Broken pipe.
+    monkeypatch.setattr(host_ranks, "_export_channels", lambda channels: (_ for _ in ()).throw(RuntimeError("bad channel fd")))
+    group_pre, calls_pre, socks_pre = make_group()
+    try:
+        with export_options(tmp_path / "cache"):
+            with pytest.raises(RuntimeError, match="bad channel fd") as caught_pre:
+                with group_pre:
+                    host_ranks.HostRankGroup.export(
+                        group_pre, None, options={}, export_id="exp-pre",
+                        images=None, storage=SimpleNamespace(host_regions=[]), publisher=object(),
+                    )
+        assert caught_pre.value.__context__ is None
+        assert group_pre._aborted is True
+        assert calls_pre == [False]
+    finally:
+        for sock in socks_pre:
+            with contextlib.suppress(OSError):
+                sock.close()
+
+    # 4. Happy path still passes check=True so a broken transport helper surfaces when export itself did not abort.
+    monkeypatch.setattr(host_ranks, "_export_channels", lambda channels: [{"fd": 9}])
+    monkeypatch.setattr(
+        flare_heliopause,
+        "export_receive_ranks",
+        lambda *args: json.dumps([{
+            "channels": [{"sent": 1, "received": 1}],
+            "inventory": {"rank": 1},
+            "stats": {"payload_bytes": 0, "payload_seconds": 0.1, "payload_gbps": 0.0, "streams": 1, "transport": "fabric-tcp"},
+        }]),
+    )
+    group_happy, calls_happy, socks_happy = make_group(broken_pipe_on_checked_close=True)
+    try:
+        with export_options(tmp_path / "cache"):
+            with pytest.raises(RuntimeError, match="checkpoint fabric helper failed"):
+                host_ranks.HostRankGroup.export(
+                    group_happy, None, options={}, export_id="exp-happy-check",
+                    images=None, storage=SimpleNamespace(host_regions=[]), publisher=object(),
+                )
+        assert calls_happy == [True]
+    finally:
+        for sock in socks_happy:
+            with contextlib.suppress(OSError):
+                sock.close()
+
+    # 5. HostRendezvous.abort closes listener and admitted peer sockets immediately.
+    listener = socket.create_server(("127.0.0.1", 0))
+    peer_ctrl_a, peer_ctrl_b = socket.socketpair()
+    peer_exec_a, peer_exec_b = socket.socketpair()
+    try:
+        rv = object.__new__(host_ranks.HostRendezvous)
+        rv.stopping = threading.Event()
+        rv.listener = listener
+        rv.peers = {1: SimpleNamespace(control=peer_ctrl_a, executor=peer_exec_a)}
+        rv.abort()
+        assert rv.stopping.is_set()
+        assert listener.fileno() == -1
+        assert peer_ctrl_a.fileno() == -1
+        assert peer_exec_a.fileno() == -1
+    finally:
+        for sock in (listener, peer_ctrl_a, peer_ctrl_b, peer_exec_a, peer_exec_b):
+            with contextlib.suppress(OSError):
+                sock.close()

@@ -13,6 +13,8 @@ no physical memory. Active requests need at least 8,192 tokens each.
 from dataclasses import dataclass, replace
 import os
 from pathlib import Path
+import shutil
+import socket
 
 from ignition.declaration import Checkpoint, Recipe
 from ignition.errors import CapacityError, UsageError
@@ -37,6 +39,316 @@ CACHE_STATES_PER_REQUEST = 8
 SUPPORTED_CAPABILITIES = ((10, 3), (12, 0), (12, 1))
 SUPPORTED_ARCHITECTURES = "SM103, SM120, or SM121"
 _GIB = 1 << 30
+EXPORT_EXECUTION_FLOOR_BYTES = 256 << 20
+EXPORT_EXECUTION_CAP_BYTES = 1 << 30
+
+
+@dataclass(frozen=True)
+class FilesystemSpace:
+    path: Path | str
+    device: int
+    free_bytes: int
+
+
+def probe_filesystem(path: Path | str) -> FilesystemSpace:
+    """Resolve `path` through its deepest existing ancestor and query device ID and free bytes."""
+    display = Path(path).expanduser()
+    current = display if display.is_absolute() else Path.cwd() / display
+    while not current.exists():
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    resolved = current.resolve()
+    return FilesystemSpace(
+        path=display,
+        device=os.stat(resolved).st_dev,
+        free_bytes=shutil.disk_usage(resolved).free,
+    )
+
+
+def probe_export_storage(core_cache: Path | str | None,
+                         export_staging: Path | str | None = None) -> dict | None:
+    """Capture serializable filesystem availability for `core_cache` and `export_staging`."""
+    if core_cache is None and export_staging is None:
+        return None
+    cache_space = None if core_cache is None else probe_filesystem(core_cache)
+    effective_staging = export_staging if export_staging is not None else core_cache
+    stage_space = None if effective_staging is None else probe_filesystem(effective_staging)
+    return {
+        "core_cache": None if cache_space is None else {
+            "path": str(cache_space.path),
+            "device": cache_space.device,
+            "free_bytes": cache_space.free_bytes,
+        },
+        "export_staging": None if stage_space is None else {
+            "path": str(stage_space.path),
+            "device": stage_space.device,
+            "free_bytes": stage_space.free_bytes,
+        },
+    }
+
+
+def _space_from_dict(entry: dict | None) -> FilesystemSpace | None:
+    if entry is None:
+        return None
+    return FilesystemSpace(
+        path=str(entry["path"]),
+        device=int(entry["device"]),
+        free_bytes=int(entry["free_bytes"]),
+    )
+
+
+def _model_cache_key(model_id: str) -> str:
+    """Encode `model_id` into the lossless directory name used by `helios::core::cache::model_key`."""
+    pieces = []
+    for byte in model_id.encode("utf-8"):
+        if (48 <= byte <= 57) or (65 <= byte <= 90) or (97 <= byte <= 122) or byte in (45, 46):
+            pieces.append(chr(byte))
+        else:
+            pieces.append(f"_{byte:02X}")
+    return "".join(pieces)
+
+
+def _cached_model_weight_bytes(core_cache: Path | str | None, model_id: str, world_size: int) -> int:
+    """Sum unique weight and Engram companion blob bytes published in `core_cache` for `(model_id, world_size)`."""
+    if core_cache is None or not model_id:
+        return 0
+    models_dir = Path(core_cache).expanduser() / "models" / _model_cache_key(model_id)
+    try:
+        if not models_dir.is_dir():
+            return 0
+        entries = sorted(models_dir.iterdir())
+    except OSError:
+        return 0
+    seen_inodes = set()
+    total = 0
+
+    def add_files(paths):
+        nonlocal total
+        for candidate in paths:
+            try:
+                stat_result = candidate.stat()
+            except OSError:
+                continue
+            inode_key = (stat_result.st_dev, stat_result.st_ino)
+            if inode_key not in seen_inodes:
+                seen_inodes.add(inode_key)
+                total += stat_result.st_size
+
+    tp_token = f"-tp{world_size}"
+    for entry in entries:
+        weights_dir = entry / "weights"
+        try:
+            has_weights = weights_dir.is_dir()
+        except OSError:
+            has_weights = False
+        if has_weights:
+            if world_size == 1:
+                add_files(weights_dir.glob("*.safetensors"))
+                tp1_dir = weights_dir / "tp1"
+                if tp1_dir.is_dir():
+                    add_files(tp1_dir.rglob("*.safetensors"))
+            else:
+                tp_dir = weights_dir / f"tp{world_size}"
+                if tp_dir.is_dir():
+                    add_files(tp_dir.rglob("*.safetensors"))
+                add_files(weights_dir.glob("engram-*.safetensors"))
+        deployments_dir = entry / "deployments"
+        try:
+            deployments = sorted(deployments_dir.iterdir()) if deployments_dir.is_dir() else ()
+        except OSError:
+            deployments = ()
+        for deployment in deployments:
+            name = deployment.name
+            if (name.endswith(tp_token) or f"{tp_token}-" in name) and deployment.is_dir():
+                add_files(deployment.glob("engram-*.safetensors"))
+    return total
+
+
+def _checkpoint_host_weight_bytes(checkpoint: Checkpoint | None) -> int:
+    """Estimate non-device checkpoint payload bytes (such as host-resident Engram or PLE tables) published on rank zero."""
+    if checkpoint is None:
+        return 0
+    return max(checkpoint.mapped_host_bytes, checkpoint.stored_bytes - checkpoint.device_bytes)
+
+
+def _export_execution_bytes_per_rank(graph_bytes: int) -> int:
+    return min(EXPORT_EXECUTION_CAP_BYTES, max(EXPORT_EXECUTION_FLOOR_BYTES, graph_bytes // 4))
+
+
+def _check_rank_export_disk(
+    *,
+    rank: int,
+    host_name: str,
+    ranks_on_host: int,
+    weights_per_rank: int,
+    exec_per_rank: int,
+    cache_space: FilesystemSpace | None,
+    stage_space: FilesystemSpace | None,
+    skip_weights: bool,
+    host_weight_bytes: int = 0,
+    cached_weight_bytes: int = 0,
+) -> None:
+    if cache_space is None and stage_space is None:
+        return
+    location = f"rank {rank} ({host_name})"
+    gross_weights = 0 if skip_weights else ranks_on_host * weights_per_rank + host_weight_bytes
+    net_weights = max(0, gross_weights - cached_weight_bytes)
+    stream_floor = min(EXPORT_EXECUTION_CAP_BYTES, weights_per_rank)
+    if not skip_weights and cached_weight_bytes > 0 and net_weights < stream_floor:
+        net_weights = stream_floor
+
+    if cache_space is None:
+        assert stage_space is not None
+        without_weights = ranks_on_host * exec_per_rank
+        required = net_weights + without_weights
+        if stage_space.free_bytes < required:
+            if not skip_weights and stage_space.free_bytes >= without_weights:
+                hint = ("pass --reuse-weights or --no-weights when compatible weights are already cached, "
+                        "or configure [paths] export_staging on a filesystem with more free space")
+            else:
+                hint = "free disk space or configure [paths] export_staging on a filesystem with more free space"
+            raise UsageError(
+                f"insufficient disk space for export on {location}: {stage_space.path} has "
+                f"{_gib(stage_space.free_bytes)} GiB available, needs at least {_gib(required)} GiB; {hint}"
+            )
+        return
+
+    effective_stage = cache_space if stage_space is None else stage_space
+    cache_exec = ranks_on_host * exec_per_rank
+    stage_exec = ranks_on_host * exec_per_rank
+
+    if cache_space.device == effective_stage.device:
+        without_weights = cache_exec + stage_exec
+        required = net_weights + without_weights
+        if cache_space.free_bytes < required:
+            path_label = (
+                f"{cache_space.path}"
+                if effective_stage.path == cache_space.path
+                else f"{cache_space.path} (shared filesystem with {effective_stage.path})"
+            )
+            if not skip_weights:
+                weight_scope = f"weights across {ranks_on_host} ranks" if ranks_on_host > 1 else "rank weights"
+                detail = f" ({_gib(net_weights)} GiB {weight_scope} + {_gib(without_weights)} GiB executables and staging)"
+            else:
+                detail = " for executables and export staging"
+            if not skip_weights and cache_space.free_bytes >= without_weights:
+                hint = ("pass --reuse-weights or --no-weights when compatible weights are already cached, "
+                        "or configure [paths] core_cache on a filesystem with more free space")
+            else:
+                hint = ("free disk space or configure [paths] core_cache and [paths] export_staging "
+                        "on a filesystem with more free space")
+            raise UsageError(
+                f"insufficient disk space for export on {location}: {path_label} has "
+                f"{_gib(cache_space.free_bytes)} GiB available, needs at least {_gib(required)} GiB{detail}; {hint}"
+            )
+        return
+
+    cache_required = net_weights + cache_exec
+    if cache_space.free_bytes < cache_required:
+        if not skip_weights:
+            weight_scope = f"weights across {ranks_on_host} ranks" if ranks_on_host > 1 else "rank weights"
+            detail = f" ({_gib(net_weights)} GiB {weight_scope} + {_gib(cache_exec)} GiB executables)"
+        else:
+            detail = " for core executables and metadata"
+        if not skip_weights and cache_space.free_bytes >= cache_exec:
+            hint = ("pass --reuse-weights or --no-weights when compatible weights are already cached, "
+                    "or configure [paths] core_cache on a filesystem with more free space")
+        else:
+            hint = "free disk space or configure [paths] core_cache on a filesystem with more free space"
+        raise UsageError(
+            f"insufficient disk space for export on {location}: {cache_space.path} has "
+            f"{_gib(cache_space.free_bytes)} GiB available, needs at least {_gib(cache_required)} GiB{detail}; {hint}"
+        )
+
+    if effective_stage.free_bytes < stage_exec:
+        raise UsageError(
+            f"insufficient disk space for export on {location}: {effective_stage.path} has "
+            f"{_gib(effective_stage.free_bytes)} GiB available, needs at least {_gib(stage_exec)} GiB "
+            f"for rank export staging; free disk space or configure [paths] export_staging "
+            f"on a filesystem with more free space"
+        )
+
+
+def check_export_disk_space(
+    plan: "Plan | None" = None,
+    model_id: str = "",
+    *,
+    checkpoint: Checkpoint | None = None,
+    core_cache: Path | str | None,
+    export_staging: Path | str | None = None,
+    no_weights: bool = False,
+    reuse_weights: bool = False,
+    world_size: int | None = None,
+    weights_bytes: int | None = None,
+    graph_bytes: int | None = None,
+    host_weight_bytes: int | None = None,
+    host_name: str | None = None,
+    topologies: tuple[dict, ...] | list[dict] | None = None,
+) -> None:
+    """Reject exports whose `core_cache` or `export_staging` filesystems cannot hold the planned output."""
+    effective_world = plan.world_size if world_size is None and plan is not None else world_size
+    effective_weights = plan.weights_bytes if weights_bytes is None and plan is not None else weights_bytes
+    effective_graphs = plan.graph_bytes if graph_bytes is None and plan is not None else graph_bytes
+    if effective_world is None or effective_weights is None or effective_graphs is None:
+        raise ValueError("check_export_disk_space requires a Plan or explicit world_size, weights_bytes, and graph_bytes")
+    effective_checkpoint = plan.checkpoint if checkpoint is None and plan is not None else checkpoint
+    effective_host_weights = (
+        _checkpoint_host_weight_bytes(effective_checkpoint)
+        if host_weight_bytes is None
+        else host_weight_bytes
+    )
+
+    skip_weights = bool(no_weights or reuse_weights)
+    exec_per_rank = _export_execution_bytes_per_rank(effective_graphs)
+    root_host = (
+        topologies[0]["host"]
+        if topologies and isinstance(topologies[0], dict) and "host" in topologies[0]
+        else (host_name or socket.gethostname())
+    )
+    root_storage = (
+        topologies[0].get("storage")
+        if topologies and isinstance(topologies[0], dict) and "storage" in topologies[0]
+        else probe_export_storage(core_cache, export_staging)
+    )
+    if root_storage is not None:
+        cached_weights = (
+            0
+            if skip_weights
+            else _cached_model_weight_bytes(core_cache, model_id, effective_world)
+        )
+        _check_rank_export_disk(
+            rank=0,
+            host_name=root_host,
+            ranks_on_host=effective_world,
+            weights_per_rank=effective_weights,
+            exec_per_rank=exec_per_rank,
+            cache_space=_space_from_dict(root_storage.get("core_cache")),
+            stage_space=_space_from_dict(root_storage.get("export_staging")),
+            skip_weights=skip_weights,
+            host_weight_bytes=effective_host_weights,
+            cached_weight_bytes=cached_weights,
+        )
+
+    if topologies is not None:
+        for peer_rank, topology in enumerate(topologies[1:], start=1):
+            if not isinstance(topology, dict):
+                continue
+            peer_storage = topology.get("storage")
+            if peer_storage is None:
+                continue
+            peer_host = topology.get("host", f"rank-{peer_rank}")
+            _check_rank_export_disk(
+                rank=peer_rank,
+                host_name=peer_host,
+                ranks_on_host=1,
+                weights_per_rank=effective_weights,
+                exec_per_rank=exec_per_rank,
+                cache_space=_space_from_dict(peer_storage.get("core_cache")),
+                stage_space=_space_from_dict(peer_storage.get("export_staging")),
+                skip_weights=skip_weights,
+            )
 
 
 @dataclass(frozen=True)

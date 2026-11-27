@@ -123,13 +123,18 @@ def _rdma_devices():
     return devices
 
 
-def local_topology(gpu):
-    """What a rank reports about its host: identity, its GPU, and its active RDMA devices."""
-    return {"host": socket.gethostname(),
-            "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
-            "gpu": {"name": gpu.name, "uuid": gpu.uuid, "total_bytes": gpu.total_bytes,
-                    "free_bytes": gpu.free_bytes, "capability": list(gpu.capability)},
-            "rdma": _rdma_devices()}
+def local_topology(gpu, *, storage=None):
+    """What a rank reports about its host: identity, its GPU, active RDMA devices, and optional export storage."""
+    topology = {
+        "host": socket.gethostname(),
+        "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+        "gpu": {"name": gpu.name, "uuid": gpu.uuid, "total_bytes": gpu.total_bytes,
+                "free_bytes": gpu.free_bytes, "capability": list(gpu.capability)},
+        "rdma": _rdma_devices(),
+    }
+    if storage is not None:
+        topology["storage"] = storage
+    return topology
 
 
 def topology_gpu(topology, index):
@@ -169,7 +174,7 @@ def parse_address(text):
     return host, int(port)
 
 
-def _watch_until_closed(sockets, finished, reason, *, cleanup=None):
+def _watch_until_closed(sockets, finished, reason, *, cleanup=None, suppress=None):
     """Exit this process when another rank's connection closes before coordinated shutdown."""
     def watch():
         poller = select.poll()
@@ -179,6 +184,9 @@ def _watch_until_closed(sockets, finished, reason, *, cleanup=None):
             events = poller.poll(200)
             if finished.is_set():
                 return
+            if suppress is not None and suppress.is_set():
+                time.sleep(0.05)
+                continue
             if events:
                 print(f"flare: {reason}", flush=True)
                 if cleanup is not None:
@@ -215,6 +223,7 @@ class HostRendezvous:
         self.store = None
         # Set once coordinated shutdown begins: peers then exit and close their connections.
         self.stopping = threading.Event()
+        self.suppress_watch = threading.Event()
 
     @property
     def hosts(self):
@@ -250,6 +259,17 @@ class HostRendezvous:
         if len(set(boots)) != len(boots):
             raise ValueError("every multi-host tensor-parallel rank must run on a different host")
         return self.topologies
+
+    def abort(self):
+        """Close the listener and any admitted peer sockets before preparation starts."""
+        self.stopping.set()
+        with contextlib.suppress(OSError):
+            self.listener.close()
+        for peer in self.peers.values():
+            for sock in (peer.control, peer.executor):
+                if sock is not None:
+                    with contextlib.suppress(OSError):
+                        sock.close()
 
     def _admit(self, sock, origin, report):
         sock.settimeout(_HANDSHAKE_SECONDS)
@@ -308,12 +328,21 @@ class HostRendezvous:
             raise ValueError("multi-host preparation sends peers a Hugging Face checkpoint from the hub cache, "
                              f"not the directory {snapshot}")
         controls = [self.peers[rank].control for rank in range(1, self.world)]
-        _watch_until_closed(controls, self.stopping, "a tensor-parallel peer disconnected before shutdown")
         from .checkpoint_source import RootSource, SourceServer, token
 
         source = RootSource(snapshot, checkpoint)
         readers = []
         fabric = None
+
+        def cleanup_root():
+            if fabric is not None:
+                with contextlib.suppress(Exception):
+                    fabric.close(check=False)
+            with contextlib.suppress(Exception):
+                source.close()
+
+        _watch_until_closed(controls, self.stopping, "a tensor-parallel peer disconnected before shutdown",
+                            cleanup=cleanup_root, suppress=self.suppress_watch)
         try:
             key = token(self.checkpoint_token_file)
             with phase(progress, "Admit checkpoint range readers"):
@@ -417,13 +446,25 @@ class HostRankGroup:
     def __init__(self, rendezvous, model, reports, *, checkpoint_fabric=None):
         self.rendezvous, self.model = rendezvous, model
         self.memory_report = {"world_size": rendezvous.world, "ranks": [model.memory_report, *reports]}
-        self._started = self._closed = False
+        self._started = self._closed = self._aborted = False
         self.checkpoint_fabric = checkpoint_fabric
 
     def _close_checkpoint_fabric(self):
-        if self.checkpoint_fabric is not None:
-            self.checkpoint_fabric.close()
+        fabric = self.checkpoint_fabric
+        if fabric is not None:
             self.checkpoint_fabric = None
+            check = not getattr(self, "_aborted", False)
+            try:
+                if check:
+                    fabric.close()
+                else:
+                    try:
+                        fabric.close(check=False)
+                    except TypeError:
+                        fabric.close()
+            except BaseException:
+                if check:
+                    raise
 
     @property
     def controls(self):
@@ -446,7 +487,7 @@ class HostRankGroup:
         from .runtime_core import export_model
         from .memory_inventory import print_inventory
 
-        if self._started or self._closed:
+        if self._started or self._closed or getattr(self, "_aborted", False):
             raise RuntimeError("prepared rank group has already been consumed or closed")
         if publisher is None:
             raise ValueError("final model publication requires a signing publisher")
@@ -458,31 +499,86 @@ class HostRankGroup:
         if settings is None:
             raise RuntimeError("export requires the configured core cache")
         cache_only = path is None
+        stopping = getattr(self.rendezvous, "stopping", None)
+        suppress = getattr(self.rendezvous, "suppress_watch", None)
         native_stage = flare_heliopause.NativeExportStage(
             None if cache_only else Path(path), staging, settings.cache)
         try:
             roots = [Path(native_stage.rank_path(rank))
                      for rank in range(self.rendezvous.world)]
-            for control in self.controls:
-                send_object(control, ("export", options, settings))
-            with export_options(settings.cache, no_weights=settings.no_weights, reuse_weights=settings.reuse_weights,
-                                kernel_cache=settings.kernel_cache):
-                core = export_model(self.model, images, storage, roots[0], options=options,
-                                       progress=progress, sources=True)
-                channels = [[self.checkpoint_fabric.readers[rank, stream].channel
-                             for stream in range(self.checkpoint_fabric.streams)]
-                            for rank in range(1, self.rendezvous.world)]
-                requests = [dict(control_fd=control.fileno(), channels=_export_channels(rank_channels),
-                                 destination=str(roots[rank]))
-                            for rank, (control, rank_channels) in enumerate(zip(self.controls, channels, strict=True), 1)]
-                try:
-                    received = json.loads(flare_heliopause.export_receive_ranks(
-                        json.dumps(requests), settings.cache, settings.no_weights,
-                        (self.controls, channels, self.checkpoint_fabric), native_stage))
+            if suppress is not None:
+                suppress.set()
+            channels = []
+            receiver_thread = None
+            received = None
+            receive_error = None
+
+            def abort_export_sockets():
+                for sock in self.controls:
+                    shutdown = getattr(sock, "shutdown", None)
+                    if shutdown is not None:
+                        with contextlib.suppress(OSError):
+                            shutdown(socket.SHUT_RDWR)
+                for rank_channels in channels:
+                    for channel in rank_channels:
+                        connection = getattr(channel, "connection", None)
+                        shutdown = getattr(connection, "shutdown", None)
+                        if shutdown is not None:
+                            with contextlib.suppress(OSError):
+                                shutdown(socket.SHUT_RDWR)
+
+            try:
+                for control in self.controls:
+                    send_object(control, ("export", options, settings))
+                with export_options(settings.cache, no_weights=settings.no_weights, reuse_weights=settings.reuse_weights,
+                                    kernel_cache=settings.kernel_cache):
+                    channels = [[self.checkpoint_fabric.readers[rank, stream].channel
+                                 for stream in range(self.checkpoint_fabric.streams)]
+                                for rank in range(1, self.rendezvous.world)]
+                    requests = [dict(control_fd=control.fileno(), channels=_export_channels(rank_channels),
+                                     destination=str(roots[rank]))
+                                for rank, (control, rank_channels) in enumerate(zip(self.controls, channels, strict=True), 1)]
+                    requests_json = json.dumps(requests)
+                    owners = (self.controls, channels, self.checkpoint_fabric)
+
+                    def receive_peers():
+                        nonlocal received, receive_error
+                        try:
+                            received = json.loads(flare_heliopause.export_receive_ranks(
+                                requests_json, settings.cache, settings.no_weights, owners, native_stage))
+                        except BaseException as error:  # noqa: BLE001 - Re-raised on the coordinator thread after join.
+                            self._aborted = True
+                            if stopping is not None:
+                                stopping.set()
+                            receive_error = error
+
+                    receiver_thread = threading.Thread(target=receive_peers, name="flare-export-receive")
+                    receiver_thread.start()
+                    core = export_model(self.model, images, storage, roots[0], options=options,
+                                           progress=progress, sources=True)
+                    receiver_thread.join()
+                    if receive_error is not None:
+                        raise receive_error
                     for rank_channels, result in zip(channels, received, strict=True):
                         _restore_export_channels(rank_channels, result["channels"])
-                finally:
-                    self._close_checkpoint_fabric()
+            except BaseException as error:
+                self._aborted = True
+                if stopping is not None:
+                    stopping.set()
+                abort_export_sockets()
+                if receiver_thread is not None and receiver_thread.is_alive():
+                    receiver_thread.join()
+                if receive_error is not None and receive_error is not error:
+                    error.add_note(f"peer export receive aborted: {receive_error!r}")
+                raise
+            finally:
+                if receiver_thread is not None and receiver_thread.is_alive():
+                    receiver_thread.join()
+                self._close_checkpoint_fabric()
+                if suppress is not None:
+                    suppress.clear()
+            with export_options(settings.cache, no_weights=settings.no_weights, reuse_weights=settings.reuse_weights,
+                                kernel_cache=settings.kernel_cache):
                 inventories = [core.memory_inventory, *(result["inventory"] for result in received)]
                 for rank, result in enumerate(received, 1):
                     report = result["stats"]
@@ -541,7 +637,26 @@ class HostRankGroup:
     def close(self):
         if self._closed:
             return
-        self.rendezvous.stopping.set()
+        stopping = getattr(self.rendezvous, "stopping", None)
+        if stopping is not None:
+            stopping.set()
+        if getattr(self, "_aborted", False):
+            import torch.distributed as dist
+
+            self._close_checkpoint_fabric()
+            close_model = getattr(self.model, "close", None)
+            if close_model is not None:
+                close_model()
+            for peer in getattr(self.rendezvous, "peers", {}).values():
+                for sock in (getattr(peer, "control", None), getattr(peer, "executor", None)):
+                    if sock is not None:
+                        with contextlib.suppress(OSError):
+                            sock.close()
+            if dist.is_initialized():
+                dist.destroy_process_group()
+            self.rendezvous.store = None
+            self._closed = True
+            return
         try:
             self._close_checkpoint_fabric()
             if not self._started:
@@ -606,8 +721,22 @@ def serve_peer(control, executor, rank, world, *, hub_cache, progress=None, expo
 
     finished = threading.Event()
     owned_sources = []
+    owned_stages = []
+    owned_fabrics = []
+
+    def cleanup_peer():
+        for stage in list(owned_stages):
+            with contextlib.suppress(Exception):
+                stage.close()
+        for active_fabric in list(owned_fabrics):
+            with contextlib.suppress(Exception):
+                active_fabric.close(check=False)
+        for active_source in list(owned_sources):
+            with contextlib.suppress(Exception):
+                active_source.close()
+
     _watch_until_closed([control], finished, "rank zero disconnected before shutdown",
-                        cleanup=lambda: [source.close() for source in owned_sources])
+                        cleanup=cleanup_peer)
     # Rank zero coordinates shutdown; a terminal interrupt must not end a peer mid-drain.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     source = source_scope = fabric = None
@@ -619,6 +748,7 @@ def serve_peer(control, executor, rank, world, *, hub_cache, progress=None, expo
             from .checkpoint_fabric import FabricTransport
 
             fabric = FabricTransport(rank, world, **command[1])
+            owned_fabrics.append(fabric)
             send_object(control, fabric.endpoint)
             fabric.configure(receive_object(control))
             send_object(control, {"fabric_ready": True})
@@ -676,6 +806,7 @@ def serve_peer(control, executor, rank, world, *, hub_cache, progress=None, expo
             _, options, settings = command
             native_stage = flare_heliopause.NativeExportStage(
                 None, export_staging, core_cache)
+            owned_stages.append(native_stage)
             try:
                 path = Path(native_stage.rank_path(rank))
                 if progress is not None:
@@ -689,10 +820,12 @@ def serve_peer(control, executor, rank, world, *, hub_cache, progress=None, expo
                                     channels=[channel for channel, _ in source.channel_stats])
                 source.close_transport()
             finally:
+                owned_stages.clear()
                 native_stage.close()
             command = receive_object(control)
         source.close_transport()
         if fabric is not None:
+            owned_fabrics.clear()
             fabric.close()
             fabric = None
         if command == "serve":

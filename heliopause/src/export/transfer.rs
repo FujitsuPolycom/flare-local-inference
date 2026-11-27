@@ -12,13 +12,18 @@ use std::io::{Read, Write};
 #[cfg(test)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{
+    Arc, Condvar, Mutex,
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+};
 use std::time::Instant;
 
-use ring::hmac;
+use ring::{
+    digest::{Context, SHA256},
+    hmac,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use super::{RankOutput, Result, invalid};
 
@@ -67,11 +72,46 @@ fn descriptor_headroom() -> Result<usize> {
         .saturating_sub(open)
         .saturating_sub(2))
 }
+struct AbortScope {
+    sockets: Vec<Socket>,
+    aborted: AtomicBool,
+}
+impl AbortScope {
+    fn new(sockets: Vec<Socket>) -> Self {
+        Self {
+            sockets,
+            aborted: AtomicBool::new(false),
+        }
+    }
+    fn trigger(&self) {
+        if !self.aborted.swap(true, Ordering::AcqRel) {
+            for socket in &self.sockets {
+                socket.abort();
+            }
+            FILE_TRANSACTIONS.1.notify_all();
+        }
+    }
+    fn is_aborted(&self) -> bool {
+        self.aborted.load(Ordering::Acquire)
+    }
+}
+
 impl FileTransaction {
     fn acquire(direction: FileDirection, descriptors: usize) -> Result<Self> {
+        Self::acquire_with_abort(direction, descriptors, None)
+    }
+
+    fn acquire_with_abort(
+        direction: FileDirection,
+        descriptors: usize,
+        abort: Option<&AbortScope>,
+    ) -> Result<Self> {
         let (lock, ready) = &FILE_TRANSACTIONS;
         let mut state = lock.lock().unwrap();
         loop {
+            if abort.is_some_and(AbortScope::is_aborted) {
+                return Err(invalid("rank export aborted"));
+            }
             if state.reserved == 0 {
                 state.capacity = descriptor_headroom()?;
             }
@@ -101,6 +141,23 @@ impl FileTransaction {
             state = ready.wait(state).unwrap();
         }
     }
+
+    fn note_retained_descriptors(count: usize) {
+        let (lock, _) = &FILE_TRANSACTIONS;
+        let mut state = lock.lock().unwrap();
+        if state.reserved > 0 {
+            state.capacity = state.capacity.saturating_sub(count);
+        }
+    }
+
+    fn release_retained_descriptors(count: usize) {
+        let (lock, ready) = &FILE_TRANSACTIONS;
+        let mut state = lock.lock().unwrap();
+        if state.reserved > 0 {
+            state.capacity = state.capacity.saturating_add(count);
+        }
+        ready.notify_all();
+    }
 }
 impl Drop for FileTransaction {
     fn drop(&mut self) {
@@ -112,6 +169,51 @@ impl Drop for FileTransaction {
             FileDirection::Receive => state.receive -= 1,
         }
         ready.notify_all();
+    }
+}
+
+/// Retains installed `PayloadObject` leases during one rank receive and restores
+/// their descriptor headroom if the receive fails before ownership transfers out.
+struct RetainedLeases {
+    objects: Mutex<Vec<helios_core::core::cache::PayloadObject>>,
+    retained_descriptors: AtomicUsize,
+}
+impl RetainedLeases {
+    fn new() -> Self {
+        Self {
+            objects: Mutex::new(Vec::new()),
+            retained_descriptors: AtomicUsize::new(0),
+        }
+    }
+
+    fn push(&self, object: helios_core::core::cache::PayloadObject) -> Result<()> {
+        self.objects
+            .lock()
+            .map_err(|_| invalid("payload lease lock poisoned"))?
+            .push(object);
+        self.retained_descriptors.fetch_add(2, Ordering::AcqRel);
+        FileTransaction::note_retained_descriptors(2);
+        Ok(())
+    }
+
+    fn into_leases(self) -> Result<crate::export::PayloadLeases> {
+        self.retained_descriptors.store(0, Ordering::Release);
+        let mut guard = self
+            .objects
+            .lock()
+            .map_err(|_| invalid("payload lease lock poisoned"))?;
+        Ok(crate::export::PayloadLeases(std::mem::take(&mut *guard)))
+    }
+}
+impl Drop for RetainedLeases {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.objects.lock() {
+            guard.clear();
+        }
+        let released = self.retained_descriptors.swap(0, Ordering::AcqRel);
+        if released > 0 {
+            FileTransaction::release_retained_descriptors(released);
+        }
     }
 }
 
@@ -141,7 +243,7 @@ impl Socket {
             libc::shutdown(self.0, libc::SHUT_RDWR);
         }
     }
-    fn ready(&self, events: i16) -> std::io::Result<()> {
+    fn ready(&self, events: i16) -> std::io::Result<i16> {
         let mut poll = libc::pollfd {
             fd: self.0,
             events,
@@ -151,7 +253,7 @@ impl Socket {
             // Peers may be hashing sources, verifying cache entries, or draining bounded disk writers.
             let result = unsafe { libc::poll(&mut poll, 1, EXPORT_IDLE_TIMEOUT_MS) };
             if result > 0 {
-                return Ok(());
+                return Ok(poll.revents);
             }
             if result == 0 {
                 return Err(std::io::Error::new(
@@ -194,7 +296,7 @@ impl Read for Socket {
 impl Write for Socket {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         loop {
-            self.ready(libc::POLLOUT)?;
+            let revents = self.ready(libc::POLLOUT | libc::POLLRDHUP)?;
             let size = unsafe {
                 libc::send(
                     self.0,
@@ -204,9 +306,23 @@ impl Write for Socket {
                 )
             };
             if size >= 0 {
+                if (revents & libc::POLLRDHUP) != 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "rank export peer closed connection",
+                    ));
+                }
                 return Ok(size as usize);
             }
             let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                && (revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR)) != 0
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "rank export peer closed connection",
+                ));
+            }
             if !matches!(
                 error.kind(),
                 std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
@@ -401,11 +517,12 @@ fn streams<T: Send>(
         .into_iter()
         .map(Channel::new)
         .collect::<Result<_>>()?;
-    streams_ready(channels, action)
+    streams_ready(channels, None, action)
 }
 
 fn streams_ready<T: Send>(
     channels: Vec<Channel>,
+    external_abort: Option<&AbortScope>,
     action: impl Fn(usize, &mut Channel) -> Result<T> + Sync,
 ) -> Result<(Vec<T>, Vec<ChannelState>)> {
     let abort: Vec<_> = channels
@@ -431,6 +548,9 @@ fn streams_ready<T: Send>(
                             for socket in abort {
                                 socket.abort();
                             }
+                            if let Some(scope) = external_abort {
+                                scope.trigger();
+                            }
                         }
                         None
                     }
@@ -449,6 +569,9 @@ fn streams_ready<T: Send>(
                 Err(_) => {
                     for socket in &abort {
                         socket.abort();
+                    }
+                    if let Some(scope) = external_abort {
+                        scope.trigger();
                     }
                     return Err(invalid("rank export worker panicked"));
                 }
@@ -537,6 +660,26 @@ pub(crate) fn send_rank(
     control_fd: i32,
     channels: Vec<ChannelState>,
 ) -> Result<Vec<ChannelState>> {
+    let abort_fds: Vec<i32> = std::iter::once(control_fd)
+        .chain(channels.iter().map(|channel| channel.fd))
+        .collect();
+    let result = send_rank_inner(output, inventory, control_fd, channels);
+    if result.is_err() {
+        for fd in abort_fds {
+            if let Ok(socket) = Socket::borrow(fd) {
+                socket.abort();
+            }
+        }
+    }
+    result
+}
+
+fn send_rank_inner(
+    output: RankOutput,
+    inventory: Value,
+    control_fd: i32,
+    channels: Vec<ChannelState>,
+) -> Result<Vec<ChannelState>> {
     // Hold the leases for the whole transfer: the rank's declared payload objects
     // must outlive the manifest, the data channels, and the completion exchange.
     let payload_leases = output.payload_leases.0.clone();
@@ -549,77 +692,122 @@ pub(crate) fn send_rank(
     let budget = super::io::IoBudget::for_ranks(1)?;
     let progress = helios_core::startup::StartupProgress::silent();
     let scan_phase = progress.phase("Hash rank export sources", None);
-    let mut hashed_bytes = 0;
+    // Cache-backed declared payloads resolve one leased object per declared group.
+    let objects = cache_payload_sources(&output)?;
+    let mut seen = BTreeSet::new();
+    let mut scan_targets: Vec<(PathBuf, Option<String>)> = Vec::new();
+    for part in &output.payload {
+        if seen.insert(part.source.path.clone()) {
+            scan_targets.push((part.source.path.clone(), None));
+        }
+    }
+    for (path, hex, _length) in objects {
+        if seen.insert(path.clone()) {
+            scan_targets.push((path, Some(hex)));
+        }
+    }
+    let hashed_bytes = AtomicU64::new(0);
     let mut files = BTreeMap::new();
     let mut identities = BTreeMap::new();
-    for part in &output.payload {
-        let path = &part.source.path;
-        if files.contains_key(path) {
-            continue;
+    if !scan_targets.is_empty() {
+        let workers = (descriptor_headroom().unwrap_or(3) / 4)
+            .clamp(1, 4)
+            .min(scan_targets.len());
+        let next = AtomicUsize::new(0);
+        let failed = AtomicBool::new(false);
+        let failure: Mutex<Option<Box<dyn std::error::Error + Send + Sync>>> = Mutex::new(None);
+        let scanned: Mutex<Vec<(PathBuf, Source, super::io::Identity)>> =
+            Mutex::new(Vec::with_capacity(scan_targets.len()));
+        let scan_one = |(path, payload): &(PathBuf, Option<String>)| -> Result<(PathBuf, Source, super::io::Identity)> {
+            let _transaction = FileTransaction::acquire(FileDirection::Send, 3)?;
+            let file = Arc::new(super::io::open_read(path)?);
+            let before = super::io::Identity::of(&file)?;
+            let size = file.metadata()?.len();
+            let mut digest = Context::new(&SHA256);
+            let source = super::io::Source::from_file(file.clone(), 0, size)?;
+            budget.scan(&source, |bytes| {
+                if failed.load(Ordering::Relaxed) {
+                    return Err(invalid("rank export scan aborted"));
+                }
+                digest.update(bytes);
+                let count = bytes.len() as u64;
+                let total = hashed_bytes.fetch_add(count, Ordering::Relaxed) + count;
+                if payload.is_none() {
+                    scan_phase.advance(count);
+                    scan_phase.detail(format!("{total} bytes hashed"));
+                }
+                Ok(())
+            })?;
+            if super::io::Identity::of(&file)? != before {
+                return Err(invalid(if payload.is_some() {
+                    "cached payload object changed during metadata scan"
+                } else {
+                    "rank export source changed during metadata scan"
+                }));
+            }
+            let sha256 = super::blob::hex(digest.finish().as_ref());
+            let blob = payload.is_none()
+                && path.file_name().and_then(|n| n.to_str())
+                    == Some(&format!("{sha256}.safetensors"));
+            drop(source);
+            drop(file);
+            Ok((
+                path.clone(),
+                Source {
+                    size,
+                    sha256,
+                    blob,
+                    payload: payload.clone(),
+                },
+                before,
+            ))
+        };
+        let worker_loop = || {
+            while !failed.load(Ordering::Acquire) {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                if index >= scan_targets.len() {
+                    break;
+                }
+                match scan_one(&scan_targets[index]) {
+                    Ok(entry) => scanned.lock().unwrap().push(entry),
+                    Err(error) => {
+                        failed.store(true, Ordering::Release);
+                        let mut first = failure.lock().unwrap();
+                        if first.is_none() {
+                            *first = Some(error);
+                        }
+                        break;
+                    }
+                }
+            }
+        };
+        if workers == 1 {
+            worker_loop();
+        } else {
+            std::thread::scope(|scope| -> Result<()> {
+                let handles: Vec<_> = (1..workers).map(|_| scope.spawn(worker_loop)).collect();
+                worker_loop();
+                for handle in handles {
+                    handle
+                        .join()
+                        .map_err(|_| invalid("rank export scan worker panicked"))?;
+                }
+                Ok(())
+            })?;
         }
-        let _transaction = FileTransaction::acquire(FileDirection::Send, 3)?;
-        let file = Arc::new(super::io::open_read(path)?);
-        let before = super::io::Identity::of(&file)?;
-        let mut digest = Sha256::new();
-        let source = super::io::Source::from_file(file.clone(), 0, file.metadata()?.len())?;
-        budget.scan(&source, |bytes| {
-            digest.update(bytes);
-            hashed_bytes += bytes.len() as u64;
-            scan_phase.advance(bytes.len() as u64);
-            scan_phase.detail(format!("{hashed_bytes} bytes hashed"));
-            Ok(())
-        })?;
-        if super::io::Identity::of(&file)? != before {
-            return Err(invalid("rank export source changed during metadata scan"));
+        if let Some(error) = failure.into_inner().unwrap() {
+            return Err(error);
         }
-        let sha256 = format!("{:x}", digest.finalize());
-        let blob =
-            path.file_name().and_then(|n| n.to_str()) == Some(&format!("{sha256}.safetensors"));
-        files.insert(
-            path.clone(),
-            Source {
-                size: file.metadata()?.len(),
-                sha256,
-                blob,
-                payload: None,
-            },
-        );
-        identities.insert(path.clone(), before);
+        for (path, info, before) in scanned.into_inner().unwrap() {
+            files.insert(path.clone(), info);
+            identities.insert(path, before);
+        }
     }
     scan_phase.finish(format!(
-        "{} files, {hashed_bytes} bytes hashed",
-        files.len()
+        "{} files, {} bytes hashed",
+        files.len(),
+        hashed_bytes.load(Ordering::Relaxed)
     ));
-    // Cache-backed declared payloads: one leased object per declared group.
-    let objects = cache_payload_sources(&output)?;
-    for (path, hex, _length) in &objects {
-        if files.contains_key(path) {
-            continue;
-        }
-        let _transaction = FileTransaction::acquire(FileDirection::Send, 3)?;
-        let file = Arc::new(super::io::open_read(path)?);
-        let before = super::io::Identity::of(&file)?;
-        let mut digest = Sha256::new();
-        let source = super::io::Source::from_file(file.clone(), 0, file.metadata()?.len())?;
-        budget.scan(&source, |bytes| {
-            digest.update(bytes);
-            hashed_bytes += bytes.len() as u64;
-            Ok(())
-        })?;
-        if super::io::Identity::of(&file)? != before {
-            return Err(invalid("cached payload object changed during metadata scan"));
-        }
-        files.insert(
-            path.clone(),
-            Source {
-                size: file.metadata()?.len(),
-                sha256: format!("{:x}", digest.finalize()),
-                blob: false,
-                payload: Some(hex.clone()),
-            },
-        );
-        identities.insert(path.clone(), before);
-    }
     let mut control = Socket::borrow(control_fd)?;
     send_control(
         &mut control,
@@ -755,6 +943,7 @@ fn install_payload_object(
     let root = helios_core::core::cache::Root::open(cache)?;
     let container = helios_core::core::container::Container::open(partial)?;
     let slice = container.tensor(helios_core::core::container::COMPANION_TENSOR)?;
+    drop(container);
     if slice.len() != length {
         return Err(invalid(
             "received payload object length differs from its declared group",
@@ -770,6 +959,26 @@ fn install_payload_object(
     Ok(object)
 }
 
+/// Adopt a synced canonical companion whose payload digest was verified while
+/// streaming the transfer, falling back to slice installation when the framing
+/// is non-canonical or hard-linking is refused.
+fn install_verified_payload_object(
+    cache: &Path,
+    id: helios_core::core::PayloadId,
+    length: u64,
+    partial: &Path,
+    expected_dev_ino: (u64, u64),
+) -> Result<helios_core::core::cache::PayloadObject> {
+    let root = helios_core::core::cache::Root::open(cache)?;
+    if let Some(object) = root.adopt_verified_companion(id, length, partial, expected_dev_ino)? {
+        if object.length() != length {
+            return Err(invalid("received payload object has the wrong length"));
+        }
+        return Ok(object);
+    }
+    install_payload_object(cache, id, length, partial)
+}
+
 fn receive_rank(
     request: ReceiveRequest,
     mut control: Socket,
@@ -778,6 +987,7 @@ fn receive_rank(
     no_weights: bool,
     budget: &Arc<super::io::IoBudget>,
     aggregate: &ReceiveProgress,
+    abort: &AbortScope,
 ) -> Result<ReceiveOutput> {
     if request.channels.is_empty() {
         return Err(invalid(
@@ -809,8 +1019,7 @@ fn receive_rank(
             .ok_or_else(|| invalid("rank export destination has no parent"))?,
     )?;
     let store = super::blob::BlobStore::new(cache, budget.clone())?;
-    let installed: std::sync::Mutex<Vec<helios_core::core::cache::PayloadObject>> =
-        std::sync::Mutex::new(Vec::new());
+    let installed = RetainedLeases::new();
     let progress = helios_core::startup::StartupProgress::silent();
     let cache_phase = progress.phase("Verify rank export cache", None);
     let mut cached_bytes = 0;
@@ -876,13 +1085,15 @@ fn receive_rank(
                 return Err(invalid("cached rank payload differs from its declared group"));
             }
             if cached_objects.insert(id) {
+                let _transaction =
+                    FileTransaction::acquire_with_abort(FileDirection::Receive, 3, Some(abort))?;
                 let root = helios_core::core::cache::Root::open(cache)?;
                 let object = root.payload(helios_core::core::PayloadId::from_bytes(id))?
                     .ok_or_else(|| invalid("reused payload object disappeared"))?;
                 if object.length() != descriptor.nbytes {
                     return Err(invalid("reused payload object has the wrong length"));
                 }
-                installed.lock().map_err(|_| invalid("payload lease lock poisoned"))?.push(object);
+                installed.push(object)?;
                 cached_bytes += descriptor.nbytes;
                 cached_files += 1;
             }
@@ -936,15 +1147,13 @@ fn receive_rank(
                 .join(format!("{}.source", info.sha256))
         };
         if target.try_exists()? {
-            let _transaction = FileTransaction::acquire(FileDirection::Receive, 3)?;
+            let _transaction =
+                FileTransaction::acquire_with_abort(FileDirection::Receive, 3, Some(abort))?;
             if let Some(hex) = &info.payload {
                 let id = helios_core::core::PayloadId::parse(hex)?;
                 let length = declared_objects[id.as_bytes()];
                 let object = verify_cached_payload(cache, id, length)?;
-                installed
-                    .lock()
-                    .map_err(|_| invalid("payload lease lock poisoned"))?
-                    .push(object);
+                installed.push(object)?;
             } else {
                 super::blob::verify_file(&target, digest_bytes(&info.sha256)?, info.size, &budget)?;
             }
@@ -995,7 +1204,7 @@ fn receive_rank(
     let count = request.channels.len();
     let total: u64 = requested.iter().map(|name| manifest.files[name].size).sum();
     let phase = progress.phase("Receive export payload", Some(total));
-    let (_, channels) = streams_ready(channels, |stream, channel| {
+    let (_, channels) = streams_ready(channels, Some(abort), |stream, channel| {
         let names: Vec<_> = requested
             .iter()
             .skip(stream)
@@ -1006,11 +1215,36 @@ fn receive_rank(
             let info = &manifest.files[name];
             let target = &targets[name];
             channel.socket.ready(libc::POLLIN)?;
-            let _transaction = FileTransaction::acquire(FileDirection::Receive, 4)?;
+            let _transaction =
+                FileTransaction::acquire_with_abort(FileDirection::Receive, 4, Some(abort))?;
             let (file, partial) =
                 super::archive::temporary(target.parent().unwrap(), ".rank-blob-")?;
             let result = (|| -> Result<()> {
-                let mut digest = Sha256::new();
+                struct StreamedCompanion {
+                    expected_prefix: Vec<u8>,
+                    header: Vec<u8>,
+                    payload_digest: Context,
+                    next_offset: u64,
+                }
+                let mut declared_payload = if let Some(hex) = info.payload.as_deref() {
+                    let id = helios_core::core::PayloadId::parse(hex)?;
+                    let length = declared_objects[id.as_bytes()];
+                    let streamed = helios_core::core::cache::companion_prefix(length)
+                        .ok()
+                        .filter(|prefix| {
+                            (prefix.len() as u64).checked_add(length) == Some(info.size)
+                        })
+                        .map(|expected_prefix| StreamedCompanion {
+                            header: Vec::with_capacity(expected_prefix.len()),
+                            expected_prefix,
+                            payload_digest: Context::new(&SHA256),
+                            next_offset: 0,
+                        });
+                    Some((id, length, streamed))
+                } else {
+                    None
+                };
+                let mut digest = Context::new(&SHA256);
                 budget.write(&file, 0, info.size, |position, bytes| {
                     let mut filled = 0;
                     while filled < bytes.len() {
@@ -1027,14 +1261,74 @@ fn receive_rank(
                             return Err(invalid("rank export payload range differs"));
                         }
                         digest.update(payload);
+                        if let Some((_, _, Some(verifier))) = &mut declared_payload {
+                            if offset != verifier.next_offset {
+                                return Err(invalid("rank export payload range differs"));
+                            }
+                            let prefix_len = verifier.expected_prefix.len() as u64;
+                            if offset < prefix_len {
+                                let header_take = ((prefix_len - offset) as usize).min(payload.len());
+                                verifier.header.extend_from_slice(&payload[..header_take]);
+                                if header_take < payload.len() {
+                                    verifier.payload_digest.update(&payload[header_take..]);
+                                }
+                            } else {
+                                verifier.payload_digest.update(payload);
+                            }
+                            verifier.next_offset = offset + payload.len() as u64;
+                        }
                         filled += length;
                         phase.advance_bytes(length as u64);
                         aggregate.advance(length as u64);
                     }
                     Ok(())
                 })?;
-                if format!("{:x}", digest.finalize()) != info.sha256 {
+                if super::blob::hex(digest.finish().as_ref()) != info.sha256 {
                     return Err(invalid("rank payload digest mismatch"));
+                }
+                if let Some((declared_id, declared_len, streamed)) = declared_payload {
+                    if let Some(verifier) = streamed
+                        && verifier.next_offset == info.size
+                        && verifier.header == verifier.expected_prefix
+                    {
+                        let actual_id = helios_core::core::PayloadId::from_digest(
+                            verifier.payload_digest.finish(),
+                        );
+                        if actual_id != declared_id {
+                            return Err(invalid(
+                                "received payload digest does not match its declared identity",
+                            ));
+                        }
+                        #[cfg(unix)]
+                        file.set_permissions({
+                            use std::os::unix::fs::PermissionsExt;
+                            fs::Permissions::from_mode(0o444)
+                        })?;
+                        file.sync_all()?;
+                        #[cfg(unix)]
+                        let dev_ino = {
+                            use std::os::unix::fs::MetadataExt;
+                            let metadata = file.metadata()?;
+                            (metadata.dev(), metadata.ino())
+                        };
+                        #[cfg(not(unix))]
+                        let dev_ino = (0, 0);
+                        drop(file);
+                        let object = install_verified_payload_object(
+                            cache,
+                            declared_id,
+                            declared_len,
+                            &partial,
+                            dev_ino,
+                        )?;
+                        installed.push(object)?;
+                        return Ok(());
+                    }
+                    file.sync_all()?;
+                    drop(file);
+                    let object = install_payload_object(cache, declared_id, declared_len, &partial)?;
+                    installed.push(object)?;
+                    return Ok(());
                 }
                 file.sync_all()?;
                 if info.blob {
@@ -1046,19 +1340,6 @@ fn receive_rank(
                 // The synced file may become a cache object itself: close the
                 // writable descriptor before it is published.
                 drop(file);
-                if info.payload.is_some() {
-                    let id = helios_core::core::PayloadId::parse(
-                        info.payload.as_deref().unwrap_or_default(),
-                    )?;
-                    let object = install_payload_object(
-                        cache,
-                        id,
-                        declared_objects[id.as_bytes()],
-                        &partial,
-                    )?;
-                    installed.lock().map_err(|_| invalid("payload lease lock poisoned"))?.push(object);
-                    return Ok(());
-                }
                 match fs::hard_link(&partial, target) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1082,13 +1363,12 @@ fn receive_rank(
         part.source.path = targets[&part.source.path].clone();
     }
     manifest.output.staging = None;
-    let leases = crate::export::PayloadLeases(
-        installed.into_inner().map_err(|_| invalid("payload lease lock poisoned"))?,
-    );
     {
-        let _transaction = FileTransaction::acquire(FileDirection::Receive, 1)?;
+        let _transaction =
+            FileTransaction::acquire_with_abort(FileDirection::Receive, 1, Some(abort))?;
         super::core::write_sources(&request.destination, &manifest.output)?;
     }
+    let leases = installed.into_leases()?;
     let seconds = started.elapsed().as_secs_f64();
     let size: u64 = requested.iter().map(|n| manifest.files[n].size).sum();
     phase.finish(format!(
@@ -1133,13 +1413,14 @@ pub(crate) fn receive_ranks(
             Ok((request, control, channels))
         })
         .collect::<Result<Vec<_>>>()?;
-    let abort: Vec<_> = jobs
-        .iter()
-        .flat_map(|(_, control, channels)| {
-            std::iter::once(control.clone())
-                .chain(channels.iter().map(|channel| channel.socket.clone()))
-        })
-        .collect();
+    let abort = AbortScope::new(
+        jobs.iter()
+            .flat_map(|(_, control, channels)| {
+                std::iter::once(control.clone())
+                    .chain(channels.iter().map(|channel| channel.socket.clone()))
+            })
+            .collect(),
+    );
     let failure = Mutex::new(None);
     let outputs = std::thread::scope(|scope| {
         let handles: Vec<_> = jobs
@@ -1151,17 +1432,15 @@ pub(crate) fn receive_ranks(
                 let aggregate = &aggregate;
                 scope.spawn(move || {
                     match receive_rank(
-                        request, control, channels, cache, no_weights, budget, aggregate,
+                        request, control, channels, cache, no_weights, budget, aggregate, abort,
                     ) {
                         Ok(output) => Some(output),
                         Err(error) => {
+                            abort.trigger();
                             let mut first = failure.lock().unwrap();
                             if first.is_none() {
                                 eprintln!("rank export failed: {error}");
                                 *first = Some(error);
-                                for socket in abort {
-                                    socket.abort();
-                                }
                             }
                             None
                         }
@@ -1175,9 +1454,7 @@ pub(crate) fn receive_ranks(
                 Ok(Some(output)) => outputs.push(output),
                 Ok(None) => {}
                 Err(_) => {
-                    for socket in &abort {
-                        socket.abort();
-                    }
+                    abort.trigger();
                     return Err(invalid("rank export receiver panicked"));
                 }
             }
@@ -1282,9 +1559,11 @@ pub(crate) fn register(module: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3:
 mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     static SERIAL: AtomicU64 = AtomicU64::new(0);
+    fn sha256_hex(bytes: &[u8]) -> String {
+        super::super::blob::hex(ring::digest::digest(&SHA256, bytes).as_ref())
+    }
     struct Directory(PathBuf);
     impl Directory {
         fn new() -> Self {
@@ -1845,7 +2124,7 @@ mod tests {
         let shared = vec![87; 16_385];
         let shared_path = directory
             .0
-            .join(format!("{:x}.safetensors", Sha256::digest(&shared)));
+            .join(format!("{}.safetensors", sha256_hex(&shared)));
         fs::write(&shared_path, &shared).unwrap();
         let mut requests = Vec::new();
         let mut peers = Vec::new();
@@ -1917,7 +2196,7 @@ mod tests {
     fn verified_cache_hit_transfers_no_weights() {
         let directory = Directory::new();
         let bytes = vec![19; 8193];
-        let name = format!("{:x}.safetensors", Sha256::digest(&bytes));
+        let name = format!("{}.safetensors", sha256_hex(&bytes));
         let path = directory.0.join(name);
         fs::write(&path, &bytes).unwrap();
         let rank = output(path, bytes.len() as u64);
@@ -1932,7 +2211,7 @@ mod tests {
         let bytes = vec![19; 8193];
         let path = directory
             .0
-            .join(format!("{:x}.safetensors", Sha256::digest(&bytes)));
+            .join(format!("{}.safetensors", sha256_hex(&bytes)));
         fs::write(&path, &bytes).unwrap();
         let error = roundtrip(
             &directory,
@@ -1949,7 +2228,7 @@ mod tests {
     fn corrupt_cached_blob_is_rejected() {
         let directory = Directory::new();
         let bytes = vec![19; 8193];
-        let name = format!("{:x}.safetensors", Sha256::digest(&bytes));
+        let name = format!("{}.safetensors", sha256_hex(&bytes));
         let path = directory.0.join(&name);
         fs::write(&path, &bytes).unwrap();
         fs::create_dir_all(directory.0.join("cache/blobs")).unwrap();
@@ -2093,7 +2372,7 @@ mod tests {
             let (root, peer) = sockets();
             let source = directory.0.join("source");
             let bytes = vec![41; 8193];
-            let digest = format!("{:x}", Sha256::digest(&bytes));
+            let digest = sha256_hex(&bytes);
             let mut files = BTreeMap::new();
             files.insert(
                 source.clone(),
@@ -2164,5 +2443,398 @@ mod tests {
                 .to_string()
                 .contains("capacity")
         );
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn received_verified_companion_adopts_without_payload_readback_and_rejects_mismatch() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let directory = Directory::new();
+        let payload: Vec<u8> = (0..(BLOCK_BYTES + 137) as u32)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let (source, id) = cache_backed_output(&directory, &payload);
+        let sent = directory
+            .0
+            .join("sender-cache")
+            .join("blobs")
+            .join(id.file_name());
+        let cache = directory.0.join("verified-cache");
+        fs::create_dir_all(cache.join("blobs")).unwrap();
+
+        // Direct verified adoption links the synced partial inode into the cache
+        // without reading payload bytes from disk.
+        let partial = cache.join("blobs").join(".rank-blob-verified");
+        fs::copy(&sent, &partial).unwrap();
+        fs::set_permissions(&partial, fs::Permissions::from_mode(0o444)).unwrap();
+        let partial_meta = fs::metadata(&partial).unwrap();
+        let dev_ino = (partial_meta.dev(), partial_meta.ino());
+        let (adopted, bytes_read) =
+            helios_core::core::container::count_payload_reads(&[partial.clone()], || {
+                install_verified_payload_object(&cache, id, payload.len() as u64, &partial, dev_ino)
+            });
+        let object = adopted.unwrap();
+        assert_eq!(bytes_read, 0, "verified adoption re-read payload bytes");
+        assert_eq!(
+            (
+                fs::metadata(object.path()).unwrap().dev(),
+                fs::metadata(object.path()).unwrap().ino()
+            ),
+            dev_ino,
+            "verified canonical wrapper was copied instead of adopted"
+        );
+        fs::remove_file(&partial).unwrap();
+        assert_eq!(object.slice().digest().unwrap(), id);
+        drop(object);
+
+        // Multi-frame transfer across BLOCK_BYTES adopts into a fresh receiver cache.
+        let multi = Directory::new();
+        let received = roundtrip_with_cache(&multi, "rank.json", &source, false).unwrap();
+        assert_eq!(received.leases.0.len(), 1);
+        assert_eq!(received.leases.0[0].id(), id);
+        assert_eq!(received.leases.0[0].slice().digest().unwrap(), id);
+        drop(received);
+
+        // A companion whose transport sha256 matches the manifest but whose payload
+        // bytes disagree with the declared PayloadId must be rejected before cache entry.
+        let bad_dir = Directory::new();
+        let declared_bytes = vec![0x3a; 8192];
+        let wrong_bytes = vec![0x3b; 8192];
+        let declared_id = helios_core::core::PayloadId::of(&declared_bytes);
+        let mut wrong_wrapper =
+            helios_core::core::cache::companion_prefix(wrong_bytes.len() as u64).unwrap();
+        wrong_wrapper.extend_from_slice(&wrong_bytes);
+        let transport_sha = sha256_hex(&wrong_wrapper);
+        let staged_res = bad_dir.0.join("staged-res");
+        fs::write(&staged_res, b"res").unwrap();
+        let res_sha = sha256_hex(b"res");
+        let fake_companion = bad_dir.0.join("fake-companion.safetensors");
+        let mut rank_out = output(staged_res.clone(), 3);
+        rank_out.weight_payload = Some(crate::export::WeightPayloadSources {
+            cached: Vec::new(),
+            engram: None,
+            groups: vec![crate::export::WeightPayloadGroup {
+                name: "layer-000".into(),
+                storage: "stable".into(),
+                nbytes: declared_bytes.len() as u64,
+                spans: Vec::new(),
+                payload_id: declared_id.as_bytes().to_vec(),
+            }],
+            initial_state: crate::export::WeightPayloadGroup::default(),
+            views: Vec::new(),
+        });
+        let mut files = BTreeMap::new();
+        files.insert(
+            staged_res.clone(),
+            Source {
+                size: 3,
+                sha256: res_sha,
+                blob: false,
+                payload: None,
+            },
+        );
+        files.insert(
+            fake_companion.clone(),
+            Source {
+                size: wrong_wrapper.len() as u64,
+                sha256: transport_sha,
+                blob: false,
+                payload: Some(declared_id.to_hex()),
+            },
+        );
+        let (control_root, control_peer) = sockets();
+        let (root, peer) = sockets();
+        let receiver_cache = bad_dir.0.join("cache");
+        let error = std::thread::scope(|scope| {
+            let sender = scope.spawn(move || {
+                let mut control = Socket::borrow(control_peer.as_raw_fd()).unwrap();
+                send_control(
+                    &mut control,
+                    &Manifest {
+                        version: PROTOCOL,
+                        output: rank_out,
+                        files,
+                        inventory: Value::Null,
+                    },
+                )
+                .unwrap();
+                let req: Request = receive_control(&mut control).unwrap();
+                let mut channel = Channel::new(state(&peer, false)).unwrap();
+                for requested_path in &req.files {
+                    if requested_path == &staged_res {
+                        channel
+                            .send(
+                                json!({"kind":"export-data","name":staged_res,"offset":0}),
+                                b"res",
+                            )
+                            .unwrap();
+                    } else {
+                        channel
+                            .send(
+                                json!({"kind":"export-data","name":fake_companion,"offset":0}),
+                                &wrong_wrapper,
+                            )
+                            .unwrap();
+                    }
+                }
+            });
+            let result = receive_ranks(
+                vec![ReceiveRequest {
+                    control_fd: control_root.as_raw_fd(),
+                    channels: vec![state(&root, true)],
+                    destination: bad_dir.0.join("rank.json"),
+                }],
+                &receiver_cache,
+                false,
+            );
+            sender.join().unwrap();
+            result.err().expect("mismatched payload digest must fail")
+        });
+        assert!(
+            error
+                .to_string()
+                .contains("received payload digest does not match its declared identity"),
+            "{error}"
+        );
+        let store = helios_core::core::cache::Root::open(&receiver_cache).unwrap();
+        assert!(store.payload(declared_id).unwrap().is_none());
+        assert!(
+            store
+                .payload(helios_core::core::PayloadId::of(&wrong_bytes))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !fs::read_dir(receiver_cache.join("blobs"))
+                .unwrap()
+                .any(|entry| entry.unwrap().path().is_file())
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn failed_receive_rolls_back_retained_descriptors_and_aborts_zero_window_peers_promptly() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // 1. Retained-descriptor rollback: while another FileTransaction keeps reserved > 0,
+        // a failed receive_rank that leased cached payloads must restore its descriptor count
+        // when its partial PayloadObject list drops.
+        {
+            let directory = Directory::new();
+            let payload_bytes = vec![0x51; 4096];
+            let (mut source, id) = cache_backed_output(&directory, &payload_bytes);
+            // Seed receiver cache so `sources.cached` opens a 2-FD PayloadObject lease,
+            // then force receive_rank to fail on an absent `--no-weights` second group.
+            roundtrip_with_cache(&directory, "seed.json", &source, false).unwrap();
+            let missing_id = helios_core::core::PayloadId::of(b"missing-second-group");
+            let missing_blob = directory.0.join("missing-companion.safetensors");
+            let mut missing_wrapper = helios_core::core::cache::companion_prefix(20).unwrap();
+            missing_wrapper.extend_from_slice(b"missing-second-group");
+            fs::write(&missing_blob, &missing_wrapper).unwrap();
+            let missing_lease = {
+                let extra_cache = directory.0.join("extra-sender-cache");
+                let extra_root = helios_core::core::cache::Root::open(&extra_cache).unwrap();
+                extra_root
+                    .insert_payload(missing_id, 20, &b"missing-second-group"[..])
+                    .unwrap()
+            };
+            {
+                let weight = source.weight_payload.as_mut().unwrap();
+                weight.cached = vec![helios_core::core::schema::wire::PayloadDescriptor {
+                    id: id.as_bytes().to_vec(),
+                    nbytes: payload_bytes.len() as u64,
+                }];
+                weight.groups.push(crate::export::WeightPayloadGroup {
+                    name: "layer-001".into(),
+                    storage: "stable".into(),
+                    nbytes: 20,
+                    spans: Vec::new(),
+                    payload_id: missing_id.as_bytes().to_vec(),
+                });
+            }
+            source.payload_leases = crate::export::PayloadLeases(vec![missing_lease]);
+
+            let _pin = FileTransaction::acquire(FileDirection::Send, 1).unwrap();
+            let before_capacity = FILE_TRANSACTIONS.0.lock().unwrap().capacity;
+            // Thirty-two failing attempts open and drop 64 cached-payload descriptors;
+            // without rollback on failure, capacity drops by at least 64 even when
+            // sibling tests run concurrently in the same process.
+            for attempt in 0..32 {
+                let dest = format!("fail-no-weights-{attempt}.json");
+                assert!(roundtrip_with_cache(&directory, &dest, &source, true).is_err());
+            }
+            let after_capacity = FILE_TRANSACTIONS.0.lock().unwrap().capacity;
+            assert!(
+                before_capacity.saturating_sub(after_capacity) < 32,
+                "failed receive_rank leaked retained-descriptor subtractions: before={before_capacity}, after={after_capacity}"
+            );
+        }
+
+        // 2. Early scan failure in send_rank must abort borrowed sockets so a concurrent
+        // receive_ranks does not block in receive_control until the 2-hour idle timeout.
+        {
+            let directory = Directory::new();
+            let absent_source = directory.0.join("absent-source.bin");
+            let (control_root, control_peer) = sockets();
+            let (root, peer) = sockets();
+            let control_root = Arc::new(control_root);
+            let control_peer = Arc::new(control_peer);
+            let root = Arc::new(root);
+            let peer = Arc::new(peer);
+            let (done_tx, done_rx) = mpsc::channel();
+            let c_root = Arc::clone(&control_root);
+            let c_peer = Arc::clone(&control_peer);
+            let d_root = Arc::clone(&root);
+            let d_peer = Arc::clone(&peer);
+            let dir_path = directory.0.clone();
+            std::thread::spawn(move || {
+                let sender = std::thread::spawn(move || {
+                    send_rank(
+                        output(absent_source, 64),
+                        Value::Null,
+                        c_peer.as_raw_fd(),
+                        vec![state(&d_peer, false)],
+                    )
+                });
+                let receiver = receive_ranks(
+                    vec![ReceiveRequest {
+                        control_fd: c_root.as_raw_fd(),
+                        channels: vec![state(&d_root, true)],
+                        destination: dir_path.join("rank.json"),
+                    }],
+                    &dir_path.join("cache"),
+                    false,
+                );
+                let sent = sender.join().unwrap();
+                let _ = done_tx.send((sent.is_err(), receiver.is_err()));
+            });
+            let (sent_err, recv_err) = done_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("receive_ranks hung after peer send_rank failed during source scan");
+            assert!(sent_err && recv_err);
+        }
+
+        // 3. Multi-peer TCP zero-window abort: Peer 1 fails mid-receive on Rank 0 while
+        // Peer 2 is blocked inside Socket::write sending multi-megabyte frames across a
+        // zero-window TCP buffer while socket owners remain open.
+        {
+            let directory = Directory::new();
+            let small_socket_pair = || -> (Arc<TcpStream>, Arc<TcpStream>) {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                unsafe {
+                    let rcvbuf: libc::c_int = 32_768;
+                    libc::setsockopt(
+                        listener.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_RCVBUF,
+                        (&rcvbuf as *const libc::c_int).cast(),
+                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                    );
+                }
+                let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+                unsafe {
+                    let sndbuf: libc::c_int = 32_768;
+                    libc::setsockopt(
+                        client.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_SNDBUF,
+                        (&sndbuf as *const libc::c_int).cast(),
+                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                    );
+                }
+                let (accepted, _) = listener.accept().unwrap();
+                (Arc::new(accepted), Arc::new(client))
+            };
+
+            let peer1_data = vec![0x33u8; BLOCK_BYTES * 2];
+            let peer2_data = vec![0x44u8; BLOCK_BYTES * 4];
+            let peer1_src = directory.0.join("peer1.bin");
+            let peer2_src = directory.0.join("peer2.bin");
+            fs::write(&peer1_src, &peer1_data).unwrap();
+            fs::write(&peer2_src, &peer2_data).unwrap();
+
+            // Peer 1's destination parent is read-only so creating `.rank-blob-*` fails on
+            // Rank 0 right as Peer 1's first frame arrives, while Peer 2 is streaming 16 MiB.
+            let peer1_ro_dir = directory.0.join("ro-stage");
+            fs::create_dir_all(&peer1_ro_dir).unwrap();
+
+            let (c1_root, c1_peer) = small_socket_pair();
+            let (d1_root, d1_peer) = small_socket_pair();
+            let (c2_root, c2_peer) = small_socket_pair();
+            let (d2_root, d2_peer) = small_socket_pair();
+
+            let retained = vec![
+                Arc::clone(&c1_root),
+                Arc::clone(&d1_root),
+                Arc::clone(&c2_root),
+                Arc::clone(&d2_root),
+                Arc::clone(&c1_peer),
+                Arc::clone(&d1_peer),
+                Arc::clone(&c2_peer),
+                Arc::clone(&d2_peer),
+            ];
+            let cache_dir = directory.0.join("cache");
+            let peer2_dst = directory.0.join("peer2-rank.json");
+            let peer1_dst = peer1_ro_dir.join("peer1-rank.json");
+            fs::set_permissions(&peer1_ro_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+            let (done_tx, done_rx) = mpsc::channel();
+            let ro_cleanup = peer1_ro_dir.clone();
+            std::thread::spawn(move || {
+                let s1 = std::thread::spawn(move || {
+                    send_rank(
+                        output(peer1_src, peer1_data.len() as u64),
+                        json!({"rank": 1}),
+                        c1_peer.as_raw_fd(),
+                        vec![state(&d1_peer, false)],
+                    )
+                });
+                let s2 = std::thread::spawn(move || {
+                    send_rank(
+                        output(peer2_src, peer2_data.len() as u64),
+                        json!({"rank": 2}),
+                        c2_peer.as_raw_fd(),
+                        vec![state(&d2_peer, false)],
+                    )
+                });
+                let recv_res = receive_ranks(
+                    vec![
+                        ReceiveRequest {
+                            control_fd: c1_root.as_raw_fd(),
+                            channels: vec![state(&d1_root, true)],
+                            destination: peer1_dst,
+                        },
+                        ReceiveRequest {
+                            control_fd: c2_root.as_raw_fd(),
+                            channels: vec![state(&d2_root, true)],
+                            destination: peer2_dst,
+                        },
+                    ],
+                    &cache_dir,
+                    false,
+                );
+                let r1 = s1.join().unwrap();
+                let r2 = s2.join().unwrap();
+                drop(retained);
+                let _ = done_tx.send((recv_res.is_err(), r1.is_err(), r2_err_flag(&r2)));
+            });
+
+            let outcome = done_rx.recv_timeout(Duration::from_secs(5));
+            let _ = fs::set_permissions(&ro_cleanup, fs::Permissions::from_mode(0o755));
+            let (recv_err, r1_err, r2_err) =
+                outcome.expect("peer send_rank or receive_ranks hung after mid-transfer abort");
+            assert!(recv_err, "receive_ranks must report failure");
+            assert!(r1_err, "peer 1 send_rank must terminate with error");
+            assert!(
+                r2_err,
+                "peer 2 blocked in zero-window send must terminate with error"
+            );
+        }
+    }
+
+    fn r2_err_flag<T, E>(res: &std::result::Result<T, E>) -> bool {
+        res.is_err()
     }
 }
