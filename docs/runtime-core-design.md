@@ -320,6 +320,18 @@ leading bytes, and trailing bytes use positioned I/O where needed. Output files
 retain their exact declared lengths. Direct-I/O errors fail the operation.
 
 Payload publication verifies source bytes and existing cache objects before reuse.
+During core payload assembly, Engram table weight and scale planes resolve across
+up to eight concurrent workers, starting the largest planes first, stopping new
+planes after the first error, and recording cache leases and deployment payloads
+in declared table and shard order. Single-file planes pin their checkpoint range
+directly and share the process-wide read-ahead digest pool (bounded to sixteen
+concurrent read-ahead digests and 1 GiB of buffers across export and verification
+workers); multi-file planes stream-hash their pieces through 4 MiB buffers to
+reuse verified cache objects without staging or materialize uncached planes
+through 4 MiB buffered writes. Temporary uncompressed cubin and graph spans
+extracted during rank assembly skip standalone digests and per-file `fsync` calls
+because executable sealing compresses, hashes, and syncs each rank's archive
+before publication.
 Cache publication checks up to eight payloads concurrently, retaining each
 verified object's file handle and cache lease until its staging link is created.
 Object installation, staging links, and location records remain serialized.

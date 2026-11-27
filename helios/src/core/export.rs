@@ -1035,8 +1035,108 @@ fn data_result(total: u64, reused: u64) -> String {
     }
 }
 
-/// Concurrent payload checks or directory installations in one publication phase.
-const MAX_PAYLOAD_INSTALL_WORKERS: usize = 8;
+/// Maximum concurrent payload workers in one assembly or publication phase.
+pub const MAX_PAYLOAD_INSTALL_WORKERS: usize = 8;
+
+/// Execute `work(index)` across up to `max_workers` scoped threads ordered by
+/// descending `weight(index)`, returning outputs in `0..len` declared order.
+///
+/// Scheduling stops after the first worker error, panic, or thread-spawn failure
+/// so remaining queued items do not start. Single-item inputs execute inline
+/// without spawning threads.
+pub fn run_payload_workers<T, E>(
+    len: usize,
+    max_workers: usize,
+    weight: impl Fn(usize) -> u64,
+    work: impl Fn(usize) -> std::result::Result<T, E> + Sync,
+    on_spawn_error: impl FnOnce(std::io::Error) -> E,
+    on_panic: impl Fn() -> E + Sync,
+) -> std::result::Result<Vec<T>, E>
+where
+    T: Send,
+    E: Send,
+{
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |available| available.get())
+        .min(max_workers.max(1))
+        .min(len)
+        .max(1);
+    let mut order: Vec<usize> = (0..len).collect();
+    order.sort_by_key(|&index| std::cmp::Reverse(weight(index)));
+    if workers == 1 {
+        let mut results: Vec<Option<T>> = (0..len).map(|_| None).collect();
+        for index in order {
+            results[index] = Some(work(index)?);
+        }
+        return Ok(results
+            .into_iter()
+            .map(|slot| slot.expect("every payload item visited"))
+            .collect());
+    }
+
+    let cursor = AtomicUsize::new(0);
+    let stopped = AtomicBool::new(false);
+    let results: Mutex<Vec<Option<T>>> = Mutex::new((0..len).map(|_| None).collect());
+    let failure: Mutex<Option<E>> = Mutex::new(None);
+    let mut spawn_error = None;
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let worker = std::thread::Builder::new().spawn_scoped(scope, || loop {
+                if stopped.load(Ordering::Acquire) {
+                    break;
+                }
+                let Some(&index) = order.get(cursor.fetch_add(1, Ordering::Relaxed)) else {
+                    break;
+                };
+                if stopped.load(Ordering::Acquire) {
+                    break;
+                }
+                let run_one = std::panic::AssertUnwindSafe(|| work(index));
+                let outcome = std::panic::catch_unwind(run_one).unwrap_or_else(|_| Err(on_panic()));
+                match outcome {
+                    Ok(value) => {
+                        results.lock().expect("payload worker result mutex")[index] = Some(value);
+                    }
+                    Err(error) => {
+                        stopped.store(true, Ordering::Release);
+                        failure
+                            .lock()
+                            .expect("payload worker failure mutex")
+                            .get_or_insert(error);
+                        break;
+                    }
+                }
+            });
+            if let Err(error) = worker {
+                stopped.store(true, Ordering::Release);
+                spawn_error = Some(error);
+                break;
+            }
+        }
+    });
+
+    if let Some(error) = spawn_error {
+        return Err(on_spawn_error(error));
+    }
+    if let Some(error) = failure.into_inner().expect("payload worker failure mutex") {
+        return Err(error);
+    }
+    Ok(results
+        .into_inner()
+        .expect("payload worker result mutex")
+        .into_iter()
+        .map(|slot| slot.expect("every payload worker item must record a result"))
+        .collect())
+}
 
 /// Install or re-verify one data phase's payloads and record their locations
 /// in listed order. Returns the cached weight bytes linked without hashing.
@@ -1085,48 +1185,24 @@ fn install_phase_payloads(
         .iter()
         .map(|payload| located.insert(payload.id, ()).is_none())
         .collect();
-    let workers = std::thread::available_parallelism()
-        .map_or(1, |workers| workers.get())
-        .min(MAX_PAYLOAD_INSTALL_WORKERS)
-        .min(payloads.len())
-        .max(1);
-    let cursor = std::sync::atomic::AtomicUsize::new(0);
-    let results = std::sync::Mutex::new(
-        (0..payloads.len())
-            .map(|_| None)
-            .collect::<Vec<Option<Result<(), crate::Error>>>>(),
-    );
-    let mut spawn_error = None;
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            let worker = std::thread::Builder::new().spawn_scoped(scope, || loop {
-                let index = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let Some(payload) = payloads.get(index) else {
-                    break;
-                };
-                phase.detail(format!("{} ({} bytes)", payload.relative, payload.nbytes()));
-                let result = if installs[index] {
-                    install_directory_payload(root, payload)
-                } else {
-                    verify_payload_source(payload).map(|_| ())
-                };
-                if result.is_ok() {
-                    phase.advance_bytes(payload.nbytes());
-                }
-                results.lock().expect("payload installation result mutex")[index] = Some(result);
-            });
-            if let Err(error) = worker {
-                spawn_error = Some(error);
-                break;
+    run_payload_workers(
+        payloads.len(),
+        MAX_PAYLOAD_INSTALL_WORKERS,
+        |index| payloads[index].nbytes(),
+        |index| {
+            let payload = &payloads[index];
+            phase.detail(format!("{} ({} bytes)", payload.relative, payload.nbytes()));
+            if installs[index] {
+                install_directory_payload(root, payload)?;
+            } else {
+                verify_payload_source(payload)?;
             }
-        }
-    });
-    if let Some(error) = spawn_error {
-        return Err(invalid(format!("spawn payload installer: {error}")));
-    }
-    for result in results.into_inner().expect("payload installation result mutex") {
-        result.expect("every payload installation worker must record a result")?;
-    }
+            phase.advance_bytes(payload.nbytes());
+            Ok(())
+        },
+        |error| invalid(format!("spawn payload installer: {error}")),
+        || invalid("payload installer worker panicked"),
+    )?;
     for (payload, install) in payloads.iter().zip(installs) {
         if install {
             locations.push(wire::PayloadLocation {
@@ -1141,7 +1217,7 @@ fn install_phase_payloads(
 
 /// Verify, insert and link one cache publication phase's payloads.
 ///
-/// Up to `MAX_PAYLOAD_INSTALL_WORKERS` workers take the payloads largest first,
+/// Up to `MAX_PAYLOAD_WORKERS` workers take the payloads largest first,
 /// so a long payload does not start after the short ones. A reused cached weight
 /// is linked without hashing. Any other payload's source is hashed; the first
 /// occurrence of an identity then resolves its cache object (checking an
@@ -1163,85 +1239,48 @@ fn install_cache_phase_payloads(
     phase: &crate::startup::Phase,
 ) -> Result<u64, crate::Error> {
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     let mut seen: std::collections::BTreeSet<_> = located.keys().copied().collect();
     let installs: Vec<_> = payloads
         .iter()
         .map(|payload| seen.insert(payload.id))
         .collect();
-    let mut order: Vec<usize> = (0..payloads.len()).collect();
-    order.sort_by_key(|&index| std::cmp::Reverse(payloads[index].nbytes()));
-    let workers = std::thread::available_parallelism()
-        .map_or(1, |workers| workers.get())
-        .min(MAX_PAYLOAD_INSTALL_WORKERS)
-        .min(payloads.len())
-        .max(1);
     let staging = Mutex::new(staging);
     let reused_bytes = AtomicU64::new(0);
-    let cursor = AtomicUsize::new(0);
-    let failure: Mutex<Option<crate::Error>> = Mutex::new(None);
-    let publish = |index: usize| -> Result<(), crate::Error> {
-        let payload = &payloads[index];
-        phase.detail(format!("{} ({} bytes)", payload.relative, payload.nbytes()));
-        let object = match reused_weight(payload, weights)? {
-            Some(object) => {
-                reused_bytes.fetch_add(payload.nbytes(), Ordering::Relaxed);
-                installs[index].then(|| object.clone())
-            }
-            None => {
-                verify_payload_source(payload)?;
-                if installs[index] {
-                    Some(resolve_cache_object(root, payload, no_weights && is_weight(payload))?)
-                } else {
-                    None
+    run_payload_workers(
+        payloads.len(),
+        MAX_PAYLOAD_INSTALL_WORKERS,
+        |index| payloads[index].nbytes(),
+        |index| {
+            let payload = &payloads[index];
+            phase.detail(format!("{} ({} bytes)", payload.relative, payload.nbytes()));
+            let object = match reused_weight(payload, weights)? {
+                Some(object) => {
+                    reused_bytes.fetch_add(payload.nbytes(), Ordering::Relaxed);
+                    installs[index].then(|| object.clone())
                 }
-            }
-        };
-        if let Some(object) = object {
-            staging
-                .lock()
-                .map_err(|_| invalid("cache staging lock poisoned"))?
-                .link(&object, &payload.relative)?;
-        }
-        phase.advance_bytes(payload.nbytes());
-        Ok(())
-    };
-    let mut spawn_error = None;
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            let worker = std::thread::Builder::new().spawn_scoped(scope, || loop {
-                if failure.lock().expect("cache payload worker mutex").is_some() {
-                    break;
+                None => {
+                    verify_payload_source(payload)?;
+                    if installs[index] {
+                        Some(resolve_cache_object(root, payload, no_weights && is_weight(payload))?)
+                    } else {
+                        None
+                    }
                 }
-                let Some(&index) = order.get(cursor.fetch_add(1, Ordering::Relaxed)) else {
-                    break;
-                };
-                // A panic stops new payloads like any other error.
-                let publish_one = std::panic::AssertUnwindSafe(|| publish(index));
-                let result = std::panic::catch_unwind(publish_one)
-                    .unwrap_or_else(|_| Err(invalid("cache payload worker panicked")));
-                if let Err(error) = result {
-                    failure.lock().expect("cache payload worker mutex").get_or_insert(error);
-                    break;
-                }
-            });
-            if let Err(error) = worker {
-                failure
+            };
+            if let Some(object) = object {
+                staging
                     .lock()
-                    .expect("cache payload worker mutex")
-                    .get_or_insert(invalid("cache payload worker stopped"));
-                spawn_error = Some(error);
-                break;
+                    .map_err(|_| invalid("cache staging lock poisoned"))?
+                    .link(&object, &payload.relative)?;
             }
-        }
-    });
-    if let Some(error) = spawn_error {
-        return Err(invalid(format!("spawn cache payload worker: {error}")));
-    }
-    if let Some(error) = failure.into_inner().expect("cache payload worker mutex") {
-        return Err(error);
-    }
+            phase.advance_bytes(payload.nbytes());
+            Ok(())
+        },
+        |error| invalid(format!("spawn cache payload worker: {error}")),
+        || invalid("cache payload worker panicked"),
+    )?;
     for (payload, install) in payloads.iter().zip(installs) {
         if install {
             locations.push(wire::PayloadLocation {
