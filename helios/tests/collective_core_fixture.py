@@ -23,6 +23,96 @@ def _process():
     return dict(pid=os.getpid(), start_ticks=int(Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19]))
 
 
+def _operands(rows, columns, step):
+    generator = torch.Generator().manual_seed(4181 + columns + step)
+    values = [(torch.randn((rows, columns), generator=generator)
+               * 2. ** torch.randint(-12, 13, (rows, columns), generator=generator)).bfloat16()
+              for _ in range(4)]
+    values[2][:rows // 2] = -values[0][:rows // 2]
+    values[3][:rows // 2] = -values[1][:rows // 2]
+    return values
+
+
+def _selected_query(operation):
+    query = operation.plan.prepared.state.query
+    return dict(surface=query.surface, call=dict(query.call))
+
+
+def _expected(values, rank, query):
+    surface = query["surface"]
+    assert surface in ("OneshotAllReduce.all_reduce", "PCIeTwoShotBF16.all_reduce"), surface
+    transport = query["call"]["transport"]
+    if surface == "PCIeTwoShotBF16.all_reduce":
+        assert transport in ("push", "pull"), transport
+        transport = "bulk_" + transport
+    else:
+        if transport in ("joint_latency", "joint_bandwidth"):
+            mode = query["call"]["submode"]
+            modes = (("full", "payload_rsag", "pull") if transport == "joint_latency"
+                     else ("payload_rsag", "bulk_push", "bulk_pull", "pull"))
+            assert mode in modes, (transport, mode)
+            transport = {"full": "remote_push_full", "payload_rsag": "remote_push_rsag"}.get(mode, mode)
+        else:
+            assert transport in ("pull", "remote_push_full", "remote_push_rsag"), transport
+    bulk = transport in ("bulk_push", "bulk_pull")
+    if transport in ("remote_push_full", "remote_push_rsag"):
+        values = [value.clone() for value in values]
+        for value in values:
+            bits = value.view(torch.int16)
+            bits[bits == 0] = -32768
+    cyclic = []
+    for first in range(4):
+        value = values[first].float()
+        if bulk:
+            value = torch.zeros_like(value) + value
+        for offset in range(1, 4):
+            value = value + values[(first + offset) % 4].float()
+        cyclic.append(value.bfloat16())
+    if bulk or transport == "remote_push_rsag":
+        elements = values[0].numel()
+        assert elements % 8 == 0
+        packs = elements // 8
+        shard = ((packs + 3) // 4 if bulk else packs // 4) * 8
+        parts = [cyclic[owner].flatten()[min(elements, owner * shard):
+                 elements if owner == 3 else min(elements, (owner + 1) * shard)].clone()
+                 for owner in range(4)]
+        if transport == "remote_push_rsag":
+            for owner, part in enumerate(parts):
+                if owner != rank:
+                    bits = part.view(torch.int16)
+                    bits[bits == 0] = -32768
+        return torch.cat(parts).view_as(values[0])
+    return cyclic[rank]
+
+
+class _FixtureAllReduce:
+    """Minimal direct b12x PCIe all-reduce binding for Helios TP4 export fixtures."""
+
+    def __init__(self, source, output, *, runtime, session, coordinator, name):
+        from b12x.preparation import CollectiveRequirement, PreparedCall
+        from ignition.preparation.tuning import declare
+
+        self.runtime, self.output = runtime, output
+        self.plan = runtime.plan(source, out=output)
+        ranks = tuple(dist.get_process_group_ranks(runtime.exchange_group))
+
+        def prepare(state):
+            if state.query.surface == "PCIeTwoShotBF16.all_reduce":
+                from b12x.comm.pcie._twoshot_preparation import prepared_call
+
+                return prepared_call(state, payload=source, out=output)
+            state.bind_input(source)
+            return PreparedCall(run=lambda: state.run_plain(source, output), output=output, owners=(runtime,))
+
+        request = self.plan.request(name=name, prepare_call=prepare,
+            collective=CollectiveRequirement(key=name, ranks=ranks))
+        declare(session, (request,), coordinator=coordinator)
+
+    def __call__(self, source):
+        self.runtime.all_reduce(source, out=self.output, plan=self.plan)
+        return self.output
+
+
 def _configuration(folder, signatures, tuned_bindings=None):
     from ignition.preparation import contract as c, runtime_core_pb2 as p
 
@@ -47,14 +137,13 @@ def _configuration(folder, signatures, tuned_bindings=None):
 
 
 def _rank(rank, directory, startup_tuning=False):
-    from ignition.components.collectives import PreparedAllReduce
-    from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
+    from b12x.comm.pcie import AllReduce
+    from ignition.preparation.collectives import CollectivePreparation
     from ignition.preparation.execution import GraphSignature, PreparedExecution, TunedBinding, TuningGraph
     from ignition.preparation.module_images import ModuleImages
     from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.runtime_core import export_model
     from ignition.preparation.tuning import RecordedPreparationSession
-    from tests.components.test_collective_transport_tp4_cuda import _expected, _operands, _selected_query
 
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
@@ -67,8 +156,9 @@ def _rank(rank, directory, startup_tuning=False):
     try:
         with ModuleImages() as images, CoreStorage(rank=rank, world=4, device=rank) as storage:
             coordinator = CollectivePreparation(dist.group.WORLD)
-            runtime = create_all_reduce_runtime(dist.group.WORLD, device, max_tokens=33,
-                hidden_size=5120, ipc=storage.peer_storage)
+            nbytes = 33 * 5120 * 2
+            runtime = AllReduce.from_exchange_group(exchange_group=dist.group.WORLD, device=device,
+                single_channel=True, max_size=nbytes, eager_buffer_bytes=nbytes, ipc=storage.peer_storage)
             with RecordedPreparationSession(device=device, checkpoint="collective-core",
                     workload_schema="tp4-bf16-peer-storage", numerical_policy="fp32-single-rounding",
                     coordinator=coordinator) as session:
@@ -78,7 +168,7 @@ def _rank(rank, directory, startup_tuning=False):
                           "prefill64": (4096, 33), "prefill128": (5120, 33)}
                 outputs = {name: torch.empty((rows, width), dtype=torch.bfloat16, device=device)
                            for name, (width, rows) in shapes.items()}
-                operations = {name: PreparedAllReduce(sources[width][:rows], outputs[name],
+                operations = {name: _FixtureAllReduce(sources[width][:rows], outputs[name],
                     runtime=runtime, session=session, coordinator=coordinator, name=name)
                     for name, (width, rows) in shapes.items()}
                 session.tune(show_progress=False)

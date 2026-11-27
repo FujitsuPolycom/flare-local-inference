@@ -28,12 +28,37 @@ def _work(NANOSECONDS: tl.constexpr):
         pass
 
 
+class _DirectAllReduceBarrier:
+    """Minimal b12x PCIe all-reduce barrier matching the readiness barrier protocol."""
+
+    def __init__(self, source, output, *, runtime, session, coordinator, name):
+        from b12x.preparation import CollectiveRequirement, PreparedCall
+        from ignition.preparation.tuning import declare
+
+        self.runtime = runtime
+        self.single = False
+        self.plan = runtime.plan(source, out=output)
+        ranks = tuple(dist.get_process_group_ranks(runtime.exchange_group))
+
+        def prepare(state):
+            state.bind_input(source)
+            return PreparedCall(run=lambda: state.run_plain(source, output), output=output, owners=(runtime,))
+
+        request = self.plan.request(name=name, prepare_call=prepare,
+            collective=CollectiveRequirement(key=name, ranks=ranks))
+        declare(session, (request,), coordinator=coordinator)
+
+    def __call__(self, source, output):
+        self.runtime.all_reduce(source, out=output, plan=self.plan)
+        return output
+
+
 def _rank(rank, world, rendezvous):
+    from b12x.comm.pcie import AllReduce
     from b12x.sequence._shared.disk_table import MappedHostAllocation
     from cuda.bindings import driver
-    from ignition.components.collectives import _all_reduce
     from ignition.components.readiness import PreparedReadinessWait, ReadinessTimings, record_timestamp, wait_for_readiness
-    from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
+    from ignition.preparation.collectives import CollectivePreparation
     from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.tuning import RecordedPreparationSession
 
@@ -49,8 +74,8 @@ def _rank(rank, world, rendezvous):
     try:
         with CoreStorage(rank=rank, world=world, device=rank) as storage:
             coordinator = CollectivePreparation(dist.group.WORLD)
-            runtime = create_all_reduce_runtime(dist.group.WORLD, device, max_tokens=1,
-                                               hidden_size=8, ipc=storage.peer_storage)
+            runtime = AllReduce.from_exchange_group(exchange_group=dist.group.WORLD, device=device,
+                single_channel=True, max_size=16, eager_buffer_bytes=16, ipc=storage.peer_storage)
             try:
                 with RecordedPreparationSession(device=device, checkpoint="readiness-timing",
                         workload_schema="readiness-intervals", numerical_policy="default",
@@ -58,8 +83,10 @@ def _rank(rank, world, rendezvous):
                     frame = torch.zeros(1, dtype=torch.int32, device=device)
                     timings = ReadinessTimings.allocate(frame, 1)
                     origin = torch.zeros((2, 1), dtype=torch.int64, device=device)
-                    wait = PreparedReadinessWait(timings, 0, runtime=runtime, session=session,
-                                                 coordinator=coordinator, name="readiness")
+                    b_in, b_out = PreparedReadinessWait.barrier_operands(device)
+                    barrier = _DirectAllReduceBarrier(b_in, b_out, runtime=runtime, session=session,
+                                                      coordinator=coordinator, name="readiness")
+                    wait = PreparedReadinessWait(timings, 0, barrier=barrier)
                     session.tune(show_progress=False)
                     ready = torch.cuda.Event(external=True)
                     ready.record()
@@ -69,7 +96,7 @@ def _rank(rank, world, rendezvous):
                         local_work = work_ns if rank == 1 else 0
 
                         def forward():
-                            _all_reduce(wait.input, wait.output, wait.handle - 1)
+                            barrier(wait.input, wait.output)
                             record_timestamp(origin, frame, 0)
                             progress.device_view.fill_(1)
                             _work[(1,)](local_work, num_warps=1)
@@ -121,8 +148,8 @@ def _rank(rank, world, rendezvous):
                         samples = [None] * world
                         dist.all_gather_object(samples, [value - offset for value in stamps])
                         through = min(end - begin for begin, _, end in samples)
-                        barrier = min(end - ready_at for _, ready_at, end in samples)
-                        exposed = through - barrier
+                        barrier_ns = min(end - ready_at for _, ready_at, end in samples)
+                        exposed = through - barrier_ns
                         reference = max(value[1] for value in samples) - max(value[0] for value in samples)
                         assert abs(exposed - reference) < 500_000
                         if generation == 2:
@@ -130,7 +157,7 @@ def _rank(rank, world, rendezvous):
                         else:
                             assert 12_000_000 < exposed < 80_000_000
                         if rank == 0:
-                            print(f"case={generation} exposed_ns={exposed} barrier_ns={barrier} rank_timestamps={samples}", flush=True)
+                            print(f"case={generation} exposed_ns={exposed} barrier_ns={barrier_ns} rank_timestamps={samples}", flush=True)
                     for graph in graphs:
                         graph.reset()
             finally:

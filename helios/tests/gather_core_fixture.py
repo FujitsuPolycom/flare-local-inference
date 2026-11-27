@@ -17,11 +17,11 @@ from signing import publisher
 
 def _rank(rank, directory):
     # Compiled forwards are pickled to compile workers, so their classes must live in an importable module.
-    from tests.components.gather_core_forwards import GatherForward, RecordForward
-    from ignition.components.collectives import PreparedAllGather, PreparedVarlenGather
+    from b12x.comm.pcie import DcpAllToAll
+    from tests.components.gather_core_forwards import (
+        FixtureAllGather, FixtureVarlenGather, GatherForward, RecordForward, VARLEN_BANK_BYTES)
     from ignition.preparation.capture import capture_forwards
-    from ignition.preparation.collectives import (
-        CollectivePreparation, create_all_gather_runtime, create_varlen_gather_runtime)
+    from ignition.preparation.collectives import CollectivePreparation
     from ignition.preparation.execution import GraphSignature
     from ignition.preparation.model import PreparedModel
     from ignition.preparation.module_images import ModuleImages
@@ -42,8 +42,9 @@ def _rank(rank, directory):
         with ModuleImages() as images, CoreStorage(rank=rank, world=4, device=rank) as storage:
             try:
                 coordinator = CollectivePreparation(dist.group.WORLD)
-                runtimes = [create_all_gather_runtime(dist.group.WORLD, device, max_rows=256,
-                    columns=columns, ipc=storage.peer_storage) for columns in (256, 2048, 256, 16384)]
+                runtimes = [DcpAllToAll.from_exchange_group(exchange_group=dist.group.WORLD, device=device,
+                    max_batch_size=256, total_heads=columns // 64, head_dim=64, stream_affine=False,
+                    ipc=storage.peer_storage) for columns in (256, 2048, 256, 16384)]
                 session = RecordedPreparationSession(device=device, checkpoint="gather-core",
                     workload_schema="tp4-column-bits", numerical_policy="exact", coordinator=coordinator,
                     compile_workers=4, benchmark_storage=storage)
@@ -55,9 +56,11 @@ def _rank(rank, directory):
                 for name, (rows, dtype, channel, width) in shapes.items():
                     source = sources[name] = torch.zeros((rows, width // dtype.itemsize), dtype=dtype, device=device)
                     output = outputs[name] = torch.empty((rows, source.shape[1] * 4), dtype=dtype, device=device)
-                    operations[name] = PreparedAllGather(source, output, runtime=runtimes[channel], session=session,
+                    operations[name] = FixtureAllGather(source, output, runtime=runtimes[channel], session=session,
                         coordinator=coordinator, name=name)
-                runtimes.append(create_varlen_gather_runtime(dist.group.WORLD, device, ipc=storage.peer_storage))
+                runtimes.append(DcpAllToAll.from_exchange_group(exchange_group=dist.group.WORLD, device=device,
+                    max_batch_size=1, total_heads=(VARLEN_BANK_BYTES // 2) // 64, head_dim=64,
+                    stream_affine=False, ipc=storage.peer_storage))
                 window = 16
                 cache = sources["prefill256"] = torch.zeros((16, 64, 528), dtype=torch.uint8, device=device)
                 table_values = torch.tensor([2, 0, 3, 1], dtype=torch.int32)
@@ -65,7 +68,7 @@ def _rank(rank, directory):
                 output = outputs["prefill256"] = torch.empty((256, 528), dtype=torch.uint8, device=device)
                 records = torch.empty((4, window * 528), dtype=torch.uint8, device=device)
                 counts = torch.zeros(4, dtype=torch.int64, device=device)
-                windows = tuple((first, PreparedVarlenGather(records, counts, runtime=runtimes[-1],
+                windows = tuple((first, FixtureVarlenGather(records, counts, runtime=runtimes[-1],
                     session=session, coordinator=coordinator, name=f"records{first}")) for first in range(0, 64, window))
                 rank_tensor = torch.tensor([rank], dtype=torch.int64, device=device)
                 record_call = RecordForward(windows, rank_tensor, 4, cache, table, output, window)

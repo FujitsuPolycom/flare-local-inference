@@ -382,12 +382,13 @@ architectural boundary before committing the change.
   their own `Recipe` tuples directly to `ignition.cli.main(...)`. Recipes own
   model-specific composition, checkpoint mapping, state layouts, and graph
   preparation.
-- Keep `ignition/components/` in this repository limited to the 13 Helios-ABI
-  runtime interface modules (`capacity`, `collectives`, `completion`, `engram`,
+- Keep `ignition/components/` in this repository limited to the 12 Helios-ABI
+  runtime interface modules (`capacity`, `completion`, `engram`,
   `flashinfer_sampling`, `logprobs`, `ngram_delivery`, `readiness`, `sampling`,
   `state`, `state_transfer`, `vision_delivery`, `vision_state`), enforced by
   `tests/preparation/test_core_boundary.py`. Put reusable b12x/Triton model
-  execution mechanisms in `hyperflare_recipes/components/` in
+  execution mechanisms — including prepared collective wrappers and PCIe
+  collective runtime factories — in `hyperflare_recipes/components/` in
   `local-inference-lab/hyperflare-recipes`. Core `ignition` must never import
   `hyperflare_recipes` or introduce a plugin discovery framework.
 - Keep native input packing, frontend processing, transport, scheduling, cache

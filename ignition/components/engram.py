@@ -128,10 +128,11 @@ class EngramInputs:
 
 class PreparedEngramLookup:
     def __init__(self, inputs, output, count, *, layer, token_map, geometry, session, name,
-                 runtime=None, coordinator=None):
+                 barrier=None, world_size=None):
         tokens = output.shape[0]
         heads = inputs.hashes.shape[1]
-        _validate_staged_heads(heads, world=getattr(runtime, "world_size", None))
+        world = world_size if world_size is not None else getattr(getattr(barrier, "runtime", None), "world_size", None)
+        _validate_staged_heads(heads, world=world)
         if (output.ndim != 2 or output.shape[1] != heads * 256
                 or output.dtype != torch.bfloat16 or not output.is_contiguous()):
             raise ValueError("Engram lookup output must match contiguous [tokens, heads * 256] bfloat16")
@@ -140,8 +141,7 @@ class PreparedEngramLookup:
         self.hashes = inputs.hashes[:tokens]
         self.count, self.output = count, output
         self.handle = inputs.ready.cuda_event
-        self.wait = PreparedReadinessWait(inputs.timings, inputs.interval, runtime=runtime, session=session,
-                                         coordinator=coordinator, name=name + ".readiness")
+        self.wait = PreparedReadinessWait(inputs.timings, inputs.interval, barrier=barrier)
         self.table_rows = geometry.num_embeddings[geometry.layer_ids.index(layer)]
         if heads == _CANONICAL_HEADS:
             self.plan = engram.plan(engram.Caps(device=output.device, max_tokens=tokens,

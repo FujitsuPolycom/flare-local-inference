@@ -74,7 +74,7 @@ def _lookup_fake(source, weight, scales, scale, ids, count, out, timings, frame,
 
 
 class PreparedPLELookup:
-    def __init__(self, table, metadata, output, caps, *, session, name, runtime=None, coordinator=None):
+    def __init__(self, table, metadata, output, caps, *, session, name, barrier=None):
         self.metadata, self.output = metadata, output
         self.geometry, self.scale = table.geometry, table.scale
         self.mailbox, self.sequence = table.mailbox.device_view, table.sequence
@@ -83,8 +83,7 @@ class PreparedPLELookup:
         self.requests = torch.empty(tokens, dtype=torch.int32, device=output.device)
         self.weights, self.scales = table.weights[:tokens * heads], table.scales[:tokens * heads]
         self.handle = table.ready.cuda_event
-        self.wait = PreparedReadinessWait(table.timings, 0, runtime=runtime, session=session,
-                                         coordinator=coordinator, name=name + ".readiness")
+        self.wait = PreparedReadinessWait(table.timings, 0, barrier=barrier)
         geometry = table.geometry
         self.plan = ple_embedding.plan(caps, geometry=geometry.geometry,
             prime_sizes=geometry.prime_sizes, table_offsets=geometry.table_offsets,

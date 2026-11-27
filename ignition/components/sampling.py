@@ -525,11 +525,14 @@ class PreparedSampling:
         self._prepared = False
         self.broadcast = None
 
-    def prepare_broadcast(self, **kwargs):
-        from .collectives import PreparedBroadcast
+    @property
+    def broadcast_tensors(self):
+        return (self.sampled_tokens, self.sample_valid, self.maximum, self.probability_mass)
 
-        self.broadcast = PreparedBroadcast(
-            (self.sampled_tokens, self.sample_valid, self.maximum, self.probability_mass), **kwargs)
+    def attach_broadcast(self, broadcast):
+        """Attach a prepared cross-rank broadcast covering `broadcast_tensors`."""
+        self.broadcast = broadcast
+        return broadcast
 
     def prepare(self) -> None:
         """Compile and warm all operators before CUDA graph capture."""

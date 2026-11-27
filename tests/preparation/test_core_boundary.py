@@ -11,7 +11,6 @@ ROOT = Path(__file__).resolve().parents[2]
 RETAINED_IGNITION_COMPONENTS = frozenset({
     "__init__",
     "capacity",
-    "collectives",
     "completion",
     "engram",
     "flashinfer_sampling",

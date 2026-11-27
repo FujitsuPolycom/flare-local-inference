@@ -231,12 +231,18 @@ def test_prepared_engram_lookup_dispatch_validation_and_fx_tracing(monkeypatch):
             layer=1, token_map=token_map, geometry=geometry, session=None, name="bad_out",
         )
 
-    # Mismatched world size on runtime must raise immediately.
+    # Mismatched world size must raise immediately.
     with pytest.raises(ValueError, match="invalid for world size 4"):
         PreparedEngramLookup(
             _make_inputs(tokens, 12), torch.empty((tokens, 12 * 256), dtype=torch.bfloat16), count,
             layer=1, token_map=token_map, geometry=geometry, session=None, name="bad_world",
-            runtime=SimpleNamespace(world_size=4),
+            world_size=4,
+        )
+    with pytest.raises(ValueError, match="invalid for world size 4"):
+        PreparedEngramLookup(
+            _make_inputs(tokens, 12), torch.empty((tokens, 12 * 256), dtype=torch.bfloat16), count,
+            layer=1, token_map=token_map, geometry=geometry, session=None, name="bad_barrier_world",
+            barrier=SimpleNamespace(single=True, runtime=SimpleNamespace(world_size=4)),
         )
 
     # Legacy 24-head path still uses b12x plan and flare::staged_engram.
