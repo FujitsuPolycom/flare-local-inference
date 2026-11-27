@@ -21,7 +21,7 @@ def error(message: str) -> None:
         Text.assemble(("error:", "bold red"), " " + message.replace("\n", "\n       ")))
 
 
-def speculation(settings, *, brief: bool = False) -> str:
+def speculation(settings, *, brief: bool = False, recipe=None, source: str | None = None) -> str:
     """Describe speculation settings: the drafts verified per round and where they come from.
 
     The brief form fits a startup line.
@@ -34,5 +34,12 @@ def speculation(settings, *, brief: bool = False) -> str:
     catalog = " · MTP-only graphs" if settings.mtp_only else ""
     if brief:
         return depth + selection + catalog
-    source = {"dflash2": "DFlash2", "dfly2": "DFly2"}.get(settings.method, "MTP module")
+    if source is None:
+        method = None if settings.method is None or recipe is None else recipe.speculative_methods.get(settings.method)
+        if method is not None and method.label:
+            source = method.label
+        elif settings.method:
+            source = settings.method
+        else:
+            source = "MTP module"
     return f"{depth} per round · {source}" + selection + catalog

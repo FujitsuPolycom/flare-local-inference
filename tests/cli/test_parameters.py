@@ -84,7 +84,8 @@ class BetaParameters(RecipeParameters):
     )
 
 
-def _make_recipe(name: str, alias: str, parameters: RecipeParameters, *, max_images: int = 0) -> Recipe:
+def _make_recipe(name: str, alias: str, parameters: RecipeParameters, *, max_images: int = 0,
+                 speculative_methods=None) -> Recipe:
     checkpoint = Checkpoint(
         alias=alias,
         repository=f"example/{alias}",
@@ -111,6 +112,7 @@ def _make_recipe(name: str, alias: str, parameters: RecipeParameters, *, max_ima
         parameters=parameters,
         ranks=ranks,
         plain_ranks=plain,
+        speculative_methods=MappingProxyType(speculative_methods or {}),
         max_images=max_images,
         prepare=lambda *args, **kwargs: None,
         usage=lambda prepared: (),
@@ -119,6 +121,8 @@ def _make_recipe(name: str, alias: str, parameters: RecipeParameters, *, max_ima
 
 
 def _recipes():
+    from ignition.declaration import SpeculativeMethod
+
     alpha = _make_recipe(
         "alpha", "alpha-1b",
         AlphaParameters(
@@ -134,6 +138,10 @@ def _recipes():
         ),
         max_images=4,
     )
+    beta_ranks = MappingProxyType({
+        1: RankCosts(100 * MIB, 2 * MIB, 4 * GIB),
+        2: RankCosts(50 * MIB, 1 * MIB, 4 * GIB),
+    })
     beta = _make_recipe(
         "beta", "beta-1b",
         BetaParameters(
@@ -145,6 +153,9 @@ def _recipes():
             ),
             mixed_prefill=MixedPrefillParameters(),
         ),
+        speculative_methods={
+            "dflash2": SpeculativeMethod(beta_ranks, draft_bytes=2 * GIB, label="DFlash2", mixed_prefill=False),
+        },
     )
     plain = _make_recipe(
         "plain", "plain-1b",
@@ -350,7 +361,7 @@ def test_pure_manifest_emission_and_reproduction_args_round_trip(monkeypatch):
         assert repro_manifest["parameters"] == manifest["parameters"]
 
 
-def test_dfly2_speculative_method_declaration_cli_display_and_planning():
+def test_recipe_declared_speculative_method_metadata_cli_display_and_planning():
     from ignition.cli import display
     from ignition.declaration import SamplingDefaults, SpeculativeMethod
 
@@ -358,8 +369,8 @@ def test_dfly2_speculative_method_declaration_cli_display_and_planning():
         draft_tokens=5,
         max_draft_tokens=7,
         token_capacity=64,
-        method="dspark",
-        supported_methods=("dspark", "dfly2"),
+        method="base-draft",
+        supported_methods=("base-draft", "custom-block"),
     )
     params = BetaParameters(
         max_concurrency=8,
@@ -367,17 +378,17 @@ def test_dfly2_speculative_method_declaration_cli_display_and_planning():
         mixed_prefill=MixedPrefillParameters(),
     )
     recipe = Recipe(
-        name="dfly2_test",
-        served_model_name="DFly2-Test",
+        name="custom_spec_test",
+        served_model_name="Custom-Spec-Test",
         prepare=lambda *a, **k: None,
         usage=lambda *a, **k: (),
         sampling_defaults=SamplingDefaults(temperature=1.0, top_p=1.0, top_k=-1),
         checkpoints=(
             Checkpoint(
-                alias="dfly2-1b",
-                repository="example/dfly2-1b",
+                alias="custom-spec-1b",
+                repository="example/custom-spec-1b",
                 revision="deadbeef",
-                architecture="DFly2ForCausalLM",
+                architecture="CustomSpecForCausalLM",
                 stored_bytes=1 << 30,
                 device_bytes=2 << 30,
                 draft_bytes=512 << 20,
@@ -389,26 +400,55 @@ def test_dfly2_speculative_method_declaration_cli_display_and_planning():
         ranks=MappingProxyType({1: RankCosts(1 << 20, 64 << 10, 1 << 28)}),
         plain_ranks=MappingProxyType({1: RankCosts(1 << 20, 64 << 10, 1 << 28)}),
         speculative_methods=MappingProxyType({
-            "dfly2": SpeculativeMethod(
+            "custom-block": SpeculativeMethod(
                 MappingProxyType({1: RankCosts(512 << 10, 64 << 10, 1 << 28)}),
                 draft_bytes=256 << 20,
+                label="CustomBlock",
+                mixed_prefill=False,
             ),
         }),
     )
-    model = SimpleNamespace(recipe=recipe, checkpoint=recipe.checkpoints[0], alias="dfly2-1b")
+    model = SimpleNamespace(recipe=recipe, checkpoint=recipe.checkpoints[0], alias="custom-spec-1b")
 
-    # --speculative-method dfly2 parses, resolves, formats, and plans cleanly.
-    args = parse_args(["export", "dfly2-1b", "--speculative-method", "dfly2"], recipes=(recipe,))
+    # Arbitrary recipe-declared methods parse, resolve, format via SpeculativeMethod.label, and plan cleanly.
+    args = parse_args(["export", "custom-spec-1b", "--speculative-method", "custom-block"], recipes=(recipe,))
     resolved = preparation.resolve_parameters(model, args)
     assert resolved.speculation is not None
-    assert resolved.speculation.method == "dfly2"
-    assert "DFly2" in display.speculation(resolved.speculation)
+    assert resolved.speculation.method == "custom-block"
+    assert "CustomBlock" in display.speculation(resolved.speculation, recipe=recipe)
+    assert "custom-block" in display.speculation(resolved.speculation)
     ctx = ParameterContext(recipe=recipe, checkpoint=recipe.checkpoints[0], root=resolved)
-    assert "DFly2 proposals" in resolved.speculation.status_parts(ctx)
+    assert "CustomBlock proposals" in resolved.speculation.status_parts(ctx)
     plan = planning.plan(recipe, recipe.checkpoints[0], (_gpu(0),), selected=(0,), parameters=resolved)
-    assert plan.speculation is not None and plan.speculation.method == "dfly2"
+    assert plan.speculation is not None and plan.speculation.method == "custom-block"
 
-    # --mixed-prefill rejects --speculative-method dfly2.
-    bad = parse_args(["export", "dfly2-1b", "--mixed-prefill", "--speculative-method", "dfly2"], recipes=(recipe,))
+    # --mixed-prefill rejects methods whose SpeculativeMethod sets mixed_prefill=False, while allowing default methods.
+    bad = parse_args(["export", "custom-spec-1b", "--mixed-prefill", "--speculative-method", "custom-block"], recipes=(recipe,))
     with pytest.raises(UsageError, match="separate prefill and verification graphs"):
         preparation.resolve_parameters(model, bad)
+    ok = parse_args(["export", "custom-spec-1b", "--mixed-prefill", "--speculative-method", "base-draft"], recipes=(recipe,))
+    assert preparation.resolve_parameters(model, ok).mixed_prefill.enabled is True
+
+    # Invalid method identifiers and undeclared methods are rejected.
+    with pytest.raises(ValueError, match="lowercase identifier"):
+        SpeculationParameters(draft_tokens=3, method="Bad Name")
+    with pytest.raises(ValueError, match="lowercase identifier"):
+        Recipe(
+            name="bad_method",
+            served_model_name="Bad",
+            prepare=lambda *a, **k: None,
+            usage=lambda *a, **k: (),
+            sampling_defaults=SamplingDefaults(temperature=1.0, top_p=1.0, top_k=-1),
+            checkpoints=recipe.checkpoints,
+            context=4096,
+            page_tokens=16,
+            parameters=params,
+            ranks=recipe.ranks,
+            plain_ranks=recipe.plain_ranks,
+            speculative_methods=MappingProxyType({
+                "UpperCase": SpeculativeMethod(recipe.ranks),
+            }),
+        )
+    with pytest.raises(UsageError, match="does not prepare this proposal method"):
+        undeclared = replace(params, speculation=replace(spec, method="other-method"))
+        undeclared.validate(ParameterContext(recipe=recipe, checkpoint=recipe.checkpoints[0], root=undeclared, defaults=params))

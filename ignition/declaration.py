@@ -15,7 +15,12 @@ from pathlib import Path
 from types import MappingProxyType
 
 from ignition.components.capacity import request_capacity
-from ignition.parameters import ParameterContext, RecipeParameters, SpeculationParameters
+from ignition.parameters import (
+    ParameterContext,
+    RecipeParameters,
+    SpeculationParameters,
+    valid_speculative_method_name,
+)
 
 
 @dataclass(frozen=True)
@@ -140,6 +145,8 @@ class SpeculativeMethod:
 
     ranks: Mapping[int, RankCosts]
     draft_bytes: int | None = None
+    label: str | None = None
+    mixed_prefill: bool = True
 
 
 @dataclass(frozen=True)
@@ -218,10 +225,16 @@ class Recipe:
         if self.parameters.speculation is not None and set(self.plain_ranks) != set(self.ranks):
             raise ValueError("a recipe that speculates declares its costs without speculation for every rank count")
         for name, method in self.speculative_methods.items():
-            if name not in ("mtp", "dspark", "dflash2", "dfly2") or set(method.ranks) != set(self.ranks):
-                raise ValueError("speculative methods require known names and every declared tensor-parallel size")
+            if not valid_speculative_method_name(name) or set(method.ranks) != set(self.ranks):
+                raise ValueError(
+                    "speculative methods require lowercase identifier names and every declared tensor-parallel size"
+                )
             if method.draft_bytes is not None and method.draft_bytes <= 0:
                 raise ValueError("speculative draft bytes must be positive")
+            if method.label is not None and (not isinstance(method.label, str) or not method.label.strip()):
+                raise ValueError("speculative method label must be a nonempty string")
+            if type(method.mixed_prefill) is not bool:
+                raise ValueError("speculative method mixed_prefill must be a bool")
         for checkpoint in self.checkpoints:
             if any(costs is not None and (not costs or not set(costs) <= set(self.ranks))
                    for costs in (checkpoint.ranks, checkpoint.plain_ranks)):

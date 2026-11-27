@@ -22,6 +22,7 @@ import argparse
 from collections.abc import Callable
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum
+import re
 from typing import Any, ClassVar
 
 from ignition.errors import UsageError
@@ -29,6 +30,12 @@ from ignition.errors import UsageError
 AUTOTUNE_EFFORTS = ("off", "default", "audit")
 EXPLICIT_FLAGS_ATTR = "_explicit_flags"
 _PARAM_META = "ignition_param_spec"
+_SPECULATIVE_METHOD_NAME = re.compile(r"[a-z0-9][a-z0-9_-]*")
+
+
+def valid_speculative_method_name(value: object) -> bool:
+    """True when `value` is a non-empty lowercase CLI identifier for a recipe speculative method."""
+    return isinstance(value, str) and bool(_SPECULATIVE_METHOD_NAME.fullmatch(value))
 
 
 class _UnsetType:
@@ -799,8 +806,10 @@ class SpeculationParameters(ParameterGroup):
             object.__setattr__(self, "max_draft_tokens", self.draft_tokens)
         if self.mtp_only and self.draft_tokens < 1:
             raise ValueError("--mtp-only requires positive learned draft depth")
-        if self.method not in (None, "mtp", "dspark", "dflash2", "dfly2"):
-            raise ValueError("speculative method must be omitted, mtp, dspark, dflash2 or dfly2")
+        if self.method is not None and not valid_speculative_method_name(self.method):
+            raise ValueError("speculative method must be omitted or a lowercase identifier")
+        if any(not valid_speculative_method_name(name) for name in self.supported_methods):
+            raise ValueError("supported speculative methods must be lowercase identifiers")
         if self.graph_budget is not None:
             if type(self.graph_budget) is not int or self.graph_budget < 1:
                 raise ValueError("speculative graph budget must be a positive integer")
@@ -884,7 +893,7 @@ class SpeculationParameters(ParameterGroup):
         method_explicit = _is_arg_explicit(args, "speculative_method", is_store_true=False)
         method = getattr(args, "speculative_method", None) if method_explicit else self.method
         allowed_methods = _speculative_methods(self, context)
-        if method is not None and allowed_methods and method not in allowed_methods:
+        if method is not None and method not in allowed_methods:
             raise UsageError(f"--speculative-method {method}: {alias} does not prepare this proposal method")
 
         drafts_explicit = _is_arg_explicit(args, "mtp_draft_tokens", is_store_true=False)
@@ -945,11 +954,15 @@ class SpeculationParameters(ParameterGroup):
         if self.mtp_only and self.draft_tokens == 0:
             raise UsageError("--mtp-only requires positive learned draft depth; --mtp-draft-tokens 0 disables MTP at loading")
         if self.method is not None and context.recipe is not None:
-            default_method = None
-            if context.defaults is not None and context.defaults.speculation is not None:
-                default_method = context.defaults.speculation.method
-            allowed = _speculative_methods(self, context)
-            if self.method != default_method and self.method not in context.recipe.speculative_methods and self.method not in allowed:
+            default_spec = (
+                context.defaults.speculation if context.defaults is not None
+                else context.recipe.parameters.speculation
+            )
+            allowed = _speculative_methods(
+                default_spec if default_spec is not None else replace(self, method=None),
+                context,
+            )
+            if self.method not in allowed:
                 raise UsageError(f"--speculative-method {self.method}: {alias} does not prepare this proposal method")
         if self.token_capacity is not None and (type(self.token_capacity) is not int or self.token_capacity < self.draft_tokens + 1):
             raise UsageError("--speculative-token-capacity must cover the maximum verification width")
@@ -1032,10 +1045,12 @@ class SpeculationParameters(ParameterGroup):
         parts.append(f"speculative token capacity {self.effective_token_capacity(context.root.max_concurrency)}")
         if self.graph_budget is not None:
             parts.append(f"packed graph budget {self.graph_budget}")
-        if self.method == "dflash2":
-            parts.append("DFlash2 proposals")
-        elif self.method == "dfly2":
-            parts.append("DFly2 proposals")
+        method_spec = (
+            None if self.method is None or context.recipe is None
+            else context.recipe.speculative_methods.get(self.method)
+        )
+        if method_spec is not None and method_spec.label:
+            parts.append(f"{method_spec.label} proposals")
         return parts
 
     def capacity_relief_options(self, attempt: Callable[[RecipeParameters], Any],
@@ -1233,9 +1248,14 @@ class MixedPrefillParameters(ParameterGroup):
 
     def validate(self, context: ParameterContext) -> None:
         if self.enabled and context.root is not None and context.root.speculation is not None:
-            if context.root.speculation.method in ("dflash2", "dfly2"):
+            method_name = context.root.speculation.method
+            method_spec = (
+                None if method_name is None or context.recipe is None
+                else context.recipe.speculative_methods.get(method_name)
+            )
+            if method_spec is not None and not method_spec.mixed_prefill:
                 raise UsageError(
-                    f"--speculative-method {context.root.speculation.method}"
+                    f"--speculative-method {method_name}"
                     " requires separate prefill and verification graphs"
                 )
 

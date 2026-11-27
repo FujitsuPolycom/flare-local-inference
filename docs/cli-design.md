@@ -465,7 +465,7 @@ precedence.
 | Flag | Meaning | Default |
 |---|---|---|
 | `--prefill-chunk-size N` | Most prompt tokens processed in one prefill step, aligned to the recipe's chunk alignment. A larger chunk reaches a long prompt's first token sooner; while it runs, other active requests wait for their next token. Command line only. | The recipe's chunk |
-| `--mixed-prefill` | Capture mixed prompt/decode graphs alongside separate graphs. Available on recipes declaring `MixedPrefillParameters` with concurrency of at least two; `--speculative-method dflash2` rejects it. Command line only; a core's catalog is fixed at export, so changing this flag requires re-export. | Disabled |
+| `--mixed-prefill` | Capture mixed prompt/decode graphs alongside separate graphs. Available on recipes declaring `MixedPrefillParameters` with concurrency of at least two; speculative methods whose `SpeculativeMethod` sets `mixed_prefill=False` reject it. Command line only; a core's catalog is fixed at export, so changing this flag requires re-export. | Disabled |
 | `--prompt-logprobs` | Capture separate scored prefill graphs for raw prompt token logprobs. Available on recipes declaring `PromptLogprobsParameters`. See [the logprob contract](logprobs-design.md#prompt-scoring). Command line only. | Disabled |
 | `--speculative-method METHOD` | Select the recipe's learned proposal method from the choices declared on `SpeculationParameters.supported_methods`. Command line only. Recorded in `PreparationManifest`; native serving replays the exported graphs. | Recipe declaration |
 | `--no-mtp` | Disable multi-token speculation: load no draft model, keep no verification rows, and decode one token per step. Available on recipes declaring `SpeculationParameters`. | Speculation on |
