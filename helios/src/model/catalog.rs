@@ -8,9 +8,7 @@
 
 use crate::{
     Result,
-    execution::{
-        BATCH_CAPACITIES, ExecutionManifest, GraphKind, SamplingMode,
-    },
+    execution::{ExecutionManifest, GraphKind, SamplingMode},
     model::ModelConfig,
     scheduler::speculation,
 };
@@ -139,8 +137,12 @@ fn validate_inner(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<
         if kind == GraphKind::Decode && !config.speculative_widths.is_empty() {
             continue;
         }
-        for batch in batches(config) {
-            select(config, manifest, kind, batch, 1, 0, SamplingMode::General)?;
+        if !manifest
+            .graphs
+            .iter()
+            .any(|graph| graph.kind == kind && graph.token_capacity == 1 && graph.prefill_capacity == 0 && graph.sampling_mode == SamplingMode::General)
+        {
+            return Err(format!("prepared model lacks {kind:?} graph").into());
         }
     }
     select(
@@ -164,33 +166,33 @@ fn validate_inner(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<
         )?;
     }
     if !config.speculative_widths.is_empty() {
-        for batch in batches(config) {
-            if !manifest.graphs.iter().any(|graph| graph.kind == GraphKind::Speculative
-                && graph.batch_capacity == batch && graph.token_capacity == 1) {
-                return Err(format!("prepared model lacks width-one speculative graph for batch {batch}").into());
-            }
-            if batch * 2 <= config.speculative_token_capacity
-                && !manifest.graphs.iter().any(|graph| graph.kind == GraphKind::Speculative
-                    && graph.batch_capacity == batch && graph.token_capacity > 1) {
-                return Err(format!("prepared model lacks speculative graph for batch {batch}").into());
-            }
+        if !manifest.graphs.iter().any(|graph| {
+            graph.kind == GraphKind::Speculative && graph.token_capacity == 1
+        }) {
+            return Err("prepared model lacks width-one speculative graph".into());
+        }
+        if config.speculative_widths.iter().any(|&width| width > 1)
+            && manifest.graphs.iter().any(|graph| {
+                graph.kind == GraphKind::Speculative
+                    && graph.token_capacity == 1
+                    && graph.batch_capacity * 2 <= config.speculative_token_capacity
+            })
+            && !manifest.graphs.iter().any(|graph| {
+                graph.kind == GraphKind::Speculative && graph.token_capacity > 1
+            })
+        {
+            return Err("prepared model lacks wider speculative graph".into());
         }
     }
     Ok(())
 }
 
 fn speculative_shape(config: &ModelConfig, batch: usize, tokens: usize) -> bool {
-    batches(config).any(|capacity| capacity == batch)
+    (1..=config.limits.request_slots).contains(&batch)
         && config.speculative_widths.contains(&tokens)
         && (tokens == 1 || (batch * tokens <= config.speculative_token_capacity && config
             .speculative_fixed_width
             .is_none_or(|width| width == tokens)))
-}
-
-fn batches(config: &ModelConfig) -> impl Iterator<Item = usize> {
-    BATCH_CAPACITIES
-        .into_iter()
-        .filter(|batch| *batch <= config.limits.max_active.next_power_of_two())
 }
 
 pub fn select(
@@ -227,7 +229,7 @@ pub fn select_shape_with_drafts(
     config: &ModelConfig, manifest: &ExecutionManifest, kind: GraphKind,
     batch: usize, tokens: usize, prefill: usize, packed: usize, drafts: usize, mode: SamplingMode,
 ) -> Result<usize> {
-    let declared = batches(config).any(|capacity| capacity == batch)
+    let declared = (1..=config.limits.request_slots).contains(&batch)
         && match kind {
             GraphKind::Mixed => {
                 batch >= 2

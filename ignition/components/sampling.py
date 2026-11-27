@@ -20,7 +20,7 @@ import triton.language as tl
 
 from .completion import CompletionOutputs, completion_record_capacity
 from .logprobs import PreparedLogprobs
-from .capacity import BATCH_CAPACITIES
+from .capacity import MAX_CONCURRENCY
 from .flashinfer_sampling import filter_probabilities_out, probability_filter_workspace, sample_probabilities
 from ignition.preparation.persistent import persistent_copy, persistent_empty
 from ignition.preparation.scratch import bind_scratch
@@ -96,8 +96,8 @@ class DeviceRequestState:
             raise ValueError("vocab_size must be a positive int32 value")
         def zeros(shape, dtype=torch.int64):
             return torch.zeros(shape, dtype=dtype, device=device)
-        if capacity not in BATCH_CAPACITIES:
-            raise ValueError("request capacity must be a power of two through 64")
+        if type(capacity) is not int or not 1 <= capacity <= MAX_CONCURRENCY:
+            raise ValueError(f"request capacity must be an integer in [1, {MAX_CONCURRENCY}]")
         consumed = zeros(capacity) if consumed_tokens is None else consumed_tokens
         actual_device = torch.empty(0, device=device).device
         _check_tensor(consumed, (capacity,), torch.int64, actual_device, "consumed_tokens", contiguous=False)
@@ -189,8 +189,8 @@ class AdmissionBuffers:
     def allocate(cls, device, *, vocab_size: int, capacity: int = 4) -> AdmissionBuffers:
         if type(vocab_size) is not int or not 1 <= vocab_size <= 2**31 - 1:
             raise ValueError("vocab_size must be a positive int32 value")
-        if capacity not in BATCH_CAPACITIES:
-            raise ValueError("admission capacity must be a power of two through 64")
+        if type(capacity) is not int or not 1 <= capacity <= MAX_CONCURRENCY:
+            raise ValueError(f"admission capacity must be an integer in [1, {MAX_CONCURRENCY}]")
         def zeros(shape, dtype=torch.int32):
             return torch.zeros(shape, dtype=dtype, device=device)
         return cls(zeros(1), torch.full((capacity,), -1, dtype=torch.int32, device=device),
@@ -803,7 +803,7 @@ class PreparedAdmission:
 
     def __init__(self, state: DeviceRequestState, buffers: AdmissionBuffers,
                  completion: CompletionOutputs, frame_index, submission_sequence, *, capacity: int = 4):
-        if capacity not in BATCH_CAPACITIES or capacity > state.capacity:
+        if type(capacity) is not int or not 1 <= capacity <= state.capacity:
             raise ValueError("admission graph capacity must fit request storage")
         device, vocab = state.generation.device, state.vocab_size
         if device.type != "cuda":

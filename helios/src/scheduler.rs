@@ -426,7 +426,7 @@ impl ScheduledStep {
             if self.draft_tokens == usize::MAX || self.token_capacity == 0
                 || (self.token_capacity == 1 && self.draft_tokens != 0)
                 || self.packed_token_capacity < self.batch_capacity
-                || !crate::execution::BATCH_CAPACITIES.contains(&self.batch_capacity)
+                || !(1..=REQUEST_LANES).contains(&self.batch_capacity)
                 || self.lanes.is_empty() || self.lanes.len() > self.batch_capacity
                 || self.lanes.iter().any(|lane| !(1..=self.token_capacity.min(self.draft_tokens + 1)).contains(&lane.tokens))
                 || self.lanes.iter().enumerate().any(|(i, lane)| self.lanes[..i].iter().any(|other| other.request.slot == lane.request.slot)) {
@@ -444,8 +444,7 @@ impl ScheduledStep {
             None if self.kind != GraphKind::Mixed => Ok(()),
             Some(m)
                 if self.kind == GraphKind::Mixed
-                    && self.batch_capacity >= 2
-                    && crate::execution::BATCH_CAPACITIES.contains(&self.batch_capacity)
+                    && (2..=REQUEST_LANES).contains(&self.batch_capacity)
                     && !self.lanes.is_empty()
                     && self.lanes.len() <= self.batch_capacity
                     && m.prefill_capacity >= 64
@@ -662,7 +661,7 @@ pub struct RequestScheduler {
     stats: SchedulerStats,
     speculative_widths: Vec<usize>,
     speculative_fixed_width: Option<usize>,
-    speculative_catalog: [Vec<usize>; 7],
+    speculative_catalog: Vec<(usize, Vec<usize>)>,
     prefill_catalog: Vec<usize>,
     terminal_prefill_catalog: Vec<usize>,
     scored_prefill_catalog: Vec<usize>,
@@ -712,7 +711,7 @@ impl RequestScheduler {
             return Err("invalid model scheduling capabilities".into());
         }
 
-        if !crate::execution::BATCH_CAPACITIES.contains(&limits.request_slots)
+        if !(1..=REQUEST_LANES).contains(&limits.request_slots)
             || limits.max_active > limits.request_slots
             || !(1..=REQUEST_LANES).contains(&limits.max_active)
             || limits.max_sequence_tokens == 0
@@ -784,7 +783,7 @@ impl RequestScheduler {
     pub fn execution_width(&self) -> usize {
         self.speculative_catalog
             .iter()
-            .flatten()
+            .flat_map(|(_, widths)| widths)
             .copied()
             .chain(self.mixed_catalog.iter().map(|(_, width, _)| *width))
             .max()
@@ -935,9 +934,7 @@ impl RequestScheduler {
         catalog.sort_unstable();
         if catalog.windows(2).any(|s| s[0] == s[1])
             || catalog.iter().any(|&(batch, width, prefill)| {
-                batch < 2
-                    || !crate::execution::BATCH_CAPACITIES.contains(&batch)
-                    || batch > self.limits.max_active.next_power_of_two()
+                !(2..=self.limits.request_slots).contains(&batch)
                     || prefill == 0
                     || !prefill.is_multiple_of(64)
                     || prefill > self.limits.prefill_chunk_size
@@ -992,11 +989,17 @@ impl RequestScheduler {
         self.refresh_speculative_catalog();
         Ok(())
     }
+    pub(super) fn speculative_widths_for(&self, batch: usize) -> &[usize] {
+        self.speculative_catalog
+            .binary_search_by_key(&batch, |&(b, _)| b)
+            .map_or(&[], |index| self.speculative_catalog[index].1.as_slice())
+    }
     fn refresh_speculative_catalog(&mut self) {
         self.speculative_catalog = speculation::graph_catalog(
+            self.costs.batches(GraphKind::Speculative),
             &self.speculative_widths,
             self.speculative_fixed_width,
-            self.limits.max_active.next_power_of_two(),
+            self.limits.request_slots,
         );
     }
     /// Restricts scheduling to graph shapes present in the loaded execution manifest.
@@ -1004,10 +1007,9 @@ impl RequestScheduler {
         if self.submitted != Fence(0) || self.slots.iter().any(|s| s.request.is_some()) {
             return Err("speculative graphs must be selected before admission".into());
         }
-        let mut catalog: [Vec<usize>; 7] = Default::default();
+        let mut catalog: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
         for &(batch, width) in shapes {
-            if !crate::execution::BATCH_CAPACITIES.contains(&batch)
-                || batch > self.limits.max_active.next_power_of_two()
+            if !(1..=self.limits.request_slots).contains(&batch)
                 || !self.speculative_widths.contains(&width)
                 || self
                     .speculative_fixed_width
@@ -1015,24 +1017,22 @@ impl RequestScheduler {
             {
                 return Err("loaded speculative shape is outside runtime limits".into());
             }
-            let widths = &mut catalog[batch.trailing_zeros() as usize];
+            let widths = catalog.entry(batch).or_default();
             if widths.contains(&width) {
                 return Err("duplicate speculative graph shape".into());
             }
             widths.push(width);
         }
-        for widths in
-            &mut catalog[..self.limits.max_active.next_power_of_two().ilog2() as usize + 1]
-        {
+        for widths in catalog.values_mut() {
             widths.sort_unstable();
             if let Some(fixed) = self.speculative_fixed_width.filter(|fixed| widths.contains(fixed)) {
                 widths.retain(|w| *w == fixed);
             }
-            if !self.speculative_widths.is_empty() && widths.is_empty() {
-                return Err("missing speculative graph for a runtime batch capacity".into());
-            }
         }
-        self.speculative_catalog = catalog;
+        if !self.speculative_widths.is_empty() && catalog.is_empty() {
+            return Err("missing speculative graph for a runtime batch capacity".into());
+        }
+        self.speculative_catalog = catalog.into_iter().collect();
         Ok(())
     }
     pub fn proposal_source(&mut self, source: speculation::ProposalSource) -> Result<()> {
@@ -1124,6 +1124,9 @@ impl RequestScheduler {
             .advance_to(self.now_ns, self.policy.estimate_ttl_ns);
         // Each graph contributes at most one candidate per request slot.
         self.candidates = std::cell::RefCell::new(Vec::with_capacity(self.costs.len() * REQUEST_LANES));
+        if !self.speculative_widths.is_empty() && self.speculative_catalog.is_empty() {
+            self.refresh_speculative_catalog();
+        }
         Ok(())
     }
 

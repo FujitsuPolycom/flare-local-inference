@@ -11,7 +11,7 @@ use std::collections::{BTreeSet, HashSet};
 use serde_json::Value;
 
 use super::format::{Core, invalid};
-use crate::{Result, execution::BATCH_CAPACITIES};
+use crate::{Result, execution::REQUEST_LANES};
 
 #[derive(Clone, Debug, Default)]
 pub struct LoadOptions {
@@ -209,15 +209,14 @@ impl LoadOptions {
                 crate::execution::SamplingMode::try_from(graph.sampling_mode.as_str())?;
                 let speculative = kind == GraphKind::Speculative || (kind == GraphKind::Mixed && graph.speculation_enabled == Some(true));
                 let valid = match kind {
-                    GraphKind::Mixed => graph.batch_capacity >= 2
-                        && BATCH_CAPACITIES.contains(&(graph.batch_capacity as usize))
+                    GraphKind::Mixed => (2..=REQUEST_LANES as u64).contains(&graph.batch_capacity)
                         && graph.prefill_capacity >= 64 && graph.prefill_capacity.is_multiple_of(64)
                         && graph.prefill_capacity <= config["prefill_chunk_size"].as_u64().unwrap_or(0)
                         && graph.speculation_enabled.is_some()
                         && if speculative { (1..=crate::execution::resolve_completion_token_capacity(execution.completion_token_capacity) as u64).contains(&graph.token_capacity) } else { graph.token_capacity == 1 },
                     GraphKind::Prefill | GraphKind::TerminalPrefill | GraphKind::ScoredPrefill | GraphKind::Vision => graph.batch_capacity == 1 && graph.token_capacity > 0,
-                    GraphKind::Speculative => BATCH_CAPACITIES.contains(&(graph.batch_capacity as usize)) && (1..=crate::execution::resolve_completion_token_capacity(execution.completion_token_capacity) as u64).contains(&graph.token_capacity),
-                    _ => BATCH_CAPACITIES.contains(&(graph.batch_capacity as usize)) && graph.token_capacity == 1,
+                    GraphKind::Speculative => (1..=REQUEST_LANES as u64).contains(&graph.batch_capacity) && (1..=crate::execution::resolve_completion_token_capacity(execution.completion_token_capacity) as u64).contains(&graph.token_capacity),
+                    _ => (1..=REQUEST_LANES as u64).contains(&graph.batch_capacity) && graph.token_capacity == 1,
                 };
                 if !valid || graph.batch_capacity > prepared.next_power_of_two() as u64
                     || (kind != GraphKind::Mixed && graph.prefill_capacity != 0)
@@ -265,8 +264,17 @@ impl LoadOptions {
             if names != resources || resources.len() != core.graphs.len() {
                 return Err(invalid("execution catalog must describe every captured graph exactly once"));
             }
+            let generation_kind = if enabled { "speculative" } else { "decode" };
+            let max_batch = execution
+                .graphs
+                .iter()
+                .filter(|g| g.kind == generation_kind && g.batch_capacity >= active as u64)
+                .map(|g| g.batch_capacity)
+                .min()
+                .unwrap_or(active as u64);
             execution.graphs.retain(|graph| {
-                graph.batch_capacity <= active.next_power_of_two() as u64
+                let limit = if graph.kind == "mixed" && active < 2 { 0 } else { max_batch };
+                graph.batch_capacity <= limit
                     && graph.speculation_enabled.is_none_or(|value| value == enabled)
                     && (graph.kind != "decode" || !enabled)
                     && (!(graph.kind == "speculative" || graph.kind == "mixed" && enabled)
@@ -291,16 +299,43 @@ impl LoadOptions {
             execution.graphs.retain(|graph| graph.draft_tokens.is_none_or(|depth|
                 depths[&(graph.kind.clone(), graph.batch_capacity, graph.token_capacity,
                     graph.packed_token_capacity, graph.prefill_capacity, graph.sampling_mode.clone())] == depth));
-            for batch in BATCH_CAPACITIES.into_iter().filter(|batch| *batch <= active.next_power_of_two()) {
+            for kind in ["init", "restore", "snapshot", "resume", if enabled { "speculative" } else { "decode" }] {
+                if !execution.graphs.iter().any(|g| g.kind == kind && (kind != "speculative" || g.token_capacity == 1)) {
+                    return Err(invalid(format!("rank {rank} lacks {kind} graph within selected generation geometry")));
+                }
+            }
+            let lifecycle_batches: BTreeSet<u64> = execution
+                .graphs
+                .iter()
+                .filter(|g| matches!(g.kind.as_str(), "init" | "restore" | "snapshot" | "resume"))
+                .map(|g| g.batch_capacity)
+                .collect();
+            for batch in &lifecycle_batches {
                 for kind in ["init", "restore", "snapshot", "resume", if enabled { "speculative" } else { "decode" }] {
-                    if !execution.graphs.iter().any(|g| g.kind == kind && g.batch_capacity == batch as u64
+                    if !execution.graphs.iter().any(|g| g.kind == kind && g.batch_capacity == *batch
                         && (kind != "speculative" || g.token_capacity == 1)) {
                         return Err(invalid(format!("rank {rank} lacks {kind} graph for batch {batch} within selected generation geometry")));
                     }
                 }
-                if enabled && batch as u64 * 2 <= selected_token_capacity
-                    && !execution.graphs.iter().any(|g| g.kind == "speculative" && g.batch_capacity == batch as u64 && g.token_capacity > 1) {
-                    return Err(invalid(format!("rank {rank} lacks speculative graph for batch {batch} within selected generation geometry")));
+            }
+            if enabled {
+                let speculative_batches: BTreeSet<u64> = lifecycle_batches
+                    .iter()
+                    .copied()
+                    .chain(
+                        execution
+                            .graphs
+                            .iter()
+                            .filter(|g| g.kind == "speculative" && g.token_capacity == 1)
+                            .map(|g| g.batch_capacity),
+                    )
+                    .collect();
+                for batch in speculative_batches {
+                    if batch * 2 <= selected_token_capacity
+                        && !execution.graphs.iter().any(|g| g.kind == "speculative" && g.batch_capacity == batch && g.token_capacity > 1)
+                    {
+                        return Err(invalid(format!("rank {rank} lacks speculative graph for batch {batch} within selected generation geometry")));
+                    }
                 }
             }
             let mut tuning_names = HashSet::new();
@@ -1535,7 +1570,7 @@ mod tests {
                 execution.graphs.push(graph);
             }
         }
-        for batch in BATCH_CAPACITIES.into_iter().filter(|batch| *batch <= active.next_power_of_two()) {
+        for batch in [1usize, 2, 4, 6, 8, 12, 16, 24, 32, 64].into_iter().filter(|batch| *batch <= active.next_power_of_two()) {
             execution.graphs.push(wire::ExecutionGraph {
                 name: format!("round-b{batch}-d0-w1-p{batch}"), kind: "speculative".into(),
                 sampling_mode: "general".into(), batch_capacity: batch as u64,
@@ -1599,7 +1634,7 @@ mod tests {
                     assert_eq!(config["speculative_token_capacity"], budget);
                     for core in ranks {
                         let graphs = &core.execution.unwrap().graphs;
-                        for batch in BATCH_CAPACITIES.into_iter().filter(|batch| *batch <= active.next_power_of_two()) {
+                        for batch in [1usize, 2, 4, 6, 8, 12, 16, 24, 32, 64].into_iter().filter(|batch| *batch <= active.next_power_of_two()) {
                             assert!(graphs.iter().any(|graph| graph.kind == "speculative" && graph.batch_capacity == batch as u64 && graph.token_capacity == 1 && graph.draft_tokens == Some(0)));
                             let rows: BTreeSet<_> = graphs.iter().filter(|graph| graph.kind == "speculative" && graph.batch_capacity == batch as u64 && graph.token_capacity == 6).map(|graph| graph.packed_token_capacity as usize).collect();
                             let upper = budget.min(batch * 6);

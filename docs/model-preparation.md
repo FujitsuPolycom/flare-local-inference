@@ -343,14 +343,15 @@ selected GPUs.
 
 | Recipe | Draft tokens | Verification layout | Speculative graphs at default concurrency | Maximum drafts at batch 32 |
 |---|---:|---|---:|---:|
-| Qwen3.8 Flash, GLM 5.3 | 5 | Rectangular | 34 | 3 |
-| Step-5 | 3 | Rectangular | 24 | 3 |
-| DeepSeek V4, MiniMax M3.1 | 5 | Packed | 64 packed + 6 width-one | Up to 5, sharing 128 rows across requests |
-| DeepSeek V4.1, MiMo V2.6 Pro, Kimi K3, Kimi K3.1 Pro, Nemotron Bolt, Qwen3.8 27B | 7 | Packed | 64 packed + 6 width-one | Up to 7, sharing 128 rows across requests |
+| Qwen3.8 Flash, GLM 5.3 | 5 | Rectangular | 51 | 3 |
+| Step-5 | 3 | Rectangular | 36 | 3 |
+| DeepSeek V4, MiniMax M3.1 | 5 | Packed | 64 packed + 9 width-one | Up to 5, sharing 128 rows across requests |
+| DeepSeek V4.1, MiMo V2.6 Pro, Kimi K3, Kimi K3.1 Pro, Nemotron Bolt, Qwen3.8 27B | 7 | Packed | 64 packed + 9 width-one | Up to 7, sharing 128 rows across requests |
 | Gemma 4 | 5 | Rectangular | 10 at concurrency 4 | Not prepared at default concurrency |
 | Muse Spark | 7 | Packed | 49 packed + 3 width-one at concurrency 4 | Not prepared above concurrency 4 |
 
-The 128-row rectangular catalogs cover full draft depth through batch 16.
+The 128-row rectangular catalogs cover full draft depth through batch 16 (and
+four drafts at batch 24 for five-draft recipes).
 Gemma 4's six-row default covers five drafts at batch 1 and two at batch 2,
 with width-one execution at batch 4. The counts include
 width-one speculative graphs and exclude ordinary decode, prefill, maintenance,
@@ -407,9 +408,10 @@ affect preparation's memory policy.
 Before compilation and capture, preparation prints a persistent graph catalog
 with counts, batch and prefill capacities, logical widths, physical target rows,
 and draft depths, including when `--verbose` is omitted.
-Ignition captures power-of-two
-batch capacities through the concurrency limit
-and width one at every bucket. Rectangular speculative and verification shapes
+Ignition captures batch capacities from its preparation catalog
+(`1, 2, 4, 6, 8, 12, 16, 24, 32, 64`) through the padded concurrency limit
+and width one at every bucket; Helios enumerates whatever valid batch
+capacities a loaded core declares rather than requiring a fixed bucket list. Rectangular speculative and verification shapes
 require `batch * width <= speculative_token_capacity`; the preparation flag
 `--speculative-token-capacity` defaults to 128 physical target rows except for
 Gemma 4's derived capacity and Muse Spark's 32 rows. Packed recipes use the

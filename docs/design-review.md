@@ -24,6 +24,15 @@ before committing; a design acknowledgment cannot authorize them.
    variants are allowed within an unchanged operation contract. A new operation
    contract requires approval even if it reuses a graph kind or enum value.
    A design acknowledgment does not grant approval.
+   Ignition alone owns which graph catalogs and batch capacities to prepare.
+   Helios and direct-execution scheduling must enumerate available graphs, batch
+   capacities, and shapes directly from prepared model core metadata; they must
+   never hardcode, require, or branch on a fixed enumeration of expected or
+   desired batch capacities or graph shapes (such as power-of-two or intermediate
+   bucket lists). Validate only structural bounds and forward-progress existence,
+   and let the scheduler operate over whatever valid graphs the core provides.
+   Reject any change that adds or expands a hardcoded batch-capacity or
+   graph-shape list in Helios or in the direct-execution policy.
 2. **Python prepares; Rust serves prepared graphs.** Serving has no Python
    callbacks, eager model fallback, runtime compilation, recapture, or steady-state
    GPU allocation. Admission reserves resources and rejects unsupported features

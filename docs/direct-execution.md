@@ -100,7 +100,8 @@ private one, as in Helios.
 chosen as Helios chooses among its decode candidates (`select_plan` in
 `helios/src/scheduler/policy.rs`, described in [scheduling-runtime-design.md](scheduling-runtime-design.md)),
 so a fault that depends on particular graphs meets them as often as under
-Helios. Every prepared batch capacity up to the concurrency's power of two
+Helios. Every prepared batch capacity present in the layout up to the
+concurrency's covering capacity
 competes at every loaded verification width, or at the fixed width without
 adaptive verification. Each carries its highest-valued decoding requests, so a
 round can leave requests out or run in a larger, padded batch when that graph is

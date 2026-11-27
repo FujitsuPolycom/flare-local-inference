@@ -1341,7 +1341,7 @@ fn speculative_cohorts_are_selected_by_expected_lane_value() {
                 .observe(speculation::ProposalSource::Mtp, 0, 7, if index >= 6 { 7 } else { 0 }, true, None);
         }
     }
-    for batch in [1, 2, 4, 8] {
+    for batch in [1, 2, 4, 6, 8] {
         for width in [1, 3, 8] {
             set_cost(&mut s, GraphKind::Speculative, batch, width, 200 * MS);
         }
@@ -1626,17 +1626,11 @@ fn snapshot_enabling_a_shared_decode_batch_competes_by_the_complete_sequence_cos
     assert_eq!(plan.estimated_duration_ns(), MS / 10);
     let handle = plan.lanes[0].request;
     let tokens = s.request(handle).unwrap().generated_tokens;
-    for batch in crate::execution::BATCH_CAPACITIES
-        .into_iter()
-        .take_while(|b| *b <= 16)
-    {
+    for batch in [1, 2, 4, 6, 8, 12, 16] {
         set_cost(&mut s, GraphKind::Snapshot, batch, 1, 1000 * MS);
     }
     assert_eq!(s.plan().unwrap().kind, GraphKind::Speculative);
-    for batch in crate::execution::BATCH_CAPACITIES
-        .into_iter()
-        .take_while(|b| *b <= 16)
-    {
+    for batch in [1, 2, 4, 6, 8, 12, 16] {
         set_cost(&mut s, GraphKind::Snapshot, batch, 1, MS / 10);
     }
     assert_eq!(step(&mut s, 7).kind, GraphKind::Snapshot);
@@ -2211,9 +2205,9 @@ fn mixed_catalog_completes_common_concurrent_workloads_without_decode_starvation
     ] {
         let active: usize = prefills + decoders;
         let mut shapes = Vec::new();
-        for b in crate::execution::BATCH_CAPACITIES
+        for b in [2, 4, 6, 8, 12, 16, 24, 32, 64]
             .into_iter()
-            .filter(|b| *b >= 2 && *b <= active.next_power_of_two())
+            .filter(|b| *b <= active.next_power_of_two())
         {
             for p in [64, 512, 4096] {
                 for w in [1, 3, 8] {
@@ -3840,7 +3834,7 @@ fn registered_ragged_graphs_preserve_physical_width_above_average_row_budget() {
             });
             scheduler.measured_graph_durations(&graphs).unwrap();
             scheduler.capabilities.speculative_allocations = vec![(batch, 7, 8, packed, allocation)];
-            let registered: Vec<_> = crate::execution::BATCH_CAPACITIES.into_iter()
+            let registered: Vec<_> = [1, 2, 4, 6, 8, 12, 16, 24, 32, 64].into_iter()
                 .take_while(|&capacity| capacity <= batch).map(|capacity| (capacity, 1))
                 .chain(std::iter::once((batch, 8))).collect();
             scheduler.speculative_graphs(&registered).unwrap();

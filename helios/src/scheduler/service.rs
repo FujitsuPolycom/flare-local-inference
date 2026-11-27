@@ -92,17 +92,9 @@ impl RequestScheduler {
                     per_delivery_ms[slot] = per_delivery_ms[slot].min(cost);
                 }
             };
-            for batch in crate::execution::BATCH_CAPACITIES
-                .into_iter()
-                .take_while(|b| *b <= self.limits.max_active.next_power_of_two())
-            {
-                let widths: &[usize] = if matches!(kind, GraphKind::Speculative) {
-                    &self.speculative_catalog[batch.ilog2() as usize]
-                } else {
-                    &[1]
-                };
-                for &width in widths {
-                    if matches!(kind, GraphKind::Speculative) {
+            if matches!(kind, GraphKind::Speculative) {
+                for &(batch, ref widths) in &self.speculative_catalog {
+                    for &width in widths {
                         let mut eligible = 0;
                         let mut nanos = None;
                         for slot in policy::bits(mask) {
@@ -113,7 +105,11 @@ impl RequestScheduler {
                             }
                         }
                         if let Some(ns) = nanos { consider(ns, batch, eligible); }
-                    } else if let Some(ns) = self.costs.duration(kind, batch, width) {
+                    }
+                }
+            } else {
+                for &batch in self.costs.batches(kind) {
+                    if let Some(ns) = self.costs.duration(kind, batch, 1) {
                         consider(ns, batch, mask);
                     }
                 }
@@ -165,10 +161,7 @@ impl RequestScheduler {
             }
         };
         if policy::terminal_cleanup(request) {
-            for batch in crate::execution::BATCH_CAPACITIES
-                .into_iter()
-                .take_while(|b| *b <= self.limits.max_active.next_power_of_two())
-            {
+            for &batch in self.costs.batches(GraphKind::Snapshot) {
                 consider(GraphKind::Snapshot, batch, 1, 0.0, true);
             }
         } else if prefill {
@@ -199,17 +192,18 @@ impl RequestScheduler {
             }
         } else {
             let mut curve = None;
-            for batch in crate::execution::BATCH_CAPACITIES {
-                if batch > self.limits.max_active.next_power_of_two() {
-                    break;
-                }
-                if request.generated_tokens == 0 {
+            if request.generated_tokens == 0 {
+                for &batch in self.costs.batches(GraphKind::Resume) {
                     consider(GraphKind::Resume, batch, 1, 1.0, true);
-                } else if request.generated_tokens < request.max_new_tokens {
-                    if self.speculative_widths.is_empty() {
+                }
+            } else if request.generated_tokens < request.max_new_tokens {
+                if self.speculative_widths.is_empty() {
+                    for &batch in self.costs.batches(GraphKind::Decode) {
                         consider(GraphKind::Decode, batch, 1, 1.0, true);
-                    } else {
-                        for &width in &self.speculative_catalog[batch.ilog2() as usize] {
+                    }
+                } else {
+                    for &(batch, ref widths) in &self.speculative_catalog {
+                        for &width in widths {
                             let tokens = self.speculative_tokens(request, width);
                             if tokens > 0 {
                                 let curve = curve.get_or_insert_with(|| self.powered_curve(request, false));

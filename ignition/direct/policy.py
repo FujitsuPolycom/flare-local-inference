@@ -7,7 +7,8 @@
 Direct execution keeps its own fixed choice of step kinds, but chooses every
 decode round's graph as Helios's `RequestScheduler::select_plan`
 (helios/src/scheduler/policy.rs) chooses among that kind's candidates: every
-prepared batch capacity up to the concurrency's power of two, at every loaded
+prepared batch capacity present in the layout up to the concurrency's covering
+capacity, at every loaded
 verification width (only the fixed width when verification is not adaptive),
 carries its highest-valued requests (`best_cohort`), and the graph with the best
 expected value per graph time wins. A request's value is its expected output
@@ -42,8 +43,6 @@ DELIVERY_FAIRNESS = 4.
 DECODE_AGE_PRICE = .1
 ADAPTATION_MS = 100.
 ESTIMATE_TTL_NS = 30_000_000_000
-# helios/src/execution/manifest.rs.
-BATCH_CAPACITIES = (1, 2, 4, 8, 16, 32, 64)
 REQUEST_LANES = 64
 
 _KINDS = {"init": "init", "restore": "restore", "prefill": "prefill", "resume": "resume", "snapshot": "snapshot"}
@@ -202,7 +201,11 @@ class Policy:
         self.costs = GraphCosts(layout.graphs)
         self.speculative = layout.speculative
         self.capacity = 1 << (layout.max_active - 1).bit_length()
-        self.batches = tuple(batch for batch in BATCH_CAPACITIES if batch <= self.capacity)
+        self.batches = tuple(sorted({
+            key[1] for key in layout.graphs
+            if key[0] in ("init", "restore", "snapshot", "resume", "decode", "speculative")
+            and key[1] <= self.capacity
+        }))
         # speculation.rs `graph_catalog`, restricted to loaded shapes as `speculative_graphs` restricts it.
         self.catalog = {batch: tuple(width for width in sorted(layout.widths)
                                      if ("speculative", batch, width) in layout.graphs

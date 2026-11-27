@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Admission limits and power-of-two capacities for prepared request batches."""
+"""Admission limits and batch capacities for prepared request batches."""
 
 from fractions import Fraction
 import heapq
@@ -10,7 +10,7 @@ from math import isqrt
 
 MAX_CONCURRENCY = 64
 DEFAULT_COMPLETION_TOKEN_CAPACITY = 8
-BATCH_CAPACITIES = (1, 2, 4, 8, 16, 32, 64)
+BATCH_CAPACITIES = (1, 2, 4, 6, 8, 12, 16, 24, 32, 64)
 
 
 def serving_modes(enabled: bool, mtp_only: bool = False) -> tuple[bool, ...]:
@@ -103,6 +103,7 @@ def packed_speculative_shapes(concurrency, width, token_capacity=None, graph_bud
     capacity = speculative_token_capacity(concurrency, width, token_capacity)
     shapes, intervals = set(), []
     total = 0
+    eligible = 0
 
     def interval(batch, lower, upper):
         if upper - lower > 1:
@@ -111,12 +112,14 @@ def packed_speculative_shapes(concurrency, width, token_capacity=None, graph_bud
     for batch in batches:
         lower, upper = batch + 1, min(capacity, batch * width)
         if lower <= upper:
+            eligible += 1
             shapes.update(((batch, lower), (batch, upper)))
             total += upper - lower + 1
             interval(batch, lower, upper)
     if type(graph_budget) is not int or graph_budget < len(shapes):
+        bucket_word = "bucket" if eligible == 1 else "buckets"
         raise ValueError(f"speculative graph budget must be an integer of at least {len(shapes)} "
-                         "to cover packed capacity endpoints")
+                         f"to cover packed capacity endpoints across {eligible} eligible request {bucket_word}")
     while len(shapes) < min(graph_budget, total):
         _, batch, lower, upper = heapq.heappop(intervals)
         root = isqrt(lower * upper)

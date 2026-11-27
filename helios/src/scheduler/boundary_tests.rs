@@ -626,7 +626,7 @@ fn runtime_concurrency_and_loaded_width_assign_fixed_execution_rows() {
             )
             .unwrap();
             s.enable_speculation(&[1, 2, 3, 4, 5, 6]).unwrap();
-            let shapes: Vec<_> = crate::execution::BATCH_CAPACITIES
+            let shapes: Vec<_> = [1, 2, 4, 6, 8, 12, 16, 24, 32, 64]
                 .into_iter()
                 .filter(|batch| *batch <= active.next_power_of_two())
                 .flat_map(|batch| (1..=width).map(move |width| (batch, width)))

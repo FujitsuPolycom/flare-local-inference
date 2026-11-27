@@ -235,7 +235,7 @@ pub(super) struct Metrics {
     replay_readiness_samples: AtomicU64,
     launches: [AtomicU64; 9],
     sampling_launches: [AtomicU64; 5],
-    speculative: [Vec<RoundMetrics>; 7],
+    speculative: Vec<Vec<RoundMetrics>>,
     draft_sources: Vec<[[AtomicU64; 2]; 2]>,
     mixed_grammar_decode_steps: AtomicU64,
     constrained_max_inflight: AtomicU64,
@@ -322,7 +322,9 @@ impl Metrics {
             total_pages: total_pages as u64,
             page_tokens: page_tokens as u64,
             decode_weight_bytes,
-            speculative: std::array::from_fn(|_| (0..token_capacity).map(|_| RoundMetrics::default()).collect()),
+            speculative: (0..=crate::execution::REQUEST_LANES)
+                .map(|_| (0..token_capacity).map(|_| RoundMetrics::default()).collect())
+                .collect(),
             draft_sources: (0..token_capacity.saturating_sub(1)).map(|_| Default::default()).collect(),
             ..Self::default()
         }
@@ -435,7 +437,7 @@ impl Metrics {
         records: &[CompletionRecord],
     ) {
         self.learned_draft_steps.fetch_add(drafts as u64, Ordering::Relaxed);
-        let counters = &self.speculative[batch.trailing_zeros() as usize][width - 1];
+        let Some(counters) = self.speculative.get(batch).and_then(|widths| widths.get(width - 1)) else { return; };
         counters.rounds.fetch_add(1, Ordering::Relaxed);
         counters.gpu_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
         for record in records.iter().filter(|r| r.status != 0) {
@@ -1010,10 +1012,10 @@ impl Metrics {
                 text,
                 "# HELP flare_speculative_{metric} {help}\n# TYPE flare_speculative_{metric} counter"
             );
-            for (batch, widths) in crate::execution::BATCH_CAPACITIES
-                .into_iter()
-                .zip(&self.speculative)
-            {
+            for (batch, widths) in self.speculative.iter().enumerate().skip(1) {
+                if widths.iter().all(|counts| counts.rounds.load(Ordering::Relaxed) == 0) {
+                    continue;
+                }
                 for (width, counts) in (1..).zip(widths) {
                     let value = match metric {
                         "rounds_total" => &counts.rounds,

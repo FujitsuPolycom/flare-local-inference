@@ -22,7 +22,6 @@ pub const MAX_LOGPROB_TOKEN_IDS: usize = 128;
 pub const LOGPROB_PAIR_FIELDS: usize = 2;
 pub const LOGPROB_FIELDS: usize = LOGPROB_PAIR_FIELDS * (1 + MAX_LOGPROB_TOKEN_IDS);
 pub const PROMPT_FIELDS: usize = 3 + 2 * MAX_TOP_LOGPROBS;
-pub const BATCH_CAPACITIES: [usize; 7] = [1, 2, 4, 8, 16, 32, 64];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Dtype {
@@ -866,8 +865,7 @@ impl ExecutionManifest {
             }
             let valid = match graph.kind {
                 GraphKind::Mixed => {
-                    BATCH_CAPACITIES.contains(&graph.batch_capacity)
-                        && (2..=self.request_capacity()).contains(&graph.batch_capacity)
+                    (2..=self.request_capacity()).contains(&graph.batch_capacity)
                         && (1..=self.completion_token_capacity).contains(&graph.token_capacity)
                         && graph.prefill_capacity >= 64
                         && graph.prefill_capacity.is_multiple_of(64)
@@ -878,8 +876,7 @@ impl ExecutionManifest {
                             .is_some()
                 }
                 GraphKind::Speculative => {
-                    BATCH_CAPACITIES.contains(&graph.batch_capacity)
-                        && graph.batch_capacity <= self.request_capacity()
+                    (1..=self.request_capacity()).contains(&graph.batch_capacity)
                         && (1..=self.completion_token_capacity).contains(&graph.token_capacity)
                 }
                 GraphKind::Prefill | GraphKind::TerminalPrefill | GraphKind::ScoredPrefill => {
@@ -890,8 +887,7 @@ impl ExecutionManifest {
                 }
                 GraphKind::Vision => graph.batch_capacity == 1 && graph.token_capacity > 0,
                 _ => {
-                    BATCH_CAPACITIES.contains(&graph.batch_capacity)
-                        && graph.batch_capacity <= self.request_capacity()
+                    (1..=self.request_capacity()).contains(&graph.batch_capacity)
                         && graph.token_capacity == 1
                 }
             };

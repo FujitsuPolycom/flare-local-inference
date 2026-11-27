@@ -244,7 +244,7 @@ def test_diagnostic_manifest_selects_fixed_width_without_discarding_export_graph
     lambda: GraphSignature("decode", 1, 1, ("token_ids", "token_ids")),
     lambda: GraphSignature("decode", 1, 1, ("completion_records",)),
     lambda: GraphSignature("decode", 1, 1, sampling_mode="automatic"),
-    lambda: GraphSignature("speculative", 3, 4),
+    lambda: GraphSignature("speculative", 65, 4),
     lambda: GraphSignature("speculative", 1, 1 << 31),
 ])
 def test_invalid_execution_signature_fails_before_cuda(signature):
@@ -343,7 +343,7 @@ def test_verification_protobuf_preserves_physical_rows_and_legacy_width_bounds()
 
 
 @pytest.mark.parametrize("changes", [
-    {"batch_capacity": 1}, {"batch_capacity": 3}, {"prefill_capacity": 0},
+    {"batch_capacity": 1}, {"batch_capacity": 65}, {"prefill_capacity": 0},
     {"prefill_capacity": 65}, {"prefill_capacity": 1 << 31}, {"prefill_capacity": True}, {"token_capacity": 1 << 31},
     {"speculation_enabled": None}, {"speculation_enabled": False, "token_capacity": 2},
     {"inputs": ()}, {"kind": "prefill"},

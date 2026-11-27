@@ -537,23 +537,21 @@ impl RequestScheduler {
             }
         } else {
             let mut curve = None;
-            for batch in crate::execution::BATCH_CAPACITIES
-                .into_iter()
-                .take_while(|b| *b <= self.limits.max_active.next_power_of_two())
-            {
-                if r.generated_tokens == 0 || self.speculative_widths.is_empty() {
-                    let kind = if r.generated_tokens == 0 {
-                        GraphKind::Resume
-                    } else {
-                        GraphKind::Decode
-                    };
+            if r.generated_tokens == 0 || self.speculative_widths.is_empty() {
+                let kind = if r.generated_tokens == 0 {
+                    GraphKind::Resume
+                } else {
+                    GraphKind::Decode
+                };
+                for &batch in self.costs.batches(kind) {
                     if let Some(ns) = self.costs.duration(kind, batch, 1) {
                         consider(ns, value.decode(1.0, ns as f64 / 1e6));
                     }
-                } else {
-                    for &width in &self.speculative_catalog[batch.ilog2() as usize] {
-                        if let Some(ns) = self.speculative_duration(r, batch, width)
-                        {
+                }
+            } else {
+                for &(batch, ref widths) in &self.speculative_catalog {
+                    for &width in widths {
+                        if let Some(ns) = self.speculative_duration(r, batch, width) {
                             let curve = curve.get_or_insert_with(|| self.powered_curve(r, false));
                             let expected = super::rounds::forecast_tokens(curve, self.speculative_tokens(r, width));
                             consider(ns, value.decode(expected, ns as f64 / 1e6));
@@ -616,9 +614,11 @@ impl RequestScheduler {
         }
         let next_window = r.following_conditioned_window();
         if next_window.is_some() {
-            let restore = crate::execution::BATCH_CAPACITIES
-                .into_iter()
-                .take_while(|batch| *batch <= self.limits.max_active.next_power_of_two())
+            let restore = self
+                .costs
+                .batches(GraphKind::Restore)
+                .iter()
+                .copied()
                 .filter_map(|batch| self.costs.duration(GraphKind::Restore, batch, 1))
                 .min()
                 .unwrap_or(0);
@@ -846,15 +846,16 @@ impl RequestScheduler {
         for &width in &self.scored_prefill_catalog {
             consider(GraphKind::ScoredPrefill, 1, width, 0);
         }
-        for batch in crate::execution::BATCH_CAPACITIES
-            .into_iter()
-            .take_while(|b| *b <= self.limits.max_active.next_power_of_two())
-        {
+        for &batch in self.costs.batches(GraphKind::Resume) {
             consider(GraphKind::Resume, batch, 1, 0);
-            if self.speculative_widths.is_empty() {
+        }
+        if self.speculative_widths.is_empty() {
+            for &batch in self.costs.batches(GraphKind::Decode) {
                 consider(GraphKind::Decode, batch, 1, 0);
-            } else {
-                for &width in &self.speculative_catalog[batch.ilog2() as usize] {
+            }
+        } else {
+            for &(batch, ref widths) in &self.speculative_catalog {
+                for &width in widths {
                     consider(GraphKind::Speculative, batch, width, 0);
                 }
             }
@@ -1088,20 +1089,17 @@ impl RequestScheduler {
                 for &capacity in &self.capabilities.vision.patch_capacities {
                     self.add_candidate(output, kind, 1, capacity, mask, values, age_price);
                 }
-            } else {
-                for batch in crate::execution::BATCH_CAPACITIES
-                    .into_iter()
-                    .take_while(|b| *b <= self.limits.max_active.next_power_of_two())
-                {
-                    if kind == GraphKind::Speculative {
-                        for &capacity in &self.speculative_catalog[batch.ilog2() as usize] {
-                            self.add_candidate(
-                                output, kind, batch, capacity, mask, values, age_price,
-                            );
-                        }
-                    } else {
-                        self.add_candidate(output, kind, batch, 1, mask, values, age_price);
+            } else if kind == GraphKind::Speculative {
+                for &(batch, ref widths) in &self.speculative_catalog {
+                    for &capacity in widths {
+                        self.add_candidate(
+                            output, kind, batch, capacity, mask, values, age_price,
+                        );
                     }
+                }
+            } else {
+                for &batch in self.costs.batches(kind) {
+                    self.add_candidate(output, kind, batch, 1, mask, values, age_price);
                 }
             }
         }
@@ -1481,10 +1479,7 @@ impl RequestScheduler {
                 self.add_candidate(&mut candidates, kind, 1, capacity, mask, &values, age_price);
             }
         } else {
-            for batch in crate::execution::BATCH_CAPACITIES
-                .into_iter()
-                .take_while(|b| *b <= self.limits.max_active.next_power_of_two())
-            {
+            for &batch in self.costs.batches(kind) {
                 self.add_candidate(&mut candidates, kind, batch, 1, mask, &values, age_price);
             }
         }

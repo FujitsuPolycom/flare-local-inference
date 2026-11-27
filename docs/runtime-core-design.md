@@ -669,8 +669,10 @@ sets `CUDA_FORCE_PRELOAD_LIBRARIES=0` and `CUDA_DISABLE_JIT=1`. The loader requi
 compiled cubins; missing native GPU code fails instead of compiling PTX.
 
 `LoadOptions` selects runtime concurrency, maximum actual MTP draft count, and
-adaptive or fixed prefix selection before CUDA initialization. Every required
-power-of-two request bucket has width-one execution. Wider programs fit the
+adaptive or fixed prefix selection before CUDA initialization. Helios enumerates
+available batch capacities directly from the loaded core's execution catalog
+within `1..=request_slots` (up to 64) and requires at least one width-one graph
+for each required execution kind rather than a hardcoded bucket list. Wider programs fit the
 prepared aggregate target envelope. A core must include its configured
 maximum prefill chunk; intermediate prefill capacities are optional.
 

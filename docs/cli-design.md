@@ -472,7 +472,7 @@ precedence.
 | `--mtp-only` | Omit MTP-disabled prefill, decode, maintenance, and mixed graphs during preparation. Retain width-one speculative rounds and vision graphs. Requires positive draft depth; rejects `--no-mtp`. The core cannot load with native `--mtp-draft-tokens 0`. | Capture both execution modes |
 | `--mtp-draft-tokens N` | Most draft tokens verified in one round; see `MODEL --help` for its limit. Verification capacities cover counts from 0 through `N` within the speculative token capacity. Each complete speculative program records its actual proposal depth independently of target width and aggregate rows. Prefix selection uses measured complete-program cost and completed acceptance or confidence. Zero retains draft state with width-one execution; `--no-mtp` excludes draft weights and state. | Recipe declaration |
 | `--speculative-token-capacity N` | Maximum physical target-token rows in wider speculative graphs; width one covers every request bucket. Applies to every recipe declaring `SpeculationParameters`. Command line only. | Recipe declaration (or derived from concurrency and draft depth when omitted) |
-| `--speculative-graph-budget N` | Maximum packed round graphs to capture, independently of physical target-token rows. Excludes mandatory width-one and ordinary graphs; requires packed learned speculation at positive draft depth. Must cover both physical-row endpoints for every eligible request bucket. Command line only. | Recipe declaration (64 for packed recipes) |
+| `--speculative-graph-budget N` | Maximum packed round graphs to capture, independently of physical target-token rows. Excludes mandatory width-one and ordinary graphs; requires packed learned speculation at positive draft depth. Must cover both physical-row endpoints for every eligible request bucket in `BATCH_CAPACITIES` (at least 18 at concurrency 32 with 128 target rows, or 20 at concurrency 64). Command line only. | Recipe declaration (64 for packed recipes) |
 | `--no-mtp-adaptive-verification` | Default to fixed-width serving. Capture includes every smaller width within the speculative token capacity. GPU confidence allocation requires adaptive selection; host-allocated ragged programs support fixed selection. | Adaptive |
 | `--language-model-only` | Prepare no vision encoder and serve text only, as vLLM's flag of the same name; requests with images are rejected and the encoder's weights, scratch, and graphs become KV pages. Available on recipes whose `VisionParameters` marks a separable encoder. | The recipe's image support |
 | `--autotune-effort off\|default\|audit` | Kernel search effort. Off uses heuristics without races; default races the candidates that pass each kernel family's performance exclusions; audit lifts those exclusions and races every legal candidate, to check that the default search prunes no winners. Overrides `[preparation] autotune_effort`. | Default |
@@ -489,8 +489,8 @@ Gemma 4 defaults to four concurrent requests and six speculative target-token
 rows, and Muse Spark to four concurrent requests and 32 target-token rows. Other
 recipes default to 32 concurrent requests and 128 target-token rows.
 Qwen3.8 Flash and GLM 5.3 use rectangular catalogs covering five
-drafts through batch 16 and three at batch 32. Step-5's rectangular catalog
-covers its full three-draft depth at batch 32. Qwen3.8 27B, DeepSeek V4/V4.1,
+drafts through batch 16, four at batch 24, and three at batch 32. Step-5's
+rectangular catalog covers its full three-draft depth at batch 32. Qwen3.8 27B, DeepSeek V4/V4.1,
 MiMo V2.6 Pro, MiMo V2.6 Pro, Kimi K3, Kimi K3.1 Pro, Nemotron Bolt, MiniMax M3.1, and Muse
 Spark use packed catalogs with a default
 budget of 64 round graphs plus width-one continuations. Each recipe selects
@@ -505,8 +505,10 @@ the packed capacity selection. The row cap bounds target work and storage;
 raising it permits longer aggregate prefixes at larger batches. The independent
 graph budget controls catalog density between each batch's smallest wider round
 and its maximum physical extent. Width-one and ordinary graphs do not consume
-that budget. Budgets below the required endpoint count fail during planning;
-budgets above the number of distinct valid capacities capture every capacity.
+that budget. Budgets below the required endpoint count (two per eligible request bucket in
+`BATCH_CAPACITIES`, e.g., 18 at concurrency 32 with 128 target rows) fail during
+planning; budgets above the number of distinct valid capacities capture every
+capacity.
 In export/conversion examples, `CACHE_ENTRY` is the directory path printed by
 `ignition export`. For eight requests with five drafts each, this example limits
 physical target capacity to 24 rows while retaining six-token per-request prefixes:
@@ -537,12 +539,13 @@ are mutually exclusive and require a packed adaptive catalog.
 
 A catalog containing only combined packed rounds and width-one continuations
 allows a runtime row budget below the selected padded batch capacity. Batches
-without a retained combined round use their width-one graphs. For the default
-DeepSeek V4.1 catalog, concurrency 32 with an exact budget of eight retains
-batches 1, 2, and 4 at eight rows each; batches
-8, 16, and 32 retain width-one execution. A maximum budget of eight retains every
-captured combined capacity at or below eight instead. At least one combined
-round must remain, and an uncaptured exact capacity fails selection.
+without a retained combined round use their width-one graphs. For the default DeepSeek V4.1 catalog (concurrency 32, 128 target rows, and 64
+packed graphs across the nine request buckets 1, 2, 4, 6, 8, 12, 16, 24, and 32),
+a maximum budget of eight retains every captured combined capacity at or below
+eight across batches 1, 2, 4, and 6, while batches 8, 12, 16, 24, and 32 retain
+width-one execution. An exact budget of four retains batches 1 and 2 at four
+rows each, while batches 4 through 32 retain width-one execution. At least one
+combined round must remain, and an uncaptured exact capacity fails selection.
 
 Every speculative catalog contains complete generation programs identified by
 B/D/W/P: request capacity, actual proposal draws, per-request target capacity,

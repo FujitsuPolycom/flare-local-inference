@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 
-from ignition.components.capacity import BATCH_CAPACITIES, request_capacity
+from ignition.components.capacity import MAX_CONCURRENCY, request_capacity
 from ignition.components.completion import validate_completion_buffers
 
 from .graphs import PreparedGraphBundle
@@ -51,12 +51,12 @@ class GraphSignature:
         if any(type(value) is not int or value <= 0 for value in (self.batch_capacity, self.token_capacity)):
             raise ValueError("graph capacities must be positive integers")
         if self.kind == "speculative" and (
-                self.batch_capacity not in BATCH_CAPACITIES or not 1 <= self.token_capacity < 1 << 31):
-            raise ValueError("speculative graphs require power-of-two batch capacities through 64 and positive Int32 verification widths")
+                not 1 <= self.batch_capacity <= MAX_CONCURRENCY or not 1 <= self.token_capacity < 1 << 31):
+            raise ValueError(f"speculative graphs require batch capacities in [1, {MAX_CONCURRENCY}] and positive Int32 verification widths")
         if type(self.prefill_capacity) is not int or self.prefill_capacity < 0:
             raise ValueError("prefill capacity must be a nonnegative integer")
         if self.kind == "mixed":
-            if (self.batch_capacity not in BATCH_CAPACITIES[1:]
+            if (not 2 <= self.batch_capacity <= MAX_CONCURRENCY
                     or not 1 <= self.token_capacity < 1 << 31
                     or self.prefill_capacity < 64 or self.prefill_capacity % 64
                     or self.prefill_capacity + (self.batch_capacity - 1) * self.token_capacity >= 1 << 31

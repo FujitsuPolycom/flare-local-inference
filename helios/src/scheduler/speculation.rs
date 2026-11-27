@@ -6,7 +6,7 @@
 
 //! Request-local speculative acceptance and copy proposal metadata.
 
-use crate::{Result, execution::BATCH_CAPACITIES};
+use crate::Result;
 
 /// Copy provenance uses the nonnegative bits of its signed 64-bit mask.
 pub const COPY_DRAFT_CAPACITY: usize = i64::BITS as usize - 1;
@@ -37,10 +37,26 @@ pub struct CopyProposal {
     pub grammar_masks: Vec<i32>,
 }
 
-pub fn graph_catalog(widths: &[usize], fixed: Option<usize>, capacity: usize) -> [Vec<usize>; 7] {
-    BATCH_CAPACITIES.map(|batch| if batch <= capacity {
-        fixed.map_or_else(|| widths.to_vec(), |width| vec![width])
-    } else { Vec::new() })
+pub fn graph_catalog(
+    batches: &[usize],
+    widths: &[usize],
+    fixed: Option<usize>,
+    capacity: usize,
+) -> Vec<(usize, Vec<usize>)> {
+    if widths.is_empty() {
+        return Vec::new();
+    }
+    batches
+        .iter()
+        .copied()
+        .filter(|&batch| batch >= 1 && batch <= capacity)
+        .map(|batch| {
+            (
+                batch,
+                fixed.map_or_else(|| widths.to_vec(), |width| vec![width]),
+            )
+        })
+        .collect()
 }
 
 pub fn validate_widths(widths: &[usize]) -> Result<()> {
@@ -252,9 +268,9 @@ mod tests {
 fn arbitrary_width_catalog_preserves_declared_values() {
     validate_widths(&[1, 8, 13, 16, 32]).unwrap();
     assert!(validate_widths(&[1, 0]).is_err());
-    assert_eq!(graph_catalog(&[1, 8, 13, 16, 32], None, 1)[0], vec![1, 8, 13, 16, 32]);
-    assert_eq!(graph_catalog(&[1, 8, 32], Some(32), 1)[0], vec![32]);
-    assert!(graph_catalog(&[1, 8, 32], None, 1)[1].is_empty());
+    assert_eq!(graph_catalog(&[1, 2], &[1, 8, 13, 16, 32], None, 1), vec![(1, vec![1, 8, 13, 16, 32])]);
+    assert_eq!(graph_catalog(&[1, 2], &[1, 8, 32], Some(32), 1), vec![(1, vec![32])]);
+    assert_eq!(graph_catalog(&[1, 2], &[1, 8, 32], None, 1).len(), 1);
 }
 
 #[cfg(test)]

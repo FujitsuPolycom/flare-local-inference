@@ -12,7 +12,7 @@ import triton.language as tl
 
 from ignition.preparation.persistent import persistent_empty
 
-from .capacity import BATCH_CAPACITIES
+from .capacity import MAX_CONCURRENCY
 from .sampling import _check_tensor, _compile
 from .state import StateStorage
 
@@ -42,8 +42,8 @@ class StateCommands:
 
     @classmethod
     def allocate(cls, device, *, capacity=4):
-        if capacity not in BATCH_CAPACITIES:
-            raise ValueError("state command capacity must be a power of two through 64")
+        if type(capacity) is not int or not 1 <= capacity <= MAX_CONCURRENCY:
+            raise ValueError(f"state command capacity must be an integer in [1, {MAX_CONCURRENCY}]")
         return cls(torch.full((capacity,), -1, dtype=torch.int64, device=device),
                    torch.full((capacity,), -1, dtype=torch.int64, device=device),
                    torch.full((capacity,), -1, dtype=torch.int64, device=device),

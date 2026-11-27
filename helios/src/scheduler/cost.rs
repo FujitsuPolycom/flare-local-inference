@@ -102,11 +102,28 @@ impl Estimate {
     }
 }
 
+fn kind_index(kind: GraphKind) -> usize {
+    match kind {
+        GraphKind::Init => 0,
+        GraphKind::Restore => 1,
+        GraphKind::Snapshot => 2,
+        GraphKind::Prefill => 3,
+        GraphKind::TerminalPrefill => 4,
+        GraphKind::ScoredPrefill => 5,
+        GraphKind::Decode => 6,
+        GraphKind::Speculative => 7,
+        GraphKind::Mixed => 8,
+        GraphKind::Resume => 9,
+        GraphKind::Vision => 10,
+    }
+}
+
 #[derive(Default)]
 pub(super) struct ActionCosts {
     entries: Vec<(Key, Estimate)>,
     index: std::collections::HashMap<Key, usize>,
-    packed_round_durations: [Vec<Option<u64>>; 7],
+    batches: [Vec<usize>; 11],
+    packed_round_durations: Vec<Vec<Option<u64>>>,
     now_ns: u64,
     ttl_ns: u64,
 }
@@ -159,11 +176,25 @@ impl ActionCosts {
             ));
         }
         let index = entries.iter().enumerate().map(|(index, (key, _))| (*key, index)).collect();
-        let mut costs = Self { entries, index,
-            packed_round_durations: std::array::from_fn(|_| vec![None; token_capacity + 1]),
+        let mut batches: [Vec<usize>; 11] = Default::default();
+        for (key, _) in &entries {
+            batches[kind_index(key.kind)].push(key.batch);
+        }
+        for list in &mut batches {
+            list.sort_unstable();
+            list.dedup();
+        }
+        let mut costs = Self { entries, index, batches,
+            packed_round_durations: (0..=super::REQUEST_LANES)
+                .map(|_| vec![None; token_capacity + 1])
+                .collect(),
             ttl_ns: super::PolicyConfig::default().estimate_ttl_ns, ..Default::default() };
         costs.refresh_packed_durations();
         Ok(costs)
+    }
+
+    pub fn batches(&self, kind: GraphKind) -> &[usize] {
+        &self.batches[kind_index(kind)]
     }
 
     pub fn advance_to(&mut self, now_ns: u64, ttl_ns: u64) {
@@ -179,17 +210,17 @@ impl ActionCosts {
         for row in &mut self.packed_round_durations { row.fill(None); }
         for (key, estimate) in &self.entries {
             if key.kind != GraphKind::Speculative || key.packed == 0 { continue; }
+            let Some(row) = self.packed_round_durations.get_mut(key.batch) else { continue; };
             let maximum = (key.drafts + 1).min(key.tokens).min(key.packed);
             let nanos = estimate.nanos;
-            for duration in self.packed_round_durations[key.batch.trailing_zeros() as usize].iter_mut().take(maximum + 1).skip(1) {
+            for duration in row.iter_mut().take(maximum + 1).skip(1) {
                 *duration = min_measured_duration(*duration, nanos);
             }
         }
     }
 
     pub fn packed_round_duration(&self, batch: usize, width: usize) -> Option<u64> {
-        if !batch.is_power_of_two() || batch > super::REQUEST_LANES { return None; }
-        self.packed_round_durations.get(batch.trailing_zeros() as usize)?.get(width).copied().flatten()
+        self.packed_round_durations.get(batch)?.get(width).copied().flatten()
     }
 
     pub fn packed_round_shapes(&self) -> impl Iterator<Item = PackedRoundShape> + '_ {
