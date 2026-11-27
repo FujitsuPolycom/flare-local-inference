@@ -16,7 +16,7 @@ use super::{
 };
 use crate::{Result, execution::ExecutionManifest, startup::StartupProgress};
 use blake2::{Blake2b, Digest, digest::consts::U32};
-use std::{collections::HashSet, path::Path, thread};
+use std::{collections::HashSet, thread};
 
 pub struct NativeModel {
     pub(super) ranks: Vec<NativeResources>,
@@ -311,7 +311,6 @@ impl NativeModel {
                 (descriptor, None, Some(cores), FilesRef::Payload(source))
             }
         };
-        let root = files.path();
         // A multi-host core holds every rank; each host keeps only the bundle it serves, so
         // it never maps another rank's storage.
         let cluster = match (descriptor.cluster.take(), options.cluster_rank) {
@@ -892,7 +891,7 @@ impl NativeModel {
                 &initial,
                 embedding_host_bytes,
             )?;
-            model.prepare_offload(root, options, progress, active)?;
+            model.prepare_offload(options, progress, active)?;
         }
         Ok(model)
     }
@@ -901,7 +900,6 @@ impl NativeModel {
     /// pools, and scan its record directory.
     unsafe fn prepare_offload(
         &mut self,
-        root: &Path,
         options: &LoadOptions,
         progress: &StartupProgress,
         max_active: usize,
@@ -940,15 +938,18 @@ impl NativeModel {
             .cluster
             .as_ref()
             .map(|cluster| (cluster.rank, cluster.world));
+        let integrated = self.ranks.iter().any(|rank| rank.integrated);
         let prepared = crate::offload::prepare_with_inputs(
             &options.prefix_cache,
-            root,
             identity,
             geometry,
             contexts,
-            max_active,
-            staging,
-            shard,
+            crate::offload::PrepareInputs {
+                max_active,
+                input_staging: staging,
+                shard,
+                integrated,
+            },
         )?;
         phase.finish(self.attach_offload(prepared)?);
         Ok(())
@@ -1293,9 +1294,7 @@ mod tests {
                 ..Default::default()
             };
             unsafe {
-                model
-                    .prepare_offload(Path::new("unopened-core"), &options, &progress, 1)
-                    .unwrap();
+                model.prepare_offload(&options, &progress, 1).unwrap();
             }
             assert!(model.offload.shared().is_none());
         }
@@ -1306,9 +1305,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let error =
-            unsafe { model.prepare_offload(Path::new("unopened-core"), &options, &progress, 1) }
-                .unwrap_err();
+        let error = unsafe { model.prepare_offload(&options, &progress, 1) }.unwrap_err();
         assert!(error.to_string().contains("lacks an identity"));
     }
 

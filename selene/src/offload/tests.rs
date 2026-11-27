@@ -5,40 +5,49 @@
 
 use super::*;
 
+fn inputs(max_active: usize) -> PrepareInputs {
+    PrepareInputs {
+        max_active,
+        input_staging: 0,
+        shard: None,
+        integrated: false,
+    }
+}
+
 fn prepare(
     options: &PrefixCacheOffload,
-    core: &std::path::Path,
     identity: [u8; 32],
     geometry: Vec<CacheGeometry>,
     contexts: Vec<(usize, i32)>,
 ) -> Result<Preparation> {
-    super::prepare(
+    super::prepare_with_inputs(
         options,
-        core,
         identity,
         geometry,
         contexts,
+        inputs(1),
         &crate::testing::IdentityRegistrar,
     )
 }
 fn prepare_with_inputs(
     options: &PrefixCacheOffload,
-    core: &std::path::Path,
     identity: [u8; 32],
     geometry: Vec<CacheGeometry>,
     contexts: Vec<(usize, i32)>,
-    inputs: u64,
+    input_staging: u64,
     shard: Option<(usize, usize)>,
 ) -> Result<Preparation> {
     super::prepare_with_inputs(
         options,
-        core,
         identity,
         geometry,
         contexts,
-        1,
-        inputs,
-        shard,
+        PrepareInputs {
+            max_active: 1,
+            input_staging,
+            shard,
+            integrated: false,
+        },
         &crate::testing::IdentityRegistrar,
     )
 }
@@ -69,7 +78,6 @@ fn a_pool_with_shards_keeps_one_local_rank_and_refuses_memory_retention() {
     let prepare = |options: &PrefixCacheOffload| {
         prepare_with_inputs(
             options,
-            std::path::Path::new("model.safetensors"),
             [0; 32],
             vec![local.clone()],
             vec![(0, 0)],
@@ -131,14 +139,9 @@ fn restore_placement_preserves_warm_capacity() {
             pool: Some(pool("unix:/run/selene.sock")),
             ..Default::default()
         };
-        let Preparation::Store(p) = prepare(
-            &options,
-            std::path::Path::new("model"),
-            [0; 32],
-            vec![g.clone()],
-            vec![(0, 0)],
-        )
-        .unwrap() else {
+        let Preparation::Store(p) = prepare(&options, [0; 32], vec![g.clone()], vec![(0, 0)])
+            .unwrap()
+        else {
             panic!("missing store")
         };
         let pool = p.memory_pool.unwrap();
@@ -163,20 +166,17 @@ fn disk_only_restore_preserves_minimum_staging() {
     for max_active in [1, 9] {
         let Preparation::Store(p) = super::prepare_with_inputs(
             &options,
-            std::path::Path::new("model"),
             [0; 32],
             vec![qualified_rank()],
             vec![(0, 0)],
-            max_active,
-            0,
-            None,
+            inputs(max_active),
             &crate::testing::IdentityRegistrar,
         )
         .unwrap() else {
             panic!("missing disk store")
         };
         let (_, budget) = options
-            .headroom_with_inputs(1, &p.layout, max_active, false, None)
+            .headroom_with_inputs(1, &p.layout, inputs(max_active), None)
             .unwrap();
         let pool = p.memory_pool.as_ref().unwrap();
         assert_eq!(pool.bytes(), budget);
@@ -191,7 +191,7 @@ fn without_a_pool_nothing_for_it_is_budgeted_or_built() {
     let layout = Layout::new(&[crate::testing::geometry(64, &[("kv", 4096)], 4096)]).unwrap();
     assert_eq!(
         PrefixCacheOffload::default()
-            .headroom_with_inputs(1, &layout, 1, false, None)
+            .headroom_with_inputs(1, &layout, inputs(1), None)
             .unwrap(),
         (0, 0)
     );
@@ -203,16 +203,26 @@ fn without_a_pool_nothing_for_it_is_budgeted_or_built() {
         pool: Some(pool("host:7000")),
         ..tiers.clone()
     };
-    let (device, host) = tiers.headroom_with_inputs(1, &layout, 1, false, None).unwrap();
+    let (device, host) = tiers
+        .headroom_with_inputs(1, &layout, inputs(1), None)
+        .unwrap();
     // Static headroom covers the copier; Hello's regions are budgeted at startup.
     assert_eq!(
-        pooled.headroom_with_inputs(1, &layout, 1, false, None).unwrap(),
+        pooled
+            .headroom_with_inputs(1, &layout, inputs(1), None)
+            .unwrap(),
         (device + STORE_DEVICE_MARGIN_BYTES, host)
     );
     // A pool shares what the CPU reads, so its memory is mapped whole by the device
     // instead of split across ranks.
-    let split = tiers.headroom_with_inputs(2, &layout, 1, false, None).unwrap().0;
-    let whole = pooled.headroom_with_inputs(2, &layout, 1, false, None).unwrap().0;
+    let split = tiers
+        .headroom_with_inputs(2, &layout, inputs(1), None)
+        .unwrap()
+        .0;
+    let whole = pooled
+        .headroom_with_inputs(2, &layout, inputs(1), None)
+        .unwrap()
+        .0;
     assert!(whole > split + STORE_DEVICE_MARGIN_BYTES, "{whole} {split}");
     let alone = PrefixCacheOffload {
         pool: Some(pool("host:7000")),
@@ -220,7 +230,9 @@ fn without_a_pool_nothing_for_it_is_budgeted_or_built() {
     };
     assert!(alone.enabled());
     assert_eq!(
-        alone.headroom_with_inputs(1, &layout, 1, false, None).unwrap(),
+        alone
+            .headroom_with_inputs(1, &layout, inputs(1), None)
+            .unwrap(),
         (STORE_DEVICE_MARGIN_BYTES, 0)
     );
 }
@@ -239,14 +251,7 @@ fn disabled_preparation_requires_no_geometry_context_or_worker_binding() {
             ..Default::default()
         },
     ] {
-        let prepared = prepare(
-            &options,
-            std::path::Path::new("/missing/model.safetensors"),
-            [0; 32],
-            Vec::new(),
-            Vec::new(),
-        )
-        .unwrap();
+        let prepared = prepare(&options, [0; 32], Vec::new(), Vec::new()).unwrap();
         assert_eq!(prepared.summary(), "disabled");
         assert!(matches!(&prepared, Preparation::None(reason) if reason == "disabled"));
         assert!(prepared.into_shared().is_none());
@@ -262,7 +267,6 @@ fn zero_disk_limit_does_not_create_a_record_directory() {
             disk_limit: Some(0),
             ..Default::default()
         },
-        std::path::Path::new("/missing/model.safetensors"),
         [0; 32],
         vec![crate::testing::geometry(64, &[("kv", 4096)], 4096)],
         Vec::new(),
@@ -292,7 +296,6 @@ fn zero_disk_limit_avoids_disk_setup_when_memory_is_enabled() {
             disk_limit: Some(0),
             ..Default::default()
         },
-        std::path::Path::new("/missing/model.safetensors"),
         [0; 32],
         geometry,
         Vec::new(),
@@ -330,7 +333,6 @@ fn zero_disk_limit_does_not_lock_or_scan_existing_records() {
             disk_limit: Some(0),
             ..Default::default()
         },
-        std::path::Path::new("/missing/model.safetensors"),
         [0; 32],
         geometry,
         Vec::new(),
@@ -374,13 +376,17 @@ fn memory_headroom_accounts_for_warm_slots_and_intake() {
     };
     let mut options = PrefixCacheOffload::default();
     assert_eq!(
-        options.headroom_with_inputs(2, &layout, 1, false, None).unwrap(),
+        options
+            .headroom_with_inputs(2, &layout, inputs(1), None)
+            .unwrap(),
         (0, 0)
     );
     let intake = intake_slots(&layout, 1) as u64 * layout.page_record_bytes;
     options.memory_bytes = Some(16 << 30);
     assert_eq!(
-        options.headroom_with_inputs(2, &layout, 1, false, None).unwrap(),
+        options
+            .headroom_with_inputs(2, &layout, inputs(1), None)
+            .unwrap(),
         (
             ((16u64 << 30) + intake).div_ceil(2).div_ceil(512) + STORE_DEVICE_MARGIN_BYTES,
             (16 << 30) + intake
@@ -389,19 +395,23 @@ fn memory_headroom_accounts_for_warm_slots_and_intake() {
     options.disk = Some("records".into());
     let host = (16u64 << 30) + intake;
     assert_eq!(
-        options.headroom_with_inputs(2, &layout, 1, false, None).unwrap(),
+        options
+            .headroom_with_inputs(2, &layout, inputs(1), None)
+            .unwrap(),
         (host.div_ceil(512) + STORE_DEVICE_MARGIN_BYTES, host)
     );
     options.memory_bytes = Some(0);
     assert_eq!(
-        options.headroom_with_inputs(2, &layout, 1, false, None).unwrap(),
+        options
+            .headroom_with_inputs(2, &layout, inputs(1), None)
+            .unwrap(),
         (intake.div_ceil(512) + STORE_DEVICE_MARGIN_BYTES, intake)
     );
     options.memory_bytes = Some(16 << 30);
     options.disk_limit = Some(0);
     assert_eq!(
         options
-            .headroom_with_inputs(2, &layout, 1, false, None)
+            .headroom_with_inputs(2, &layout, inputs(1), None)
             .unwrap()
             .1,
         (16 << 30) + intake
@@ -431,7 +441,17 @@ fn ordinary_input_share_preserves_mapping() {
         ..Default::default()
     };
     let ordinary = input_memory_bytes(1 << 30, true);
-    let (device, host) = options.headroom_with_inputs(2, &layout, 1, true, None).unwrap();
+    let (device, host) = options
+        .headroom_with_inputs(
+            2,
+            &layout,
+            PrepareInputs {
+                input_staging: 4096,
+                ..inputs(1)
+            },
+            None,
+        )
+        .unwrap();
     let intake = intake_slots(&layout, 1) as u64 * layout.page_record_bytes;
     assert_eq!(host, (1 << 30) + intake);
     assert_eq!(
@@ -450,12 +470,13 @@ fn intake_warning_reports_shrinkage_and_the_required_memory() {
         ..Default::default()
     };
     let build = |options: &PrefixCacheOffload| {
-        let Preparation::Store(prepared) = prepare(
+        let Preparation::Store(prepared) = super::prepare_with_inputs(
             options,
-            std::path::Path::new("model.safetensors"),
             [0; 32],
             geometry.clone(),
             vec![(0, 0)],
+            inputs(32),
+            &crate::testing::IdentityRegistrar,
         )
         .unwrap() else {
             panic!("no store")
@@ -477,7 +498,7 @@ fn intake_warning_reports_shrinkage_and_the_required_memory() {
                 crate::slab::SlabPool::new(layout.page_record_bytes, 128 + allocated, allocated)
                     .unwrap(),
             );
-            let warning = prepared.intake_warning(32);
+            let warning = prepared.intake_warning();
             if allocated >= required {
                 assert!(warning.is_none());
             } else {
@@ -506,9 +527,14 @@ fn pool_only_sizes_registered_capture_and_headroom_for_local_ranks() {
         ranks[1].page_capacity = pages;
         let registrar = crate::testing::TrackingRegistrar::default();
         let Preparation::Store(prepared) = super::prepare_with_inputs(
-            &options, "unused".as_ref(), [0; 32], ranks, vec![(0, 0), (1, 1)],
-            4, 0, None, &registrar,
-        ).unwrap() else {
+            &options,
+            [0; 32],
+            ranks,
+            vec![(0, 0), (1, 1)],
+            inputs(4),
+            &registrar,
+        )
+        .unwrap() else {
             panic!("missing capture buffer");
         };
         let layout = &prepared.layout;
@@ -519,10 +545,14 @@ fn pool_only_sizes_registered_capture_and_headroom_for_local_ranks() {
         assert!(buffer.rank_parts().is_none());
         assert_eq!(registrar.calls.lock().unwrap().len(), 1);
         assert_eq!(prepared.warm_bytes, 0);
-        assert!(prepared.intake_warning(4).is_none());
+        assert!(prepared.intake_warning().is_none());
         assert!(prepared.summary().contains(&format!("pool only: capture buffer {}", gibibytes(bytes))));
-        assert_eq!(options.headroom_with_inputs(2, layout, 4, false, Some(pages)).unwrap(),
-            (2 * STORE_DEVICE_MARGIN_BYTES + bytes.div_ceil(512), bytes));
+        assert_eq!(
+            options
+                .headroom_with_inputs(2, layout, inputs(4), Some(pages))
+                .unwrap(),
+            (2 * STORE_DEVICE_MARGIN_BYTES + bytes.div_ceil(512), bytes)
+        );
     }
 }
 
@@ -598,12 +628,12 @@ fn disk_and_memory_share_one_registration_with_independent_copiers_and_safe_clos
                 disk_limit: Some(1 << 30),
                 ..Default::default()
             };
-            let Preparation::Store(prepared) = super::prepare(
+            let Preparation::Store(prepared) = super::prepare_with_inputs(
                 &options,
-                std::path::Path::new("model.safetensors"),
                 [0; 32],
                 vec![crate::testing::geometry(64, &[("kv", 4096)], 4096)],
                 vec![(0, 0)],
+                inputs(1),
                 &registrar,
             )
             .unwrap() else {
@@ -669,19 +699,16 @@ fn intake_sizes_active_rows_and_rounds_warm_memory_down() {
     };
     let Preparation::Store(prepared) = super::prepare_with_inputs(
         &options,
-        std::path::Path::new("unused"),
         [0; 32],
         geometry,
         vec![(0, 0)],
-        active,
-        0,
-        None,
+        inputs(active),
         &crate::testing::IdentityRegistrar,
     )
     .unwrap() else {
         panic!("no store")
     };
-    assert!(prepared.intake_warning(active).is_none());
+    assert!(prepared.intake_warning().is_none());
     let pool = prepared.memory_pool.unwrap();
     assert_eq!(pool.intake_slots(), intake_slots(&layout, active));
     assert_eq!(pool.slot_count(), 17 + pool.intake_slots());
@@ -695,9 +722,152 @@ fn intake_shrinks_to_two_full_windows_without_refusing() {
         memory_bytes: Some(memory),
         ..Default::default()
     };
-    let (_, host) = options.headroom_with_inputs(1, &layout, 64, false, None).unwrap();
+    let (_, host) = options
+        .headroom_with_inputs(1, &layout, inputs(64), None)
+        .unwrap();
     assert_eq!(
         host - memory,
         intake_slots(&layout, 1) as u64 * layout.page_record_bytes
     );
+}
+
+#[test]
+fn integrated_disk_only_bounds_intake_without_warning_and_preserves_other_modes() {
+    let geometry = vec![crate::testing::geometry(64, &[("kv", 4096)], 5 * 4096)];
+    let layout = Layout::new(&geometry).unwrap();
+    let active = 32;
+    let bounded = intake_slots(&layout, 1);
+    let full = intake_slots(&layout, active);
+    assert!(bounded < full);
+
+    let directory = test_directory();
+    let disk_only = PrefixCacheOffload {
+        memory_bytes: Some(0),
+        disk: Some(directory.clone()),
+        disk_limit: Some(1 << 30),
+        ..Default::default()
+    };
+    assert!(disk_only.disk_only());
+    let integrated_inputs = PrepareInputs {
+        integrated: true,
+        ..inputs(active)
+    };
+    let (device, host) = disk_only
+        .headroom_with_inputs(1, &layout, integrated_inputs, None)
+        .unwrap();
+    let bounded_bytes = bounded as u64 * layout.page_record_bytes;
+    assert_eq!(host, bounded_bytes);
+    assert_eq!(
+        device,
+        bounded_bytes.div_ceil(512) + STORE_DEVICE_MARGIN_BYTES
+    );
+    assert_eq!(
+        disk_only
+            .headroom_for_test_budget(1, &layout, integrated_inputs, None, 0)
+            .unwrap()
+            .1,
+        bounded_bytes
+    );
+
+    // Integrated disk-only prepares at its two-window target (`sized_concurrency == 1`)
+    // without a shrink warning, whereas discrete disk-only shrunk to the same floor warns
+    // for the full `active` concurrency.
+    let Preparation::Store(prepared) = super::prepare_with_inputs(
+        &disk_only,
+        [0; 32],
+        geometry.clone(),
+        vec![(0, 0)],
+        integrated_inputs,
+        &crate::testing::IdentityRegistrar,
+    )
+    .unwrap() else {
+        panic!("no disk store")
+    };
+    assert_eq!(prepared.required_intake, bounded);
+    assert_eq!(prepared.sized_concurrency, 1);
+    assert!(prepared.intake_warning().is_none());
+    let integrated_pool = prepared.memory_pool.as_ref().unwrap();
+    assert_eq!(
+        (integrated_pool.slot_count(), integrated_pool.intake_slots()),
+        (bounded, bounded)
+    );
+    drop(prepared);
+
+    let (_, shrunk_host) = disk_only
+        .headroom_for_test_budget(1, &layout, inputs(active), None, 0)
+        .unwrap();
+    assert_eq!(shrunk_host, bounded_bytes);
+    let Preparation::Store(mut discrete) = super::prepare_with_inputs(
+        &disk_only,
+        [0; 32],
+        geometry,
+        vec![(0, 0)],
+        inputs(active),
+        &crate::testing::IdentityRegistrar,
+    )
+    .unwrap() else {
+        panic!("no discrete disk store")
+    };
+    assert_eq!(discrete.required_intake, full);
+    assert_eq!(discrete.sized_concurrency, active);
+    let shrunk_slots = (shrunk_host / layout.page_record_bytes) as usize;
+    discrete.memory_pool = Some(
+        crate::slab::SlabPool::new(layout.page_record_bytes, shrunk_slots, shrunk_slots).unwrap(),
+    );
+    let warning = discrete.intake_warning().unwrap();
+    assert!(
+        warning.contains(&format!("max concurrency {active}")),
+        "{warning}"
+    );
+    drop(discrete);
+
+    // Discrete GPUs, nonzero warm memory, disabled disk_limit = 0, and pool-only capture
+    // keep concurrency-scaled or capture-chain sizing.
+    let (_, discrete_host) = disk_only
+        .headroom_with_inputs(1, &layout, inputs(active), None)
+        .unwrap();
+    assert_eq!(discrete_host, full as u64 * layout.page_record_bytes);
+
+    let warm_bytes = 16 * layout.page_record_bytes;
+    let warm_and_disk = PrefixCacheOffload {
+        memory_bytes: Some(warm_bytes),
+        disk: Some(directory.clone()),
+        disk_limit: Some(1 << 30),
+        ..Default::default()
+    };
+    assert!(!warm_and_disk.disk_only());
+    let (_, warm_host) = warm_and_disk
+        .headroom_with_inputs(1, &layout, integrated_inputs, None)
+        .unwrap();
+    assert_eq!(
+        warm_host,
+        warm_bytes + full as u64 * layout.page_record_bytes
+    );
+
+    let disabled_disk = PrefixCacheOffload {
+        disk_limit: Some(0),
+        ..disk_only
+    };
+    assert!(!disabled_disk.disk_only());
+    assert_eq!(
+        disabled_disk
+            .headroom_with_inputs(1, &layout, integrated_inputs, None)
+            .unwrap(),
+        (0, 0)
+    );
+
+    let pool_only = PrefixCacheOffload {
+        memory_bytes: Some(0),
+        pool: Some(pool("unix:/run/selene.sock")),
+        ..Default::default()
+    };
+    let pages = 32u64;
+    let (_, pool_host) = pool_only
+        .headroom_with_inputs(1, &layout, integrated_inputs, Some(pages))
+        .unwrap();
+    let expected_capture =
+        full.max(pages as usize + layout.row_slots()) as u64 * layout.page_record_bytes;
+    assert_eq!(pool_host, expected_capture);
+
+    std::fs::remove_dir_all(directory).unwrap();
 }

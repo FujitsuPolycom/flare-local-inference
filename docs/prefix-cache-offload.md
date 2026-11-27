@@ -163,17 +163,29 @@ holds every rank's bytes in one process. Each disk peer uses its host's intake.
 
 Automatic registered intake is additional to the warm budget whenever warm
 memory or local disk is enabled. It needs no setting: its slot count is
-`2 × max_active × row_slots + 2 × WINDOW_PAGES`, where `WINDOW_PAGES = 64`.
+`2 × max_active × row_slots + 2 × WINDOW_PAGES`, where `WINDOW_PAGES = 64`,
+except for disk-only offload (`memory = 0` with local disk enabled) on an
+integrated-memory device (`CU_DEVICE_ATTRIBUTE_INTEGRATED`), where intake
+targets two streaming windows and two continuation rows,
+`2 × (WINDOW_PAGES + row_slots)` (`intake_slots(layout, 1)`).
 The warm checkpoint budget rounds down to whole slots. If host headroom cannot
 hold the full intake, it shrinks toward two complete windows,
-`2 × (64 + row_slots)`, and one warning reports the memory needed for full intake.
+`2 × (WINDOW_PAGES + row_slots)`, and one warning reports the memory needed for
+full intake; on an integrated-memory disk-only host, the target already equals
+that two-window floor, so host headroom neither shrinks it nor emits a warning.
+Concurrent unique-prefix disk restores and concurrent outbound disk stores on an
+integrated-memory disk-only host share and serialize window allocations through
+those two streaming windows (returning `StoreOutcome::Retry(StoreReason::Queue)`
+only if `RECORDS_IN_FLIGHT` fills, rather than budget retries).
 Prepared image inputs use one eighth of the warm budget, rounded down to 4 KiB,
 in ordinary CPU memory; the rest holds checkpoint slots. Text-only cores use
 all warm bytes for checkpoints. CPU input serialization also has a separate
 bounded window derived from prepared image buffers, including with warm zero.
 
-With zero warm memory and disk enabled, intake uses about 0.5–8 GB of host
-memory; the amount depends on checkpoint geometry and selected concurrency.
+With zero warm memory and disk enabled, intake on discrete GPUs uses about
+0.5–8 GB of host memory depending on checkpoint geometry and selected
+concurrency; on integrated-memory devices it depends only on checkpoint geometry
+(`2 × (WINDOW_PAGES + row_slots)` slots).
 
 On an integrated-memory device, such as a DGX Spark, GPU memory and host
 memory are one physical pool, and the GPU prefix cache takes the
@@ -628,10 +640,20 @@ sweep by up to one max age. The manager sweeps every namespace on its store
 tick, using each index's own once-a-minute limit. Expiry does not apply to the
 GPU tier.
 
-The disk thread in `selene/src/disk.rs` owns an `io_uring` ring over files
-opened with `O_DIRECT`,
-chunks transfers at 8 MiB, and computes and verifies checksums. Before accepting
-payload reads,
+The disk thread in `selene/src/disk.rs` owns an `io_uring` ring on Linux or an
+I/O completion port on Windows over raw v1–v3 record files opened for direct I/O,
+and chunks direct transfers at 8 MiB. On raw v1–v3 opens it reads the 4 KiB
+header and expected page-checksum segment in one direct transfer when the
+expected tail fits in its 1 MiB scratch buffer (`MAX_TAIL_PAGES`), retrying the
+4 KiB header block alone on failure so truncated-file and invalid-header
+diagnostics stay unchanged; v4 packed records read their variable-length
+directory metadata via `Header::read_metadata`. Raw page reads and writes hash
+64-bit `xxh3` checksums across `parallel_cpus.min(MAX_HASH_THREADS).min(buffers.len())`
+scoped `std::thread::scope` threads (`MAX_HASH_THREADS = 4`) when a batch holds
+at least `HASH_PARALLEL_MIN_PAGES` (`4`) pages and the host reports at least
+`HASH_PARALLEL_MIN_CPUS` (`4`) logical CPUs, keeping zero idle helper threads
+between batches and recomputing inline on the disk thread for any partition
+whose helper could not be created or unwound. Before accepting payload reads,
 it checks the opened file's header against the indexed record, including all
 layout and size fields. Changed headers cannot enlarge reads into registered
 slabs. A failed ring submission drains every kernel-owned buffer reference
@@ -861,10 +883,15 @@ Offload limits interference through bounded work and explicit ownership:
   engines through per-token latency. Batch size and stream priority alone do
   not bound those delays.
 - CPU: transfer threads sleep on event waits and channel receives; the disk
-  thread computes checksums and submits I/O. Both use `SCHED_BATCH` with a
-  positive nice value to reduce contention with the model worker, HTTP runtime,
-  and frontend workers. Adding CPU affinity requires a serving-latency
-  measurement that shows a benefit.
+  thread submits I/O and hashes multi-page raw batches across the scoped
+  helpers of section 2.5. On Linux, offload threads use `SCHED_BATCH` with a
+  positive nice value, inherited by scoped hashing helpers through `clone`; on
+  Windows, offload threads lower priority to `THREAD_PRIORITY_BELOW_NORMAL`.
+  While an inbound restore is active or waiting and no GPU step is running,
+  `Worker::idle_wait` polls at `50 µs` instead of `2 ms`; idle multi-host disk
+  peers (`selene/src/shard.rs`) wait on `poll(POLLIN)` on their rank TCP socket
+  on Unix (`1 ms` sleep on non-Unix). Adding CPU affinity requires a
+  serving-latency measurement that shows a benefit.
 - Page cache: all record I/O is direct, so disk writes neither grow the page
   cache nor evict the core file's mappings.
 - Memory: every slab pool is fixed at startup and sized by the defaults in
@@ -958,9 +985,11 @@ Offload limits interference through bounded work and explicit ownership:
   worker, so its ids and pins are neither reused nor released.
 - Offload copies are bounded per issue, and offload threads run below the
   serving threads' priority.
-- Steady-state serving allocates no device memory, no pinned memory, and no
-  threads for offload; slabs, descriptor arrays, rings, and events are created
-  at startup, as are the cuFile registrations of the `Direct` transport design.
+- Steady-state serving allocates no device memory or pinned memory, and keeps
+  persistent transfer and disk threads fixed from startup (apart from the
+  short-lived scoped page-hashing helpers of section 2.5); slabs, descriptor
+  arrays, rings, and events are created at startup, as are the cuFile
+  registrations of the `Direct` transport design.
 
 ### 2.13 Reusable CPU inputs
 
@@ -1231,6 +1260,13 @@ same completion events the store produces.
   before they fill. DRAM follows the free and clean floors described above;
   disk uses byte-based headroom. Disk headroom includes
   pending unlink and truncate bytes, which stay charged until completion.
+  Within each staged-transport submission pass, `Staged::pump_all` submits
+  interactive inbound restores ahead of outbound writes, then drains queued
+  unlinks and truncates while disk-queue space remains; after
+  `MAINTENANCE_DEFER_LIMIT` (`8`) consecutive passes where queued maintenance
+  lost free disk-queue space to inbound or outbound work, the next pass with
+  space submits one reserved maintenance job ahead of inbound and outbound so
+  reclamation remains bounded under sustained restore bursts.
   Store, eviction, spill completion, handover completion, reconnect and hashing
   progress trigger one coalesced maintenance pass per model-thread poll.
   Selection is bounded by the spill and move caps, without sorting all

@@ -53,7 +53,7 @@ use super::{
 
 #[cfg(any(test, feature = "test-support"))]
 use std::{
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     thread,
     time::Duration,
 };
@@ -111,6 +111,10 @@ pub struct Faults {
     pub disk_full: Option<PathBuf>,
     pub delay_ms: u64,
     pub trace: Option<Arc<std::sync::Mutex<Vec<u8>>>>,
+    /// Force scoped page-hashing helper thread creation to fail so the disk thread recomputes inline.
+    pub fail_hash_spawn: Arc<AtomicBool>,
+    /// 1-based scoped helper index (`1..=3`) that panics mid-batch (`0` disables helper panics).
+    pub panic_hash_helper: Arc<AtomicUsize>,
 }
 #[cfg(any(test, feature = "test-support"))]
 impl Faults {
@@ -149,6 +153,15 @@ pub const QUEUE_DEPTH: usize = 64;
 pub const NICE: i32 = 10;
 /// Chunks the ring keeps in flight for one transfer.
 const RING_DEPTH: usize = 64;
+/// Minimum page count in one batch before hashing runs across scoped helper threads
+/// (so every active thread hashes at least one full page when `MAX_HASH_THREADS` is 4;
+/// total hashing threads are `parallel_cpus.min(MAX_HASH_THREADS).min(buffers.len())`).
+const HASH_PARALLEL_MIN_PAGES: usize = 4;
+/// Minimum logical CPUs required before spawning scoped page-hashing helpers,
+/// leaving cores for the HTTP runtime, frontend workers, and model worker thread.
+const HASH_PARALLEL_MIN_CPUS: usize = 4;
+/// Maximum threads (calling disk thread plus up to three scoped helpers) used to hash one batch.
+const MAX_HASH_THREADS: usize = 4;
 /// Bytes of the thread's aligned checksum scratch.
 const CHECKSUM_SCRATCH_BYTES: usize = 1 << 20;
 /// Tail pages per record the thread can write or open, bounded by the scratch
@@ -355,10 +368,12 @@ impl DiskThread {
         let scratch = AlignedBuffer::new(HEADER_BYTES + CHECKSUM_SCRATCH_BYTES)?;
         let (sender, jobs) = mpsc::sync_channel(QUEUE_DEPTH);
         let (replies, receiver) = mpsc::channel();
+        let worker_name = name.to_owned();
         let thread = std::thread::Builder::new()
             .name(name.to_owned())
             .spawn(move || {
                 run(
+                    worker_name,
                     ring,
                     scratch,
                     jobs,
@@ -461,6 +476,7 @@ pub fn aligned(value: u64) -> bool {
 }
 
 fn run(
+    name: String,
     ring: Ring,
     scratch: AlignedBuffer,
     jobs: Receiver<Job>,
@@ -468,13 +484,13 @@ fn run(
     #[cfg(any(test, feature = "test-support"))] faults: Faults,
 ) {
     lower_priority();
-    let mut worker = Worker {
+    let mut worker = Worker::new(
+        name,
         ring,
         scratch,
-        records: HashMap::new(),
         #[cfg(any(test, feature = "test-support"))]
         faults,
-    };
+    );
     while let Ok(job) = jobs.recv() {
         let started = std::time::Instant::now();
         let mut reply = worker.execute(job);
@@ -488,6 +504,162 @@ fn run(
 /// Lower scheduling priority where the host permits it.
 fn lower_priority() {
     flare_eos::lower_priority(NICE);
+}
+
+/// Compute one 64-bit xxh3 checksum per address in `buffers` into `out`,
+/// fanning batches of at least [`HASH_PARALLEL_MIN_PAGES`] pages across
+/// `parallel_cpus.min(MAX_HASH_THREADS).min(buffers.len())` scoped threads
+/// when `parallel_cpus >= HASH_PARALLEL_MIN_CPUS`.
+///
+/// # Safety
+/// Every address in `buffers` must point to `page_bytes` readable, unchanged
+/// bytes for the duration of this call.
+unsafe fn hash_pages_parallel(
+    thread_name: &str,
+    parallel_cpus: usize,
+    buffers: &[usize],
+    page_bytes: usize,
+    out: &mut [u64],
+    #[cfg(any(test, feature = "test-support"))] faults: &Faults,
+) {
+    let threads = if buffers.len() < HASH_PARALLEL_MIN_PAGES
+        || page_bytes == 0
+        || parallel_cpus < HASH_PARALLEL_MIN_CPUS
+    {
+        1
+    } else {
+        parallel_cpus.min(MAX_HASH_THREADS).min(buffers.len())
+    };
+    // SAFETY: Caller upholds buffer validity for the duration of this call.
+    unsafe {
+        hash_pages_scoped(
+            thread_name,
+            buffers,
+            page_bytes,
+            out,
+            threads,
+            #[cfg(any(test, feature = "test-support"))]
+            faults,
+        );
+    }
+}
+
+/// # Safety
+/// Every address in `buffers` must point to `page_bytes` readable, unchanged
+/// bytes for the duration of this call.
+unsafe fn hash_pages_scoped(
+    thread_name: &str,
+    buffers: &[usize],
+    page_bytes: usize,
+    out: &mut [u64],
+    threads: usize,
+    #[cfg(any(test, feature = "test-support"))] faults: &Faults,
+) {
+    assert_eq!(buffers.len(), out.len());
+    let threads = threads.clamp(1, MAX_HASH_THREADS).min(buffers.len().max(1));
+    if threads <= 1 || buffers.is_empty() || page_bytes == 0 {
+        // SAFETY: Caller upholds buffer validity and `out` matches `buffers.len()`.
+        unsafe {
+            hash_pages_serial(buffers, page_bytes, out);
+        }
+        return;
+    }
+    let chunk_len = buffers.len().div_ceil(threads);
+    let mut completed = [false; MAX_HASH_THREADS];
+    completed[0] = true;
+    std::thread::scope(|scope| {
+        let mut chunks = buffers.chunks(chunk_len).zip(out.chunks_mut(chunk_len));
+        let Some((first_buffers, first_out)) = chunks.next() else {
+            return;
+        };
+        let mut handles = Vec::with_capacity(threads - 1);
+        for (index, (chunk_buffers, chunk_out)) in (1..).zip(chunks) {
+            let spawned = spawn_hash_helper(
+                scope,
+                thread_name,
+                index,
+                chunk_buffers,
+                page_bytes,
+                chunk_out,
+                #[cfg(any(test, feature = "test-support"))]
+                faults,
+            );
+            if let Ok(handle) = spawned {
+                handles.push((index, handle));
+            }
+        }
+        // SAFETY: `first_buffers` and `first_out` are disjoint from every helper chunk.
+        unsafe {
+            hash_pages_serial(first_buffers, page_bytes, first_out);
+        }
+        for (index, handle) in handles {
+            if handle.join().is_ok() {
+                completed[index] = true;
+            }
+        }
+    });
+    for (index, (chunk_buffers, chunk_out)) in buffers
+        .chunks(chunk_len)
+        .zip(out.chunks_mut(chunk_len))
+        .enumerate()
+    {
+        if !completed[index] {
+            // Recompute any unspawned or panicked partition inline on the disk thread.
+            // SAFETY: `scope` exited so all chunk borrows ended, and buffers remain valid.
+            unsafe {
+                hash_pages_serial(chunk_buffers, page_bytes, chunk_out);
+            }
+        }
+    }
+}
+
+fn spawn_hash_helper<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    thread_name: &str,
+    index: usize,
+    chunk_buffers: &'env [usize],
+    page_bytes: usize,
+    chunk_out: &'env mut [u64],
+    #[cfg(any(test, feature = "test-support"))] faults: &Faults,
+) -> io::Result<std::thread::ScopedJoinHandle<'scope, ()>> {
+    #[cfg(any(test, feature = "test-support"))]
+    if faults.fail_hash_spawn.load(Ordering::Acquire) {
+        return Err(io::Error::other("injected scoped helper spawn failure"));
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    let panic_now = faults.panic_hash_helper.load(Ordering::Acquire) == index;
+    // On Linux, `clone` inherits the disk thread's `SCHED_BATCH` policy and
+    // nice value; non-Linux targets lower priority explicitly in the helper.
+    std::thread::Builder::new()
+        .name(format!("{thread_name}-hash-{index}"))
+        .spawn_scoped(scope, move || {
+            #[cfg(not(target_os = "linux"))]
+            lower_priority();
+            #[cfg(any(test, feature = "test-support"))]
+            if panic_now {
+                panic!("injected mid-batch scoped hash helper failure");
+            }
+            // SAFETY: Caller keeps `chunk_buffers` valid throughout `scope`,
+            // and `chunk_out` is a disjoint mutable slice.
+            unsafe {
+                hash_pages_serial(chunk_buffers, page_bytes, chunk_out);
+            }
+        })
+}
+
+/// # Safety
+/// Every address in `buffers` must point to `page_bytes` readable, unchanged bytes.
+unsafe fn hash_pages_serial(buffers: &[usize], page_bytes: usize, out: &mut [u64]) {
+    debug_assert_eq!(buffers.len(), out.len());
+    for (&address, slot) in buffers.iter().zip(out.iter_mut()) {
+        let bytes = if page_bytes == 0 {
+            &[]
+        } else {
+            // SAFETY: Caller guarantees `address` is readable for `page_bytes` bytes.
+            unsafe { std::slice::from_raw_parts(address as *const u8, page_bytes) }
+        };
+        *slot = checksum(bytes);
+    }
 }
 
 /// A record being written: its temporary file, header, and the checksums of
@@ -529,8 +701,11 @@ enum Record {
 }
 
 struct Worker {
+    name: String,
     ring: Ring,
     scratch: AlignedBuffer,
+    parallel_cpus: usize,
+    page_sums: Vec<u64>,
     records: HashMap<JobId, Record>,
     #[cfg(any(test, feature = "test-support"))]
     faults: Faults,
@@ -547,6 +722,42 @@ impl Drop for Worker {
 }
 
 impl Worker {
+    fn new(
+        name: impl Into<String>,
+        ring: Ring,
+        scratch: AlignedBuffer,
+        #[cfg(any(test, feature = "test-support"))] faults: Faults,
+    ) -> Self {
+        let parallel_cpus =
+            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        Self {
+            name: name.into(),
+            ring,
+            scratch,
+            parallel_cpus,
+            page_sums: Vec::new(),
+            records: HashMap::new(),
+            #[cfg(any(test, feature = "test-support"))]
+            faults,
+        }
+    }
+
+    fn scratch_prefix_span(&self, checksum_bytes: usize) -> Span {
+        Span {
+            address: self.scratch.address(),
+            offset: 0,
+            length: HEADER_BYTES + checksum_bytes,
+        }
+    }
+
+    fn scratch_checksum_span(&self, checksum_bytes: usize) -> Span {
+        Span {
+            address: self.scratch.address() + HEADER_BYTES,
+            offset: HEADER_BYTES as u64,
+            length: checksum_bytes,
+        }
+    }
+
     fn execute(&mut self, job: Job) -> Reply {
         match job {
             #[cfg(unix)]
@@ -843,17 +1054,23 @@ impl Worker {
             })
             .collect();
         let moved = self.ring.transfer(&writing.file, &spans, true)?;
-        for (page, address) in pages.zip(buffers) {
-            // SAFETY: The transfer checked the span's alignment and completed;
-            // the caller keeps the slot at `address` valid and unchanged for
+        if !writing.hashed {
+            // SAFETY: The transfer checked each span's alignment and completed;
+            // the caller keeps every slot in `buffers` valid and unchanged for
             // `page_bytes` until this job's reply.
-            let bytes =
-                unsafe { std::slice::from_raw_parts(*address as *const u8, page_bytes as usize) };
-            if !writing.hashed {
-                writing.checksums[page] = checksum(bytes);
+            unsafe {
+                hash_pages_parallel(
+                    &self.name,
+                    self.parallel_cpus,
+                    buffers,
+                    page_bytes as usize,
+                    &mut writing.checksums[pages.clone()],
+                    #[cfg(any(test, feature = "test-support"))]
+                    &self.faults,
+                );
             }
-            writing.written[page] = true;
         }
+        writing.written[pages].fill(true);
         writing.bytes += moved;
         Ok(moved)
     }
@@ -930,19 +1147,8 @@ impl Worker {
             slot.copy_from_slice(&sum.to_le_bytes());
         }
         segment[writing.checksums.len() * 8..].fill(0);
-        let mut spans = vec![Span {
-            address: self.scratch.address(),
-            offset: 0,
-            length: HEADER_BYTES,
-        }];
-        if checksum_bytes > 0 {
-            spans.push(Span {
-                address: self.scratch.address() + HEADER_BYTES,
-                offset: HEADER_BYTES as u64,
-                length: checksum_bytes,
-            });
-        }
-        writing.bytes += self.ring.transfer(&writing.file, &spans, true)?;
+        let prefix = self.scratch_prefix_span(checksum_bytes);
+        writing.bytes += self.ring.transfer(&writing.file, &[prefix], true)?;
         writing
             .file
             .set_len(writing.header.length(writing.row_required))
@@ -1092,12 +1298,25 @@ impl Worker {
             .queue
             .attach(&file)
             .map_err(|e| io_failure("attach record reader", e))?;
-        let header_span = Span {
-            address: self.scratch.address(),
-            offset: 0,
-            length: HEADER_BYTES,
+        // Prefer reading the 4 KiB header and expected page-checksum segment in one
+        // direct-I/O transfer when the checksums fit in `scratch`; fall back to a
+        // header-only read when `expected` exceeds `MAX_TAIL_PAGES` or the combined
+        // read fails (for example on a truncated file), preserving header diagnostics
+        // and retry I/O errors.
+        let expected_checksum_bytes = (expected.tail_pages <= MAX_TAIL_PAGES)
+            .then(|| usize::try_from(expected.checksum_bytes()).ok())
+            .flatten()
+            .filter(|&bytes| bytes <= CHECKSUM_SCRATCH_BYTES)
+            .unwrap_or(0);
+        let combined = self.scratch_prefix_span(expected_checksum_bytes);
+        let mut bytes = match self.ring.transfer(&file, &[combined], false) {
+            Ok(bytes) => bytes,
+            Err(_) if expected_checksum_bytes > 0 => {
+                let header_only = self.scratch_prefix_span(0);
+                self.ring.transfer(&file, &[header_only], false)?
+            }
+            Err(error) => return Err(error),
         };
-        let mut bytes = self.ring.transfer(&file, &[header_span], false)?;
         let header = Header::decode(&self.scratch.as_slice()[..HEADER_BYTES])
             .map_err(|error| invalid(format!("record file {}: {error}", path.display())))?;
         check_tail_pages(&header)?;
@@ -1110,12 +1329,8 @@ impl Worker {
             )));
         }
         let checksum_bytes = header.checksum_bytes() as usize;
-        if checksum_bytes > 0 {
-            let span = Span {
-                address: self.scratch.address() + HEADER_BYTES,
-                offset: HEADER_BYTES as u64,
-                length: checksum_bytes,
-            };
+        if checksum_bytes > 0 && bytes == HEADER_BYTES as u64 {
+            let span = self.scratch_checksum_span(checksum_bytes);
             bytes += self.ring.transfer(&file, &[span], false)?;
         }
         let segment = &self.scratch.as_slice()[HEADER_BYTES..HEADER_BYTES + checksum_bytes];
@@ -1150,12 +1365,22 @@ impl Worker {
             })
             .collect();
         let moved = self.ring.transfer(&reading.file, &spans, false)?;
-        for (page, address) in pages.zip(buffers) {
-            // SAFETY: The caller keeps the slot at `address` valid for
-            // `page_bytes` until this job's reply, and the read into it completed.
-            let bytes =
-                unsafe { std::slice::from_raw_parts(*address as *const u8, page_bytes as usize) };
-            if checksum(bytes) != reading.checksums[page] {
+        self.page_sums.resize(buffers.len(), 0);
+        // SAFETY: The caller keeps every slot in `buffers` valid for
+        // `page_bytes` until this job's reply, and the read into it completed.
+        unsafe {
+            hash_pages_parallel(
+                &self.name,
+                self.parallel_cpus,
+                buffers,
+                page_bytes as usize,
+                &mut self.page_sums,
+                #[cfg(any(test, feature = "test-support"))]
+                &self.faults,
+            );
+        }
+        for ((page, address), &sum) in pages.zip(buffers).zip(&self.page_sums) {
+            if sum != reading.checksums[page] {
                 return Err(invalid(format!(
                     "page record {page} of {} failed checksum verification",
                     reading.path.display()
@@ -1401,6 +1626,8 @@ struct Ring {
     /// entries it never consumed stay in the submission queue and their slots
     /// stay reserved until the ring is dropped.
     broken: Option<String>,
+    #[cfg(test)]
+    submitted_chunks: usize,
 }
 
 #[cfg(unix)]
@@ -1413,6 +1640,8 @@ impl Ring {
             slots: vec![Chunk::default(); RING_DEPTH],
             free: (0..RING_DEPTH).collect(),
             broken: None,
+            #[cfg(test)]
+            submitted_chunks: 0,
         })
     }
 
@@ -1488,6 +1717,10 @@ impl Ring {
                     break;
                 }
                 self.slots[slot] = chunk;
+                #[cfg(test)]
+                {
+                    self.submitted_chunks += 1;
+                }
                 pending = chunks.next();
             }
             if self.free.len() == RING_DEPTH && (pending.is_none() || failure.is_some()) {
@@ -1571,6 +1804,8 @@ struct Ring {
     queue: flare_eos::completion::Queue,
     slots: Vec<Chunk>,
     free: Vec<usize>,
+    #[cfg(test)]
+    submitted_chunks: usize,
 }
 
 #[cfg(windows)]
@@ -1581,6 +1816,8 @@ impl Ring {
                 .map_err(|e| io_failure("create disk completion port", e))?,
             slots: vec![Chunk::default(); RING_DEPTH],
             free: (0..RING_DEPTH).collect(),
+            #[cfg(test)]
+            submitted_chunks: 0,
         })
     }
 
@@ -1611,6 +1848,10 @@ impl Ring {
                 } {
                     Ok(()) => {
                         self.slots[slot] = chunk;
+                        #[cfg(test)]
+                        {
+                            self.submitted_chunks += 1;
+                        }
                         pending = chunks.next();
                     }
                     Err(error) => {
@@ -3378,5 +3619,226 @@ mod tests {
             fs::remove_file(path).unwrap();
         }
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn open_reads_header_and_checksums_in_one_transfer() {
+        let Some(directory) = test_directory("single-open") else {
+            return;
+        };
+        let multi_key = PrefixKey {
+            consumed_tokens: 64 * 8,
+            digest: [11; 16],
+        };
+        let multi_header = header(multi_key, 8);
+        let page_bytes = multi_header.page_record_bytes() as usize;
+        let row_bytes = multi_header.row_record_bytes() as usize;
+        let pages: Vec<AlignedBuffer> = (0..8u8)
+            .map(|index| buffer(page_bytes, index.wrapping_mul(13) + 5))
+            .collect();
+        let row = buffer(row_bytes, 42);
+        let multi_path = directory.join(file_name(&multi_key));
+        let zero_key = PrefixKey {
+            consumed_tokens: 32,
+            digest: [12; 16],
+        };
+        let zero_header = header(zero_key, 0);
+        let zero_path = directory.join(file_name(&zero_key));
+
+        let mut writer = Worker::new(
+            "open-test",
+            Ring::new().unwrap(),
+            AlignedBuffer::new(HEADER_BYTES + CHECKSUM_SCRATCH_BYTES).unwrap(),
+            Faults::default(),
+        );
+        writer
+            .create(
+                JobId(1),
+                directory.join(temporary_name(&multi_key)),
+                multi_header.clone(),
+                true,
+                None,
+                Some(Default::default()),
+            )
+            .unwrap();
+        let page_addrs: Vec<_> = pages.iter().map(AlignedBuffer::address).collect();
+        writer.write_pages(JobId(1), 0, &page_addrs).unwrap();
+        let row_addrs: Vec<_> = (0..multi_header.layout().unwrap().row_slots())
+            .map(|i| row.address() + i * page_bytes)
+            .collect();
+        writer.write_row(JobId(1), &row_addrs).unwrap();
+        let (_, committed_multi) = writer.commit(JobId(1), &multi_path, false).unwrap();
+
+        writer
+            .create(
+                JobId(2),
+                directory.join(temporary_name(&zero_key)),
+                zero_header.clone(),
+                true,
+                None,
+                Some(Default::default()),
+            )
+            .unwrap();
+        writer.write_row(JobId(2), &row_addrs).unwrap();
+        let (_, committed_zero) = writer.commit(JobId(2), &zero_path, false).unwrap();
+
+        // Multi-page open submits one contiguous direct-I/O chunk for header + checksums.
+        writer.ring.submitted_chunks = 0;
+        let (bytes, opened) = writer
+            .open(JobId(10), multi_path, multi_header.clone())
+            .unwrap();
+        assert_eq!(writer.ring.submitted_chunks, 1);
+        assert_eq!(bytes, 2 * HEADER_BYTES as u64);
+        assert_eq!(opened, committed_multi);
+        writer.close(JobId(10)).unwrap();
+
+        // Zero-page open submits one direct-I/O chunk for the header block alone.
+        writer.ring.submitted_chunks = 0;
+        let (bytes, opened) = writer
+            .open(JobId(11), zero_path, zero_header)
+            .unwrap();
+        assert_eq!(writer.ring.submitted_chunks, 1);
+        assert_eq!(bytes, HEADER_BYTES as u64);
+        assert_eq!(opened, committed_zero);
+        writer.close(JobId(11)).unwrap();
+
+        // File truncated after a valid header retries the header block and fails reading checksums.
+        let truncated = directory.join("truncated.ckpt");
+        fs::write(&truncated, committed_multi.encode().unwrap()).unwrap();
+        writer.ring.submitted_chunks = 0;
+        let err = writer
+            .open(JobId(12), truncated, multi_header)
+            .unwrap_err();
+        assert!(err.to_string().contains("short direct read"), "{err}");
+        assert_eq!(writer.ring.submitted_chunks, 3);
+
+        drop(writer);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn parallel_page_checksums_match_serial_and_fall_back_on_helper_failure() {
+        let page_bytes = 8192;
+        let max_pages = 65usize;
+        let pages: Vec<AlignedBuffer> = (0..max_pages)
+            .map(|i| buffer(page_bytes, (i as u8).wrapping_mul(19).wrapping_add(3)))
+            .collect();
+        let addrs: Vec<usize> = pages.iter().map(AlignedBuffer::address).collect();
+        let expected: Vec<u64> = pages.iter().map(|p| checksum(p.as_slice())).collect();
+        let default_faults = Faults::default();
+
+        for count in 0..=max_pages {
+            let mut parallel = vec![0xdead_beef_cafe_f00du64; count];
+            // SAFETY: `pages` stay alive and unchanged for the duration of `hash_pages_parallel`.
+            unsafe {
+                hash_pages_parallel(
+                    "xxh3-test",
+                    MAX_HASH_THREADS,
+                    &addrs[..count],
+                    page_bytes,
+                    &mut parallel,
+                    &default_faults,
+                );
+            }
+            assert_eq!(parallel, expected[..count], "mismatch at batch size {count}");
+        }
+
+        // Helper-spawn failure and mid-batch helper panic must recompute uncompleted
+        // partitions inline rather than failing or leaving stale output values.
+        for (fail_spawn, panic_helper) in [(true, 0usize), (false, 2usize)] {
+            let faults = Faults::default();
+            faults.fail_hash_spawn.store(fail_spawn, Ordering::Release);
+            faults
+                .panic_hash_helper
+                .store(panic_helper, Ordering::Release);
+            let mut out = vec![0xdead_beef_cafe_f00du64; 12];
+            // SAFETY: `pages` stay alive and unchanged for the duration of `hash_pages_scoped`.
+            unsafe {
+                hash_pages_scoped(
+                    "fault-xxh3",
+                    &addrs[..12],
+                    page_bytes,
+                    &mut out,
+                    MAX_HASH_THREADS,
+                    &faults,
+                );
+            }
+            assert_eq!(out, expected[..12]);
+        }
+
+        // Exercise `Faults` injection end-to-end through `DiskThread::start_with_faults`.
+        if let Some(directory) = test_directory("xxh3-fault-thread") {
+            let key = PrefixKey {
+                consumed_tokens: 64 * 12,
+                digest: [29; 16],
+            };
+            let hdr = header(key, 12);
+            let rec_page_bytes = hdr.page_record_bytes() as usize;
+            let rec_pages: Vec<AlignedBuffer> = (0..12u8)
+                .map(|i| buffer(rec_page_bytes, i.wrapping_mul(23).wrapping_add(7)))
+                .collect();
+            let rec_addrs: Vec<usize> = rec_pages.iter().map(AlignedBuffer::address).collect();
+            let dst_pages: Vec<AlignedBuffer> = (0..12)
+                .map(|_| buffer(rec_page_bytes, 0))
+                .collect();
+            let dst_addrs: Vec<usize> = dst_pages.iter().map(AlignedBuffer::address).collect();
+            let path = directory.join(file_name(&key));
+
+            let faults = Faults::default();
+            faults.fail_hash_spawn.store(true, Ordering::Release);
+            let mut disk = DiskThread::start_with_faults("xxh3-fault", faults.clone()).unwrap();
+            disk.submit(Job::Create {
+                id: JobId(1),
+                temporary: directory.join(temporary_name(&key)),
+                header: hdr,
+                row: false,
+                sums: None,
+                replication: Some(Default::default()),
+            })
+            .unwrap();
+            disk.submit(Job::WritePages {
+                id: JobId(1),
+                window: 0,
+                first: 0,
+                buffers: rec_addrs,
+            })
+            .unwrap();
+            disk.submit(Job::Commit {
+                id: JobId(1),
+                path: path.clone(),
+                sync: false,
+            })
+            .unwrap();
+            let replies = wait(&disk, 3);
+            for r in &replies {
+                succeeded(r);
+            }
+            let committed = replies[2].header.clone().unwrap();
+
+            faults.fail_hash_spawn.store(false, Ordering::Release);
+            faults.panic_hash_helper.store(2, Ordering::Release);
+            disk.submit(Job::Open {
+                id: JobId(2),
+                path,
+                expected: committed,
+            })
+            .unwrap();
+            disk.submit(Job::ReadPages {
+                id: JobId(2),
+                window: 0,
+                first: 0,
+                buffers: dst_addrs,
+            })
+            .unwrap();
+            disk.submit(Job::Close { id: JobId(2) }).unwrap();
+            for r in wait(&disk, 3) {
+                succeeded(&r);
+            }
+            for (src, dst) in rec_pages.iter().zip(&dst_pages) {
+                assert_eq!(src.as_slice(), dst.as_slice());
+            }
+            disk.close().unwrap();
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
 }

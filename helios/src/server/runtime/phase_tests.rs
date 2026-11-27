@@ -1994,6 +1994,8 @@ struct FakeStore {
     reject_fetch: bool,
     store_outcomes: VecDeque<flare_selene::StoreOutcome>,
     progress: u64,
+    inbound_in_flight: usize,
+    outbound_in_flight: usize,
     stored: Vec<flare_selene::PublishedCheckpoint>,
     fetched: Vec<(flare_selene::HostHit, flare_selene::InboundTicket)>,
     events: VecDeque<flare_selene::StoreEvent>,
@@ -2034,6 +2036,8 @@ impl FakeStore {
             reject_fetch: false,
             store_outcomes: VecDeque::new(),
             progress: 0,
+            inbound_in_flight: 0,
+            outbound_in_flight: 0,
             stored: Vec::new(),
             fetched: Vec::new(),
             events: VecDeque::new(),
@@ -2180,6 +2184,8 @@ impl flare_selene::HostStore for FakeStore {
     fn stats(&self) -> flare_selene::StoreStats {
         flare_selene::StoreStats {
             progress: self.progress,
+            inbound_in_flight: self.inbound_in_flight,
+            outbound_in_flight: self.outbound_in_flight,
             ..Default::default()
         }
     }
@@ -3635,6 +3641,32 @@ fn a_pending_pool_lookup_does_not_hold_other_requests() {
     assert!(worker.active[0].is_some());
     assert_eq!(worker.pending.len(), 1);
     assert!(worker.pending[0].pool_lookup.is_some());
+}
+
+#[test]
+fn idle_wait_uses_short_interval_during_active_inbound_restore() {
+    use std::time::Duration;
+
+    let fixture = Fixture::new();
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    assert_eq!(worker.idle_wait(), Duration::from_millis(2));
+
+    let store = FakeStore::new(None);
+    worker.attach_store(Some(Box::new(store)));
+    assert_eq!(worker.idle_wait(), Duration::from_millis(2));
+
+    // Background outbound writes alone keep the 2 ms idle interval.
+    fake_store(&mut worker).outbound_in_flight = 2;
+    assert_eq!(worker.idle_wait(), Duration::from_millis(2));
+
+    // Active inbound restores use the 50 us handoff wait.
+    fake_store(&mut worker).inbound_in_flight = 1;
+    assert_eq!(worker.idle_wait(), Duration::from_micros(50));
+
+    // Completing the restore returns to the 2 ms idle interval.
+    fake_store(&mut worker).inbound_in_flight = 0;
+    assert_eq!(worker.idle_wait(), Duration::from_millis(2));
 }
 
 fn group_runtime(

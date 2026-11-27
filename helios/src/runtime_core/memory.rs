@@ -755,8 +755,12 @@ impl NativeModel {
             let (device, tier_host) = options.prefix_cache.headroom_with_inputs(
                 self.ranks.len(),
                 &layout,
-                active,
-                staging != 0,
+                crate::offload::PrepareInputs {
+                    max_active: active,
+                    input_staging: staging,
+                    shard: self.cluster().map(|cluster| (cluster.rank, cluster.world)),
+                    integrated: integrated > 0,
+                },
                 capture.then_some(minimum_pages),
             )?;
             let device = device

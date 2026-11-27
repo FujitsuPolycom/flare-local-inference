@@ -358,6 +358,29 @@ fn write_frames(mut stream: TcpStream, jobs: Receiver<Vec<u8>>, progress: Arc<Ou
 }
 
 impl Link {
+    /// Wait up to `timeout` for incoming bytes or connection close.
+    #[cfg(unix)]
+    pub(crate) fn wait_readable(&self, timeout: Duration) {
+        if self.broken.is_some() {
+            return;
+        }
+        use std::os::fd::AsRawFd as _;
+        let mut pollfd = libc::pollfd {
+            fd: self.stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = if timeout.is_zero() {
+            0
+        } else {
+            timeout.as_millis().clamp(1, i32::MAX as u128) as libc::c_int
+        };
+        // `POLLERR` and `POLLHUP` wake `poll` immediately so the next `receive()`
+        // drains `self.received` and surfaces the closed link.
+        // SAFETY: `pollfd` references one live socket descriptor owned by `self.stream`.
+        let _ = unsafe { libc::poll(&mut pollfd, 1, ms) };
+    }
+
     /// The next complete frame, if one has arrived.
     pub fn receive(&mut self) -> Result<Option<(u8, Vec<u8>)>> {
         if let Some(error) = &self.broken {
@@ -1251,12 +1274,22 @@ impl Peer {
             }
             self.forward()?;
             let (outbound, inbound) = self.staged.in_flight();
-            std::thread::sleep(if progressed || outbound + inbound > 0 {
-                BUSY
+            if progressed || outbound + inbound > 0 {
+                std::thread::sleep(BUSY);
             } else {
-                IDLE
-            });
+                self.wait_idle();
+            }
         }
+    }
+
+    #[cfg(unix)]
+    fn wait_idle(&self) {
+        self.link.wait_readable(IDLE);
+    }
+
+    #[cfg(not(unix))]
+    fn wait_idle(&self) {
+        std::thread::sleep(IDLE);
     }
 }
 

@@ -123,13 +123,15 @@ fn peer_registration_budget_fails_startup() {
         };
         let mut prepared = super::super::prepare_with_inputs(
             &options,
-            std::path::Path::new("model.safetensors"),
             [3; 32],
             vec![flare_selene::testing::geometry(64, &[("kv", 4096)], 4096)],
             vec![(0, 0)],
-            1,
-            0,
-            Some((1, 2)),
+            super::super::PrepareInputs {
+                max_active: 1,
+                input_staging: 0,
+                shard: Some((1, 2)),
+                integrated: false,
+            },
         )
         .unwrap();
         let super::super::Preparation::Store(resources) = &mut prepared else {

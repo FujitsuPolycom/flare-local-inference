@@ -704,3 +704,48 @@ fn space_pressure_survives_rank_events_and_aggregation() {
         transport.close().unwrap();
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn wait_readable_wakes_promptly_on_incoming_frame() {
+    let (a, b) = connected();
+    let mut reader = Link::new(a).unwrap();
+    let mut writer = Link::new(b).unwrap();
+    let sender = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(5));
+        writer.send(&Writer::new(CLOSE).finish()).unwrap();
+        writer
+    });
+    let started = Instant::now();
+    reader.wait_readable(Duration::from_millis(500));
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "wait_readable took {elapsed:?} instead of waking on incoming data"
+    );
+    let _writer = sender.join().unwrap();
+    assert_eq!(reader.receive().unwrap(), Some((CLOSE, Vec::new())));
+}
+
+#[cfg(unix)]
+#[test]
+fn wait_readable_waits_out_timeout_when_idle() {
+    let (a, b) = connected();
+    let mut reader = Link::new(a).unwrap();
+    let mut writer = Link::new(b).unwrap();
+    let sender = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(80));
+        writer.send(&Writer::new(CLOSE).finish()).unwrap();
+        writer
+    });
+    let started = Instant::now();
+    reader.wait_readable(Duration::from_millis(25));
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(15) && elapsed < Duration::from_millis(75),
+        "wait_readable returned after {elapsed:?} instead of waiting out its 25 ms timeout"
+    );
+    assert_eq!(reader.receive().unwrap(), None);
+    let _writer = sender.join().unwrap();
+    assert_eq!(reader.receive().unwrap(), Some((CLOSE, Vec::new())));
+}

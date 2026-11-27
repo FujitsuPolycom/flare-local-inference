@@ -689,9 +689,7 @@ impl ModelRuntime {
                         if let Some(rank) = prepared.geometry.first() {
                             worker_metrics.codec_placement(rank.placement);
                         }
-                        if let Some(warning) =
-                            prepared.intake_warning(worker_config.limits.max_active)
-                        {
+                        if let Some(warning) = prepared.intake_warning() {
                             if log_to_stderr { eprintln!("warning: {warning}"); }
                         }
                         crate::offload::open(prepared, gpu_cubins)
@@ -1195,6 +1193,14 @@ impl<'a> Worker<'a> {
     }
 
     fn idle_wait(&self) -> std::time::Duration {
+        if self
+            .store
+            .as_ref()
+            .is_some_and(|store| store.stats().inbound_in_flight > 0)
+            || self.scheduler.stats().inbound_waiting > 0
+        {
+            return std::time::Duration::from_micros(50);
+        }
         let now = std::time::Instant::now();
         if self
             .pending

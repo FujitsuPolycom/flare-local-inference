@@ -107,13 +107,15 @@ fn sharded_export_and_restore_use_each_ranks_real_record_file() {
         };
         let preparation = offload::prepare_with_inputs(
             &options,
-            &directory,
             [3; 32],
             vec![local.clone()],
             vec![(rank, 0)],
-            8,
-            0,
-            Some((rank, 2)),
+            offload::PrepareInputs {
+                max_active: 8,
+                input_staging: 0,
+                shard: Some((rank, 2)),
+                integrated: false,
+            },
             &IdentityRegistrar,
         )
         .unwrap();
@@ -246,13 +248,15 @@ fn sharded_join_rejects_mismatched_compression_modes() {
         };
         offload::prepare_with_inputs(
             &options,
-            &directory,
             [3; 32],
             vec![geo],
             vec![(rank, 0)],
-            8,
-            0,
-            Some((rank, 2)),
+            offload::PrepareInputs {
+                max_active: 8,
+                input_staging: 0,
+                shard: Some((rank, 2)),
+                integrated: false,
+            },
             &IdentityRegistrar,
         )
         .unwrap()
@@ -374,13 +378,15 @@ fn sharded_compressed_v4_store_fetch_truncate_and_restart_agree() {
         };
         let prep = offload::prepare_with_inputs(
             &options,
-            &directory,
             [3; 32],
             vec![local.clone()],
             vec![(rank, 0)],
-            8,
-            0,
-            Some((rank, 2)),
+            offload::PrepareInputs {
+                max_active: 8,
+                input_staging: 0,
+                shard: Some((rank, 2)),
+                integrated: false,
+            },
             &IdentityRegistrar,
         )
         .unwrap();
@@ -536,13 +542,15 @@ fn sharded_pool_with_compression_rejected_at_startup() {
         };
         let err = offload::prepare_with_inputs(
             &options,
-            std::path::Path::new("."),
             [1; 32],
             vec![local.clone()],
             vec![(0, 0)],
-            4,
-            0,
-            Some((0, 2)),
+            offload::PrepareInputs {
+                max_active: 4,
+                input_staging: 0,
+                shard: Some((0, 2)),
+                integrated: false,
+            },
             &IdentityRegistrar,
         )
         .err()

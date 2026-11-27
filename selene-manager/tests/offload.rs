@@ -126,12 +126,17 @@ fn startup_keeps_registration_through_attachment_and_store_drain() {
         )
         .unwrap();
     assert!(charges[0] > 0);
-    let prepared = prepare(
+    let prepared = prepare_with_inputs(
         &options,
-        std::path::Path::new("model.safetensors"),
         [3; 32],
         geometry,
         vec![(0, 0)],
+        PrepareInputs {
+            max_active: 1,
+            input_staging: 0,
+            shard: None,
+            integrated: false,
+        },
         &flare_selene::testing::IdentityRegistrar,
     )
     .unwrap();

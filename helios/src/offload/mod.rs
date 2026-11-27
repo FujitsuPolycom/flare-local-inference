@@ -28,7 +28,7 @@ use flare_selene::{CacheGeometry, HostStore};
 use crate::Result;
 
 pub use flare_selene::offload::{
-    KvCompression, PrefixCacheOffload, Preparation, Prepared, Resolved, Shared,
+    KvCompression, PrefixCacheOffload, Preparation, PrepareInputs, Prepared, Resolved, Shared,
     input_memory_bytes, parse_drain_on_shutdown, parse_max_age, parse_size,
 };
 
@@ -69,35 +69,19 @@ impl Binding {
     }
 }
 
-pub fn prepare(
-    options: &PrefixCacheOffload,
-    core: &std::path::Path,
-    identity: [u8; 32],
-    geometry: Vec<CacheGeometry>,
-    contexts: Vec<(usize, i32)>,
-) -> Result<Preparation> {
-    prepare_with_inputs(options, core, identity, geometry, contexts, 1, 0, None)
-}
-
 pub fn prepare_with_inputs(
     options: &PrefixCacheOffload,
-    core: &std::path::Path,
     identity: [u8; 32],
     geometry: Vec<CacheGeometry>,
     contexts: Vec<(usize, i32)>,
-    max_active: usize,
-    input_staging: u64,
-    shard: Option<(usize, usize)>,
+    inputs: PrepareInputs,
 ) -> Result<Preparation> {
     Ok(flare_selene::offload::prepare_with_inputs(
         options,
-        core,
         identity,
         geometry,
         contexts,
-        max_active,
-        input_staging,
-        shard,
+        inputs,
         &registrar::CudaRegistrar,
     )?)
 }

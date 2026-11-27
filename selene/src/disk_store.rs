@@ -61,6 +61,9 @@ pub const WINDOWS_IN_FLIGHT: usize = crate::shared::WINDOW_CREDITS as usize;
 pub const RECORDS_IN_FLIGHT: usize = 8;
 /// Leave room in the sharded transport's backlog for stores and fetches.
 const MAINTENANCE_IN_FLIGHT: usize = crate::shard::BACKLOG / 2;
+/// Consecutive `pump_all` passes with free disk-queue space before a queued
+/// unlink or truncate takes one disk slot ahead of inbound restores.
+const MAINTENANCE_DEFER_LIMIT: usize = 8;
 
 /// A record file as the disk index sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1500,6 +1503,8 @@ pub struct Staged {
     owners: HashMap<JobId, Owner>,
     /// Truncate and unlink jobs awaiting disk queue space.
     maintenance: VecDeque<(JobId, disk::Job)>,
+    /// Consecutive `pump_all` passes with disk space where queued maintenance won no slot.
+    maintenance_deferred: usize,
     events: Vec<TransportEvent>,
     closed: bool,
 }
@@ -1519,6 +1524,7 @@ impl Staged {
             completed_packed_reads: HashMap::new(),
             owners: HashMap::new(),
             maintenance: VecDeque::new(),
+            maintenance_deferred: 0,
             events: Vec::new(),
             closed: false,
         }
@@ -1779,24 +1785,42 @@ impl Staged {
     }
 
     fn pump_all(&mut self) {
-        while let Some((disk, _)) = self.maintenance.front()
+        if self.maintenance_deferred >= MAINTENANCE_DEFER_LIMIT
             && self.resources.disk_space()
+            && let Some((disk, job)) = self.maintenance.pop_front()
         {
-            let disk = *disk;
-            let (_, job) = self.maintenance.pop_front().unwrap();
+            self.maintenance_deferred = 0;
             if let Err(error) = self.resources.submit_disk(job) {
                 self.finish_maintenance(disk, Err(error));
             }
+        }
+        let had_space = self.resources.disk_space();
+        let before_next = self.resources.next_disk;
+        // Prioritize interactive inbound restores ahead of background writes and maintenance;
+        // sorting `JobId`s grants scarce disk slots in deterministic FIFO admission order.
+        let mut ids: Vec<JobId> = self.inbound.keys().copied().collect();
+        ids.sort_unstable();
+        for id in ids {
+            self.pump_inbound(id);
         }
         let mut ids: Vec<JobId> = self.outbound.keys().copied().collect();
         ids.sort_unstable();
         for id in ids {
             self.pump_outbound(id);
         }
-        let mut ids: Vec<JobId> = self.inbound.keys().copied().collect();
-        ids.sort_unstable();
-        for id in ids {
-            self.pump_inbound(id);
+        let mut drained_maintenance = false;
+        while self.resources.disk_space()
+            && let Some((disk, job)) = self.maintenance.pop_front()
+        {
+            drained_maintenance = true;
+            if let Err(error) = self.resources.submit_disk(job) {
+                self.finish_maintenance(disk, Err(error));
+            }
+        }
+        if drained_maintenance || self.maintenance.is_empty() {
+            self.maintenance_deferred = 0;
+        } else if had_space || self.resources.next_disk != before_next {
+            self.maintenance_deferred += 1;
         }
     }
 
@@ -8009,5 +8033,494 @@ mod tests {
         assert!(is_packed_content_error(&stored_bad));
         assert!(is_packed_content_error(&orig_bad));
         assert!(is_packed_content_error(&corrupt_pkt));
+    }
+
+    #[test]
+    fn staged_pump_all_prioritizes_inbound_ahead_of_outbound_and_maintenance() {
+        let Some(directory) = test_directory("disk-store", "pump-priority") else {
+            return;
+        };
+        let geometry = geometry();
+        let h_in = history(PAGE_TOKENS);
+        let in_header = header(&geometry, &h_in, PAGE_TOKENS, None);
+        let in_path = directory.join(record::file_name(&in_header.key));
+        let in_tmp = directory.join(record::temporary_name(&in_header.key));
+        let h_out = history(2 * PAGE_TOKENS);
+        let out_header = header(&geometry, &h_out, 2 * PAGE_TOKENS, None);
+        let out_path = directory.join(record::file_name(&out_header.key));
+        let out_tmp = directory.join(record::temporary_name(&out_header.key));
+        let stale_path = directory.join("stale.ckpt");
+        fs::write(&stale_path, vec![0u8; 4096]).unwrap();
+
+        let mut pool = host_pool();
+        let src_pages = page_slabs(&mut pool, in_header.tail_pages as usize, 10);
+        let src_row = row_slab(&mut pool, 20);
+        let out_pages = page_slabs(&mut pool, out_header.tail_pages as usize, 30);
+        let out_row = row_slab(&mut pool, 40);
+        let dst_pages = page_slabs(&mut pool, in_header.tail_pages as usize, 0);
+        let dst_row = row_slab(&mut pool, 0);
+
+        let mut staged = Staged::new(
+            None,
+            stopped_transfers(),
+            DiskThread::start("pump-priority").unwrap(),
+        );
+        staged
+            .write_from(
+                JobId(1),
+                in_header.clone(),
+                in_tmp,
+                in_path.clone(),
+                addresses(&pool, &src_pages),
+                Some(vec![pool.slot_address(src_row)]),
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            &transport_events(&mut staged, 1)[..],
+            [TransportEvent::Stored {
+                id: JobId(1),
+                result: Ok(_),
+                ..
+            }]
+        ));
+        assert!(settled(&staged));
+
+        // Saturate the disk queue bookkeeping so queued jobs wait for `pump_all`.
+        staged.resources.disk_outstanding = disk::QUEUE_DEPTH;
+        staged.unlink(JobId(10), stale_path.clone()).unwrap();
+        staged
+            .write_from(
+                JobId(11),
+                out_header.clone(),
+                out_tmp,
+                out_path.clone(),
+                addresses(&pool, &out_pages),
+                Some(vec![pool.slot_address(out_row)]),
+                None,
+            )
+            .unwrap();
+        staged
+            .read_into(
+                JobId(12),
+                in_path.clone(),
+                in_header.clone(),
+                0,
+                addresses(&pool, &dst_pages),
+                Some(vec![pool.slot_address(dst_row)]),
+            )
+            .unwrap();
+        assert_eq!(staged.maintenance.len(), 1);
+        assert!(staged.outbound[&JobId(11)].file == TemporaryFile::Unsubmitted);
+        assert!(staged.inbound[&JobId(12)].segments[0].state == FileState::Unopened);
+
+        // First three freed slots go to inbound (Open, ReadPages, ReadRow).
+        let mut submitted = 0usize;
+        for expected_inbound in 1..=3 {
+            staged.resources.disk_outstanding = disk::QUEUE_DEPTH - 1;
+            staged.pump_all();
+            submitted += 1;
+            assert_eq!(staged.inbound[&JobId(12)].outstanding, expected_inbound);
+            assert!(staged.inbound[&JobId(12)].segments[0].state == FileState::Opened);
+            assert!(staged.outbound[&JobId(11)].file == TemporaryFile::Unsubmitted);
+            assert_eq!(staged.maintenance.len(), 1);
+        }
+
+        // Next three freed slots go to outbound (Create, WritePages, WriteRow) before maintenance.
+        for expected_outbound in 1..=3 {
+            staged.resources.disk_outstanding = disk::QUEUE_DEPTH - 1;
+            staged.pump_all();
+            submitted += 1;
+            assert_eq!(staged.outbound[&JobId(11)].outstanding, expected_outbound);
+            assert!(staged.outbound[&JobId(11)].file == TemporaryFile::Creating);
+            assert_eq!(staged.maintenance.len(), 1);
+        }
+
+        // Once inbound and outbound have no immediately submittable disk jobs, maintenance runs.
+        staged.resources.disk_outstanding = disk::QUEUE_DEPTH - 1;
+        staged.pump_all();
+        submitted += 1;
+        assert!(staged.maintenance.is_empty());
+
+        // Restore actual in-flight count and let all three jobs complete cleanly.
+        staged.resources.disk_outstanding = submitted;
+        let events = transport_events(&mut staged, 3);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            TransportEvent::Fetched {
+                id: JobId(12),
+                result: Ok(_)
+            }
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            TransportEvent::Stored {
+                id: JobId(11),
+                result: Ok(_),
+                ..
+            }
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            TransportEvent::Unlinked {
+                id: JobId(10),
+                result: Ok(())
+            }
+        )));
+        assert!(settled(&staged));
+        assert!(!stale_path.exists());
+        assert!(out_path.is_file());
+        staged.close().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn sustained_inbound_burst_still_drains_maintenance_and_reclaims_bytes() {
+        let Some(directory) = test_directory("disk-store", "burst-maintenance") else {
+            return;
+        };
+        let geometry = geometry();
+        let layout = Layout::new(&geometry).unwrap();
+        let intake = crate::offload::intake_slots(&layout, 8);
+        let pool = SlabPool::new(layout.page_record_bytes, intake + 64, intake).unwrap();
+        let (copier, gpu) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
+        let guard = crate::testing::directory_lock(&directory).unwrap();
+        let mut store = DiskStore::new(
+            guard,
+            IDENTITY,
+            FINGERPRINT,
+            1 << 30,
+            geometry.clone(),
+            Vec::new(),
+            Box::new(Staged::new(
+                Some(pool),
+                copier,
+                DiskThread::start("burst-maintenance").unwrap(),
+            )),
+        )
+        .unwrap();
+
+        const PAGES: u32 = 4;
+        let mut ids = Ids::new();
+        let mut histories = Vec::new();
+        let mut keys = Vec::new();
+        for index in 0..4u32 {
+            let mut h = PrefixHistory::new(IDENTITY);
+            h.append(
+                &vec![index + 1; PAGES as usize * PAGE_TOKENS as usize],
+                &[],
+            )
+            .unwrap();
+            let base = index * PAGES;
+            for page in 0..PAGES {
+                gpu.pages.lock().unwrap().insert(
+                    base + page,
+                    vec![(index * 17 + page + 3) as u8; layout.page_record_bytes as usize],
+                );
+            }
+            gpu.rows.lock().unwrap().insert(
+                index,
+                vec![(index * 29 + 7) as u8; layout.row_record_bytes as usize],
+            );
+            let ckpt = checkpoint(
+                &mut ids,
+                &h,
+                PAGES as u64 * PAGE_TOKENS,
+                None,
+                pages(base..base + PAGES),
+                PAGES as usize,
+                StateSlotId(index),
+            );
+            keys.push(ckpt.key);
+            histories.push(h);
+            assert_eq!(store.store(&ckpt).unwrap(), StoreOutcome::Queued);
+        }
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut stored_count = 0usize;
+        while stored_count < 4 {
+            let events = poll_until(&mut store, deadline, |e| {
+                matches!(e, StoreEvent::Stored { .. })
+            });
+            for event in events {
+                if let StoreEvent::Stored { result, .. } = event {
+                    result.unwrap();
+                    stored_count += 1;
+                }
+            }
+        }
+        let record_bytes = store.record(&keys[0]).unwrap().bytes;
+        let unlinked_paths = [
+            store.record(&keys[0]).unwrap().path.clone(),
+            store.record(&keys[1]).unwrap().path.clone(),
+        ];
+        let close_unlink_path = store.record(&keys[3]).unwrap().path.clone();
+        let limit = 4 * record_bytes;
+        let budget = super::super::input::DiskBudget::new(limit, limit);
+        store.set_limit(limit);
+        store.share_budget(budget.clone());
+        assert_eq!(store.free_retention_bytes(), 0);
+        assert!(!budget.reserve_checkpoint(1));
+
+        // Hold the disk queue full while queueing two unlinks and continuous inbound fetches
+        // so every `pump_all` pass sees ready inbound work competing for one freed slot.
+        store.transport.staged_mut().unwrap().resources.disk_outstanding = disk::QUEUE_DEPTH;
+        for &victim in &keys[..2] {
+            for node in store.index.remove(&victim, |_| false).unwrap() {
+                store.unlink(node).unwrap();
+            }
+        }
+        assert_eq!(store.pending_bytes(), 2 * record_bytes);
+        assert_eq!(store.free_retention_bytes(), 2 * record_bytes);
+        // Pending unlinks stay charged against the shared retention budget until completion.
+        assert!(!store.make_room(1).unwrap());
+        assert!(!budget.reserve_checkpoint(1));
+        assert_eq!(store.transport.staged().unwrap().maintenance.len(), 2);
+
+        let mut submitted = 0usize;
+        let mut next_ticket_page = 100u32;
+        let mut next_slot = 10u32;
+        let enqueue_burst_fetches =
+            |store: &mut DiskStore, next_page: &mut u32, next_slot: &mut u32| {
+                while store.stats().inbound_in_flight < 4 {
+                    let target = if store.stats().inbound_in_flight % 2 == 0 {
+                        2
+                    } else {
+                        3
+                    };
+                    if store.inbound.values().any(|inb| inb.key == keys[target]) {
+                        break;
+                    }
+                    let hit = store.lookup(&histories[target], 0, u64::MAX).unwrap();
+                    let p = *next_page;
+                    *next_page += PAGES;
+                    let s = *next_slot;
+                    *next_slot += 1;
+                    store
+                        .fetch(
+                            hit,
+                            InboundTicket {
+                                key: keys[target],
+                                pages: pages(p..p + PAGES),
+                                slot: StateSlotId(s),
+                            },
+                        )
+                        .unwrap();
+                }
+            };
+        enqueue_burst_fetches(&mut store, &mut next_ticket_page, &mut next_slot);
+
+        // Add host-buffer reads so inbound has more than `2 * MAINTENANCE_DEFER_LIMIT`
+        // ready disk submissions waiting in `staged.inbound`.
+        let mut host = host_pool();
+        let keep_header = store.record(&keys[2]).unwrap().header.clone();
+        let keep_path = store.record(&keys[2]).unwrap().path.clone();
+        for extra in 0..8u64 {
+            let dst_pages = page_slabs(&mut host, PAGES as usize, 0);
+            let dst_row = row_slab(&mut host, 0);
+            store
+                .transport
+                .staged_mut()
+                .unwrap()
+                .read_into(
+                    JobId(500 + extra),
+                    keep_path.clone(),
+                    keep_header.clone(),
+                    0,
+                    addresses(&host, &dst_pages),
+                    Some(vec![host.slot_address(dst_row)]),
+                )
+                .unwrap();
+        }
+
+        for pass in 1..=(MAINTENANCE_DEFER_LIMIT + 1) {
+            let staged = store.transport.staged_mut().unwrap();
+            staged.resources.disk_outstanding = disk::QUEUE_DEPTH - 1;
+            staged.pump_all();
+            submitted += 1;
+            if pass <= MAINTENANCE_DEFER_LIMIT {
+                assert_eq!(staged.maintenance.len(), 2, "early drain on pass {pass}");
+            } else {
+                assert_eq!(staged.maintenance.len(), 1);
+            }
+        }
+        for pass in 1..=(MAINTENANCE_DEFER_LIMIT + 1) {
+            let staged = store.transport.staged_mut().unwrap();
+            staged.resources.disk_outstanding = disk::QUEUE_DEPTH - 1;
+            staged.pump_all();
+            submitted += 1;
+            if pass <= MAINTENANCE_DEFER_LIMIT {
+                assert_eq!(staged.maintenance.len(), 1, "early drain on pass {pass}");
+            } else {
+                assert!(staged.maintenance.is_empty());
+            }
+        }
+
+        // Release real outstanding accounting and keep restores active while completions reclaim budget.
+        store.transport.staged_mut().unwrap().resources.disk_outstanding = submitted;
+        while store.pending_bytes() > 0 || store.stats().inbound_in_flight > 0 {
+            assert!(Instant::now() < deadline, "burst maintenance reclamation stalled");
+            let mut events = Vec::new();
+            store.poll(&mut events).unwrap();
+            if store.pending_bytes() > 0 {
+                enqueue_burst_fetches(&mut store, &mut next_ticket_page, &mut next_slot);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        while !settled(store.transport.staged().unwrap()) {
+            assert!(Instant::now() < deadline, "staged host reads stalled");
+            let mut ignored = Vec::new();
+            store.transport.poll(&mut ignored).unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert_eq!(store.pending_bytes(), 0);
+        assert_eq!(store.free_retention_bytes(), 2 * record_bytes);
+        assert!(store.make_room(2 * record_bytes).unwrap());
+        assert!(budget.reserve_checkpoint(record_bytes));
+        for path in &unlinked_paths {
+            assert!(!path.exists(), "{} still exists after unlink", path.display());
+        }
+
+        // Verify `store.close()` drains queued maintenance alongside an active restore.
+        let hit = store.lookup(&histories[2], 0, u64::MAX).unwrap();
+        store
+            .fetch(
+                hit,
+                InboundTicket {
+                    key: keys[2],
+                    pages: pages(next_ticket_page..next_ticket_page + PAGES),
+                    slot: StateSlotId(next_slot),
+                },
+            )
+            .unwrap();
+        for node in store.index.remove(&keys[3], |_| false).unwrap() {
+            store.unlink(node).unwrap();
+        }
+        assert_eq!(store.transport.staged().unwrap().maintenance.len(), 1);
+        store.close().unwrap();
+        assert!(!close_unlink_path.exists());
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn integrated_two_window_intake_serializes_concurrent_unique_prefix_restores() {
+        let Some(directory) = test_directory("disk-store", "two-window-burst") else {
+            return;
+        };
+        let geometry = geometry();
+        let layout = Layout::new(&geometry).unwrap();
+        let bounded_slots = crate::offload::intake_slots(&layout, 1);
+        let pool = SlabPool::new(layout.page_record_bytes, bounded_slots, bounded_slots).unwrap();
+        let (copier, gpu) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
+        let guard = crate::testing::directory_lock(&directory).unwrap();
+        let mut store = DiskStore::new(
+            guard,
+            IDENTITY,
+            FINGERPRINT,
+            1 << 30,
+            geometry,
+            Vec::new(),
+            Box::new(Staged::new(
+                Some(pool),
+                copier,
+                DiskThread::start("two-window-burst").unwrap(),
+            )),
+        )
+        .unwrap();
+
+        // Each prefix spans two windows (`WINDOW_PAGES + 8`), so four concurrent restores
+        // require eight windows and serialize through `intake_slots(&layout, 1)`.
+        const PREFIXES: usize = 4;
+        const PAGES: usize = WINDOW_PAGES + 8;
+        let page_fill = |prefix: usize, page: u32| ((prefix as u32 * 31 + page * 7 + 5) % 251) as u8;
+        let row_fill = |prefix: usize| (prefix as u8).wrapping_mul(37).wrapping_add(9);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut ids = Ids::new();
+        let mut entries = Vec::with_capacity(PREFIXES);
+
+        for prefix in 0..PREFIXES {
+            let mut h = PrefixHistory::new(IDENTITY);
+            h.append(&vec![(prefix + 11) as u32; PAGES * PAGE_TOKENS as usize], &[])
+                .unwrap();
+            let base = (prefix * PAGES) as u32;
+            for page in 0..PAGES as u32 {
+                gpu.pages.lock().unwrap().insert(
+                    base + page,
+                    vec![page_fill(prefix, page); layout.page_record_bytes as usize],
+                );
+            }
+            gpu.rows.lock().unwrap().insert(
+                prefix as u32,
+                vec![row_fill(prefix); layout.row_record_bytes as usize],
+            );
+            let ckpt = checkpoint(
+                &mut ids,
+                &h,
+                PAGES as u64 * PAGE_TOKENS,
+                None,
+                pages(base..base + PAGES as u32),
+                PAGES,
+                StateSlotId(prefix as u32),
+            );
+            assert_eq!(store.store(&ckpt).unwrap(), StoreOutcome::Queued);
+            assert!(matches!(
+                &poll_until(&mut store, deadline, |e| matches!(e, StoreEvent::Stored { .. }))[..],
+                [StoreEvent::Stored { result: Ok(_), .. }]
+            ));
+            entries.push((h, ckpt.key));
+        }
+
+        for (prefix, (h, key)) in entries.iter().enumerate() {
+            let hit = store.lookup(h, 0, u64::MAX).unwrap();
+            let dst_base = 1000 + (prefix * PAGES) as u32;
+            store
+                .fetch(
+                    hit,
+                    InboundTicket {
+                        key: *key,
+                        pages: pages(dst_base..dst_base + PAGES as u32),
+                        slot: StateSlotId(100 + prefix as u32),
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(store.stats().inbound_in_flight, PREFIXES);
+
+        let mut completed = 0usize;
+        while completed < PREFIXES {
+            for event in poll_until(&mut store, deadline, |e| {
+                matches!(e, StoreEvent::Fetched { .. })
+            }) {
+                if let StoreEvent::Fetched { result, .. } = event {
+                    result.unwrap();
+                    completed += 1;
+                }
+            }
+        }
+        assert_eq!(store.stats().fetch_failed, 0);
+        assert_eq!(
+            store.transport.staged().unwrap().pool().unwrap().free_slots(),
+            bounded_slots
+        );
+
+        let (gpu_pages, gpu_rows) = (gpu.pages.lock().unwrap(), gpu.rows.lock().unwrap());
+        for prefix in 0..PREFIXES {
+            let dst_base = 1000 + (prefix * PAGES) as u32;
+            for page in 0..PAGES as u32 {
+                assert_eq!(
+                    gpu_pages[&(dst_base + page)],
+                    vec![page_fill(prefix, page); layout.page_record_bytes as usize]
+                );
+            }
+            assert_eq!(
+                gpu_rows[&(100 + prefix as u32)],
+                vec![row_fill(prefix); layout.row_record_bytes as usize]
+            );
+        }
+        drop((gpu_pages, gpu_rows));
+        store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
     }
 }

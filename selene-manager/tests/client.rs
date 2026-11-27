@@ -3203,13 +3203,15 @@ fn offload_startup_and_restore_cover_every_tier_combination() {
                 }
                 let preparation = prepare_with_inputs(
                     &options,
-                    std::path::Path::new("unused"),
                     [7; 32],
                     geometry.clone(),
                     vec![(0, 0)],
-                    8,
-                    0,
-                    None,
+                    PrepareInputs {
+                        max_active: 8,
+                        input_staging: 0,
+                        shard: None,
+                        integrated: false,
+                    },
                     registrar.as_ref(),
                 )
                 .unwrap();
@@ -3409,7 +3411,7 @@ fn prepared_pool_store(
     warm_slots: usize,
     drain: Duration,
 ) -> (Box<dyn HostStore>, GpuMemory, GpuMemory) {
-    use flare_selene::offload::{PrefixCacheOffload, Startup, open, prepare};
+    use flare_selene::offload::{PrefixCacheOffload, PrepareInputs, Startup, open, prepare_with_inputs};
     use flare_selene::pool::{Budget, PoolBuilder, PoolOptions};
 
     let mut geometry = geo();
@@ -3432,7 +3434,20 @@ fn prepared_pool_store(
         peers: None,
         disk: false,
     }, Arc::new(OkRegistrar), Ok).unwrap();
-    let prepared = prepare(&options, "unused".as_ref(), [7; 32], geometry, vec![(0, 0)], &OkRegistrar).unwrap();
+    let prepared = prepare_with_inputs(
+        &options,
+        [7; 32],
+        geometry,
+        vec![(0, 0)],
+        PrepareInputs {
+            max_active: 1,
+            input_staging: 0,
+            shard: None,
+            integrated: false,
+        },
+        &OkRegistrar,
+    )
+    .unwrap();
     let factory = Copiers::default();
     startup.attach(prepared, &factory).unwrap();
     let mut store = open(startup.binding(0).unwrap().take().unwrap(), &factory).unwrap();

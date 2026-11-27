@@ -102,15 +102,20 @@ impl PrefixCacheOffload {
         Ok(())
     }
 
+    fn disk_enabled(&self) -> bool {
+        self.disk.is_some() && self.disk_limit != Some(0)
+    }
+
     pub fn enabled(&self) -> bool {
-        self.memory_bytes.unwrap_or(0) != 0
-            || (self.disk.is_some() && self.disk_limit != Some(0))
-            || self.pool.is_some()
+        self.memory_bytes.unwrap_or(0) != 0 || self.disk_enabled() || self.pool.is_some()
     }
 
     pub fn pool_only(&self) -> bool {
-        self.pool.is_some() && self.memory_bytes.unwrap_or(0) == 0
-            && (self.disk.is_none() || self.disk_limit == Some(0))
+        self.pool.is_some() && self.memory_bytes.unwrap_or(0) == 0 && !self.disk_enabled()
+    }
+
+    pub fn disk_only(&self) -> bool {
+        self.memory_bytes.unwrap_or(0) == 0 && self.disk_enabled()
     }
 
     /// `local_pages` is the largest GPU page capacity when all ranks share this process.
@@ -118,28 +123,65 @@ impl PrefixCacheOffload {
         &self,
         ranks: usize,
         layout: &Layout,
-        max_active: usize,
-        inputs: bool,
+        inputs: PrepareInputs,
         local_pages: Option<u64>,
+    ) -> Result<(u64, u64)> {
+        self.headroom_inner(ranks, layout, inputs, local_pages, None)
+    }
+
+    #[cfg(test)]
+    fn headroom_for_test_budget(
+        &self,
+        ranks: usize,
+        layout: &Layout,
+        inputs: PrepareInputs,
+        local_pages: Option<u64>,
+        budget: u64,
+    ) -> Result<(u64, u64)> {
+        self.headroom_inner(ranks, layout, inputs, local_pages, Some(budget))
+    }
+
+    fn headroom_inner(
+        &self,
+        ranks: usize,
+        layout: &Layout,
+        inputs: PrepareInputs,
+        local_pages: Option<u64>,
+        budget_override: Option<u64>,
     ) -> Result<(u64, u64)> {
         if !self.enabled() {
             return Ok((0, 0));
         }
         let memory = self.memory_bytes.unwrap_or(0);
-        let disk = self.disk.is_some() && self.disk_limit != Some(0);
+        let disk = self.disk_enabled();
         let capture = local_pages.filter(|_| self.pool_only());
         let intake = if let Some(pages) = capture {
-            let chain = pages.checked_add(layout.row_slots() as u64)
+            let chain = pages
+                .checked_add(layout.row_slots() as u64)
                 .ok_or("pool capture slot count overflow")?;
-            let budget = host_pool_budget(0)? / layout.page_record_bytes;
+            let budget = match budget_override {
+                Some(budget) => budget,
+                None => host_pool_budget(0)?,
+            } / layout.page_record_bytes;
             if chain > budget {
                 return Err("host budget cannot hold a full pool capture".into());
             }
-            chain.max(intake_slots(layout, max_active) as u64).min(budget)
+            chain
+                .max(intake_slots(layout, inputs.max_active) as u64)
+                .min(budget)
         } else if memory != 0 || disk {
-            intake_slots(layout, max_active)
-                .min((host_pool_budget(memory)? / layout.page_record_bytes) as usize)
-                .max(intake_slots(layout, 1)) as u64
+            let budget = match budget_override {
+                Some(budget) => budget,
+                None => host_pool_budget(memory)?,
+            } / layout.page_record_bytes;
+            target_intake_slots(
+                layout,
+                inputs.max_active,
+                self.disk_only(),
+                inputs.integrated,
+            )
+            .min(budget as usize)
+            .max(intake_slots(layout, 1)) as u64
         } else {
             0
         };
@@ -149,7 +191,7 @@ impl PrefixCacheOffload {
         let host = memory
             .checked_add(intake)
             .ok_or("prefix cache host memory overflows the device budget")?;
-        let pinned = memory - input_memory_bytes(memory, inputs);
+        let pinned = memory - input_memory_bytes(memory, inputs.input_staging != 0);
         let mapped = if disk || self.pool.is_some() {
             pinned + intake
         } else {
@@ -174,6 +216,25 @@ impl PrefixCacheOffload {
 /// Slots for two publication bursts and two streaming windows.
 pub fn intake_slots(layout: &Layout, max_active: usize) -> usize {
     2 * max_active * layout.row_slots() + 2 * slab::WINDOW_PAGES
+}
+
+/// Target intake slot count for local tiers before clamping to the host budget
+/// and the `intake_slots(layout, 1)` two-window floor.
+///
+/// Disk-only offload on an integrated-memory device (`CU_DEVICE_ATTRIBUTE_INTEGRATED`)
+/// shares physical RAM with the GPU KV cache, so it targets two streaming windows and
+/// two continuation rows (`intake_slots(layout, 1)`) rather than scaling with `max_active`.
+fn target_intake_slots(
+    layout: &Layout,
+    max_active: usize,
+    disk_only: bool,
+    integrated: bool,
+) -> usize {
+    if integrated && disk_only {
+        intake_slots(layout, 1)
+    } else {
+        intake_slots(layout, max_active)
+    }
 }
 
 /// Transfer streams, events, and their driver allocations on each GPU; eight streams
@@ -247,6 +308,20 @@ pub struct Resolved {
     pub disk_limit: u64,
 }
 
+/// Runtime sizing and topology inputs for [`prepare_with_inputs`].
+#[derive(Clone, Copy, Debug)]
+pub struct PrepareInputs {
+    /// Maximum concurrent active sequences (`max_active`) for intake row sizing.
+    pub max_active: usize,
+    /// Bounded ordinary-memory bytes reserved for serialized prepared inputs (`0` when text-only).
+    pub input_staging: u64,
+    /// Local `(rank, world)` identity when multi-host ranks run in separate processes.
+    pub shard: Option<(usize, usize)>,
+    /// Whether any local rank's device reports integrated memory (`CU_DEVICE_ATTRIBUTE_INTEGRATED`);
+    /// bounds disk-only intake on shared-memory GPUs.
+    pub integrated: bool,
+}
+
 /// Host resources the loader prepares once per process and the model worker
 /// turns into a store: registered pools, the scanned record directory, and
 /// every rank's geometry and CUDA context.
@@ -262,6 +337,8 @@ pub struct Prepared {
     pub contexts: Vec<(usize, i32)>,
     pub memory_pool: Option<slab::SlabPool>,
     pub warm_bytes: u64,
+    required_intake: usize,
+    sized_concurrency: usize,
     rank_process: bool,
     pub scanned: Vec<record::Scanned>,
     pub directory_lock: Option<record::DirectoryLock>,
@@ -300,12 +377,13 @@ impl Preparation {
 }
 
 impl Prepared {
-    pub fn intake_warning(&self, max_concurrency: usize) -> Option<String> {
+    pub fn intake_warning(&self) -> Option<String> {
         let pool = self.memory_pool.as_ref()?;
         if pool.intake_slots() == 0 {
             return None;
         }
-        let required = intake_slots(&self.layout, max_concurrency);
+        let required = self.required_intake;
+        let max_concurrency = self.sized_concurrency;
         (pool.intake_slots() < required).then(|| {
             let bytes = required as u64 * self.layout.page_record_bytes;
             format!(
@@ -439,42 +517,28 @@ impl std::fmt::Debug for Binding {
     }
 }
 
-/// Resolve the settings against the core and host, map and register the
+/// Resolve the settings against the geometry and host, map and register the
 /// pools with rank zero's context current, and scan the record directory.
-/// Without a disk or pool tier the CPU never reads a record, so the memory pool is
-/// split by rank and each device maps only its part.
-///
-/// `core` is the core file, beside which the default record directory
-/// would be created once derived defaults are enabled.
-pub fn prepare(
-    options: &PrefixCacheOffload,
-    core: &std::path::Path,
-    identity: [u8; 32],
-    geometry: Vec<CacheGeometry>,
-    contexts: Vec<(usize, i32)>,
-    registrar: &dyn crate::HostRegistrar,
-) -> Result<Preparation> {
-    prepare_with_inputs(
-        options, core, identity, geometry, contexts, 1, 0, None, registrar,
-    )
-}
-
+/// Without a disk or pool tier (and with compression `off`) the CPU never reads
+/// a record, so the memory pool is split by rank and each device maps only its part.
 pub fn prepare_with_inputs(
     options: &PrefixCacheOffload,
-    core: &std::path::Path,
     identity: [u8; 32],
     mut geometry: Vec<CacheGeometry>,
     contexts: Vec<(usize, i32)>,
-    max_active: usize,
-    input_staging: u64,
-    shard: Option<(usize, usize)>,
+    inputs: PrepareInputs,
     registrar: &dyn crate::HostRegistrar,
 ) -> Result<Preparation> {
+    let PrepareInputs {
+        max_active,
+        input_staging,
+        shard,
+        integrated,
+    } = inputs;
     options.validate_compression()?;
     if !options.enabled() {
         return Ok(Preparation::None("disabled".to_owned()));
     }
-    let _ = core;
     for rank in &mut geometry {
         rank.placement = options.compression;
     }
@@ -492,11 +556,7 @@ pub fn prepare_with_inputs(
     }
     options.validate_topology(shard.is_some())?;
     let mut notes = Vec::new();
-    let directory = match options
-        .disk
-        .as_ref()
-        .filter(|_| options.disk_limit != Some(0))
-    {
+    let directory = match options.disk.as_ref().filter(|_| options.disk_enabled()) {
         None => None,
         Some(base) => {
             let directory = base.join(record::directory_name(&identity, &fingerprint));
@@ -524,6 +584,18 @@ pub fn prepare_with_inputs(
         notes.insert(0, "disabled".to_owned());
         return Ok(Preparation::None(notes.join("; ")));
     }
+    let effective = PrefixCacheOffload {
+        disk: directory.clone(),
+        disk_limit: Some(disk_limit),
+        ..options.clone()
+    };
+    let sized_concurrency = if integrated && effective.disk_only() {
+        1
+    } else {
+        max_active
+    };
+    let required_intake =
+        target_intake_slots(&layout, max_active, effective.disk_only(), integrated);
     let directory_lock = directory
         .as_deref()
         .map(record::DirectoryLock::acquire)
@@ -535,14 +607,13 @@ pub fn prepare_with_inputs(
     let input_memory = input_memory_bytes(memory_bytes, input_staging != 0);
     let checkpoint_memory = memory_bytes - input_memory;
     let local_pages = geometry.iter().map(|rank| rank.page_capacity).max().filter(|_| shard.is_none());
-    let capture = local_pages.is_some() && options.pool_only();
+    let capture = local_pages.is_some() && effective.pool_only();
     let memory_pool = (capture || checkpoint_memory != 0 || directory.is_some())
         .then(|| {
-            let (_, host) = options.headroom_with_inputs(
+            let (_, host) = effective.headroom_with_inputs(
                 contexts.len(),
                 &layout,
-                max_active,
-                input_staging != 0,
+                inputs,
                 local_pages,
             )?;
             let transfer_slots = (host - memory_bytes) / layout.page_record_bytes;
@@ -550,8 +621,8 @@ pub fn prepare_with_inputs(
             let bytes = (checkpoint_memory / layout.page_record_bytes + transfer_slots) * layout.page_record_bytes;
             // Shared and compressed records must be readable by the CPU.
             let pool = if directory.is_none()
-                && options.pool.is_none()
-                && options.compression == KvCompression::Off
+                && effective.pool.is_none()
+                && effective.compression == KvCompression::Off
             {
                 slab::SlabPool::sized_by_rank(&layout, bytes, intake, &contexts, registrar)?
             } else {
@@ -597,6 +668,8 @@ pub fn prepare_with_inputs(
         contexts,
         memory_pool,
         warm_bytes: checkpoint_memory,
+        required_intake,
+        sized_concurrency,
         rank_process: shard.is_some(),
         scanned,
         directory_lock,
@@ -635,6 +708,8 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
         contexts,
         memory_pool,
         warm_bytes,
+        required_intake: _,
+        sized_concurrency: _,
         rank_process: _,
         scanned,
         directory_lock,
