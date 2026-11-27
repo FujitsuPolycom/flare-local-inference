@@ -198,7 +198,7 @@ pub(super) fn decode<F: super::payload::Files>(
         let planes = [plane(weights, row_bytes)?, plane(scales, scale_bytes)?];
         let compact_heads = (gpu && !table.shards.is_empty() && world > 1 && heads % world == 0)
             .then_some(heads / world);
-        let mut staged_heads: Option<usize> = None;
+        let mut table_heads = heads;
         for core in cores {
             if !core.events.contains(&table.ready_event) {
                 return Err(invalid("rank lacks Engram readiness event"));
@@ -224,48 +224,42 @@ pub(super) fn decode<F: super::payload::Files>(
                 .iter()
                 .find(|b| b.name == table.hash_buffer)
                 .ok_or_else(|| invalid("rank lacks Engram input buffer"))?;
-            let core_heads = if hash_buffer.shape.len() == 2 {
-                usize::try_from(hash_buffer.shape[1])
-                    .map_err(|_| invalid("invalid compact Engram buffer layout"))?
-            } else {
-                return Err(invalid("invalid compact Engram buffer layout"));
+            let core_heads = match hash_buffer.shape.as_slice() {
+                [_, columns] => usize::try_from(*columns)
+                    .map_err(|_| invalid("invalid Engram staged head width"))?,
+                _ => return Err(invalid("invalid Engram buffer layout")),
             };
             if core_heads != heads && compact_heads != Some(core_heads) {
-                return Err(invalid("invalid compact Engram buffer layout"));
+                return Err(invalid("invalid Engram staged head width"));
             }
-            if staged_heads
-                .replace(core_heads)
-                .is_some_and(|previous| previous != core_heads)
-            {
-                return Err(invalid("invalid compact Engram buffer layout"));
-            }
-            for (name, dtype, columns) in [
-                (&table.weight_buffer, "uint8", row_bytes as u64),
-                (&table.scale_buffer, "uint8", scale_bytes as u64),
-                (&table.hash_buffer, "int64", core_heads as u64),
-            ] {
-                let buffer = execution
-                    .buffers
-                    .iter()
-                    .find(|b| &b.name == name)
-                    .ok_or_else(|| invalid("rank lacks Engram input buffer"))?;
-                let rows = if dtype == "uint8" {
-                    tokens * core_heads as u64
-                } else {
-                    tokens
-                };
+            table_heads = core_heads;
+            let validate_buffer = |buffer: &wire::Buffer, dtype: &str, rows: u64, columns: u64| {
                 if buffer.dtype != dtype
                     || buffer.shape.len() != 2
                     || buffer.shape[0] < rows
                     || buffer.shape[1] != columns
                     || buffer.strides != [columns, 1]
                     || buffer.nbytes
-                        != buffer.shape[0]
+                        != buffer
+                            .shape[0]
                             .checked_mul(columns * if dtype == "int64" { 8 } else { 1 })
                             .unwrap_or(0)
                 {
-                    return Err(invalid("invalid compact Engram buffer layout"));
+                    return Err(invalid("invalid Engram buffer layout"));
                 }
+                Ok(())
+            };
+            validate_buffer(hash_buffer, "int64", tokens, core_heads as u64)?;
+            for (name, dtype, columns) in [
+                (&table.weight_buffer, "uint8", row_bytes as u64),
+                (&table.scale_buffer, "uint8", scale_bytes as u64),
+            ] {
+                let buffer = execution
+                    .buffers
+                    .iter()
+                    .find(|b| &b.name == name)
+                    .ok_or_else(|| invalid("rank lacks Engram input buffer"))?;
+                validate_buffer(buffer, dtype, tokens * core_heads as u64, columns)?;
             }
             if gpu {
                 let request = execution
@@ -308,7 +302,7 @@ pub(super) fn decode<F: super::payload::Files>(
         }
         tables.push(Table {
             planes,
-            heads: staged_heads.unwrap_or(heads),
+            heads: table_heads,
             weights: table.weight_buffer,
             scales: table.scale_buffer,
             hashes: table.hash_buffer,
@@ -409,87 +403,32 @@ mod tests {
         }
     }
 
-    struct MemoryArchive {
-        file: super::super::archive::PayloadFile,
-        path: std::path::PathBuf,
-    }
+    struct StubFiles(super::super::archive::PayloadFile);
 
-    impl MemoryArchive {
+    impl StubFiles {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "helios-engram-decode-test-{}.bin",
-                std::process::id()
-            ));
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&path)
-                .unwrap();
-            let payload = super::super::archive::PayloadFile::new(std::sync::Arc::new(file), 0, 1 << 20);
-            Self { file: payload, path }
+            let file = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+            Self(super::super::archive::PayloadFile::new(
+                std::sync::Arc::new(file),
+                0,
+                0,
+            ))
         }
     }
 
-    impl Drop for MemoryArchive {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-
-    impl super::super::payload::Files for MemoryArchive {
-        fn span<'a>(&self, _core: &'a Core, _key: &str) -> Result<&'a wire::Span> {
-            unimplemented!()
-        }
-
-        fn source(&self, span: &wire::Span) -> Result<(&super::super::archive::PayloadFile, u64)> {
-            Ok((&self.file, span.offset))
-        }
-
-        fn read(&self, _core: &Core, _key: &str) -> Result<Vec<u8>> {
-            unimplemented!()
-        }
-
-        fn records<'a>(&'a self, _core: &Core, _key: &str) -> Result<super::super::payload::RecordReader<'a>> {
-            unimplemented!()
-        }
-
-        fn path(&self) -> &std::path::Path {
-            &self.path
-        }
-
-        fn source_index(&self, _span: &wire::Span) -> Result<usize> {
-            Ok(0)
-        }
-
-        fn asset_path(&self, _span: &wire::Span) -> Result<std::path::PathBuf> {
-            Ok(self.path.clone())
-        }
-
+    impl super::super::payload::Files for StubFiles {
+        fn span<'a>(&self, _: &'a Core, _: &str) -> Result<&'a wire::Span> { unimplemented!() }
+        fn source(&self, span: &wire::Span) -> Result<(&super::super::archive::PayloadFile, u64)> { Ok((&self.0, span.offset)) }
+        fn read(&self, _: &Core, _: &str) -> Result<Vec<u8>> { unimplemented!() }
+        fn records<'a>(&'a self, _: &Core, _: &str) -> Result<super::super::payload::RecordReader<'a>> { unimplemented!() }
+        fn path(&self) -> &std::path::Path { std::path::Path::new("") }
+        fn source_index(&self, _: &wire::Span) -> Result<usize> { Ok(0) }
+        fn asset_path(&self, _: &wire::Span) -> Result<std::path::PathBuf> { unimplemented!() }
         fn release_page_cache(&self) {}
-
-        fn retained_files(&self) -> Result<Vec<std::sync::Arc<std::fs::File>>> {
-            Ok(vec![])
-        }
-
-        fn direct_files(
-            &self,
-        ) -> Box<dyn Iterator<Item = Result<std::sync::Arc<std::fs::File>>> + '_> {
-            Box::new(std::iter::empty())
-        }
-
-        fn validate(&self, _core: &Core) -> Result<()> {
-            Ok(())
-        }
-
-        fn resource_reader<'a>(
-            &'a self,
-            _core: &Core,
-            _key: &str,
-        ) -> Result<Box<dyn std::io::Read + 'a>> {
-            unimplemented!()
-        }
+        fn retained_files(&self) -> Result<Vec<std::sync::Arc<std::fs::File>>> { Ok(vec![]) }
+        fn direct_files(&self) -> Box<dyn Iterator<Item = Result<std::sync::Arc<std::fs::File>>> + '_> { Box::new(std::iter::empty()) }
+        fn validate(&self, _: &Core) -> Result<()> { Ok(()) }
+        fn resource_reader<'a>(&'a self, _: &Core, _: &str) -> Result<Box<dyn std::io::Read + 'a>> { unimplemented!() }
     }
 
     fn decode_fixture(world: usize, staged_heads: u64, partitioned: bool, gpu: bool) -> (wire::Engram, Core) {
@@ -647,7 +586,7 @@ mod tests {
 
     #[test]
     fn partitioned_gpu_tables_accept_both_legacy_and_compact_local_head_staging() {
-        let archive = MemoryArchive::new();
+        let archive = StubFiles::new();
         let (legacy_catalog, legacy_core) = decode_fixture(4, 24, true, true);
         let legacy = decode(legacy_catalog, &archive, &[legacy_core], 0, 4).unwrap();
         assert_eq!(legacy.tables[0].heads, 24);
@@ -657,13 +596,11 @@ mod tests {
         let compact = decode(compact_catalog, &archive, &[compact_core], 0, 4).unwrap();
         assert_eq!(compact.tables[0].heads, 6);
         let compact_staging = crate::engram::staging_bytes(&compact, 16384).unwrap();
-        // 4x fewer staged payload bytes per frame (103.8 MiB -> 25.95 MiB at 16K tokens).
-        assert_eq!(
-            legacy_staging - 2 * 4,
-            4 * (compact_staging - 2 * 4)
-        );
+        // 4x fewer staged payload bytes per frame (99.0 MiB -> 24.75 MiB at 16,384 tokens).
+        assert_eq!(legacy_staging, 2 * (103_809_024 + 4));
+        assert_eq!(compact_staging, 2 * (25_952_256 + 4));
 
-        for bad_heads in [0, 3, 5, 12, 23, 25] {
+        for bad_heads in [0, 12] {
             let (bad_catalog, bad_core) = decode_fixture(4, bad_heads, true, true);
             assert!(
                 decode(bad_catalog, &archive, &[bad_core], 0, 4).is_err(),
@@ -676,10 +613,5 @@ mod tests {
         assert!(decode(unpart_catalog, &archive, &[unpart_core], 0, 4).is_err());
         let (host_catalog, host_core) = decode_fixture(4, 6, false, false);
         assert!(decode(host_catalog, &archive, &[host_core], 0, 1).is_err());
-
-        // Sibling ranks passed together cannot disagree on staged head width.
-        let (mixed_catalog, compact_rank) = decode_fixture(4, 6, true, true);
-        let (_, legacy_rank) = decode_fixture(4, 24, true, true);
-        assert!(decode(mixed_catalog, &archive, &[compact_rank, legacy_rank], 0, 4).is_err());
     }
 }

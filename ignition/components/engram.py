@@ -84,6 +84,26 @@ def _lookup_compact_fake(source, weight, scales, hashes, count, out, timings, fr
     pass
 
 
+_CANONICAL_HEADS = 24
+
+
+def _validate_staged_heads(heads: int, *, world: int | None = None) -> None:
+    if type(heads) is not int or not 1 <= heads <= _CANONICAL_HEADS or _CANONICAL_HEADS % heads != 0:
+        raise ValueError("Engram staged heads must divide 24")
+    if world is not None:
+        if type(world) is not int or world < 1:
+            raise ValueError("Engram world size must be a positive integer")
+        legal = (
+            (_CANONICAL_HEADS,)
+            if (world == 1 or _CANONICAL_HEADS % world != 0)
+            else (_CANONICAL_HEADS, _CANONICAL_HEADS // world)
+        )
+        if heads not in legal:
+            raise ValueError(
+                f"Engram staged heads {heads} is invalid for world size {world}; expected one of {legal}"
+            )
+
+
 @dataclass(frozen=True)
 class EngramInputs:
     weights: torch.Tensor
@@ -94,9 +114,8 @@ class EngramInputs:
     interval: int
 
     @classmethod
-    def allocate(cls, tokens, device, *, timings, interval=0, heads=24):
-        if type(heads) is not int or not 1 <= heads <= 24:
-            raise ValueError("Engram inputs require between 1 and 24 staged heads")
+    def allocate(cls, tokens, device, *, timings, interval=0, heads=24, world=None):
+        _validate_staged_heads(heads, world=world)
         ready = torch.cuda.Event(external=True)
         ready.record(torch.cuda.current_stream(device))
         return cls(torch.zeros((tokens * heads, 256), dtype=torch.uint8, device=device),
@@ -111,29 +130,20 @@ class PreparedEngramLookup:
     def __init__(self, inputs, output, count, *, layer, token_map, geometry, session, name,
                  runtime=None, coordinator=None):
         tokens = output.shape[0]
-        if inputs.hashes.ndim != 2 or not 1 <= inputs.hashes.shape[1] <= 24:
-            raise ValueError("Engram lookup requires between 1 and 24 staged heads")
         heads = inputs.hashes.shape[1]
+        _validate_staged_heads(heads, world=getattr(runtime, "world_size", None))
         if (output.ndim != 2 or output.shape[1] != heads * 256
                 or output.dtype != torch.bfloat16 or not output.is_contiguous()):
             raise ValueError("Engram lookup output must match contiguous [tokens, heads * 256] bfloat16")
-        if (inputs.weights.ndim != 2 or inputs.weights.shape[0] < tokens * heads or inputs.weights.shape[1] != 256
-                or inputs.scales.ndim != 2 or inputs.scales.shape[0] < tokens * heads or inputs.scales.shape[1] != 8
-                or inputs.hashes.shape[0] < tokens):
-            raise ValueError("Engram lookup inputs must cover tokens * heads staged rows")
-        self.heads = heads
         self.weights = inputs.weights[:tokens * heads]
         self.scales = inputs.scales[:tokens * heads]
         self.hashes = inputs.hashes[:tokens]
-        if (not self.weights.is_contiguous() or not self.scales.is_contiguous()
-                or not self.hashes.is_contiguous()):
-            raise ValueError("Engram lookup inputs must be contiguous")
         self.count, self.output = count, output
         self.handle = inputs.ready.cuda_event
         self.wait = PreparedReadinessWait(inputs.timings, inputs.interval, runtime=runtime, session=session,
                                          coordinator=coordinator, name=name + ".readiness")
         self.table_rows = geometry.num_embeddings[geometry.layer_ids.index(layer)]
-        if heads == 24:
+        if heads == _CANONICAL_HEADS:
             self.plan = engram.plan(engram.Caps(device=output.device, max_tokens=tokens,
                 max_seqs=tokens, max_requests=tokens, vocab_size=len(token_map), layer_id=layer,
                 tp_size=1, tp_rank=0), token_map=token_map, geometry=geometry,
@@ -183,27 +193,29 @@ class PreparedEngramRequests:
         self.compressed = torch.empty(tokens, dtype=torch.int64, device=device)
         self.requests = torch.empty(tokens, dtype=torch.int32, device=device)
         self.hashes = inputs.hashes[:tokens]
-        if self.hashes.ndim != 2 or not 1 <= self.hashes.shape[1] <= 24:
-            raise ValueError("Engram requests require between 1 and 24 staged heads")
         local_heads = self.hashes.shape[1]
-        if mailbox.ndim != 1 or mailbox.shape[0] < tokens * local_heads + 1:
-            raise ValueError("Engram request mailbox must hold tokens * staged_heads entries plus sequence flag")
+        world = None
+        if row_mapping is not None:
+            if row_mapping.ndim != 2 or row_mapping.shape[1] != 3 or row_mapping.dtype != torch.int64 or row_mapping.device != device:
+                raise ValueError("embedding row mapping must have int64 source bounds and a destination per head")
+            if row_mapping.shape[0] == _CANONICAL_HEADS:
+                owned = int((row_mapping[:, 2] >= 0).sum().item())
+                world = _CANONICAL_HEADS // owned if owned > 0 and _CANONICAL_HEADS % owned == 0 else 1
+        _validate_staged_heads(local_heads, world=world)
         self.mailbox, self.sequence = mailbox, sequence
         if head_indices is not None:
             indices_list = head_indices.tolist() if isinstance(head_indices, torch.Tensor) else list(head_indices)
             if (len(indices_list) != local_heads
-                    or any(type(head) is not int or not 0 <= head < 24 for head in indices_list)
+                    or any(type(head) is not int or not 0 <= head < _CANONICAL_HEADS for head in indices_list)
                     or len(set(indices_list)) != local_heads):
                 raise ValueError("head_indices must name distinct canonical heads matching staged width")
             self.head_indices = persistent_copy(torch.tensor(indices_list, dtype=torch.int64, device=device))
-        elif local_heads < 24:
+        elif local_heads < _CANONICAL_HEADS:
             raise ValueError("compact Engram request staging requires explicit head_indices")
         else:
             self.head_indices = None
         if row_mapping is not None:
-            if row_mapping.ndim != 2 or row_mapping.shape[1] != 3 or row_mapping.dtype != torch.int64 or row_mapping.device != device:
-                raise ValueError("embedding row mapping must have int64 source bounds and a destination per head")
-            if row_mapping.shape[0] == 24 and self.head_indices is not None:
+            if row_mapping.shape[0] == _CANONICAL_HEADS and self.head_indices is not None:
                 row_mapping = persistent_copy(torch.index_select(row_mapping, 0, self.head_indices))
             elif row_mapping.shape[0] != local_heads:
                 raise ValueError("embedding row mapping must have int64 source bounds and a destination per head")

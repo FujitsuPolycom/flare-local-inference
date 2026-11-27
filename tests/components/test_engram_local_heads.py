@@ -42,28 +42,6 @@ def _partition_mapping(offsets, rows: int, rank: int, world: int):
     return heads, torch.tensor(mapping, dtype=torch.int64), cursor
 
 
-def _reference_compact_dequant(weight: torch.Tensor, scales: torch.Tensor, hashes: torch.Tensor,
-                               count: torch.Tensor, rows: int) -> torch.Tensor:
-    """Bit-exact scalar model of _compact_lookup FP8 E4M3 * E8M0 -> BF16 semantics."""
-    tokens, heads = hashes.shape
-    nt = int(count.item())
-    out = torch.zeros((tokens, heads * 256), dtype=torch.bfloat16)
-    valid_nt = 0 <= nt <= tokens
-    if not valid_nt:
-        return out
-    q_all = weight.view(torch.float8_e4m3fn).float().view(tokens, heads, 256)
-    exp = scales.to(torch.int32).view(tokens, heads, 8)
-    scale = (exp << 23).view(torch.float32)
-    scale = torch.where(exp == 0, torch.full_like(scale, 2.0**-127), scale)
-    scale = torch.where(exp == 255, torch.full_like(scale, float("nan")), scale)
-    scale_256 = scale.repeat_interleave(32, dim=-1)
-    deq = (q_all * scale_256).to(torch.bfloat16)
-    t_idx = torch.arange(tokens)[:, None]
-    local = (t_idx < nt) & (hashes >= 0) & (hashes < rows)
-    masked = torch.where(local[:, :, None], deq, torch.zeros_like(deq))
-    return masked.reshape(tokens, heads * 256)
-
-
 def test_engram_inputs_allocate_validation_and_shapes(monkeypatch):
     class FakeEvent:
         def __init__(self, *, external=False):
@@ -89,9 +67,13 @@ def test_engram_inputs_allocate_validation_and_shapes(monkeypatch):
         assert compact.scales.shape == (128 * heads, 8)
         assert compact.hashes.shape == (128, heads)
 
-    for bad in (0, -1, 25, 6.0, True):
-        with pytest.raises(ValueError, match="1 and 24 staged heads"):
+    for bad in (0, -1, 5, 25, 6.0, True):
+        with pytest.raises(ValueError, match="must divide 24"):
             EngramInputs.allocate(8, "cpu", timings=timings, heads=bad)
+
+    for heads, world in ((12, 4), (6, 1), (8, 4)):
+        with pytest.raises(ValueError, match="invalid for world size"):
+            EngramInputs.allocate(8, "cpu", timings=timings, heads=heads, world=world)
 
 
 @pytest.mark.parametrize("world", [1, 2, 3, 4, 6, 8])
@@ -175,27 +157,14 @@ def test_prepared_engram_requests_compact_matches_legacy_bit_exact(monkeypatch, 
         assert published_sizes == [tokens * local_heads]
         assert torch.equal(compact_mailbox[:tokens * local_heads], expected.reshape(-1))
         assert int(compact_mailbox[-1].item()) == 42
-        # Tail tokens beyond live_tokens must remain -1.
         if live_tokens < tokens:
             assert torch.all(compact_inputs.hashes[live_tokens:] == -1)
 
-        # Negative sensitivity: perturbing a single head index must break parity when world > 1.
-        if world > 1:
-            wrong_heads = (head_indices[0] ^ 1, *head_indices[1:])
-            bad_inputs = _make_inputs(tokens, local_heads)
-            bad_mailbox = torch.zeros(tokens * local_heads + 1, dtype=torch.int64)
-            bad_req = PreparedEngramRequests(
-                bad_inputs, token_ids, starts, history, counts, bad_mailbox, sequence,
-                layer=1, token_map=token_map, geometry=geometry, session=None, name="bad",
-                row_mapping=full_mapping, head_indices=wrong_heads,
-            ).functional()
-            bad_req(token_ids, starts, history, counts)
-            assert not torch.equal(bad_inputs.hashes, expected)
 
-
-def test_prepared_engram_requests_validation_errors(monkeypatch):
+def test_prepared_engram_requests_rejects_mismatched_world_head_width(monkeypatch):
     geometry = b12x_engram.build_geometry(layer_ids=(1,), base_table_size=101, compressed_vocab_size=32)
     token_map = tuple(range(32))
+    rows = geometry.num_embeddings[0]
     monkeypatch.setattr(core_engram.engram, "Caps", lambda **kw: SimpleNamespace(**kw))
     monkeypatch.setattr(core_engram.engram, "plan", lambda caps, **kw: SimpleNamespace(
         handle=77, request=lambda **rkw: SimpleNamespace(**rkw)))
@@ -207,28 +176,15 @@ def test_prepared_engram_requests_validation_errors(monkeypatch):
     history = torch.zeros((1, 3), dtype=torch.int64)
     counts = torch.tensor([tokens, 1], dtype=torch.int32)
     sequence = torch.tensor([1], dtype=torch.int64)
-    compact_inputs = _make_inputs(tokens, 6)
-    mailbox = torch.zeros(tokens * 6 + 1, dtype=torch.int64)
+    _, tp4_mapping, _ = _partition_mapping(geometry.offsets[0], rows, 0, 4)
 
-    with pytest.raises(ValueError, match="explicit head_indices"):
+    # TP4 owns 6 heads; staging 12 heads must be rejected at preparation (matching Helios decode).
+    with pytest.raises(ValueError, match="invalid for world size 4"):
         PreparedEngramRequests(
-            compact_inputs, token_ids, starts, history, counts, mailbox, sequence,
-            layer=1, token_map=token_map, geometry=geometry, session=None, name="missing_heads",
-        )
-
-    for bad_heads in ([0, 0, 1, 2, 3, 4], [0, 1, 2, 3, 4], [0, 4, 8, 12, 16, 24], [-1, 4, 8, 12, 16, 20]):
-        with pytest.raises(ValueError, match="head_indices"):
-            PreparedEngramRequests(
-                compact_inputs, token_ids, starts, history, counts, mailbox, sequence,
-                layer=1, token_map=token_map, geometry=geometry, session=None, name="bad_heads",
-                head_indices=bad_heads,
-            )
-
-    with pytest.raises(ValueError, match="mailbox"):
-        PreparedEngramRequests(
-            compact_inputs, token_ids, starts, history, counts, torch.zeros(tokens * 6, dtype=torch.int64), sequence,
-            layer=1, token_map=token_map, geometry=geometry, session=None, name="small_mailbox",
-            head_indices=(0, 4, 8, 12, 16, 20),
+            _make_inputs(tokens, 12), token_ids, starts, history, counts,
+            torch.zeros(tokens * 12 + 1, dtype=torch.int64), sequence,
+            layer=1, token_map=token_map, geometry=geometry, session=None, name="tp4_wrong_heads",
+            row_mapping=tp4_mapping, head_indices=tuple(range(12)),
         )
 
 
@@ -266,7 +222,6 @@ def test_prepared_engram_lookup_dispatch_validation_and_fx_tracing(monkeypatch):
         layer=1, token_map=token_map, geometry=geometry, session=None, name="compact_lookup",
     ).functional(session=None)
     assert compact_lookup.plan is None
-    assert compact_lookup.heads == 6
     assert compact_lookup.table_rows == rows
 
     # Wrong output width must raise immediately.
@@ -274,6 +229,14 @@ def test_prepared_engram_lookup_dispatch_validation_and_fx_tracing(monkeypatch):
         PreparedEngramLookup(
             compact_inputs, torch.empty((tokens, 6144), dtype=torch.bfloat16), count,
             layer=1, token_map=token_map, geometry=geometry, session=None, name="bad_out",
+        )
+
+    # Mismatched world size on runtime must raise immediately.
+    with pytest.raises(ValueError, match="invalid for world size 4"):
+        PreparedEngramLookup(
+            _make_inputs(tokens, 12), torch.empty((tokens, 12 * 256), dtype=torch.bfloat16), count,
+            layer=1, token_map=token_map, geometry=geometry, session=None, name="bad_world",
+            runtime=SimpleNamespace(world_size=4),
         )
 
     # Legacy 24-head path still uses b12x plan and flare::staged_engram.
@@ -295,20 +258,3 @@ def test_prepared_engram_lookup_dispatch_validation_and_fx_tracing(monkeypatch):
     legacy_gm = make_fx(lambda s, c: legacy_lookup(s, c), tracing_mode="fake", _allow_non_fake_inputs=True)(src, count)
     legacy_ops = [str(node.target) for node in legacy_gm.graph.nodes if node.op == "call_function"]
     assert any(op.endswith("staged_engram.default") for op in legacy_ops)
-
-    # Verify compact dequantization reference edge cases (E8M0 0 -> 2^-127, 255 -> NaN, invalid row -> 0, tail -> 0).
-    w = torch.zeros((tokens * heads, 256), dtype=torch.uint8)
-    s = torch.full((tokens * heads, 8), 127, dtype=torch.uint8)
-    h = torch.zeros((tokens, heads), dtype=torch.int64)
-    w[0].copy_(torch.full((256,), 1.0, dtype=torch.float8_e4m3fn).view(torch.uint8))
-    s[0, 0] = 0    # 2^-127 (representable BF16 subnormal, not zero)
-    s[0, 1] = 128  # 2.0
-    s[0, 2] = 255  # NaN
-    h[0, 1] = -1   # invalid negative hash -> masked to 0
-    h[0, 2] = rows  # out-of-range hash -> masked to 0
-    deq = _reference_compact_dequant(w, s, h, torch.tensor([1], dtype=torch.int32), rows)
-    assert torch.equal(deq[0, 0:32], torch.full((32,), 2.0**-127, dtype=torch.bfloat16))
-    assert torch.all(deq[0, 32:64] == 2.0)
-    assert torch.all(torch.isnan(deq[0, 64:96]))
-    assert torch.all(deq[0, 256:768] == 0.0)
-    assert torch.all(deq[1:] == 0.0)

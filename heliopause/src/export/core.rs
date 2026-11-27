@@ -675,7 +675,6 @@ pub(crate) fn publish_payload(
                 &staging,
                 &format!("frontend-{position}.payload"),
                 None,
-                None,
             )?;
             let tensor = format!(
                 "frontend.{}",
@@ -745,11 +744,8 @@ pub(crate) fn publish_payload(
             Some(path) => Some(helios_core::core::cache::Root::open(path)?),
             None => None,
         };
-        preflight_export_fds(ranks, core_payloads.len())?;
-        let mut leases: BTreeMap<
-            helios_core::core::PayloadId,
-            helios_core::core::cache::PayloadObject,
-        > = BTreeMap::new();
+        preflight_export_fds(ranks, core_payloads.len(), cache_root.is_some())?;
+        let mut leases: LeaseMap = BTreeMap::new();
         let mut engram_payloads = Vec::new();
         let reused_engram = ranks[0].weight_payload.as_ref().and_then(|sources| sources.engram.as_ref());
         let engram = if let Some(engram) = reused_engram {
@@ -1031,10 +1027,30 @@ pub(crate) fn publish_payload(
 }
 
 type Materialized = (helios_core::core::PayloadId, u64, PathBuf);
+type LeaseMap =
+    BTreeMap<helios_core::core::PayloadId, helios_core::core::cache::PayloadObject>;
 
-fn hash_pieces(pieces: &[FileSource]) -> Result<helios_core::core::PayloadId> {
+fn lease_payload(
+    root: &helios_core::core::cache::Root,
+    leases: &mut LeaseMap,
+    id: helios_core::core::PayloadId,
+) -> Result<Option<helios_core::core::cache::PayloadObject>> {
+    if let Some(existing) = leases.get(&id) {
+        return Ok(Some(existing.clone()));
+    }
+    let Some(opened) = root.payload(id)? else {
+        return Ok(None);
+    };
+    leases.insert(id, opened.clone());
+    Ok(Some(opened))
+}
+
+fn stream_pieces(
+    pieces: &[FileSource],
+    mut sink: Option<&mut File>,
+) -> Result<helios_core::core::PayloadId> {
     use sha2::{Digest, Sha256};
-    use std::io::{Read, Seek};
+    use std::io::{Read, Seek, Write};
 
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1 << 20];
@@ -1046,6 +1062,9 @@ fn hash_pieces(pieces: &[FileSource]) -> Result<helios_core::core::PayloadId> {
             let chunk = remaining.min(buffer.len() as u64) as usize;
             source.read_exact(&mut buffer[..chunk])?;
             hasher.update(&buffer[..chunk]);
+            if let Some(file) = sink.as_deref_mut() {
+                file.write_all(&buffer[..chunk])?;
+            }
             remaining -= chunk as u64;
         }
     }
@@ -1058,10 +1077,7 @@ fn payload_source(
     span: &wire::Span,
     staging: &Path,
     name: &str,
-    cache: Option<&helios_core::core::cache::Root>,
-    leases: Option<
-        &mut BTreeMap<helios_core::core::PayloadId, helios_core::core::cache::PayloadObject>,
-    >,
+    cache: Option<(&helios_core::core::cache::Root, &mut LeaseMap)>,
 ) -> Result<(
     helios_core::core::PayloadId,
     u64,
@@ -1077,19 +1093,12 @@ fn payload_source(
         )?;
         return Ok((source.digest()?, span.nbytes, source));
     }
-    if let (Some(root), Some(leases)) = (cache, leases) {
-        let id = hash_pieces(&pieces)?;
-        if let Some(existing) = leases.get(&id)
-            && existing.length() == span.nbytes
-        {
-            return Ok((id, span.nbytes, existing.slice().clone()));
-        }
-        if let Some(object) = root.payload(id)?
+    if let Some((root, leases)) = cache {
+        let id = stream_pieces(&pieces, None)?;
+        if let Some(object) = lease_payload(root, leases, id)?
             && object.length() == span.nbytes
         {
-            let slice = object.slice().clone();
-            leases.insert(id, object);
-            return Ok((id, span.nbytes, slice));
+            return Ok((id, span.nbytes, object.slice().clone()));
         }
     }
     let (id, nbytes, path) = materialize(payload, span, staging, name)?;
@@ -1102,33 +1111,12 @@ fn materialize(
     staging: &Path,
     name: &str,
 ) -> Result<Materialized> {
-    use sha2::{Digest, Sha256};
     let pieces = locate(payload, span)?;
     let path = staging.join(name);
     let mut file = File::create(&path)?;
-    let mut hasher = Sha256::new();
-    for piece in pieces {
-        let mut source = File::open(&piece.path)?;
-        use std::io::Seek;
-        source.seek(std::io::SeekFrom::Start(piece.offset))?;
-        let mut remaining = piece.nbytes;
-        let mut buffer = vec![0u8; 1 << 20];
-        while remaining > 0 {
-            use std::io::Read;
-            let chunk = remaining.min(buffer.len() as u64) as usize;
-            source.read_exact(&mut buffer[..chunk])?;
-            hasher.update(&buffer[..chunk]);
-            std::io::Write::write_all(&mut file, &buffer[..chunk])?;
-            remaining -= chunk as u64;
-        }
-    }
+    let id = stream_pieces(&pieces, Some(&mut file))?;
     file.sync_all()?;
-    let digest: [u8; 32] = hasher.finalize().into();
-    Ok((
-        helios_core::core::PayloadId::from_bytes(digest),
-        span.nbytes,
-        path,
-    ))
+    Ok((id, span.nbytes, path))
 }
 
 /// Translate declared provenance exactly: source tensors, their ordered
@@ -1257,36 +1245,86 @@ fn safe_group(name: &str) -> Result<String> {
     }
 }
 
-fn preflight_export_fds(ranks: &[RankOutput], core_payloads: usize) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let mut distinct_cached = BTreeSet::new();
-        let mut uncached_groups = 0usize;
-        for rank in ranks {
-            if let Some(sources) = &rank.weight_payload {
-                for group in sources
-                    .groups
-                    .iter()
-                    .chain(std::iter::once(&sources.initial_state))
-                {
-                    if !group.payload_id.is_empty() {
-                        distinct_cached.insert(group.payload_id.as_slice());
-                    } else if !group.spans.is_empty() {
-                        uncached_groups += 1;
-                    }
+fn estimated_export_fds(
+    ranks: &[RankOutput],
+    core_payloads: usize,
+    has_cache: bool,
+) -> (usize, usize, usize) {
+    let mut distinct_cached = BTreeSet::new();
+    let mut uncached_groups = 0usize;
+    for rank in ranks {
+        if let Some(sources) = &rank.weight_payload {
+            for group in sources
+                .groups
+                .iter()
+                .chain(std::iter::once(&sources.initial_state))
+            {
+                if !group.payload_id.is_empty() {
+                    distinct_cached.insert(group.payload_id.as_slice());
+                } else if !group.spans.is_empty() {
+                    uncached_groups += 1;
                 }
-                if let Some(engram) = &sources.engram {
-                    for source in super::weight_reuse::engram_uses(engram) {
-                        if let Some(slice) = source.slice.as_ref() {
-                            distinct_cached.insert(slice.payload_id.as_slice());
-                        }
+            }
+            if let Some(engram) = &sources.engram {
+                for source in super::weight_reuse::engram_uses(engram) {
+                    if let Some(slice) = source.slice.as_ref() {
+                        distinct_cached.insert(slice.payload_id.as_slice());
                     }
                 }
             }
         }
-        // Each deduplicated cache lease holds 2 FDs (data + flock); each uncached payload and
-        // rank staging file holds 1 FD, plus headroom for standard/runtime FDs and worker I/O.
-        let required = distinct_cached.len() * 2 + uncached_groups + core_payloads + ranks.len() * 4 + 64;
+    }
+    let mut engram_cached_leases = 0usize;
+    let reused_engram = ranks
+        .first()
+        .and_then(|rank| rank.weight_payload.as_ref())
+        .and_then(|sources| sources.engram.as_ref());
+    if reused_engram.is_none()
+        && let Some(root_rank) = ranks.first()
+        && let Some(engram) = &root_rank.index.engram
+    {
+        for table in &engram.tables {
+            let spans: Vec<&wire::Span> = if table.shards.is_empty() {
+                [table.weights.as_ref(), table.scales.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .collect()
+            } else {
+                table
+                    .shards
+                    .iter()
+                    .flat_map(|shard| [shard.weights.as_ref(), shard.scales.as_ref()])
+                    .flatten()
+                    .collect()
+            };
+            for span in spans {
+                let multi_file = locate(&root_rank.payload, span)
+                    .map_or(true, |pieces| pieces.len() > 1);
+                if multi_file && has_cache {
+                    // Multi-file Engram planes can hit the core cache and retain a lease (2 FDs).
+                    engram_cached_leases += 1;
+                } else {
+                    uncached_groups += 1;
+                }
+            }
+        }
+    }
+    let cached_leases = distinct_cached.len() + engram_cached_leases;
+    // Each deduplicated cache lease holds 2 FDs (data + flock); each uncached payload and
+    // rank staging file holds 1 FD, plus headroom for standard/runtime FDs and worker I/O.
+    let required = cached_leases * 2 + uncached_groups + core_payloads + ranks.len() * 4 + 64;
+    (required, cached_leases, uncached_groups)
+}
+
+fn preflight_export_fds(
+    ranks: &[RankOutput],
+    core_payloads: usize,
+    has_cache: bool,
+) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let (required, cached_leases, uncached_groups) =
+            estimated_export_fds(ranks, core_payloads, has_cache);
         let mut limit = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
@@ -1296,16 +1334,15 @@ fn preflight_export_fds(ranks: &[RankOutput], core_payloads: usize) -> Result<()
             && (required as u64) > limit.rlim_cur
         {
             return Err(invalid(format!(
-                "TP core export needs approximately {required} open file descriptors ({} cached leases, \
+                "TP core export needs approximately {required} open file descriptors ({cached_leases} cached leases, \
                  {uncached_groups} uncached weight payloads), exceeding the current soft limit of {}; \
                  raise it with `ulimit -n {required}` before exporting",
-                distinct_cached.len(),
                 limit.rlim_cur
             )));
         }
     }
     #[cfg(not(unix))]
-    let _ = (ranks, core_payloads);
+    let _ = (ranks, core_payloads, has_cache);
     Ok(())
 }
 
@@ -1314,7 +1351,7 @@ fn cached_engram(
     root: &helios_core::core::cache::Root,
     deployment: &str,
     installed: &mut Vec<helios_core::core::export::PublishPayload>,
-    leases: &mut BTreeMap<helios_core::core::PayloadId, helios_core::core::cache::PayloadObject>,
+    leases: &mut LeaseMap,
 ) -> Result<helios_core::core::schema::wire::Engram> {
     use helios_core::core::{PayloadId, export::PublishPayload, schema::wire as pwire};
     for (index, table) in engram.tables.iter().enumerate() {
@@ -1339,16 +1376,8 @@ fn cached_engram(
                 .as_ref()
                 .ok_or_else(|| invalid("cached Engram plane has no slice"))?;
             let id = PayloadId::from_bytes(slice.payload_id.as_slice().try_into()?);
-            let object = match leases.get(&id) {
-                Some(existing) => existing.clone(),
-                None => {
-                    let opened = root
-                        .payload(id)?
-                        .ok_or_else(|| invalid(format!("missing cached Engram payload {id}")))?;
-                    leases.insert(id, opened.clone());
-                    opened
-                }
-            };
+            let object = lease_payload(root, leases, id)?
+                .ok_or_else(|| invalid(format!("missing cached Engram payload {id}")))?;
             if slice
                 .offset
                 .checked_add(slice.nbytes)
@@ -1374,7 +1403,7 @@ fn core_engram(
     deployment: &str,
     installed: &mut Vec<helios_core::core::export::PublishPayload>,
     cache: Option<&helios_core::core::cache::Root>,
-    leases: &mut BTreeMap<helios_core::core::PayloadId, helios_core::core::cache::PayloadObject>,
+    leases: &mut LeaseMap,
 ) -> Result<helios_core::core::schema::wire::Engram> {
     use helios_core::core::schema::wire as pwire;
     let use_of = |id: &helios_core::core::PayloadId, nbytes: u64| pwire::PayloadUse {
@@ -1396,8 +1425,7 @@ fn core_engram(
                     .ok_or_else(|| invalid("engram table lacks weights"))?,
                 staging,
                 &format!("engram-{index}-w.payload"),
-                cache,
-                Some(leases),
+                cache.map(|root| (root, &mut *leases)),
             )?;
             let scales = payload_source(
                 payload,
@@ -1407,8 +1435,7 @@ fn core_engram(
                     .ok_or_else(|| invalid("engram table lacks scales"))?,
                 staging,
                 &format!("engram-{index}-s.payload"),
-                cache,
-                Some(leases),
+                cache.map(|root| (root, &mut *leases)),
             )?;
             for (plane, materialized) in [("weights", &weights), ("scales", &scales)] {
                 installed.push(helios_core::core::export::PublishPayload {
@@ -1447,8 +1474,7 @@ fn core_engram(
                         .ok_or_else(|| invalid("engram shard lacks weights"))?,
                     staging,
                     &format!("engram-{index}-shard-{position}-w.payload"),
-                    cache,
-                    Some(leases),
+                    cache.map(|root| (root, &mut *leases)),
                 )?;
                 let scales = payload_source(
                     payload,
@@ -1458,8 +1484,7 @@ fn core_engram(
                         .ok_or_else(|| invalid("engram shard lacks scales"))?,
                     staging,
                     &format!("engram-{index}-shard-{position}-s.payload"),
-                    cache,
-                    Some(leases),
+                    cache.map(|root| (root, &mut *leases)),
                 )?;
                 for (plane, materialized) in [("weights", &weights), ("scales", &scales)] {
                     installed.push(helios_core::core::export::PublishPayload {
@@ -1586,7 +1611,7 @@ fn rank_plan(
     staging: &Path,
     deployment_id: &str,
     cache: Option<&helios_core::core::cache::Root>,
-    leases: &mut BTreeMap<helios_core::core::PayloadId, helios_core::core::cache::PayloadObject>,
+    leases: &mut LeaseMap,
 ) -> Result<helios_core::core::export::PublishRank> {
     use helios_core::core::{export as payload_export, schema::wire as pwire};
     let bundle = &rank.index.ranks[0];
@@ -1637,18 +1662,11 @@ fn rank_plan(
                     .try_into()
                     .map_err(|_| invalid("declared payload identity is not 32 bytes"))?;
                 let id = helios_core::core::PayloadId::from_bytes(id_bytes);
-                let object = match leases.get(&id) {
-                    Some(existing) => existing.clone(),
-                    None => {
-                        let opened = root.payload(id)?.ok_or_else(|| {
-                            invalid(format!(
-                                "declared payload {id} is absent from the core cache"
-                            ))
-                        })?;
-                        leases.insert(id, opened.clone());
-                        opened
-                    }
-                };
+                let object = lease_payload(root, leases, id)?.ok_or_else(|| {
+                    invalid(format!(
+                        "declared payload {id} is absent from the core cache"
+                    ))
+                })?;
                 if object.length() != group.nbytes {
                     return Err(invalid(format!(
                         "declared payload {id} length {} differs from group {} length {}",
@@ -3842,8 +3860,7 @@ mod payload_export_tests {
             ..Default::default()
         };
         let staging = base.path().join("absent-staging");
-        let (id, nbytes, source) =
-            payload_source(&parts, &span, &staging, "unused", None, None).unwrap();
+        let (id, nbytes, source) = payload_source(&parts, &span, &staging, "unused", None).unwrap();
         assert_eq!(id, PayloadId::of(b"weights"));
         assert_eq!(nbytes, 7);
         assert_eq!(source.offset(), 7);
@@ -3891,7 +3908,7 @@ mod payload_export_tests {
             ..Default::default()
         };
         let (id, nbytes, source) =
-            payload_source(&parts, &span, base.path(), "joined", None, None).unwrap();
+            payload_source(&parts, &span, base.path(), "joined", None).unwrap();
         assert_eq!(id, PayloadId::of(b"cdef"));
         assert_eq!(nbytes, 4);
         assert_eq!(fs::read(base.path().join("joined")).unwrap(), b"cdef");
@@ -3942,8 +3959,7 @@ mod payload_export_tests {
             &span,
             &absent_staging,
             "joined",
-            Some(&root),
-            Some(&mut leases),
+            Some((&root, &mut leases)),
         )
         .unwrap();
         assert_eq!(id, expected_id);
@@ -3953,6 +3969,82 @@ mod payload_export_tests {
         let mut bytes = [0; 4];
         source.read_at(0, &mut bytes).unwrap();
         assert_eq!(&bytes, b"cdef");
+    }
+
+    #[test]
+    fn preflight_export_fds_counts_multi_file_engram_leases() {
+        let mut rank0 = empty_rank(Some("gb202"));
+        let dummy = PathBuf::from("shard.safetensors");
+        // Logical payload [0..16) split into two files [0..8) and [8..16).
+        rank0.payload = vec![
+            FilePart {
+                offset: 0,
+                source: FileSource {
+                    path: dummy.clone(),
+                    offset: 0,
+                    nbytes: 8,
+                },
+            },
+            FilePart {
+                offset: 8,
+                source: FileSource {
+                    path: dummy,
+                    offset: 8,
+                    nbytes: 8,
+                },
+            },
+        ];
+        let multi_span = wire::Span {
+            offset: 4,
+            nbytes: 8,
+            ..Default::default()
+        };
+        let single_span = wire::Span {
+            offset: 0,
+            nbytes: 4,
+            ..Default::default()
+        };
+        // Two tables x four shards: multi-file weights + single-file scales per shard = 8 multi + 8 single.
+        let shards: Vec<_> = (0..4)
+            .map(|rank| wire::EngramTableShard {
+                rank,
+                first_row: rank as u64,
+                rows: 1,
+                weights: Some(multi_span.clone()),
+                scales: Some(single_span.clone()),
+            })
+            .collect();
+        rank0.index.engram = Some(wire::Engram {
+            tables: vec![
+                wire::EngramTable {
+                    layer: 1,
+                    shards: shards.clone(),
+                    ..Default::default()
+                },
+                wire::EngramTable {
+                    layer: 14,
+                    shards,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        let ranks = [
+            rank0,
+            empty_rank(Some("gb202")),
+            empty_rank(Some("gb202")),
+            empty_rank(Some("gb202")),
+        ];
+        let (req_cached, leases_cached, uncached_cached) = estimated_export_fds(&ranks, 2, true);
+        assert_eq!(leases_cached, 8);
+        assert_eq!(uncached_cached, 8);
+        assert_eq!(req_cached, 8 * 2 + 8 + 2 + 4 * 4 + 64);
+
+        let (req_nocache, leases_nocache, uncached_nocache) =
+            estimated_export_fds(&ranks, 2, false);
+        assert_eq!(leases_nocache, 0);
+        assert_eq!(uncached_nocache, 16);
+        assert_eq!(req_nocache, 16 + 2 + 4 * 4 + 64);
     }
 
     #[test]
