@@ -17,6 +17,7 @@ from torch.cuda.graphs import CUDAGraph, _RetainedCallbacks
 from ignition.preparation import capture
 from ignition.preparation.module_images import ModuleImages
 from ignition.preparation.runtime_core import (
+    CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY,
     RecordedExportGraph, _graphs, capture_graph, instantiate_graph, record_export_graph,
 )
 
@@ -204,9 +205,69 @@ def test_export_instantiates_and_retains_executable(monkeypatch, recorder):
     assert graph.instantiations == 1
     assert graph.template == 11
     assert graph.executable == 12
-    assert _graphs({"decode": graph}) == [dict(name="decode", graph=11, executable=12)]
+    assert graph._flare_instantiation_flags == CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY
+    assert _graphs({"decode": graph}) == [
+        dict(name="decode", graph=11, instantiate_flags=CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY)
+    ]
     assert not recorder.templates
     assert recorder.events == []
+
+    plain = Graph(keep_graph=True)
+    plain.pools = lambda: [(0, 2)]
+    plain.capture_end()
+    record_export_graph(plain, storage, owners=(kernel_owner,), instantiation_flags=None)
+    assert not hasattr(plain, "_flare_instantiation_flags")
+    assert _graphs({"decode": plain}) == [dict(name="decode", graph=11, executable=13)]
+
+    bad = Graph(keep_graph=True)
+    bad.pools = lambda: [(0, 2)]
+    bad.capture_end()
+    with pytest.raises(ValueError, match="instantiation flags"):
+        record_export_graph(bad, storage, instantiation_flags=2)
+    assert bad.instantiations == 0 and not bad._retained.objects
+
+
+def test_capture_forwards_export_sets_node_priority_instantiation_flag(monkeypatch, recorder):
+    stream = SimpleNamespace(wait_stream=lambda other: None, synchronize=lambda: None)
+    storage = SimpleNamespace(
+        pool=SimpleNamespace(id=(0, 1)),
+        graph_pool=SimpleNamespace(id=(0, 2)),
+        transient=nullcontext,
+        retain_transient_backing=nullcontext,
+    )
+
+    class ExportGraph(Graph):
+        def pools(self):
+            return [(0, 2)]
+
+    @contextmanager
+    def graph_scope(graph, **kwargs):
+        yield
+        graph.capture_end()
+
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", ExportGraph)
+    for name, value in dict(current_stream=lambda device: stream, stream=lambda stream: nullcontext(),
+                            synchronize=lambda device: None, graph=graph_scope,
+                            mem_get_info=lambda device: (1024, 2048), memory_allocated=lambda device: 0,
+                            memory_reserved=lambda device: 0).items():
+        monkeypatch.setattr(torch.cuda, name, value)
+    monkeypatch.setattr(capture, "_warmup_stream", lambda device: stream)
+    monkeypatch.setattr(capture, "_seed_warmup_workspaces", lambda stream, device: None)
+    graphs, _ = capture.capture_forwards(
+        {"prefill": lambda: None, "decode": lambda: None},
+        {"prefill": SimpleNamespace(kind="prefill"), "decode": SimpleNamespace(kind="decode")},
+        session=SimpleNamespace(capture=nullcontext),
+        device="cpu",
+        stream=stream,
+        pool=(0, 2),
+        compile_decoder=False,
+        retain_graphs=True,
+        warmup_storage=storage,
+    )
+    assert _graphs(graphs) == [
+        dict(name="prefill", graph=11, instantiate_flags=CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY),
+        dict(name="decode", graph=11, instantiate_flags=CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY),
+    ]
 
 
 @pytest.mark.parametrize("release", ("reset", "collection"))

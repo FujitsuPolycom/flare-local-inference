@@ -189,12 +189,28 @@ class RecordedExportGraph:
         self.owners = ()
 
 
-def record_export_graph(graph, storage, *, owners=()):
+CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY = 8
+
+
+def record_export_graph(
+    graph,
+    storage,
+    *,
+    owners=(),
+    instantiation_flags=CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY,
+):
     """Retain a captured template, its executable and external export resources.
 
     Owners must not reference the graph: Torch's destruction finalizer retains
     them independently. Native replay callers must drain before resetting graphs.
+    When ``instantiation_flags`` is set, export serializes that bitmask so Helios
+    instantiates the graph with matching flags (such as honoring per-node stream
+    priorities recorded during capture).
     """
+    if instantiation_flags is not None and (
+        type(instantiation_flags) is not int or instantiation_flags < 0 or instantiation_flags & ~9
+    ):
+        raise ValueError("graph instantiation flags may only select automatic free and node priority")
     pools = (storage.pool, storage.graph_pool)
     owned = {pool.id for pool in pools}
     if not set(graph.pools()) <= owned:
@@ -203,6 +219,8 @@ def record_export_graph(graph, storage, *, owners=()):
     # Release these references only when the graph is reset or collected.
     graph.retain_object((pools, tuple(owners)), synchronize_before_release=True)
     instantiate_graph(graph)
+    if instantiation_flags is not None:
+        graph._flare_instantiation_flags = instantiation_flags
     return graph
 
 
