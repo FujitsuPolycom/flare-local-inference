@@ -28,7 +28,7 @@
 use prost::Message as _;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(windows)]
@@ -45,11 +45,12 @@ thread_local! {
 }
 use crate::Result;
 use crate::core::container::{
-    COMPANION_TENSOR, Container, PAYLOAD_FORMAT, Slice, Source, Writer, link_companion,
-    open_relative, validate_relative_path, write_companion,
+    ALIGNMENT, COMPANION_TENSOR, Container, PAYLOAD_FORMAT, Slice, Source, Writer,
+    companion_prefix, link_companion, open_relative, validate_relative_path, write_companion,
 };
 
 const MAX_NAME: usize = 128;
+const STREAMING_CAPTURE_BUFFER: usize = 4 << 20;
 
 static TRANSACTION: AtomicU64 = AtomicU64::new(0);
 
@@ -1679,6 +1680,114 @@ impl Root {
         self.publish_verified_payload(&transaction, &staged, id, length)
     }
 
+    /// Stream one payload of initially unknown length into a buffered companion
+    /// wrapper, backfilling the 4096-byte deterministic header once the stream
+    /// completes. Returns `Ok(None)` without creating a cache object when `produce`
+    /// writes zero bytes.
+    pub fn capture_payload_streaming<F, E>(
+        &self,
+        produce: F,
+    ) -> std::result::Result<Option<(PayloadObject, u64)>, E>
+    where
+        F: FnOnce(&mut dyn io::Write) -> std::result::Result<(), E>,
+        E: From<crate::Error>,
+    {
+        struct StagedFileGuard<'a> {
+            path: &'a Path,
+            armed: bool,
+        }
+        impl Drop for StagedFileGuard<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    let _ = remove_file(self.path);
+                }
+            }
+        }
+
+        let transaction = Transaction::begin(self)?;
+        let staged = transaction.staging_file("wrapped")?;
+        let mut guard = StagedFileGuard {
+            path: &staged,
+            armed: true,
+        };
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)
+            .map_err(|error| E::from(failure(error)))?;
+        let mut writer = io::BufWriter::with_capacity(STREAMING_CAPTURE_BUFFER, file);
+        // Every single-tensor companion wrapper begins with a 4096-byte padded header.
+        io::Write::write_all(&mut writer, &[0u8; ALIGNMENT as usize])
+            .map_err(|error| E::from(failure(error)))?;
+
+        let (context, written_nbytes, poisoned) = {
+            let mut stream = StreamingHashWriter::new(&mut writer);
+            produce(&mut stream)?;
+            (stream.context, stream.written, stream.poisoned)
+        };
+        if let Some(reason) = poisoned {
+            return Err(E::from(
+                format!("streaming payload writer failed before completion: {reason}").into(),
+            ));
+        }
+
+        if written_nbytes == 0 {
+            drop(writer);
+            guard.armed = false;
+            let _ = remove_file(&staged);
+            return Ok(None);
+        }
+
+        let id = PayloadId::from_digest(context.finish());
+        // Discard the staged file before syncing when a verified object already exists.
+        if let Some(object) = self.payload(id)? {
+            drop(writer);
+            guard.armed = false;
+            let _ = remove_file(&staged);
+            validate_hit(&object, id, written_nbytes, None)?;
+            return Ok(Some((object, written_nbytes)));
+        }
+
+        let mut file = writer
+            .into_inner()
+            .map_err(|error| E::from(failure(error.into_error())))?;
+        let prefix = companion_prefix(written_nbytes)?;
+        if prefix.len() != ALIGNMENT as usize {
+            return Err(E::from(
+                format!(
+                    "companion header prefix is {} bytes, expected {ALIGNMENT}",
+                    prefix.len()
+                )
+                .into(),
+            ));
+        }
+        let expected_wrapper_len = ALIGNMENT
+            .checked_add(written_nbytes)
+            .ok_or_else(|| E::from(invalid("companion wrapper length overflow")))?;
+        let actual_wrapper_len = file
+            .metadata()
+            .map_err(|error| E::from(failure(error)))?
+            .len();
+        if actual_wrapper_len != expected_wrapper_len {
+            return Err(E::from(
+                format!(
+                    "staged companion wrapper is {actual_wrapper_len} bytes, expected {expected_wrapper_len}"
+                )
+                .into(),
+            ));
+        }
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| E::from(failure(error)))?;
+        io::Write::write_all(&mut file, &prefix)
+            .map_err(|error| E::from(failure(error)))?;
+        file.sync_all()
+            .map_err(|error| E::from(failure(error)))?;
+        drop(file);
+        let object = self.publish_verified_payload(&transaction, &staged, id, written_nbytes)?;
+        guard.armed = false;
+        Ok(Some((object, written_nbytes)))
+    }
+
     /// Store a legacy immutable container verbatim under its container digest.
     pub fn insert_legacy_container(
         &self,
@@ -3160,6 +3269,81 @@ impl Root {
             .join("locks")
             .join(kind)
             .join(format!("{key}.lock"))
+    }
+}
+
+/// Hashes payload bytes as they are accepted by the underlying writer, poisoning
+/// the stream if any write or flush fails so a caller that ignores an I/O error
+/// cannot publish a desynchronized companion wrapper.
+struct StreamingHashWriter<'a, W: io::Write> {
+    inner: &'a mut W,
+    context: DigestContext,
+    written: u64,
+    poisoned: Option<String>,
+}
+
+impl<'a, W: io::Write> StreamingHashWriter<'a, W> {
+    fn new(inner: &'a mut W) -> Self {
+        Self {
+            inner,
+            context: DigestContext::new(&SHA256),
+            written: 0,
+            poisoned: None,
+        }
+    }
+}
+
+impl<W: io::Write> io::Write for StreamingHashWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Some(reason) = &self.poisoned {
+            return Err(io::Error::other(format!(
+                "streaming payload writer poisoned: {reason}"
+            )));
+        }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let max_payload = u64::MAX - ALIGNMENT;
+        let remaining = max_payload.saturating_sub(self.written);
+        if remaining == 0 {
+            let error = io::Error::other("payload length overflow");
+            self.poisoned = Some(error.to_string());
+            return Err(error);
+        }
+        let limit = buf
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        let written = match self.inner.write(&buf[..limit]) {
+            Ok(written) => written,
+            Err(error) => {
+                if error.kind() != io::ErrorKind::Interrupted {
+                    self.poisoned = Some(error.to_string());
+                }
+                return Err(error);
+            }
+        };
+        self.context.update(&buf[..written]);
+        self.written = self.written.checked_add(written as u64).ok_or_else(|| {
+            let error = io::Error::other("payload length overflow");
+            self.poisoned = Some(error.to_string());
+            error
+        })?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if let Some(reason) = &self.poisoned {
+            return Err(io::Error::other(format!(
+                "streaming payload writer poisoned: {reason}"
+            )));
+        }
+        if let Err(error) = self.inner.flush() {
+            if error.kind() != io::ErrorKind::Interrupted {
+                self.poisoned = Some(error.to_string());
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
@@ -8127,6 +8311,228 @@ mod tests {
                 .exists()
         );
         drop(entry);
+    }
+
+    #[test]
+    fn streaming_capture_skips_empty_payload_and_cleans_up_errors() {
+        let temporary = Temporary::new();
+        let root = temporary.root();
+
+        let empty = root
+            .capture_payload_streaming(|_writer| -> Result<()> { Ok(()) })
+            .unwrap();
+        assert!(empty.is_none());
+        assert_eq!(objects(&root), 0);
+        assert_eq!(staged(&root), 0);
+
+        let zero_slice = root
+            .capture_payload_streaming(|writer| -> Result<()> {
+                writer.write_all(&[]).map_err(failure)?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(zero_slice.is_none());
+        assert_eq!(objects(&root), 0);
+        assert_eq!(staged(&root), 0);
+
+        let error = root
+            .capture_payload_streaming(|writer| -> Result<()> {
+                writer.write_all(&vec![0x5Au8; 128 << 10]).map_err(failure)?;
+                Err("stream aborted".into())
+            })
+            .err()
+            .expect("callback error must propagate");
+        assert_eq!(error.to_string(), "stream aborted");
+        assert_eq!(objects(&root), 0);
+        assert_eq!(staged(&root), 0);
+    }
+
+    #[test]
+    fn streaming_capture_matches_companion_framing_and_reuses_verified_hits() {
+        let streaming_dir = Temporary::new();
+        let reference_dir = Temporary::new();
+        let streaming_root = streaming_dir.root();
+        let reference_root = reference_dir.root();
+
+        let small: Vec<u8> = (0..17u8).map(|i| i.wrapping_mul(13).wrapping_add(5)).collect();
+        let page: Vec<u8> = (0..4096usize)
+            .map(|i| ((i * 37 + 11) & 0xFF) as u8)
+            .collect();
+        let large: Vec<u8> = (0usize..(5 << 20))
+            .map(|i| ((i.wrapping_mul(29) ^ (i >> 9)) & 0xFF) as u8)
+            .collect();
+
+        for (index, payload) in [&small, &page, &large].into_iter().enumerate() {
+            let chunk_pattern = [1usize, 19, 4096, 65_536, 131_071, 1_111_111];
+            let (streamed, streamed_len) = streaming_root
+                .capture_payload_streaming(|writer| -> Result<()> {
+                    let mut cursor = 0usize;
+                    let mut step = 0usize;
+                    while cursor < payload.len() {
+                        let chunk_len = chunk_pattern[step % chunk_pattern.len()]
+                            .min(payload.len() - cursor);
+                        let chunk = &payload[cursor..cursor + chunk_len];
+                        if step % 2 == 0 {
+                            let mut written = 0usize;
+                            while written < chunk.len() {
+                                let count = writer.write(&chunk[written..]).map_err(failure)?;
+                                assert!(count > 0);
+                                written += count;
+                            }
+                        } else {
+                            writer.write_all(chunk).map_err(failure)?;
+                        }
+                        cursor += chunk_len;
+                        step += 1;
+                    }
+                    Ok(())
+                })
+                .unwrap()
+                .expect("non-empty payload produces a cached object");
+            let reference = reference_root
+                .capture_payload(payload.len() as u64, payload.as_slice())
+                .unwrap();
+
+            assert_eq!(streamed_len, payload.len() as u64);
+            assert_eq!(streamed.length(), payload.len() as u64);
+            assert_eq!(streamed.id(), PayloadId::of(payload));
+            assert_eq!(streamed.id(), reference.id());
+            assert_eq!(
+                fs::read(streamed.path()).unwrap(),
+                fs::read(reference.path()).unwrap(),
+                "companion wrapper bytes must match for case {index}"
+            );
+            assert_eq!(staged(&streaming_root), 0);
+        }
+        assert_eq!(objects(&streaming_root), 3);
+
+        // Hitting an existing object skips staging publication without overwriting the blob.
+        let existing = streaming_root
+            .payload(PayloadId::of(&large))
+            .unwrap()
+            .unwrap();
+        let existing_path = existing.path().to_path_buf();
+        #[cfg(unix)]
+        let existing_inode = inode_of(&existing_path);
+        drop(existing);
+
+        let (hit, hit_len) = streaming_root
+            .capture_payload_streaming(|writer| -> Result<()> {
+                writer.write_all(&large).map_err(failure)?;
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit_len, large.len() as u64);
+        assert_eq!(hit.id(), PayloadId::of(&large));
+        assert_eq!(hit.path(), existing_path);
+        #[cfg(unix)]
+        assert_eq!(inode_of(hit.path()), existing_inode);
+        assert_eq!(objects(&streaming_root), 3);
+        assert_eq!(staged(&streaming_root), 0);
+        drop(hit);
+
+        // Corrupting the cached blob is still detected on a streaming cache hit.
+        let mut permissions = fs::metadata(&existing_path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        fs::set_permissions(&existing_path, permissions).unwrap();
+        let mut raw = fs::read(&existing_path).unwrap();
+        raw[ALIGNMENT as usize] ^= 0xFF;
+        fs::write(&existing_path, &raw).unwrap();
+        make_immutable(&existing_path).unwrap();
+
+        assert!(
+            streaming_root
+                .capture_payload_streaming(|writer| -> Result<()> {
+                    writer.write_all(&large).map_err(failure)?;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert_eq!(staged(&streaming_root), 0);
+    }
+
+    #[test]
+    fn streaming_capture_rejects_mismatched_staged_size_without_polluting_blobs() {
+        use std::io::Write as _;
+        let temporary = Temporary::new();
+        let root = temporary.root();
+        let valid_payload = b"valid-streaming-payload";
+
+        let error = root.capture_payload_streaming(|writer| -> Result<()> {
+            writer.write_all(valid_payload).map_err(failure)?;
+            writer.flush().map_err(failure)?;
+            // Simulate unhashed trailing bytes flushed to the staged file (for example,
+            // from a partial write before an error that the producer suppressed).
+            let wrapped_dir = root.path().join("staging/wrapped");
+            let staged_entry = fs::read_dir(&wrapped_dir)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            OpenOptions::new()
+                .write(true)
+                .open(&staged_entry)
+                .unwrap()
+                .set_len(ALIGNMENT + valid_payload.len() as u64 + 64)
+                .unwrap();
+            Ok(())
+        });
+        assert!(error.is_err(), "corrupt wrapper length must be rejected");
+        assert_eq!(
+            objects(&root),
+            0,
+            "corrupt staged file must never be linked into blobs/"
+        );
+        assert_eq!(staged(&root), 0);
+
+        // Subsequent capture of the same payload identity must succeed cleanly.
+        let recovered = root
+            .capture_payload(valid_payload.len() as u64, &valid_payload[..])
+            .expect("blobs/ must not be poisoned by a rejected streaming capture");
+        assert_eq!(recovered.id(), PayloadId::of(valid_payload));
+
+        // Partial write_all before StorageFull updates byte/hash accounting per chunk,
+        // poisons the stream against subsequent writes, and bounds length below u64::MAX - ALIGNMENT.
+        struct LimitedSink {
+            bytes: Vec<u8>,
+            limit: usize,
+        }
+        impl io::Write for LimitedSink {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                let spare = self.limit.saturating_sub(self.bytes.len());
+                if spare == 0 {
+                    return Err(io::Error::from(io::ErrorKind::StorageFull));
+                }
+                let take = spare.min(buf.len()).min(512);
+                self.bytes.extend_from_slice(&buf[..take]);
+                Ok(take)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut sink = LimitedSink {
+            bytes: Vec::new(),
+            limit: 1536,
+        };
+        let mut hasher = StreamingHashWriter::new(&mut sink);
+        hasher.write_all(&[0x11; 1024]).unwrap();
+        let mid_err = hasher
+            .write_all(&[0x22; 1024])
+            .expect_err("sink limit must trigger StorageFull");
+        assert_eq!(mid_err.kind(), io::ErrorKind::StorageFull);
+        assert_eq!(hasher.written, 1536);
+        assert!(hasher.poisoned.is_some());
+        assert!(hasher.write(&[0x33; 1]).is_err());
+
+        let mut overflow_sink = Vec::new();
+        let mut near_max = StreamingHashWriter::new(&mut overflow_sink);
+        near_max.written = u64::MAX - ALIGNMENT;
+        assert!(near_max.write(&[0x44; 1]).is_err());
+        assert!(near_max.poisoned.is_some());
     }
 
 }

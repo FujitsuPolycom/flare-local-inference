@@ -19,10 +19,11 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::core::container::{self, Slice, Source, Writer as ContainerWriter};
-use crate::core::protection::{compress_stream, EnvelopeBuilder};
+use crate::core::protection::{CompressedResource, EnvelopeBuilder, compress_stream};
 use crate::core::schema::{self, wire};
 use crate::core::{PayloadId, invalid};
 use prost::Message;
+use rayon::prelude::*;
 
 #[cfg(test)]
 #[path = "export_cache_tests.rs"]
@@ -355,6 +356,284 @@ pub fn publish_reusing_cached_weights(
     publish_inner(request, key, destination, Some(weights))
 }
 
+/// Stored range of one executable resource: assigned id, decoded bytes, stored
+/// end offset, and the SHA-256 of every stored chunk.
+type ExecutableSpan = (u64, u64, u64, Vec<Vec<u8>>);
+
+/// Removes an uninstalled `.sealing-*` payload file when publication exits early.
+struct ScratchFile(Option<PathBuf>);
+
+impl ScratchFile {
+    fn remove(mut self) -> Result<(), crate::Error> {
+        if let Some(path) = self.0.take() {
+            std::fs::remove_file(path).map_err(|e| io("remove sealed scratch", e))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ScratchFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Largest executable resource, in plaintext bytes, compressed in memory.
+///
+/// Resources larger than this limit compress directly into the payload file via
+/// [`compress_stream`]; smaller resources are grouped by [`in_memory_batch`]
+/// into batches of at most [`COMPRESSION_BATCH`] items.
+const IN_MEMORY_RESOURCE_BYTES: u64 = 64 << 20;
+
+/// Executable resources compressed concurrently within one batch.
+const COMPRESSION_BATCH: usize = 16;
+
+/// Buffer size for reading plaintext executable files into the zstd encoder.
+const EXECUTABLE_READ_BUFFER_BYTES: usize = 256 << 10;
+
+/// Buffer size for writing sealed executable frames to disk.
+const SEALING_BUFFER_BYTES: usize = 4 << 20;
+
+/// Buffered file sink that computes the payload SHA-256 digest and byte count
+/// as compressed executable frames are written.
+struct SealingWriter {
+    writer: std::io::BufWriter<File>,
+    hasher: Sha256,
+    written_nbytes: u64,
+}
+
+impl SealingWriter {
+    fn new(file: File) -> Self {
+        Self {
+            writer: std::io::BufWriter::with_capacity(SEALING_BUFFER_BYTES, file),
+            hasher: Sha256::new(),
+            written_nbytes: 0,
+        }
+    }
+
+    fn finish(self) -> Result<(PayloadId, u64), crate::Error> {
+        let file = self
+            .writer
+            .into_inner()
+            .map_err(|error| io("flush executable payload", error.into_error()))?;
+        file.sync_all()
+            .map_err(|error| io("sync executable payload", error))?;
+        drop(file);
+        Ok((
+            PayloadId::from_bytes(self.hasher.finish()),
+            self.written_nbytes,
+        ))
+    }
+}
+
+impl Write for SealingWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.writer.write(bytes)?;
+        let written_u64 = u64::try_from(written)
+            .map_err(|_| std::io::Error::other("executable payload write length overflow"))?;
+        self.written_nbytes = self
+            .written_nbytes
+            .checked_add(written_u64)
+            .ok_or_else(|| std::io::Error::other("executable payload length overflow"))?;
+        self.hasher.update(&bytes[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+/// Number of leading `resources` compressed together in memory.
+///
+/// The run ends at [`COMPRESSION_BATCH`] items or at the first resource above
+/// `limit`, bounding the compressed frames retained in memory at once.
+fn in_memory_batch(resources: &[&PublishResource], limit: u64) -> usize {
+    resources
+        .iter()
+        .take(COMPRESSION_BATCH)
+        .take_while(|resource| resource.nbytes <= limit)
+        .count()
+}
+
+/// Compress independent executable resources into their own zstd frames.
+///
+/// Each frame carries its own chunk commitments and depends only on its resource,
+/// so compression order and thread count cannot change the stored bytes or the
+/// recorded digests. Results keep the input order for writing.
+fn compress_batch(
+    resources: &[&PublishResource],
+) -> Result<Vec<(CompressedResource, Vec<u8>)>, crate::Error> {
+    resources
+        .par_iter()
+        .map(|resource| {
+            let file = File::open(&resource.path).map_err(|e| io("open executable plaintext", e))?;
+            let capacity = usize::try_from(resource.nbytes / 2)
+                .unwrap_or(8 << 20)
+                .clamp(4096, 8 << 20);
+            let mut stored = Vec::with_capacity(capacity);
+            let compressed = compress_stream(
+                std::io::BufReader::with_capacity(EXECUTABLE_READ_BUFFER_BYTES, file),
+                resource.nbytes,
+                &mut stored,
+            )?;
+            Ok((compressed, stored))
+        })
+        .collect()
+}
+
+/// Record one stored executable range and advance the resource and byte counters.
+fn push_executable_span(
+    resource: &PublishResource,
+    compressed: CompressedResource,
+    stored_end: &mut u64,
+    resource_id: &mut u64,
+    plaintext_bytes: &mut u64,
+) -> Result<ExecutableSpan, crate::Error> {
+    *stored_end = stored_end
+        .checked_add(compressed.stored_nbytes)
+        .ok_or_else(|| invalid("executable payload length overflow"))?;
+    let next_resource_id = resource_id
+        .checked_add(1)
+        .ok_or_else(|| invalid("executable resource identifier overflow"))?;
+    *plaintext_bytes = plaintext_bytes
+        .checked_add(resource.nbytes)
+        .ok_or_else(|| invalid("executable plaintext length overflow"))?;
+    let span = (*resource_id, resource.nbytes, *stored_end, compressed.chunk_sha256);
+    *resource_id = next_resource_id;
+    Ok(span)
+}
+
+fn write_compressed_batch(
+    writer: &mut SealingWriter,
+    batch: &[&PublishResource],
+    compressed_batch: Vec<(CompressedResource, Vec<u8>)>,
+    spans: &mut Vec<ExecutableSpan>,
+    stored_end: &mut u64,
+    resource_id: &mut u64,
+    plaintext_bytes: &mut u64,
+) -> Result<(), crate::Error> {
+    for (resource, (compressed, stored)) in batch.iter().copied().zip(compressed_batch) {
+        writer
+            .write_all(&stored)
+            .map_err(|e| io("write executable payload", e))?;
+        spans.push(push_executable_span(
+            resource,
+            compressed,
+            stored_end,
+            resource_id,
+            plaintext_bytes,
+        )?);
+    }
+    Ok(())
+}
+
+/// Compress and seal one rank executable group into `scratch`, hashing the
+/// written payload stream so publication does not re-read the staged file.
+fn seal_executable_resources(
+    scratch: &Path,
+    resources: &[&PublishResource],
+    in_memory_limit: u64,
+    resource_id: &mut u64,
+    executable_phase: &crate::startup::Phase,
+) -> Result<(ScratchFile, PayloadId, u64, u64, Vec<ExecutableSpan>), crate::Error> {
+    let mut scratch_guard = ScratchFile(None);
+    let output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(scratch)
+        .map_err(|e| io("create executable payload", e))?;
+    scratch_guard.0 = Some(scratch.to_path_buf());
+    let mut writer = SealingWriter::new(output);
+    let mut stored_end = 0u64;
+    let mut plaintext_bytes = 0u64;
+    let mut spans: Vec<ExecutableSpan> = Vec::with_capacity(resources.len());
+    let mut next = 0;
+    let mut pending: Option<(&[&PublishResource], Vec<(CompressedResource, Vec<u8>)>)> = None;
+
+    while next < resources.len() || pending.is_some() {
+        if let Some((batch, compressed_batch)) = pending.take() {
+            let next_count = in_memory_batch(&resources[next..], in_memory_limit);
+            if next_count > 0 {
+                let next_batch = &resources[next..next + next_count];
+                executable_phase.detail(format!("compressing {} resources", next_batch.len()));
+                let (write_result, next_compressed) = rayon::join(
+                    || {
+                        write_compressed_batch(
+                            &mut writer,
+                            batch,
+                            compressed_batch,
+                            &mut spans,
+                            &mut stored_end,
+                            resource_id,
+                            &mut plaintext_bytes,
+                        )
+                    },
+                    || compress_batch(next_batch),
+                );
+                write_result?;
+                pending = Some((next_batch, next_compressed?));
+                next += next_count;
+            } else {
+                write_compressed_batch(
+                    &mut writer,
+                    batch,
+                    compressed_batch,
+                    &mut spans,
+                    &mut stored_end,
+                    resource_id,
+                    &mut plaintext_bytes,
+                )?;
+            }
+            continue;
+        }
+
+        let count = in_memory_batch(&resources[next..], in_memory_limit);
+        if count == 0 {
+            // A resource above the in-memory limit streams into the payload
+            // file so one frame never inflates the retained batch.
+            let resource = resources[next];
+            executable_phase.detail(format!("compressing {}", resource.path.display()));
+            let file =
+                File::open(&resource.path).map_err(|e| io("open executable plaintext", e))?;
+            let compressed = compress_stream(
+                std::io::BufReader::with_capacity(EXECUTABLE_READ_BUFFER_BYTES, file),
+                resource.nbytes,
+                &mut writer,
+            )?;
+            spans.push(push_executable_span(
+                resource,
+                compressed,
+                &mut stored_end,
+                resource_id,
+                &mut plaintext_bytes,
+            )?);
+            next += 1;
+        } else {
+            let batch = &resources[next..next + count];
+            executable_phase.detail(format!("compressing {} resources", batch.len()));
+            pending = Some((batch, compress_batch(batch)?));
+            next += count;
+        }
+    }
+
+    let (id, written_nbytes) = writer.finish()?;
+    let payload_len = std::fs::metadata(scratch)
+        .map_err(|e| io("stat executable payload", e))?
+        .len();
+    if payload_len != stored_end || payload_len != written_nbytes {
+        return Err(invalid(
+            "executable payload length disagrees with its stored ranges",
+        ));
+    }
+    if payload_len == 0 {
+        return Err(invalid("executable payload is empty"));
+    }
+    Ok((scratch_guard, id, payload_len, plaintext_bytes, spans))
+}
+
 fn publish_inner(
     request: &PublishRequest,
     key: &ring::signature::Ed25519KeyPair,
@@ -448,7 +727,11 @@ fn publish_inner(
             }) {
                 return Err(invalid("rank resources must list cubins before graphs"));
             }
-            let executable_bytes = rank.resources.iter().map(|resource| resource.nbytes).sum();
+            let executable_bytes = rank
+                .resources
+                .iter()
+                .try_fold(0u64, |sum, resource| sum.checked_add(resource.nbytes))
+                .ok_or_else(|| invalid("rank executable plaintext length overflow"))?;
             let executable_phase = progress.phase(
                 &format!("Compress and publish rank {} executables", rank.body.rank),
                 Some(executable_bytes),
@@ -470,56 +753,21 @@ fn publish_inner(
                     body.deployment_id, rank_body.rank
                 );
                 let scratch = staging_name(&destination, &format!(".sealing-{}", rank_body.rank));
-                let mut output = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&scratch)
-                    .map_err(|e| io("create executable payload", e))?;
-                let mut stored_end = 0u64;
-                let mut plaintext_bytes = 0u64;
-                let mut spans = Vec::with_capacity(indices.len());
-                for position in indices {
-                    let resource = &rank.resources[position];
-                    executable_phase.detail(format!("compressing {}", resource.path.display()));
-                    let compressed = compress_stream(
-                        std::io::BufReader::new(
-                            File::open(&resource.path)
-                                .map_err(|e| io("open executable plaintext", e))?,
-                        ),
-                        resource.nbytes,
-                        &mut output,
+                let resources: Vec<&PublishResource> = indices
+                    .iter()
+                    .map(|&position| &rank.resources[position])
+                    .collect();
+                // Every fresh occurrence is hashed as it is written before deduplication.
+                // Identical rank groups share one companion while still checking their bytes and length.
+                let (scratch_guard, id, payload_len, plaintext_bytes, spans) =
+                    seal_executable_resources(
+                        &scratch,
+                        &resources,
+                        IN_MEMORY_RESOURCE_BYTES,
+                        &mut resource_id,
+                        &executable_phase,
                     )?;
-                    stored_end = stored_end
-                        .checked_add(compressed.stored_nbytes)
-                        .ok_or_else(|| invalid("executable payload length overflow"))?;
-                    spans.push((
-                        resource_id,
-                        resource.nbytes,
-                        stored_end,
-                        compressed.chunk_sha256,
-                    ));
-                    resource_id += 1;
-                    plaintext_bytes += resource.nbytes;
-                }
-                output
-                    .sync_all()
-                    .map_err(|e| io("sync executable payload", e))?;
-                drop(output);
-                let payload_len = std::fs::metadata(&scratch)
-                    .map_err(|e| io("stat executable payload", e))?
-                    .len();
-                if payload_len != stored_end {
-                    return Err(invalid(
-                        "executable payload length disagrees with its stored ranges",
-                    ));
-                }
-                if payload_len == 0 {
-                    return Err(invalid("executable payload is empty"));
-                }
-                // Hash every fresh occurrence before deduplication. Identical rank groups
-                // share one companion; later occurrences still verify their bytes and length.
                 executable_phase.detail(format!("verifying and installing {payload_len} compressed bytes"));
-                let id = hash_file(&scratch, payload_len)?;
                 if !located.contains_key(&id) {
                     install_path_bytes(
                         &scratch,
@@ -540,7 +788,7 @@ fn publish_inner(
                         id
                     )));
                 }
-                std::fs::remove_file(&scratch).map_err(|e| io("remove sealed scratch", e))?;
+                scratch_guard.remove()?;
                 executable_phase.advance_bytes(plaintext_bytes);
                 let descriptor = wire::PayloadDescriptor {
                     id: id.as_bytes().to_vec(),
@@ -779,6 +1027,7 @@ fn write_primary(root: &Path, bytes: &[u8]) -> Result<(), crate::Error> {
     Ok(())
 }
 
+#[cfg(test)]
 fn hash_file(path: &Path, nbytes: u64) -> Result<PayloadId, crate::Error> {
     hash_reader(File::open(path).map_err(|e| io("open payload", e))?, nbytes)
 }
@@ -1573,6 +1822,7 @@ fn container_base(path: &Path) -> Result<u64, crate::Error> {
     Ok(container.tensor(container::COMPANION_TENSOR)?.offset())
 }
 
+#[cfg(test)]
 fn hash_reader(mut reader: impl Read, nbytes: u64) -> Result<PayloadId, crate::Error> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1 << 20];
@@ -3142,5 +3392,544 @@ mod tests {
             sources: vec![part],
         }];
         assert!(assemble(&output, &ranks).is_err());
+    }
+
+    fn publish_resource(nbytes: u64) -> PublishResource {
+        PublishResource {
+            kind: wire::ExecutableKind::Cubin,
+            path: PathBuf::from("unused.plain"),
+            nbytes,
+        }
+    }
+
+    #[test]
+    fn in_memory_batch_bounds_each_compression_run() {
+        let many: Vec<PublishResource> = (0u64..20).map(publish_resource).collect();
+        let many: Vec<&PublishResource> = many.iter().collect();
+        assert_eq!(
+            in_memory_batch(&many, IN_MEMORY_RESOURCE_BYTES),
+            COMPRESSION_BATCH
+        );
+        assert_eq!(in_memory_batch(&many[..5], IN_MEMORY_RESOURCE_BYTES), 5);
+        let mixed = [
+            publish_resource(10),
+            publish_resource(IN_MEMORY_RESOURCE_BYTES + 1),
+            publish_resource(10),
+        ];
+        let mixed: Vec<&PublishResource> = mixed.iter().collect();
+        assert_eq!(in_memory_batch(&mixed, IN_MEMORY_RESOURCE_BYTES), 1);
+        assert_eq!(in_memory_batch(&mixed[1..], IN_MEMORY_RESOURCE_BYTES), 0);
+        let edge = publish_resource(IN_MEMORY_RESOURCE_BYTES);
+        assert_eq!(in_memory_batch(&[&edge], IN_MEMORY_RESOURCE_BYTES), 1);
+    }
+
+    /// Deterministic bytes that differ per seed, so executable payloads stay
+    /// distinct and incompressible frames span more than one chunk.
+    fn executable_bytes(seed: u64, nbytes: usize) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        (0..nbytes)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn publishing_many_executables_stores_serial_frames_in_capture_order() {
+        use crate::core::protection::{self, Selection};
+        use crate::runtime_core::Publisher;
+        use ring::signature::KeyPair;
+
+        let work = scratch("many-executables");
+        let sources = work.join("sources");
+        std::fs::create_dir_all(&sources).unwrap();
+        // The cubins alone exceed one batch, and the sizes cover frames smaller
+        // than one cacheline, single-chunk frames, and multi-chunk frames.
+        let cubin_sizes = [
+            1usize, 63, 64, 65, 997, 4096, 65_537, 200_003, 1 << 20, 2 << 20, 17, 4095, 4 << 20,
+            5 << 20, 700_001, 3, 999_983, 12_345, 100_000, 31,
+        ];
+        let graph_sizes = [7usize, 64, 70_001, 5 << 20, 0x1234, 2, 65_536, 400_000];
+        let write_sources = |prefix: &str, sizes: &[usize]| -> Vec<(PathBuf, Vec<u8>)> {
+            sizes
+                .iter()
+                .enumerate()
+                .map(|(index, &nbytes)| {
+                    let bytes = executable_bytes((index + 1) as u64, nbytes);
+                    let path = sources.join(format!("{prefix}-{index}.plain"));
+                    std::fs::write(&path, &bytes).unwrap();
+                    (path, bytes)
+                })
+                .collect()
+        };
+        let cubins = write_sources("kernel", &cubin_sizes);
+        let graphs = write_sources("graph", &graph_sizes);
+        let cubin_plaintexts: Vec<&[u8]> = cubins.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+        let graph_plaintexts: Vec<&[u8]> =
+            graphs.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+        // Independent serial compression: frames and chunk commitments cannot
+        // depend on batch composition or thread count.
+        let expected: Vec<(Vec<u8>, CompressedResource)> = cubin_plaintexts
+            .iter()
+            .chain(graph_plaintexts.iter())
+            .map(|bytes| protection::compress(bytes).unwrap())
+            .collect();
+        let rank = wire::RankBody {
+            rank: 0,
+            deployment_id: "sm120-tp1".into(),
+            context: Some(crate::runtime_core::wire::Context::default()),
+            allocations: vec![wire::Allocation {
+                name: "storage".into(),
+                nbytes: 256,
+                alignment: 256,
+                address: Some(0x1000),
+                memory: 0,
+                sizing: None,
+                relocations: vec![],
+            }],
+            modules: (0..cubins.len())
+                .map(|index| wire::Module {
+                    name: format!("kernel-{index}"),
+                    cubin: index as u32,
+                    globals: vec![],
+                })
+                .collect(),
+            functions: (0..cubins.len())
+                .map(|index| wire::Function {
+                    module: format!("kernel-{index}"),
+                    symbol: "run".into(),
+                    parameter_sizes: vec![],
+                    attributes: vec![],
+                })
+                .collect(),
+            graphs: (0..graphs.len())
+                .map(|index| wire::Graph {
+                    name: format!("graph-{index}"),
+                    flags: 0,
+                    resource: (cubins.len() + index) as u32,
+                    node_count: 1,
+                    edge_count: 0,
+                    functions: vec![index as u64],
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let resources: Vec<PublishResource> = cubins
+            .iter()
+            .map(|(path, bytes)| PublishResource {
+                kind: wire::ExecutableKind::Cubin,
+                path: path.clone(),
+                nbytes: bytes.len() as u64,
+            })
+            .chain(graphs.iter().map(|(path, bytes)| PublishResource {
+                kind: wire::ExecutableKind::Graph,
+                path: path.clone(),
+                nbytes: bytes.len() as u64,
+            }))
+            .collect();
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let key = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let public_key: [u8; 32] = key.public_key().as_ref().try_into().unwrap();
+        let core_id = [23u8; 32];
+        let request = PublishRequest {
+            core: wire::CoreBody {
+                format_version: schema::FORMAT_VERSION,
+                core_id: core_id.to_vec(),
+                model_identity: "model".into(),
+                hardware_identity: "sm120".into(),
+                publisher: Some(wire::PublisherMetadata {
+                    namespace: "example".into(),
+                    official_source: "https://huggingface.co/example/model".into(),
+                    development: false,
+                    license_name: String::new(),
+                    license_link: String::new(),
+                    ranks: 1,
+                }),
+                frontend: Some(crate::runtime_core::wire::FrontendSettings::default()),
+                sampling_defaults: Some(
+                    crate::runtime_core::wire::DefaultSamplingParameters::default(),
+                ),
+                payloads: vec![],
+                assets: vec![],
+                deployments: vec![],
+            },
+            payloads: vec![],
+            deployments: vec![PublishDeployment {
+                body: wire::DeploymentBody {
+                    deployment_id: "sm120-tp1".into(),
+                    architecture: vec![12, 0],
+                    tensor_parallel: 1,
+                    contract: Some(crate::runtime_core::wire::ServingContract::default()),
+                    ..Default::default()
+                },
+                ranks: vec![PublishRank {
+                    body: rank,
+                    payloads: vec![],
+                    resources,
+                }],
+                payloads: vec![],
+            }],
+            core_id,
+            public_key,
+            accepted: "example".into(),
+            no_weights: false,
+        };
+        let publisher = Publisher {
+            name: "Example".into(),
+            namespace: "example".into(),
+            public_key,
+            development: false,
+        };
+        let check = |directory: &Path| -> (Vec<Vec<u8>>, Vec<wire::ExecutableResource>) {
+            let metadata = crate::core::reader::Metadata::open(directory).unwrap();
+            let verified = protection::verify(
+                &metadata.envelope,
+                std::slice::from_ref(&publisher),
+                Selection::Deployment {
+                    deployment: 0,
+                    rank: Some(0),
+                },
+            )
+            .unwrap();
+            let authorized = verified.authorize("example").unwrap();
+            let ranks = authorized.verified().ranks();
+            assert_eq!(ranks.len(), 1);
+            let resources = &ranks[0].resources;
+            assert_eq!(resources.len(), cubins.len() + graphs.len());
+            let mut payload_ids = Vec::new();
+            for (start, plaintexts) in [
+                (0usize, &cubin_plaintexts),
+                (cubins.len(), &graph_plaintexts),
+            ] {
+                let payload_id = resources[start]
+                    .stored
+                    .as_ref()
+                    .unwrap()
+                    .payload_id
+                    .clone();
+                let files = metadata
+                    .payloads(authorized.verified().catalog(), [payload_id.as_slice()])
+                    .unwrap();
+                files.verify().unwrap();
+                let mut offset = 0u64;
+                for (index, plaintext) in plaintexts.iter().enumerate() {
+                    let position = start + index;
+                    let resource = &resources[position];
+                    let stored = resource.stored.as_ref().unwrap();
+                    let (frame, compressed) = &expected[position];
+                    assert_eq!(resource.resource_id, position as u64 + 1);
+                    assert_eq!(stored.payload_id, payload_id);
+                    assert_eq!(stored.offset, offset);
+                    assert_eq!(stored.nbytes, frame.len() as u64);
+                    assert_eq!(resource.decoded_nbytes, plaintext.len() as u64);
+                    assert_eq!(resource.chunk_nbytes, schema::MAX_CHUNK as u32);
+                    assert_eq!(resource.chunk_sha256, compressed.chunk_sha256);
+                    let mut bytes = vec![0u8; stored.nbytes as usize];
+                    files
+                        .get(&stored.payload_id)
+                        .unwrap()
+                        .read_at(stored.offset, &mut bytes)
+                        .unwrap();
+                    assert_eq!(bytes, *frame);
+                    assert_eq!(
+                        authorized
+                            .open_resource(resource, &bytes)
+                            .unwrap()
+                            .as_slice(),
+                        *plaintext
+                    );
+                    offset += stored.nbytes;
+                }
+                assert_eq!(
+                    offset,
+                    expected[start..start + plaintexts.len()]
+                        .iter()
+                        .map(|(frame, _)| frame.len() as u64)
+                        .sum::<u64>()
+                );
+                payload_ids.push(payload_id);
+            }
+            assert_ne!(payload_ids[0], payload_ids[1]);
+            (payload_ids, resources.clone())
+        };
+
+        let first = work.join("first");
+        std::fs::create_dir_all(&first).unwrap();
+        let published = publish(&request, &key, Destination::Directory(&first)).unwrap();
+        assert_eq!(published.payloads.len(), 2);
+        let first = check(&first);
+        drop(published);
+
+        let second = work.join("second");
+        std::fs::create_dir_all(&second).unwrap();
+        let published = publish(&request, &key, Destination::Directory(&second)).unwrap();
+        assert_eq!(published.payloads.len(), 2);
+        let second = check(&second);
+        drop(published);
+
+        assert_eq!(first, second);
+
+        // Removing one plaintext source causes batch compression to fail and cleans up `.sealing-*`.
+        let failed_dir = work.join("failed");
+        std::fs::create_dir_all(&failed_dir).unwrap();
+        std::fs::remove_file(&cubins[3].0).unwrap();
+        assert!(publish(&request, &key, Destination::Directory(&failed_dir)).is_err());
+        let leftovers: Vec<_> = std::fs::read_dir(&failed_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(leftovers.is_empty(), "leftover sealing files: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn sealing_writer_matches_file_digest_across_batched_and_streamed_resources() {
+        use crate::core::cache::Root;
+        use crate::core::protection;
+        use ring::signature::KeyPair;
+
+        let work = scratch("sealing-writer");
+        let sources = work.join("sources");
+        std::fs::create_dir_all(&sources).unwrap();
+        let small_limit = 4096u64;
+        // Nineteen leading resources <= small_limit span two in-memory batches,
+        // followed by a streamed resource above small_limit, another small batch,
+        // and a 5 MiB streamed resource that exceeds SEALING_BUFFER_BYTES.
+        let cubin_sizes = [
+            1usize, 19, 64, 65, 257, 511, 1024, 1500, 2048, 2500, 3000, 3333, 3600, 3900, 4000,
+            4095, 4096, 512, 2049, 262_147, 128, 1023, 4096, 5 << 20,
+        ];
+        let graph_sizes = [33usize, 4096, 131_075, 1 << 20];
+        let write_group =
+            |prefix: &str, kind: wire::ExecutableKind, sizes: &[usize], seed_base: u64| {
+                sizes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &nbytes)| {
+                        let bytes = executable_bytes(seed_base + index as u64, nbytes);
+                        let path = sources.join(format!("{prefix}-{index}.plain"));
+                        std::fs::write(&path, &bytes).unwrap();
+                        (
+                            PublishResource {
+                                kind,
+                                path,
+                                nbytes: nbytes as u64,
+                            },
+                            bytes,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+        let cubins = write_group("cubin", wire::ExecutableKind::Cubin, &cubin_sizes, 100);
+        let graphs = write_group("graph", wire::ExecutableKind::Graph, &graph_sizes, 500);
+        let cubin_refs: Vec<&PublishResource> = cubins.iter().map(|(res, _)| res).collect();
+
+        let seal_dir = work.join("seal-direct");
+        std::fs::create_dir_all(&seal_dir).unwrap();
+        let sealed_path = seal_dir.join(".sealing-0");
+        let progress = crate::startup::StartupProgress::silent();
+        let phase = progress.phase("Seal test executables", None);
+        let mut next_resource_id = 1u64;
+        let (guard, sealed_id, payload_len, plaintext_len, spans) = seal_executable_resources(
+            &sealed_path,
+            &cubin_refs,
+            small_limit,
+            &mut next_resource_id,
+            &phase,
+        )
+        .unwrap();
+        assert_eq!(spans.len(), cubins.len());
+        assert_eq!(next_resource_id, cubins.len() as u64 + 1);
+        assert_eq!(
+            plaintext_len,
+            cubins.iter().map(|(res, _)| res.nbytes).sum::<u64>()
+        );
+        assert_eq!(
+            sealed_id,
+            hash_file(&sealed_path, payload_len).unwrap(),
+            "streaming digest must match hash_file on the sealed payload"
+        );
+        let mut expected_frames = Vec::new();
+        for (_, plaintext) in &cubins {
+            let (frame, _) = protection::compress(plaintext).unwrap();
+            expected_frames.extend_from_slice(&frame);
+        }
+        assert_eq!(payload_len, expected_frames.len() as u64);
+        assert_eq!(std::fs::read(&sealed_path).unwrap(), expected_frames);
+        assert_eq!(sealed_id, PayloadId::of(&expected_frames));
+        guard.remove().unwrap();
+        assert!(!sealed_path.exists());
+
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let key = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let public_key: [u8; 32] = key.public_key().as_ref().try_into().unwrap();
+        let core_id = [31u8; 32];
+        let rank_body = wire::RankBody {
+            rank: 0,
+            deployment_id: "sm120-tp1".into(),
+            context: Some(crate::runtime_core::wire::Context::default()),
+            allocations: vec![wire::Allocation {
+                name: "storage".into(),
+                nbytes: 256,
+                alignment: 256,
+                address: Some(0x1000),
+                memory: 0,
+                sizing: None,
+                relocations: vec![],
+            }],
+            modules: (0..cubins.len())
+                .map(|index| wire::Module {
+                    name: format!("kernel-{index}"),
+                    cubin: index as u32,
+                    globals: vec![],
+                })
+                .collect(),
+            functions: (0..cubins.len())
+                .map(|index| wire::Function {
+                    module: format!("kernel-{index}"),
+                    symbol: "run".into(),
+                    parameter_sizes: vec![],
+                    attributes: vec![],
+                })
+                .collect(),
+            graphs: (0..graphs.len())
+                .map(|index| wire::Graph {
+                    name: format!("graph-{index}"),
+                    flags: 0,
+                    resource: (cubins.len() + index) as u32,
+                    node_count: 1,
+                    edge_count: 0,
+                    functions: vec![0],
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let resources: Vec<PublishResource> = cubins
+            .iter()
+            .chain(graphs.iter())
+            .map(|(res, _)| res.clone())
+            .collect();
+        let request = PublishRequest {
+            core: wire::CoreBody {
+                format_version: schema::FORMAT_VERSION,
+                core_id: core_id.to_vec(),
+                model_identity: "model".into(),
+                hardware_identity: "sm120".into(),
+                publisher: Some(wire::PublisherMetadata {
+                    namespace: "example".into(),
+                    official_source: "https://huggingface.co/example/model".into(),
+                    development: false,
+                    license_name: String::new(),
+                    license_link: String::new(),
+                    ranks: 1,
+                }),
+                frontend: Some(crate::runtime_core::wire::FrontendSettings::default()),
+                sampling_defaults: Some(
+                    crate::runtime_core::wire::DefaultSamplingParameters::default(),
+                ),
+                payloads: vec![],
+                assets: vec![],
+                deployments: vec![],
+            },
+            payloads: vec![],
+            deployments: vec![PublishDeployment {
+                body: wire::DeploymentBody {
+                    deployment_id: "sm120-tp1".into(),
+                    architecture: vec![12, 0],
+                    tensor_parallel: 1,
+                    contract: Some(crate::runtime_core::wire::ServingContract::default()),
+                    ..Default::default()
+                },
+                ranks: vec![PublishRank {
+                    body: rank_body,
+                    payloads: vec![],
+                    resources,
+                }],
+                payloads: vec![],
+            }],
+            core_id,
+            public_key,
+            accepted: "example".into(),
+            no_weights: false,
+        };
+
+        let published_dir = work.join("published");
+        std::fs::create_dir_all(&published_dir).unwrap();
+        let published = publish(&request, &key, Destination::Directory(&published_dir)).unwrap();
+        assert_eq!(published.payloads.len(), 2);
+        for payload in &published.payloads {
+            let companion_path = published_dir.join(&payload.relative);
+            let slice = container::Container::open(&companion_path)
+                .unwrap()
+                .tensor(container::COMPANION_TENSOR)
+                .unwrap();
+            assert_eq!(slice.len(), payload.nbytes);
+            let extracted = work.join("extracted.payload");
+            let mut raw = Vec::new();
+            slice.copy_to(&mut raw).unwrap();
+            std::fs::write(&extracted, &raw).unwrap();
+            assert_eq!(payload.id, hash_file(&extracted, payload.nbytes).unwrap());
+            assert_eq!(payload.id, slice.digest().unwrap());
+        }
+        let kernels_published = published
+            .payloads
+            .iter()
+            .find(|payload| payload.role == wire::PayloadRole::Kernels as i32)
+            .unwrap();
+        assert_eq!(kernels_published.id, sealed_id);
+
+        let cache_dir = work.join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let cache_root = Root::open(&cache_dir).unwrap();
+        let mut staging = cache_root.stage("model", "entry").unwrap();
+        let cached = publish(&request, &key, Destination::Cache(&cache_root, &mut staging)).unwrap();
+        assert_eq!(cached.payloads, published.payloads);
+        drop(staging);
+
+        // Truncate the streamed resource after the leading batches so streaming fails
+        // after buffered writes have already occurred, verifying `.sealing-*` cleanup.
+        OpenOptions::new()
+            .write(true)
+            .open(&cubins[19].0.path)
+            .unwrap()
+            .set_len(64)
+            .unwrap();
+        let mut failed_resource_id = 1u64;
+        assert!(
+            seal_executable_resources(
+                &seal_dir.join(".sealing-stream-fail"),
+                &cubin_refs,
+                small_limit,
+                &mut failed_resource_id,
+                &phase,
+            )
+            .is_err()
+        );
+        let seal_leftovers: Vec<_> = std::fs::read_dir(&seal_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(
+            seal_leftovers.is_empty(),
+            "leftover sealing files after streaming failure: {seal_leftovers:?}"
+        );
+
+        let failed_publish_dir = work.join("failed-publish");
+        std::fs::create_dir_all(&failed_publish_dir).unwrap();
+        assert!(publish(&request, &key, Destination::Directory(&failed_publish_dir)).is_err());
+        let publish_leftovers: Vec<_> = std::fs::read_dir(&failed_publish_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(
+            publish_leftovers.is_empty(),
+            "leftover sealing files after publish failure: {publish_leftovers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&work);
     }
 }

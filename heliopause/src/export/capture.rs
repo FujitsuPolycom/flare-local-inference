@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use libloading::Library;
 use prost::Message;
+use rayon::prelude::*;
 
 use super::{
     Allocation, Argument, CaptureRequest, DeviceIdentity, ExportResult, FilePart, FileSource,
@@ -44,21 +45,43 @@ macro_rules! cu {
     ($cuda:expr, $name:literal, ()) => {{ $cuda.check($name, status!($cuda, $name, ())) }};
 }
 
-struct Cuda {
+pub(crate) struct Cuda {
     library: Library,
+    symbols: std::sync::RwLock<HashMap<&'static [u8], usize>>,
 }
 impl Cuda {
-    fn new() -> ExportResult<Self> {
+    pub(crate) fn new() -> ExportResult<Self> {
         #[cfg(windows)]
         let library =
             unsafe { libloading::os::windows::Library::load_with_flags("nvcuda.dll", 0x800)? }
                 .into();
         #[cfg(not(windows))]
         let library = unsafe { Library::new("libcuda.so.1")? };
-        Ok(Self { library })
+        Ok(Self {
+            library,
+            symbols: std::sync::RwLock::new(HashMap::new()),
+        })
     }
-    unsafe fn symbol<T: Copy>(&self, name: &[u8]) -> ExportResult<T> {
-        Ok(*unsafe { self.library.get::<T>(name)? })
+    pub(crate) unsafe fn symbol<T: Copy>(&self, name: &'static [u8]) -> ExportResult<T> {
+        const {
+            assert!(std::mem::size_of::<T>() == std::mem::size_of::<*const c_void>());
+        }
+        if let Some(&address) = self
+            .symbols
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+        {
+            let pointer = address as *const c_void;
+            return Ok(unsafe { std::mem::transmute_copy(&pointer) });
+        }
+        let function = unsafe { *self.library.get::<T>(name)? };
+        let pointer: *const c_void = unsafe { std::mem::transmute_copy(&function) };
+        self.symbols
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name, pointer as usize);
+        Ok(function)
     }
     fn check(&self, name: &str, status: c_int) -> ExportResult<()> {
         if status == 0 {
@@ -435,18 +458,15 @@ unsafe fn argument_data(
 }
 
 fn function_layout(cuda: &Cuda, function: usize) -> ExportResult<Vec<(usize, usize)>> {
+    let get_param_info = unsafe {
+        cuda.symbol::<unsafe extern "C" fn(Handle, usize, *mut usize, *mut usize) -> c_int>(
+            b"cuFuncGetParamInfo\0",
+        )?
+    };
     let mut layout = Vec::new();
     for index in 0..4096usize {
         let (mut offset, mut size) = (0usize, 0usize);
-        let status = status!(
-            cuda,
-            "cuFuncGetParamInfo",
-            (Handle, usize, *mut usize, *mut usize),
-            function as Handle,
-            index,
-            &mut offset,
-            &mut size
-        );
+        let status = unsafe { get_param_info(function as Handle, index, &mut offset, &mut size) };
         if status == 1 {
             return Ok(layout);
         }
@@ -530,27 +550,30 @@ fn record_kernel(
     cuda: &Cuda,
     node: Handle,
     layouts: &mut BTreeMap<usize, Vec<(usize, usize)>>,
+    cached_layouts: Option<&HashMap<usize, Vec<(usize, usize)>>>,
 ) -> ExportResult<RecordedKernel> {
     let (params, function) = kernel_params(cuda, node)?;
     if let std::collections::btree_map::Entry::Vacant(entry) = layouts.entry(function) {
-        entry.insert(function_layout(cuda, function)?);
+        let layout = match cached_layouts.and_then(|cached| cached.get(&function)) {
+            Some(layout) => layout.clone(),
+            None => function_layout(cuda, function)?,
+        };
+        entry.insert(layout);
     }
     let arguments = unsafe { argument_data(&params, &layouts[&function])? }
         .into_iter()
         .flatten()
         .collect();
+    let get_attribute = unsafe {
+        cuda.symbol::<unsafe extern "C" fn(Handle, c_int, *mut c_void) -> c_int>(
+            b"cuGraphKernelNodeGetAttribute\0",
+        )?
+    };
     let mut attributes = Vec::new();
     let mut attribute_11 = false;
     for id in KERNEL_ATTRIBUTES {
         let mut value = [0u64; 8];
-        let status = status!(
-            cuda,
-            "cuGraphKernelNodeGetAttribute",
-            (Handle, c_int, *mut c_void),
-            node,
-            id,
-            value.as_mut_ptr().cast()
-        );
+        let status = unsafe { get_attribute(node, id, value.as_mut_ptr().cast()) };
         if id == 11 && status == 1 {
             continue;
         }
@@ -583,6 +606,7 @@ fn record_graph(
     cuda: &Cuda,
     graph: usize,
     flags: u64,
+    cached_layouts: Option<&HashMap<usize, Vec<(usize, usize)>>>,
     mut node_id: impl FnMut(usize) -> ExportResult<u64>,
 ) -> ExportResult<RecordedGraph> {
     let context = cuda.current()?;
@@ -605,7 +629,7 @@ fn record_graph(
     let mut result = Vec::with_capacity(ordered.len());
     for (_, node) in ordered {
         let operation = match node_kind(cuda, node)? {
-            0 => RecordedNode::Kernel(record_kernel(cuda, node, &mut layouts)?),
+            0 => RecordedNode::Kernel(record_kernel(cuda, node, &mut layouts, cached_layouts)?),
             1 => {
                 let mut params = CopyParams::default();
                 cu!(
@@ -732,6 +756,28 @@ fn record_graph(
     })
 }
 
+fn record_graph_with_recorder(
+    cuda: &Cuda,
+    graph: usize,
+    flags: u64,
+    recorder: &Recorder,
+) -> ExportResult<RecordedGraph> {
+    let context = cuda.current()?;
+    let snapshot = recorder.cached_function_layouts(context);
+    let cached = snapshot.as_ref().map(|(_, layouts)| layouts);
+    let recorded = record_graph(cuda, graph, flags, cached, |node| {
+        recorder.graph_node_id(node)
+    })?;
+    if let Some((generation, _)) = snapshot {
+        if !recorder.store_function_layouts(recorded.context, generation, &recorded.layouts) {
+            return Err(invalid(
+                "captured function's module was unloaded during export",
+            ));
+        }
+    }
+    Ok(recorded)
+}
+
 pub(crate) fn record_prepared_graph(
     graph: usize,
     executable: usize,
@@ -742,10 +788,8 @@ pub(crate) fn record_prepared_graph(
             "graph recording requires live template and executable handles",
         ));
     }
-    let cuda = Cuda::new()?;
-    record_graph(&cuda, graph, executable_flags(&cuda, executable)?, |node| {
-        recorder.graph_node_id(node)
-    })
+    let cuda = recorder.cuda()?;
+    record_graph_with_recorder(cuda, graph, executable_flags(cuda, executable)?, recorder)
 }
 
 pub(crate) fn record_prepared_template(
@@ -753,8 +797,8 @@ pub(crate) fn record_prepared_template(
     flags: u64,
     recorder: &Recorder,
 ) -> ExportResult<RecordedGraph> {
-    let cuda = Cuda::new()?;
-    record_graph(&cuda, graph, flags, |node| recorder.graph_node_id(node))
+    let cuda = recorder.cuda()?;
+    record_graph_with_recorder(cuda, graph, flags, recorder)
 }
 
 fn graph_metadata(
@@ -785,30 +829,45 @@ fn graph_metadata(
         }
         return Ok(recorded);
     }
+    let flags = match graph.instantiate_flags {
+        Some(flags) => flags,
+        None => executable_flags(cuda, graph.executable)?,
+    };
+    if let Some(recorder) = recorder {
+        return Ok(Arc::new(record_graph_with_recorder(
+            cuda,
+            graph.graph,
+            flags,
+            recorder,
+        )?));
+    }
+    let mut get_node_id = None;
     Ok(Arc::new(record_graph(
         cuda,
         graph.graph,
-        match graph.instantiate_flags {
-            Some(flags) => flags,
-            None => executable_flags(cuda, graph.executable)?,
-        },
+        flags,
+        None,
         |node| {
-            if let Some(recorder) = recorder {
-                recorder.graph_node_id(node)
-            } else {
-                let library = cupti.ok_or_else(|| invalid("graph node ordering requires CUPTI"))?;
-                let function = unsafe {
-                    library.get::<unsafe extern "C" fn(Handle, *mut u64) -> c_int>(
-                        b"cuptiGetGraphNodeId\0",
-                    )?
-                };
-                let mut id = 0u64;
-                let status = unsafe { function(node as Handle, &mut id) };
-                if status != 0 {
-                    return Err(invalid(format!("cuptiGetGraphNodeId: CUPTI {status}")));
+            let function = match get_node_id {
+                Some(function) => function,
+                None => {
+                    let library =
+                        cupti.ok_or_else(|| invalid("graph node ordering requires CUPTI"))?;
+                    let resolved = unsafe {
+                        *library.get::<unsafe extern "C" fn(Handle, *mut u64) -> c_int>(
+                            b"cuptiGetGraphNodeId\0",
+                        )?
+                    };
+                    get_node_id = Some(resolved);
+                    resolved
                 }
-                Ok(id)
+            };
+            let mut id = 0u64;
+            let status = unsafe { function(node as Handle, &mut id) };
+            if status != 0 {
+                return Err(invalid(format!("cuptiGetGraphNodeId: CUPTI {status}")));
             }
+            Ok(id)
         },
     )?))
 }
@@ -1904,6 +1963,47 @@ fn allocation_scan_ranges(
     }
     (read, reused)
 }
+
+/// Granularity of allocation zero scanning; stored spans are recorded per block.
+const SCAN_BLOCK: usize = 64 << 10;
+
+/// Downloaded chunks at least this large scan their zero blocks concurrently.
+const PARALLEL_SCAN_BYTES: usize = 512 << 10;
+
+/// Whether `bytes` is empty or contains only zero bytes.
+///
+/// Each 64-byte cacheline folds eight native-endian words into one compare, so a
+/// dense block costs one branch per cacheline instead of one per byte, and a
+/// nonzero cacheline skips the remainder of the block.
+#[inline]
+fn is_zero_block(bytes: &[u8]) -> bool {
+    fn zero_cacheline(block: &[u8]) -> bool {
+        let mut folded = 0u64;
+        for word in block.chunks_exact(8) {
+            folded |= u64::from_ne_bytes(word.try_into().expect("8-byte word"));
+        }
+        folded == 0
+    }
+    let mut blocks = bytes.chunks_exact(64);
+    blocks.by_ref().all(zero_cacheline) && blocks.remainder().iter().all(|&byte| byte == 0)
+}
+
+/// Nonzero flag per [`SCAN_BLOCK`] block of one downloaded chunk.
+///
+/// Chunks at least [`PARALLEL_SCAN_BYTES`] long classify their blocks
+/// concurrently; the flags map one-to-one onto the later block walk.
+fn nonzero_blocks(data: &[u8]) -> Vec<bool> {
+    if data.len() >= PARALLEL_SCAN_BYTES {
+        data.par_chunks(SCAN_BLOCK)
+            .map(|bytes| !is_zero_block(bytes))
+            .collect()
+    } else {
+        data.chunks(SCAN_BLOCK)
+            .map(|bytes| !is_zero_block(bytes))
+            .collect()
+    }
+}
+
 fn write_allocation(
     downloader: &mut Downloader<'_>,
     allocation: &Allocation,
@@ -1932,11 +2032,14 @@ fn write_allocation(
         reach.contents(allocation, offset, data)?;
         *scanned += data.len() as u64;
         phase.advance_bytes(data.len() as u64);
-        for (block, bytes) in data.chunks(64 << 10).enumerate() {
-            if !bytes.iter().any(|&b| b != 0) {
+        // Large downloads scan their blocks concurrently; the record-and-write
+        // pass below stays in block order so stored spans and file bytes match.
+        let nonzero = nonzero_blocks(data);
+        for ((block, bytes), nonzero) in data.chunks(SCAN_BLOCK).enumerate().zip(nonzero) {
+            if !nonzero {
                 continue;
             }
-            let begin = offset + (block * (64 << 10)) as u64;
+            let begin = offset + (block * SCAN_BLOCK) as u64;
             if let Some(last) = stored.last_mut().filter(|last| last.0 + last.1 == begin) {
                 last.1 += bytes.len() as u64;
             } else {
@@ -2105,7 +2208,7 @@ fn current_platform(cuda: &Cuda) -> ExportResult<Option<String>> {
         let get = cuda.symbol::<unsafe extern "C" fn(*mut c_int) -> c_int>(b"cuCtxGetDevice\0")?;
         cuda.check("cuCtxGetDevice", get(&mut device))?;
     }
-    let attribute = |name: &str, number: c_int, what: &[u8]| -> ExportResult<c_uint> {
+    let attribute = |name: &str, number: c_int, what: &'static [u8]| -> ExportResult<c_uint> {
         let mut value: c_int = 0;
         unsafe {
             let get = cuda
@@ -2178,11 +2281,83 @@ pub(super) fn resolve_staged_weight_payload(
 ) -> ExportResult<Option<WeightPayloadSources>> {
     resolve_weight_payload(request, &output.allocations.clone(), output, None)
 }
+const STAGED_WEIGHT_WRITE_BUFFER: usize = 4 << 20;
+const STAGED_WEIGHT_WORKERS: usize = 4;
+
+#[allow(clippy::type_complexity)]
+fn materialize_staged_weight_group(
+    index: usize,
+    spans: &[weight_payload::PayloadSpan],
+    stage: &Path,
+    retained: &HashMap<String, (u64, Vec<(u64, u64, u64)>)>,
+    parts: &[FilePart],
+    pool: Option<&RetainedFilePool>,
+) -> ExportResult<(String, PathBuf, Vec<(String, u64, u64, u64)>, u64)> {
+    let file = format!("weight-{index}.bin");
+    let path = stage.join(&file);
+    let mut reader = RetainedReader::with_pool(retained, parts, pool);
+    let mut writer = BufWriter::with_capacity(STAGED_WEIGHT_WRITE_BUFFER, File::create(&path)?);
+    let mut written = 0u64;
+    let mut mapped = Vec::new();
+    let write_result = (|| -> ExportResult<()> {
+        weight_payload::for_each_owner_block(
+            spans,
+            &mut |allocation, destination, buffer| {
+                reader.read_into(allocation, destination, buffer)
+            },
+            &mut |span, offset, block| {
+                writer.write_all(block)?;
+                let destination = span
+                    .destination_offset
+                    .checked_add(offset)
+                    .ok_or_else(|| invalid("weight span offset overflow"))?;
+                mapped.push((
+                    span.allocation.clone(),
+                    destination,
+                    written,
+                    block.len() as u64,
+                ));
+                written = written
+                    .checked_add(block.len() as u64)
+                    .ok_or_else(|| invalid("staged weight length overflow"))?;
+                Ok(())
+            },
+        )?;
+        writer.flush()?;
+        Ok(())
+    })();
+    drop(writer);
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&path);
+        return Err(error);
+    }
+    if written == 0 {
+        let _ = fs::remove_file(&path);
+    }
+    Ok((file, path, mapped, written))
+}
+
 fn resolve_weight_payload(
     request: &CaptureRequest,
     all_allocations: &[Allocation],
     output: &mut RankOutput,
     device: Option<(&mut Downloader<'_>, &[Allocation])>,
+) -> ExportResult<Option<WeightPayloadSources>> {
+    resolve_weight_payload_with_workers(
+        request,
+        all_allocations,
+        output,
+        device,
+        STAGED_WEIGHT_WORKERS,
+    )
+}
+
+fn resolve_weight_payload_with_workers(
+    request: &CaptureRequest,
+    all_allocations: &[Allocation],
+    output: &mut RankOutput,
+    device: Option<(&mut Downloader<'_>, &[Allocation])>,
+    max_workers: usize,
 ) -> ExportResult<Option<WeightPayloadSources>> {
     let Some(declaration) = request.weight_payload.clone() else {
         return Ok(None);
@@ -2255,17 +2430,190 @@ fn resolve_weight_payload(
         Vec<u8>,
         u64,
     )> = Vec::with_capacity(payloads.len());
+    if root.is_none() && device_reader.is_none() {
+        let file_pool = RetainedFilePool::new();
+        let group_count = payloads.len();
+        let staged = if max_workers <= 1 || group_count <= 1 {
+            payloads
+                .drain(..)
+                .enumerate()
+                .map(|(index, (is_weight, name, storage, spans))| {
+                    let (file, path, mapped, written) = materialize_staged_weight_group(
+                        index,
+                        spans,
+                        &stage,
+                        &retained,
+                        &parts,
+                        Some(&file_pool),
+                    )?;
+                    Ok((is_weight, name, storage, file, path, mapped, written))
+                })
+                .collect::<ExportResult<Vec<_>>>()
+        } else {
+            let workers = group_count.min(max_workers);
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .map_err(|error| invalid(format!("building weight staging pool: {error}")))?;
+            pool.install(|| {
+                payloads
+                    .par_iter()
+                    .enumerate()
+                    .map(|(index, &(is_weight, ref name, storage, spans))| {
+                        let (file, path, mapped, written) = materialize_staged_weight_group(
+                            index,
+                            spans,
+                            &stage,
+                            &retained,
+                            &parts,
+                            Some(&file_pool),
+                        )?;
+                        Ok((is_weight, name.clone(), storage, file, path, mapped, written))
+                    })
+                    .collect::<ExportResult<Vec<_>>>()
+            })
+        };
+        let staged = match staged {
+            Ok(staged) => staged,
+            Err(error) => {
+                for index in 0..group_count {
+                    let _ = fs::remove_file(stage.join(format!("weight-{index}.bin")));
+                }
+                return Err(error);
+            }
+        };
+        payloads.clear();
+        for (is_weight, name, storage, file, path, mapped, written) in staged {
+            if written == 0 {
+                resolved.push((is_weight, name, storage, Vec::new(), Vec::new(), 0));
+                continue;
+            }
+            append_resource(
+                output,
+                file.clone(),
+                FileSource {
+                    path,
+                    offset: 0,
+                    nbytes: written,
+                },
+            )?;
+            let base = output.index.ranks[0]
+                .resources
+                .get(&file)
+                .ok_or_else(|| invalid("staged weight resource missing"))?
+                .offset;
+            resolved.push((
+                is_weight,
+                name,
+                storage,
+                mapped
+                    .into_iter()
+                    .map(|(allocation, destination_offset, file_offset, nbytes)| {
+                        WeightPayloadSourceSpan {
+                            allocation,
+                            destination_offset,
+                            source_offset: base + file_offset,
+                            nbytes,
+                        }
+                    })
+                    .collect(),
+                Vec::new(),
+                written,
+            ));
+        }
+    }
+    if let Some(root) = &root
+        && !request.options.no_weights
+        && device_reader.is_none()
+    {
+        let file_pool = RetainedFilePool::new();
+        let group_count = payloads.len();
+        let captured = if max_workers <= 1 || group_count <= 1 {
+            payloads
+                .drain(..)
+                .map(|(is_weight, name, storage, spans)| {
+                    let mut group_reader =
+                        RetainedReader::with_pool(&retained, &parts, Some(&file_pool));
+                    let captured = capture_cached_weight_group(
+                        root,
+                        spans,
+                        &mut |allocation, destination, buffer| {
+                            group_reader.read_into(allocation, destination, buffer)
+                        },
+                    )?;
+                    Ok((is_weight, name, storage, captured))
+                })
+                .collect::<ExportResult<Vec<_>>>()?
+        } else {
+            let workers = group_count.min(max_workers);
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .map_err(|error| invalid(format!("building weight staging pool: {error}")))?;
+            let captured = pool.install(|| {
+                payloads
+                    .par_iter()
+                    .map(|&(is_weight, ref name, storage, spans)| {
+                        let mut group_reader =
+                            RetainedReader::with_pool(&retained, &parts, Some(&file_pool));
+                        let captured = capture_cached_weight_group(
+                            root,
+                            spans,
+                            &mut |allocation, destination, buffer| {
+                                group_reader.read_into(allocation, destination, buffer)
+                            },
+                        )?;
+                        Ok((is_weight, name.clone(), storage, captured))
+                    })
+                    .collect::<ExportResult<Vec<_>>>()
+            })?;
+            payloads.clear();
+            captured
+        };
+        for (is_weight, name, storage, captured) in captured {
+            let Some((object, length, blocks)) = captured else {
+                continue;
+            };
+            let payload_id = object.id().as_bytes().to_vec();
+            output.payload_leases.0.push(object);
+            resolved.push((is_weight, name, storage, blocks, payload_id, length));
+        }
+    }
     for (is_weight, name, storage, spans) in payloads.drain(..) {
         if let Some(root) = &root {
+            if !request.options.no_weights {
+                let captured = {
+                    let mut download = device_reader
+                        .as_deref_mut()
+                        .map(|downloader| {
+                            WeightDownload::new(downloader, device_allocations, spans)
+                        })
+                        .transpose()?;
+                    capture_cached_weight_group(
+                        root,
+                        spans,
+                        &mut |allocation, destination, buffer| match download.as_mut() {
+                            Some(download) => download.read_into(allocation, destination, buffer),
+                            None => reader.read_into(allocation, destination, buffer),
+                        },
+                    )?
+                };
+                let Some((object, length, blocks)) = captured else {
+                    continue;
+                };
+                let payload_id = object.id().as_bytes().to_vec();
+                output.payload_leases.0.push(object);
+                resolved.push((is_weight, name, storage, blocks, payload_id, length));
+                continue;
+            }
             let (payload_id, length, blocks) = {
                 let mut download = device_reader.as_deref_mut()
                     .map(|downloader| WeightDownload::new(downloader, device_allocations, spans))
                     .transpose()?;
-                let mut cache_reader = RetainedReader::new(&retained, &parts);
                 scan_group_blocks(&mut |allocation, destination, buffer| {
                     match download.as_mut() {
                         Some(download) => download.read_into(allocation, destination, buffer),
-                        None => cache_reader.read_into(allocation, destination, buffer),
+                        None => reader.read_into(allocation, destination, buffer),
                     }
                 }, spans)?
             };
@@ -2298,12 +2646,11 @@ fn resolve_weight_payload(
                 let mut download = device_reader.as_deref_mut()
                     .map(|downloader| WeightDownload::new(downloader, device_allocations, spans))
                     .transpose()?;
-                let mut insert_reader = RetainedReader::new(&retained, &parts);
                 root.insert_payload(payload_id, length, ElidedBlocks::new(
                     |allocation: &str, destination: u64, buffer: &mut [u8]| {
                         match download.as_mut() {
                             Some(download) => download.read_into(allocation, destination, buffer),
-                            None => insert_reader.read_into(allocation, destination, buffer),
+                            None => reader.read_into(allocation, destination, buffer),
                         }
                     }, spans,
                 ))?
@@ -2330,38 +2677,9 @@ fn resolve_weight_payload(
             ));
             continue;
         }
-        let file = format!("weight-{}.bin", resolved.len());
-        let path = stage.join(&file);
-        let mut writer = BufWriter::new(File::create(&path)?);
-        let mut written = 0u64;
-        let mut mapped = Vec::new();
-        weight_payload::for_each_owner_block(
-            spans,
-            &mut |allocation, destination, buffer| {
-                reader.read_into(allocation, destination, buffer)
-            },
-            &mut |span, offset, block| {
-                writer.write_all(block)?;
-                let destination = span
-                    .destination_offset
-                    .checked_add(offset)
-                    .ok_or_else(|| invalid("weight span offset overflow"))?;
-                mapped.push((
-                    span.allocation.clone(),
-                    destination,
-                    written,
-                    block.len() as u64,
-                ));
-                written = written
-                    .checked_add(block.len() as u64)
-                    .ok_or_else(|| invalid("staged weight length overflow"))?;
-                Ok(())
-            },
-        )?;
-        writer.flush()?;
-        drop(writer);
+        let (file, path, mapped, written) =
+            materialize_staged_weight_group(resolved.len(), spans, &stage, &retained, &parts, None)?;
         if written == 0 {
-            let _ = fs::remove_file(&path);
             resolved.push((is_weight, name, storage, Vec::new(), Vec::new(), 0));
             continue;
         }
@@ -2369,7 +2687,7 @@ fn resolve_weight_payload(
             output,
             file.clone(),
             FileSource {
-                path: path.clone(),
+                path,
                 offset: 0,
                 nbytes: written,
             },
@@ -2523,7 +2841,7 @@ where
             let block = &mut buffer[..nbytes as usize];
             block.fill(0);
             read_into(&span.allocation, destination, block)?;
-            if block.iter().any(|byte| *byte != 0) {
+            if !is_zero_block(block) {
                 emit(&span.allocation, destination, block)?;
             }
             offset += nbytes;
@@ -2575,7 +2893,7 @@ where
                 self.span += 1;
                 self.offset = 0;
             }
-            if self.block.iter().any(|byte| *byte != 0) {
+            if !is_zero_block(&self.block) {
                 self.position = 0;
                 self.length = nbytes as usize;
                 return Ok(true);
@@ -2600,6 +2918,43 @@ where
         self.position += count;
         Ok(count)
     }
+}
+
+/// Stream one group's owner-anchored nonzero 64 KiB blocks into the object
+/// store in one pass, recording each stored block's placement.
+fn capture_cached_weight_group<R>(
+    root: &helios_core::core::cache::Root,
+    spans: &[weight_payload::PayloadSpan],
+    read_into: &mut R,
+) -> ExportResult<
+    Option<(
+        helios_core::core::cache::PayloadObject,
+        u64,
+        Vec<WeightPayloadSourceSpan>,
+    )>,
+>
+where
+    R: FnMut(&str, u64, &mut [u8]) -> ExportResult<()>,
+{
+    let mut blocks = Vec::new();
+    let mut offset = 0u64;
+    let captured = root.capture_payload_streaming(|writer| -> ExportResult<()> {
+        for_each_group_block(read_into, spans, |allocation, destination, block| {
+            writer.write_all(block)?;
+            let nbytes = block.len() as u64;
+            blocks.push(WeightPayloadSourceSpan {
+                allocation: allocation.to_string(),
+                destination_offset: destination,
+                source_offset: offset,
+                nbytes,
+            });
+            offset = offset
+                .checked_add(nbytes)
+                .ok_or_else(|| invalid("group payload length overflow"))?;
+            Ok(())
+        })
+    })?;
+    Ok(captured.map(|(object, length)| (object, length, blocks)))
 }
 
 /// Hash and size one group's block stream, recording each stored block.
@@ -2678,12 +3033,80 @@ fn retained_sources(
     Ok(retained)
 }
 
+const MAX_OPEN_PART_FILES: usize = 64;
+
+struct RetainedFilePool {
+    #[cfg(unix)]
+    files: std::sync::RwLock<HashMap<PathBuf, Arc<File>>>,
+}
+
+impl RetainedFilePool {
+    fn new() -> Self {
+        Self {
+            #[cfg(unix)]
+            files: std::sync::RwLock::new(HashMap::new()),
+        }
+    }
+
+    #[cfg(unix)]
+    fn open(&self, path: &Path) -> std::io::Result<Arc<File>> {
+        if let Some(file) = self
+            .files
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(path)
+            .cloned()
+        {
+            return Ok(file);
+        }
+        let opened = Arc::new(File::open(path)?);
+        let mut guard = self.files.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = guard.get(path) {
+            return Ok(existing.clone());
+        }
+        if guard.len() >= MAX_OPEN_PART_FILES {
+            guard.clear();
+        }
+        guard.insert(path.to_path_buf(), opened.clone());
+        Ok(opened)
+    }
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buffer, offset)
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buffer.is_empty() {
+        let read = file.seek_read(buffer, offset)?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "failed to fill whole buffer",
+            ));
+        }
+        buffer = &mut buffer[read..];
+        offset += read as u64;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+static RETAINED_READ_INTO_CALLS: std::sync::Mutex<BTreeMap<PathBuf, u64>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
 /// Reads allocation bytes back from the staged payload parts, returning zero for
 /// bytes the emitter elided.
 struct RetainedReader<'a> {
     retained: &'a HashMap<String, (u64, Vec<(u64, u64, u64)>)>,
     parts: &'a [FilePart],
-    open: HashMap<PathBuf, File>,
+    ordered: bool,
+    open: HashMap<PathBuf, Arc<File>>,
+    pool: Option<&'a RetainedFilePool>,
 }
 
 impl<'a> RetainedReader<'a> {
@@ -2691,10 +3114,27 @@ impl<'a> RetainedReader<'a> {
         retained: &'a HashMap<String, (u64, Vec<(u64, u64, u64)>)>,
         parts: &'a [FilePart],
     ) -> Self {
+        Self::with_pool(retained, parts, None)
+    }
+
+    fn with_pool(
+        retained: &'a HashMap<String, (u64, Vec<(u64, u64, u64)>)>,
+        parts: &'a [FilePart],
+        pool: Option<&'a RetainedFilePool>,
+    ) -> Self {
+        let ordered = parts.windows(2).all(|w| {
+            w[0].offset
+                .checked_add(w[0].source.nbytes)
+                .is_some_and(|end| end <= w[1].offset)
+        }) && parts
+            .last()
+            .is_none_or(|part| part.offset.checked_add(part.source.nbytes).is_some());
         Self {
             retained,
             parts,
+            ordered,
             open: HashMap::new(),
+            pool,
         }
     }
 
@@ -2704,6 +3144,13 @@ impl<'a> RetainedReader<'a> {
         destination: u64,
         buffer: &mut [u8],
     ) -> ExportResult<()> {
+        #[cfg(test)]
+        if let Some(first_part) = self.parts.first() {
+            let mut counts = RETAINED_READ_INTO_CALLS.lock().unwrap();
+            if let Some(calls) = counts.get_mut(&first_part.source.path) {
+                *calls += 1;
+            }
+        }
         buffer.fill(0);
         let Some((_base, stored)) = self.retained.get(allocation) else {
             return Ok(());
@@ -2735,21 +3182,46 @@ impl<'a> RetainedReader<'a> {
         let end = offset
             .checked_add(buffer.len() as u64)
             .ok_or_else(|| invalid("payload read overflow"))?;
-        let part = self
-            .parts
-            .iter()
-            .find(|part| part.offset <= offset && end <= part.offset + part.source.nbytes)
-            .ok_or_else(|| invalid("retained bytes are not covered by staged payload parts"))?;
-        let file = match self.open.get_mut(&part.source.path) {
-            Some(file) => file,
-            None => self
-                .open
-                .entry(part.source.path.clone())
-                .or_insert(File::open(&part.source.path)?),
+        let part = if self.ordered {
+            let index = self.parts.partition_point(|part| part.offset <= offset);
+            index
+                .checked_sub(1)
+                .and_then(|i| self.parts.get(i))
+                .filter(|part| end <= part.offset + part.source.nbytes)
+        } else {
+            self.parts.iter().find(|part| {
+                part.offset <= offset
+                    && part
+                        .offset
+                        .checked_add(part.source.nbytes)
+                        .is_some_and(|part_end| end <= part_end)
+            })
+        }
+        .ok_or_else(|| invalid("retained bytes are not covered by staged payload parts"))?;
+        let file_offset = part
+            .source
+            .offset
+            .checked_add(offset - part.offset)
+            .ok_or_else(|| invalid("payload source offset overflow"))?;
+        if let Some(file) = self.open.get(&part.source.path) {
+            read_exact_at(file, buffer, file_offset)?;
+            return Ok(());
+        }
+        #[cfg(unix)]
+        let opened = match self.pool {
+            Some(pool) => pool.open(&part.source.path)?,
+            None => Arc::new(File::open(&part.source.path)?),
         };
-        use std::io::{Read, Seek, SeekFrom};
-        file.seek(SeekFrom::Start(part.source.offset + (offset - part.offset)))?;
-        file.read_exact(buffer)?;
+        #[cfg(not(unix))]
+        let opened = {
+            let _ = self.pool;
+            Arc::new(File::open(&part.source.path)?)
+        };
+        read_exact_at(&opened, buffer, file_offset)?;
+        if self.open.len() >= MAX_OPEN_PART_FILES {
+            self.open.clear();
+        }
+        self.open.insert(part.source.path.clone(), opened);
         Ok(())
     }
 }
@@ -3211,15 +3683,30 @@ pub(crate) fn capture_rank(
     let module_phase = progress.phase("Capture compiled modules and globals", None);
     let mut module_bytes = 0u64;
     let mut downloader = Downloader::new(&cuda)?;
-    for (index, (name, image)) in modules.into_iter().enumerate() {
-        let file = format!("module-{index}.cubin");
-        let exported = cubin::strip_debug(&image)?;
-        module_bytes += exported.len() as u64;
-        module_phase.advance_bytes(exported.len() as u64);
-        fs::write(stage.path.join(&file), exported)?;
+    // Stripped images and global symbol lists depend only on each module's cubin
+    // bytes, so they are written concurrently; CUDA driver queries stay sequential
+    // in module order afterward.
+    let modules: Vec<(String, Arc<[u8]>)> = modules.into_iter().collect();
+    let stage_path = stage.path.as_path();
+    let prepared: Vec<(String, String, u64, Vec<String>)> = modules
+        .into_par_iter()
+        .enumerate()
+        .map(|(index, (name, image))| -> ExportResult<(String, String, u64, Vec<String>)> {
+            let exported = cubin::strip_debug(&image)?;
+            let symbols = cubin::global_symbols(&image)?;
+            drop(image);
+            let file = format!("module-{index}.cubin");
+            let exported_len = exported.len() as u64;
+            fs::write(stage_path.join(&file), exported)?;
+            Ok((name, file, exported_len, symbols))
+        })
+        .collect::<ExportResult<Vec<_>>>()?;
+    for (index, (name, file, exported_len, symbols)) in prepared.into_iter().enumerate() {
+        module_bytes += exported_len;
+        module_phase.advance_bytes(exported_len);
         let mut globals = Vec::new();
         let Some(kernel) = kernels.iter().find(|k| k.module == name) else {
-            if !cubin::global_symbols(&image)?.is_empty() {
+            if !symbols.is_empty() {
                 return Err(invalid(format!(
                     "standalone module {name} declares globals without a captured kernel"
                 )));
@@ -3240,7 +3727,7 @@ pub(crate) fn capture_rank(
             &mut module,
             kernel.function as Handle
         )?;
-        for symbol in cubin::global_symbols(&image)? {
+        for symbol in symbols {
             let symbol_c = std::ffi::CString::new(symbol.clone())?;
             let (mut address, mut size) = (0u64, 0usize);
             cu!(
@@ -3558,6 +4045,76 @@ mod tests {
             snapshot_spans: None,
             sizing: None,
         }
+    }
+
+    #[test]
+    fn zero_block_check_matches_a_byte_scan() {
+        let lengths = [
+            0usize,
+            1,
+            7,
+            63,
+            64,
+            65,
+            127,
+            128,
+            129,
+            4095,
+            64 << 10,
+            (64 << 10) + 3,
+        ];
+        for &nbytes in &lengths {
+            let mut bytes = vec![0u8; nbytes];
+            assert!(is_zero_block(&bytes), "empty {nbytes}-byte block");
+            if nbytes == 0 {
+                continue;
+            }
+            for index in [0, nbytes / 2, nbytes - 1] {
+                bytes[index] = 0xFF;
+                assert!(!is_zero_block(&bytes), "nonzero at {index} of {nbytes}");
+                bytes[index] = 0;
+            }
+            for index in [63, 64, 127, 128] {
+                if index < nbytes {
+                    bytes[index] = 1;
+                    assert!(!is_zero_block(&bytes), "nonzero at {index} of {nbytes}");
+                    bytes[index] = 0;
+                }
+            }
+            assert!(is_zero_block(&bytes), "restored {nbytes}-byte block");
+        }
+        // A remainder shorter than one cacheline and unaligned sub-slices report their own bytes.
+        let mut tail = vec![0u8; 78];
+        for shift in 0..8 {
+            let view = &mut tail[shift..shift + 70];
+            assert!(is_zero_block(view));
+            view[69] = 0x80;
+            assert!(!is_zero_block(view));
+            view[69] = 0;
+        }
+    }
+
+    #[test]
+    fn nonzero_block_flags_keep_download_order() {
+        // Ten full blocks plus a short tail, above the concurrent scan threshold.
+        let mut data = vec![0u8; 10 * SCAN_BLOCK + 7];
+        data[0] = 1;
+        data[SCAN_BLOCK + 5] = 2;
+        data[9 * SCAN_BLOCK + 3] = 3;
+        let last = data.len() - 1;
+        data[last] = 4;
+        assert_eq!(
+            nonzero_blocks(&data)
+                .iter()
+                .enumerate()
+                .filter_map(|(block, &nonzero)| nonzero.then_some(block))
+                .collect::<Vec<_>>(),
+            vec![0, 1, 9, 10]
+        );
+        let mut small = vec![0u8; SCAN_BLOCK + 1];
+        assert_eq!(nonzero_blocks(&small), vec![false, false]);
+        small[SCAN_BLOCK] = 1;
+        assert_eq!(nonzero_blocks(&small), vec![false, true]);
     }
 
     #[test]
@@ -4072,8 +4629,15 @@ mod tests {
                 eprintln!("weight materialization: bytes={size}, cached={}, copies={}, elapsed={:?}",
                     pass == 1, downloader.copies - copies, started.elapsed());
                 assert_eq!(serde_json::to_value(actual)?, serde_json::to_value(&expected)?);
-                assert_eq!(downloader.downloaded - downloaded, 2 * (size - (hole.1 - hole.0)) as u64);
-                assert!(downloader.copies - copies <= 2 * (size.div_ceil(Downloader::CHUNK) + 4) as u64);
+                let passes = if pass == 0 { 1 } else { 2 };
+                assert_eq!(
+                    downloader.downloaded - downloaded,
+                    passes * (size - (hole.1 - hole.0)) as u64
+                );
+                assert!(
+                    downloader.copies - copies
+                        <= passes * (size.div_ceil(Downloader::CHUNK) + 4) as u64
+                );
             }
             let mut host = allocation("host", bytes.as_ptr() as u64, size as u64);
             host.memory = "mapped_host".into();
@@ -4444,7 +5008,10 @@ mod tests {
         let library = libloading::os::unix::Library::this().into();
         #[cfg(windows)]
         let library = libloading::os::windows::Library::this().unwrap().into();
-        Cuda { library }
+        Cuda {
+            library,
+            symbols: std::sync::RwLock::new(HashMap::new()),
+        }
     }
 
     fn recorded_kernel_graph() -> (RecordedGraph, Vec<Kernel>, Vec<Vec<(usize, usize)>>) {
@@ -4905,5 +5472,802 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn retained_reader_binary_searches_parts_boundaries_gaps_and_unsorted_fallback()
+    -> ExportResult<()> {
+        let directory = tempfile::tempdir()?;
+        let first_path = directory.path().join("storage-0.bin");
+        let second_path = directory.path().join("storage-1.bin");
+        let third_path = directory.path().join("storage-2.bin");
+        fs::write(&first_path, b"xxxxABCDEFyyyy")?;
+        fs::write(&second_path, b"0123456789abcdef")?;
+        fs::write(&third_path, b"!!GHIJKLMN??")?;
+        let parts = vec![
+            FilePart {
+                offset: 0x1000,
+                source: FileSource {
+                    path: first_path,
+                    offset: 4,
+                    nbytes: 6,
+                },
+            },
+            FilePart {
+                offset: 0x2000,
+                source: FileSource {
+                    path: second_path.clone(),
+                    offset: 0,
+                    nbytes: 8,
+                },
+            },
+            FilePart {
+                offset: 0x2008,
+                source: FileSource {
+                    path: second_path,
+                    offset: 8,
+                    nbytes: 8,
+                },
+            },
+            FilePart {
+                offset: 0x4000,
+                source: FileSource {
+                    path: third_path,
+                    offset: 2,
+                    nbytes: 8,
+                },
+            },
+        ];
+        let retained = HashMap::from([(
+            "arena".to_string(),
+            (
+                0x1000u64,
+                vec![
+                    (0x00u64, 6u64, 0x1000u64),
+                    (0x10u64, 8u64, 0x2000u64),
+                    (0x18u64, 8u64, 0x2008u64),
+                    (0x30u64, 8u64, 0x4000u64),
+                ],
+            ),
+        )]);
+        let pool = RetainedFilePool::new();
+        let mut reader = RetainedReader::with_pool(&retained, &parts, Some(&pool));
+        assert!(reader.ordered);
+
+        let mut full = [0xFFu8; 0x40];
+        reader.read_into("arena", 0, &mut full)?;
+        assert_eq!(&full[0x00..0x06], b"ABCDEF");
+        assert!(full[0x06..0x10].iter().all(|&b| b == 0));
+        assert_eq!(&full[0x10..0x20], b"0123456789abcdef");
+        assert!(full[0x20..0x30].iter().all(|&b| b == 0));
+        assert_eq!(&full[0x30..0x38], b"GHIJKLMN");
+        assert!(full[0x38..0x40].iter().all(|&b| b == 0));
+
+        // Single-byte reads at exact part start, interior seam, and end boundaries.
+        let mut byte = [0u8; 1];
+        reader.read_payload(0x1000, &mut byte)?;
+        assert_eq!(&byte, b"A");
+        reader.read_payload(0x1005, &mut byte)?;
+        assert_eq!(&byte, b"F");
+        reader.read_payload(0x2007, &mut byte)?;
+        assert_eq!(&byte, b"7");
+        reader.read_payload(0x2008, &mut byte)?;
+        assert_eq!(&byte, b"8");
+        reader.read_payload(0x4007, &mut byte)?;
+        assert_eq!(&byte, b"N");
+
+        // Reads before the first part, inside padding gaps, past the last part, or
+        // straddling two adjacent parts must fail rather than returning zero bytes.
+        assert!(reader.read_payload(0x0FFF, &mut byte).is_err());
+        assert!(reader.read_payload(0x1006, &mut byte).is_err());
+        assert!(reader.read_payload(0x4008, &mut byte).is_err());
+        let mut seam = [0u8; 2];
+        assert!(reader.read_payload(0x2007, &mut seam).is_err());
+
+        // Unsorted parts fall back cleanly without losing byte accuracy.
+        let mut unsorted = parts.clone();
+        unsorted.swap(0, 3);
+        let mut fallback = RetainedReader::new(&retained, &unsorted);
+        assert!(!fallback.ordered);
+        let mut check = [0xAAu8; 0x40];
+        fallback.read_into("arena", 0, &mut check)?;
+        assert_eq!(check, full);
+        Ok(())
+    }
+
+    #[test]
+    fn multi_group_weight_materialization_matches_serial_resources_offsets_and_bytes()
+    -> ExportResult<()> {
+        let block = weight_payload::ELIDE_BLOCK as usize;
+        let build_fixture =
+            |directory: &Path, mutate_byte: Option<(usize, u8)>| -> ExportResult<(CaptureRequest, RankOutput)> {
+                let stage = directory.join("stage");
+                fs::create_dir_all(&stage)?;
+
+                let mut arena0 = vec![0u8; 6 * block];
+                for index in 0..block {
+                    arena0[index] = ((index * 3 + 1) & 0xFF) as u8;
+                }
+                // Block 1 of arena0 is all zero and elided from storage-0.bin.
+                for index in 0..(2 * block) {
+                    arena0[2 * block + index] = ((index * 5 + 7) & 0xFF) as u8;
+                }
+                // Block 4 of arena0 is all zero (feeds the all-zero weight group).
+                for index in 0..(block / 2) {
+                    arena0[5 * block + index] = ((index * 11 + 3) & 0xFF) as u8;
+                }
+                if let Some((pos, val)) = mutate_byte {
+                    arena0[pos] = val;
+                }
+                let mut stored0 = Vec::new();
+                stored0.extend_from_slice(&arena0[0..block]);
+                stored0.extend_from_slice(&arena0[2 * block..4 * block]);
+                stored0.extend_from_slice(&arena0[5 * block..5 * block + block / 2]);
+                let storage0 = directory.join("storage-0.bin");
+                fs::write(&storage0, &stored0)?;
+
+                let mut arena1 = vec![0u8; 5 * block + 321];
+                for index in 0..block {
+                    arena1[index] = ((index * 7 + 13) & 0xFF) as u8;
+                }
+                // Block 1 inside arena1 stays stored as zeros so owner-block zero elision runs.
+                for index in 0..block {
+                    arena1[2 * block + index] = ((index * 13 + 19) & 0xFF) as u8;
+                }
+                for index in (3 * block)..arena1.len() {
+                    arena1[index] = ((index * 17 + 29) & 0xFF) as u8;
+                }
+                let storage1 = directory.join("storage-1.bin");
+                fs::write(&storage1, &arena1)?;
+
+                let mut bundle = wire::BundleIndex {
+                    architecture: vec![12, 0],
+                    ..Default::default()
+                };
+                let addr0 = 0x10_0000u64;
+                let addr1 = 0x80_0000u64;
+                bundle.allocations.push(wire::Allocation {
+                    name: "arena-0".into(),
+                    nbytes: arena0.len() as u64,
+                    alignment: 256,
+                    address: Some(addr0),
+                    file: Some("storage-0.bin".into()),
+                    data_spans: vec![
+                        wire::Span {
+                            offset: 0,
+                            nbytes: block as u64,
+                            filename: String::new(),
+                        },
+                        wire::Span {
+                            offset: (2 * block) as u64,
+                            nbytes: (2 * block) as u64,
+                            filename: String::new(),
+                        },
+                        wire::Span {
+                            offset: (5 * block) as u64,
+                            nbytes: (block / 2) as u64,
+                            filename: String::new(),
+                        },
+                    ],
+                    ..Default::default()
+                });
+                bundle.allocations.push(wire::Allocation {
+                    name: "arena-1".into(),
+                    nbytes: arena1.len() as u64,
+                    alignment: 256,
+                    address: Some(addr1),
+                    file: Some("storage-1.bin".into()),
+                    data_spans: vec![wire::Span {
+                        offset: 0,
+                        nbytes: arena1.len() as u64,
+                        filename: String::new(),
+                    }],
+                    ..Default::default()
+                });
+
+                let mut output = RankOutput {
+                    hardware: Some("gb202".to_string()),
+                    payload_leases: Default::default(),
+                    index: wire::ModelIndex {
+                        version: 4,
+                        ranks: vec![bundle],
+                        contract: Some(Default::default()),
+                        frontend: Some(Default::default()),
+                        sampling_defaults: Some(Default::default()),
+                        ..Default::default()
+                    },
+                    payload: Vec::new(),
+                    allocations: vec![
+                        allocation("arena-0", addr0, arena0.len() as u64),
+                        allocation("arena-1", addr1, arena1.len() as u64),
+                    ],
+                    module_globals: vec![],
+                    external: vec![],
+                    staging: Some(stage),
+                    weight_payload: None,
+                };
+                append_resource(
+                    &mut output,
+                    "storage-0.bin".into(),
+                    FileSource {
+                        path: storage0,
+                        offset: 0,
+                        nbytes: stored0.len() as u64,
+                    },
+                )?;
+                append_resource(
+                    &mut output,
+                    "storage-1.bin".into(),
+                    FileSource {
+                        path: storage1,
+                        offset: 0,
+                        nbytes: arena1.len() as u64,
+                    },
+                )?;
+
+                let request: CaptureRequest = serde_json::from_value(serde_json::json!({
+                    "path": directory.join("core"),
+                    "context": 0,
+                    "graphs": [],
+                    "allocations": [],
+                    "weight_payload": {
+                        "version": 1,
+                        "views": [
+                            {
+                                "name": "weights.embedding",
+                                "group": "embedding",
+                                "storage": "stable",
+                                "element_bytes": 1,
+                                "shape": [2 * block],
+                                "stride": [1],
+                                "address": addr0
+                            },
+                            {
+                                "name": "weights.layers.0.attn",
+                                "group": "layer-000",
+                                "storage": "stable",
+                                "element_bytes": 1,
+                                "shape": [block],
+                                "stride": [1],
+                                "address": addr0 + (2 * block) as u64
+                            },
+                            {
+                                "name": "weights.layers.0.mlp_tuned",
+                                "group": "layer-000",
+                                "storage": "tuned",
+                                "element_bytes": 1,
+                                "shape": [block],
+                                "stride": [1],
+                                "address": addr0 + (3 * block) as u64
+                            },
+                            {
+                                "name": "weights.layers.1.zero",
+                                "group": "layer-001-zero",
+                                "storage": "stable",
+                                "element_bytes": 1,
+                                "shape": [block],
+                                "stride": [1],
+                                "address": addr0 + (4 * block) as u64
+                            },
+                            {
+                                "name": "weights.layers.2.experts",
+                                "group": "layer-002",
+                                "storage": "stable",
+                                "element_bytes": 1,
+                                "shape": [3 * block],
+                                "stride": [1],
+                                "address": addr1
+                            },
+                            {
+                                "name": "weights.layers.3.norm",
+                                "group": "layer-003",
+                                "storage": "stable",
+                                "element_bytes": 1,
+                                "shape": [block],
+                                "stride": [1],
+                                "address": addr1 + (3 * block) as u64
+                            },
+                            {
+                                "name": "weights.head",
+                                "group": "lm-head",
+                                "storage": "stable",
+                                "element_bytes": 1,
+                                "shape": [block / 2],
+                                "stride": [1],
+                                "address": addr1 + (4 * block) as u64
+                            }
+                        ]
+                    },
+                    "options": {},
+                }))?;
+                Ok((request, output))
+            };
+
+        let serial_dir = tempfile::tempdir()?;
+        let parallel_dir = tempfile::tempdir()?;
+        let (serial_req, mut serial_out) = build_fixture(serial_dir.path(), None)?;
+        let (parallel_req, mut parallel_out) = build_fixture(parallel_dir.path(), None)?;
+        let serial_allocs = serial_out.allocations.clone();
+        let parallel_allocs = parallel_out.allocations.clone();
+
+        let serial_sources = resolve_weight_payload_with_workers(
+            &serial_req,
+            &serial_allocs,
+            &mut serial_out,
+            None,
+            1,
+        )?
+        .unwrap();
+        let parallel_sources =
+            resolve_weight_payload(&parallel_req, &parallel_allocs, &mut parallel_out, None)?
+                .unwrap();
+
+        assert_eq!(parallel_sources.groups.len(), 7);
+        assert_eq!(
+            serde_json::to_value(&parallel_sources)?,
+            serde_json::to_value(&serial_sources)?
+        );
+        assert_eq!(
+            parallel_out.index.ranks[0].resources,
+            serial_out.index.ranks[0].resources
+        );
+        assert_eq!(parallel_out.payload.len(), serial_out.payload.len());
+        for (parallel_part, serial_part) in parallel_out.payload.iter().zip(&serial_out.payload) {
+            assert_eq!(parallel_part.offset, serial_part.offset);
+            assert_eq!(parallel_part.source.offset, serial_part.source.offset);
+            assert_eq!(parallel_part.source.nbytes, serial_part.source.nbytes);
+            assert_eq!(
+                parallel_part.source.path.file_name(),
+                serial_part.source.path.file_name()
+            );
+            assert_eq!(
+                fs::read(&parallel_part.source.path)?,
+                fs::read(&serial_part.source.path)?
+            );
+        }
+
+        // The all-zero group (`layer-001-zero`, sorted index 3) produces no staged file,
+        // while subsequent groups preserve their exact `weight-{index}.bin` numbering.
+        let parallel_stage = parallel_dir.path().join("stage");
+        assert!(!parallel_stage.join("weight-3.bin").exists());
+        assert!(parallel_stage.join("weight-4.bin").exists());
+        assert!(parallel_stage.join("weight-7.bin").exists());
+
+        // Sensitivity check: mutating one retained source byte alters the staged payload bytes.
+        let mutated_dir = tempfile::tempdir()?;
+        let (mutated_req, mut mutated_out) =
+            build_fixture(mutated_dir.path(), Some((0, 0xFE)))?;
+        let mutated_allocs = mutated_out.allocations.clone();
+        resolve_weight_payload(&mutated_req, &mutated_allocs, &mut mutated_out, None)?;
+        assert_ne!(
+            fs::read(mutated_dir.path().join("stage/weight-0.bin"))?,
+            fs::read(parallel_stage.join("weight-0.bin"))?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cuda_symbol_lookup_caches_resolved_function_pointers() {
+        let cuda = metadata_cuda();
+        assert!(cuda.symbols.read().unwrap().is_empty());
+        assert!(
+            unsafe {
+                cuda.symbol::<unsafe extern "C" fn() -> c_int>(b"flare_absent_test_symbol\0")
+            }
+            .is_err()
+        );
+        assert!(cuda.symbols.read().unwrap().is_empty());
+
+        #[cfg(unix)]
+        {
+            type Strlen = unsafe extern "C" fn(*const c_char) -> usize;
+            let first = unsafe { cuda.symbol::<Strlen>(b"strlen\0").unwrap() };
+            assert_eq!(cuda.symbols.read().unwrap().len(), 1);
+            let second = unsafe { cuda.symbol::<Strlen>(b"strlen\0").unwrap() };
+            assert_eq!(first as usize, second as usize);
+            assert_eq!(unsafe { second(c"hyperflare".as_ptr()) }, 10);
+        }
+    }
+
+    fn count_retained_block_reads<T>(
+        first_part_path: &Path,
+        operation: impl FnOnce() -> T,
+    ) -> (T, u64) {
+        struct Reset(PathBuf);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                RETAINED_READ_INTO_CALLS.lock().unwrap().remove(&self.0);
+            }
+        }
+        assert!(
+            RETAINED_READ_INTO_CALLS
+                .lock()
+                .unwrap()
+                .insert(first_part_path.to_path_buf(), 0)
+                .is_none()
+        );
+        let reset = Reset(first_part_path.to_path_buf());
+        let result = operation();
+        let reads = RETAINED_READ_INTO_CALLS.lock().unwrap()[&reset.0];
+        (result, reads)
+    }
+
+    #[test]
+    fn cached_multi_group_weight_materialization_streams_once_and_preserves_no_weights_checks()
+    -> ExportResult<()> {
+        let block = weight_payload::ELIDE_BLOCK as usize;
+        let build_fixture = |directory: &Path,
+                             cache_dir: &Path,
+                             no_weights: bool,
+                             mutate_byte: Option<(usize, u8)>|
+         -> ExportResult<(CaptureRequest, RankOutput, PathBuf)> {
+            let stage = directory.join("stage");
+            fs::create_dir_all(&stage)?;
+
+            let mut arena0 = vec![0u8; 6 * block];
+            for index in 0..block {
+                arena0[index] = ((index * 3 + 1) & 0xFF) as u8;
+            }
+            for index in 0..(2 * block) {
+                arena0[2 * block + index] = ((index * 5 + 7) & 0xFF) as u8;
+            }
+            for index in 0..(block / 2) {
+                arena0[5 * block + index] = ((index * 11 + 3) & 0xFF) as u8;
+            }
+            if let Some((pos, val)) = mutate_byte {
+                arena0[pos] = val;
+            }
+            let mut stored0 = Vec::new();
+            stored0.extend_from_slice(&arena0[0..block]);
+            stored0.extend_from_slice(&arena0[2 * block..4 * block]);
+            stored0.extend_from_slice(&arena0[5 * block..5 * block + block / 2]);
+            let storage0 = directory.join("storage-0.bin");
+            fs::write(&storage0, &stored0)?;
+
+            let mut arena1 = vec![0u8; 5 * block + 321];
+            for index in 0..block {
+                arena1[index] = ((index * 7 + 13) & 0xFF) as u8;
+            }
+            for index in 0..block {
+                arena1[2 * block + index] = ((index * 13 + 19) & 0xFF) as u8;
+            }
+            for index in (3 * block)..arena1.len() {
+                arena1[index] = ((index * 17 + 29) & 0xFF) as u8;
+            }
+            let storage1 = directory.join("storage-1.bin");
+            fs::write(&storage1, &arena1)?;
+
+            let mut bundle = wire::BundleIndex {
+                architecture: vec![12, 0],
+                ..Default::default()
+            };
+            let addr0 = 0x10_0000u64;
+            let addr1 = 0x80_0000u64;
+            bundle.allocations.push(wire::Allocation {
+                name: "arena-0".into(),
+                nbytes: arena0.len() as u64,
+                alignment: 256,
+                address: Some(addr0),
+                file: Some("storage-0.bin".into()),
+                data_spans: vec![
+                    wire::Span {
+                        offset: 0,
+                        nbytes: block as u64,
+                        filename: String::new(),
+                    },
+                    wire::Span {
+                        offset: (2 * block) as u64,
+                        nbytes: (2 * block) as u64,
+                        filename: String::new(),
+                    },
+                    wire::Span {
+                        offset: (5 * block) as u64,
+                        nbytes: (block / 2) as u64,
+                        filename: String::new(),
+                    },
+                ],
+                ..Default::default()
+            });
+            bundle.allocations.push(wire::Allocation {
+                name: "arena-1".into(),
+                nbytes: arena1.len() as u64,
+                alignment: 256,
+                address: Some(addr1),
+                file: Some("storage-1.bin".into()),
+                data_spans: vec![wire::Span {
+                    offset: 0,
+                    nbytes: arena1.len() as u64,
+                    filename: String::new(),
+                }],
+                ..Default::default()
+            });
+
+            let mut output = RankOutput {
+                hardware: Some("gb202".to_string()),
+                payload_leases: Default::default(),
+                index: wire::ModelIndex {
+                    version: 4,
+                    ranks: vec![bundle],
+                    contract: Some(Default::default()),
+                    frontend: Some(Default::default()),
+                    sampling_defaults: Some(Default::default()),
+                    ..Default::default()
+                },
+                payload: Vec::new(),
+                allocations: vec![
+                    allocation("arena-0", addr0, arena0.len() as u64),
+                    allocation("arena-1", addr1, arena1.len() as u64),
+                ],
+                module_globals: vec![],
+                external: vec![],
+                staging: Some(stage),
+                weight_payload: None,
+            };
+            append_resource(
+                &mut output,
+                "storage-0.bin".into(),
+                FileSource {
+                    path: storage0.clone(),
+                    offset: 0,
+                    nbytes: stored0.len() as u64,
+                },
+            )?;
+            append_resource(
+                &mut output,
+                "storage-1.bin".into(),
+                FileSource {
+                    path: storage1,
+                    offset: 0,
+                    nbytes: arena1.len() as u64,
+                },
+            )?;
+
+            let request: CaptureRequest = serde_json::from_value(serde_json::json!({
+                "path": directory.join("core"),
+                "context": 0,
+                "graphs": [],
+                "allocations": [],
+                "weight_payload": {
+                    "version": 1,
+                    "views": [
+                        {
+                            "name": "weights.embedding",
+                            "group": "embedding",
+                            "storage": "stable",
+                            "element_bytes": 1,
+                            "shape": [2 * block],
+                            "stride": [1],
+                            "address": addr0
+                        },
+                        {
+                            "name": "weights.layers.0.attn",
+                            "group": "layer-000",
+                            "storage": "stable",
+                            "element_bytes": 1,
+                            "shape": [block],
+                            "stride": [1],
+                            "address": addr0 + (2 * block) as u64
+                        },
+                        {
+                            "name": "weights.layers.0.mlp_tuned",
+                            "group": "layer-000",
+                            "storage": "tuned",
+                            "element_bytes": 1,
+                            "shape": [block],
+                            "stride": [1],
+                            "address": addr0 + (3 * block) as u64
+                        },
+                        {
+                            "name": "weights.layers.1.zero",
+                            "group": "layer-001-zero",
+                            "storage": "stable",
+                            "element_bytes": 1,
+                            "shape": [block],
+                            "stride": [1],
+                            "address": addr0 + (4 * block) as u64
+                        },
+                        {
+                            "name": "weights.layers.2.experts",
+                            "group": "layer-002",
+                            "storage": "stable",
+                            "element_bytes": 1,
+                            "shape": [3 * block],
+                            "stride": [1],
+                            "address": addr1
+                        },
+                        {
+                            "name": "weights.layers.3.norm",
+                            "group": "layer-003",
+                            "storage": "stable",
+                            "element_bytes": 1,
+                            "shape": [block],
+                            "stride": [1],
+                            "address": addr1 + (3 * block) as u64
+                        },
+                        {
+                            "name": "weights.head",
+                            "group": "lm-head",
+                            "storage": "stable",
+                            "element_bytes": 1,
+                            "shape": [block / 2],
+                            "stride": [1],
+                            "address": addr1 + (4 * block) as u64
+                        }
+                    ]
+                },
+                "options": {
+                    "cache": cache_dir,
+                    "no_weights": no_weights,
+                },
+            }))?;
+            Ok((request, output, storage0))
+        };
+
+        // 12 total 64 KiB span blocks across 7 weight groups (2 + 1 + 1 + 1 + 3 + 1 + 1)
+        // plus 2 unowned initial-state blocks (1 in arena-0, 1 in arena-1).
+        let expected_span_blocks = 12u64;
+
+        let serial_dir = tempfile::tempdir()?;
+        let serial_cache = tempfile::tempdir()?;
+        let (serial_req, mut serial_out, serial_storage0) =
+            build_fixture(serial_dir.path(), serial_cache.path(), false, None)?;
+        let serial_allocs = serial_out.allocations.clone();
+        let (serial_res, serial_reads) = count_retained_block_reads(&serial_storage0, || {
+            resolve_weight_payload_with_workers(&serial_req, &serial_allocs, &mut serial_out, None, 1)
+        });
+        let serial_sources = serial_res?.unwrap();
+        assert_eq!(serial_reads, expected_span_blocks);
+
+        let parallel_dir = tempfile::tempdir()?;
+        let parallel_cache = tempfile::tempdir()?;
+        let (parallel_req, mut parallel_out, parallel_storage0) =
+            build_fixture(parallel_dir.path(), parallel_cache.path(), false, None)?;
+        let parallel_allocs = parallel_out.allocations.clone();
+        let (parallel_res, parallel_reads) = count_retained_block_reads(&parallel_storage0, || {
+            resolve_weight_payload_with_workers(
+                &parallel_req,
+                &parallel_allocs,
+                &mut parallel_out,
+                None,
+                4,
+            )
+        });
+        let parallel_sources = parallel_res?.unwrap();
+        assert_eq!(parallel_reads, expected_span_blocks);
+
+        // 6 non-empty weight groups (`layer-001-zero` is all zeros and omitted) + initial_state.
+        assert_eq!(parallel_sources.groups.len(), 6);
+        assert!(
+            parallel_sources
+                .groups
+                .iter()
+                .all(|group| group.name != "layer-001-zero" && group.payload_id.len() == 32)
+        );
+        assert_eq!(parallel_sources.initial_state.payload_id.len(), 32);
+        assert_eq!(
+            serde_json::to_value(&parallel_sources)?,
+            serde_json::to_value(&serial_sources)?
+        );
+
+        assert_eq!(parallel_out.payload_leases.0.len(), 7);
+        assert_eq!(serial_out.payload_leases.0.len(), 7);
+        let expected_groups: Vec<&WeightPayloadGroup> = parallel_sources
+            .groups
+            .iter()
+            .chain(std::iter::once(&parallel_sources.initial_state))
+            .collect();
+        for ((parallel_lease, serial_lease), group) in parallel_out
+            .payload_leases
+            .0
+            .iter()
+            .zip(&serial_out.payload_leases.0)
+            .zip(expected_groups)
+        {
+            assert_eq!(parallel_lease.id(), serial_lease.id());
+            assert_eq!(parallel_lease.id().as_bytes(), group.payload_id.as_slice());
+            assert_eq!(parallel_lease.length(), group.nbytes);
+            let mut parallel_bytes = vec![0u8; parallel_lease.length() as usize];
+            let mut serial_bytes = vec![0u8; serial_lease.length() as usize];
+            parallel_lease.slice().read_at(0, &mut parallel_bytes)?;
+            serial_lease.slice().read_at(0, &mut serial_bytes)?;
+            assert_eq!(parallel_bytes, serial_bytes);
+            assert_eq!(
+                helios_core::core::PayloadId::of(&parallel_bytes),
+                parallel_lease.id()
+            );
+        }
+
+        // Warm cache hit also reads each 64 KiB span block once and reuses cached blobs.
+        let hit_dir = tempfile::tempdir()?;
+        let (hit_req, mut hit_out, hit_storage0) =
+            build_fixture(hit_dir.path(), parallel_cache.path(), false, None)?;
+        let hit_allocs = hit_out.allocations.clone();
+        let (hit_res, hit_reads) = count_retained_block_reads(&hit_storage0, || {
+            resolve_weight_payload_with_workers(&hit_req, &hit_allocs, &mut hit_out, None, 4)
+        });
+        let hit_sources = hit_res?.unwrap();
+        assert_eq!(hit_reads, expected_span_blocks);
+        assert_eq!(
+            serde_json::to_value(&hit_sources)?,
+            serde_json::to_value(&parallel_sources)?
+        );
+        for (hit_lease, parallel_lease) in hit_out
+            .payload_leases
+            .0
+            .iter()
+            .zip(&parallel_out.payload_leases.0)
+        {
+            assert_eq!(hit_lease.path(), parallel_lease.path());
+        }
+
+        // Sensitivity check: mutating one retained byte alters the embedding payload_id.
+        let mutated_dir = tempfile::tempdir()?;
+        let mutated_cache = tempfile::tempdir()?;
+        let (mutated_req, mut mutated_out, _) =
+            build_fixture(mutated_dir.path(), mutated_cache.path(), false, Some((0, 0xFE)))?;
+        let mutated_allocs = mutated_out.allocations.clone();
+        let mutated_sources = resolve_weight_payload_with_workers(
+            &mutated_req,
+            &mutated_allocs,
+            &mut mutated_out,
+            None,
+            4,
+        )?
+        .unwrap();
+        assert_ne!(
+            mutated_sources.groups[0].payload_id,
+            parallel_sources.groups[0].payload_id
+        );
+
+        // `no_weights = true` rejects missing cached weight groups before writing any blob.
+        let missing_dir = tempfile::tempdir()?;
+        let empty_cache = tempfile::tempdir()?;
+        let (missing_req, mut missing_out, _) =
+            build_fixture(missing_dir.path(), empty_cache.path(), true, None)?;
+        let missing_allocs = missing_out.allocations.clone();
+        let error = resolve_weight_payload_with_workers(
+            &missing_req,
+            &missing_allocs,
+            &mut missing_out,
+            None,
+            4,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no-weights export is missing cached payload"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read_dir(empty_cache.path().join("blobs"))?
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| entry.path().is_file())
+                .count(),
+            0
+        );
+        assert_eq!(
+            fs::read_dir(empty_cache.path().join("staging/wrapped"))?.count(),
+            0
+        );
+
+        // `no_weights = true` succeeds when all weight groups are present in the cache.
+        let reuse_dir = tempfile::tempdir()?;
+        let (reuse_req, mut reuse_out, _) =
+            build_fixture(reuse_dir.path(), parallel_cache.path(), true, None)?;
+        let reuse_allocs = reuse_out.allocations.clone();
+        let reuse_sources = resolve_weight_payload_with_workers(
+            &reuse_req,
+            &reuse_allocs,
+            &mut reuse_out,
+            None,
+            4,
+        )?
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&reuse_sources)?,
+            serde_json::to_value(&parallel_sources)?
+        );
+        Ok(())
     }
 }
