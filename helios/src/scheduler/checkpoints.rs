@@ -155,23 +155,6 @@ impl RequestScheduler {
         true
     }
 
-    fn checkpoint_headroom(&self) -> usize {
-        self.slots
-            .iter()
-            .filter_map(|slot| slot.request.as_ref())
-            .filter(|request| request.growable_output && request.phase == RequestPhase::Decode)
-            .map(|request| {
-                self.pages_through(
-                    request,
-                    request
-                        .scheduled_consumed
-                        .saturating_add(self.decode_horizon()),
-                )
-                .saturating_sub(request.reserved_pages.len())
-            })
-            .fold(0usize, usize::saturating_add)
-    }
-
     /// Each prefill capacity this request can use, with its measured non-terminal and terminal
     /// costs when known and nonzero. Selection reads the costs once instead of once per chunk of
     /// every interval.
@@ -518,9 +501,18 @@ impl RequestScheduler {
                 .filter(|cut| cut.endpoint > start)
                 .count()
                 - usize::from(request.anchor_guard.is_some() && start < anchor);
-            if quote_storage && self
-                .quote_snapshots_preserving(1, rows, self.checkpoint_headroom(), rank)
-                .is_none()
+            let protected_budget = (role == RetentionRole::Endpoint)
+                .then_some(endpoint.saturating_sub(left) as u64);
+            if quote_storage
+                && self
+                    .quote_snapshots_preserving_with_budget(
+                        1,
+                        rows,
+                        0,
+                        rank,
+                        protected_budget,
+                    )
+                    .is_none()
             {
                 continue;
             }
@@ -586,16 +578,20 @@ impl RequestScheduler {
                 .len()
                 .saturating_sub(usize::from(request.anchor_guard.is_some()))
                 .max(rows);
+            let protected_budget = cut
+                .filter(|cut| cut.role == RetentionRole::Endpoint)
+                .map(|cut| (cut.endpoint as u64).saturating_sub(request.prefix_tokens));
             let quote = if cut.is_some_and(|cut| cut.role == RetentionRole::Anchor)
                 && request.anchor_guard.is_some()
             {
                 None
             } else if rows > 0 {
-                self.quote_snapshots_preserving(
+                self.quote_snapshots_preserving_with_budget(
                     rows,
                     planned_rows,
-                    self.checkpoint_headroom(),
+                    0,
                     rank,
+                    protected_budget,
                 )
             } else {
                 None
@@ -623,7 +619,7 @@ impl RequestScheduler {
                         .request(plan.handle)
                         .is_ok_and(|request| request.anchor_guard.is_none())
                     && plan.quote.is_none()
-                    && self.pending_resources(self.checkpoint_headroom(), 1)
+                    && self.pending_resources(self.decode_growth_pages(), 1)
             })
     }
 
@@ -675,7 +671,7 @@ impl RequestScheduler {
                         role: cut.role,
                         consumed_tokens: cut.endpoint as u64,
                     };
-                    quote = self.quote_snapshots(1, self.checkpoint_headroom(), rank);
+                    quote = self.quote_snapshots(1, 0, rank);
                 }
                 if let Some(quote) = quote {
                     if let Some(mut rows) = self.apply_snapshot_quote(&quote)? {
@@ -696,7 +692,7 @@ impl RequestScheduler {
                     role: RetentionRole::Anchor,
                     consumed_tokens: plan.anchor as u64,
                 };
-                if let Some(quote) = self.quote_snapshots(1, self.checkpoint_headroom(), rank) {
+                if let Some(quote) = self.quote_snapshots(1, 0, rank) {
                     if let Some(rows) = self.apply_snapshot_quote(&quote)? {
                         self.request_mut(handle)?.anchor_guard = rows.first().copied();
                     }
@@ -810,7 +806,8 @@ impl RequestScheduler {
             role: RetentionRole::Endpoint,
             consumed_tokens: request.consumed_tokens,
         };
-        let quote = self.quote_snapshots(1, self.checkpoint_headroom(), rank);
+        let gain_tokens = request.consumed_tokens.saturating_sub(request.prefix_tokens);
+        let quote = self.quote_snapshots_with_budget(1, 0, rank, Some(gain_tokens));
         let rows = match quote {
             Some(quote) => self.apply_snapshot_quote(&quote)?,
             None => None,
@@ -1675,5 +1672,391 @@ mod tests {
         );
         assert!(!partial_budget);
         assert_eq!(partial_selected.initial_prefill_ns, Some(150_000));
+    }
+
+    fn publish_test_checkpoint(
+        scheduler: &mut RequestScheduler,
+        parent: Option<CheckpointId>,
+        token_fill: u32,
+        consumed_tokens: u64,
+        role: RetentionRole,
+    ) -> CheckpointId {
+        let mut history = PrefixHistory::new([9; 32]);
+        if let Some(parent_id) = parent {
+            let parent_len = scheduler
+                .cache
+                .checkpoint(parent_id)
+                .unwrap()
+                .prefix()
+                .consumed_tokens as usize;
+            history.append(&vec![token_fill; parent_len], &[]).unwrap();
+            let extra = consumed_tokens as usize - parent_len;
+            history.append(&vec![token_fill + 1; extra], &[]).unwrap();
+        } else {
+            history
+                .append(&vec![token_fill; consumed_tokens as usize], &[])
+                .unwrap();
+        }
+        let parent_pages = parent.map_or(0, |id| {
+            scheduler
+                .cache
+                .checkpoint(id)
+                .unwrap()
+                .prefix()
+                .consumed_tokens as usize
+                / scheduler.capabilities.page_tokens
+        });
+        let total_pages = consumed_tokens as usize / scheduler.capabilities.page_tokens;
+        let tail_pages: Vec<_> = (0..(total_pages - parent_pages))
+            .map(|_| scheduler.free_pages.pop_first().unwrap())
+            .collect();
+        let snapshot = scheduler.reserve_snapshot(0).unwrap();
+        let epoch = scheduler.cache.new_use_epoch().unwrap();
+        scheduler
+            .cache
+            .publish_with_retention(
+                &history,
+                &Publication {
+                    parent,
+                    consumed_tokens,
+                    tail_pages,
+                    snapshot: StateSnapshot {
+                        id: snapshot,
+                        consumed_tokens,
+                    },
+                    ready_after: Fence(0),
+                },
+                role,
+                epoch,
+            )
+            .unwrap()
+            .id()
+    }
+
+    #[test]
+    fn short_terminal_endpoint_preserves_larger_resident_anchor_leaves_for_all_prompts() {
+        for message_boundaries in [vec![512], vec![]] {
+            let mut scheduler = super::super::tests::scheduler(2, 64, 2);
+            scheduler.enable_evictions();
+            linear_costs(&mut scheduler);
+            let doc_a =
+                publish_test_checkpoint(&mut scheduler, None, 101, 512, RetentionRole::Anchor);
+            let doc_b =
+                publish_test_checkpoint(&mut scheduler, None, 202, 512, RetentionRole::Anchor);
+            assert_eq!(scheduler.free_snapshot_count(), 0);
+
+            let mut spec = super::super::tests::spec(544, 64);
+            spec.prompt[..512].fill(202);
+            spec.prompt[512..].fill(203);
+            spec.message_boundaries = message_boundaries;
+            let handle = scheduler.admit(spec).unwrap();
+            assert_eq!(scheduler.request(handle).unwrap().prefix, Some(doc_b));
+            {
+                let req = scheduler.request_mut(handle).unwrap();
+                req.consumed_tokens = 544;
+                req.checkpoints.initial_prefill_ns = Some(500_000);
+            }
+
+            let capture = scheduler.allocate_terminal_capture(handle).unwrap();
+            assert!(
+                capture.is_none(),
+                "short terminal endpoint must not evict a larger protected anchor leaf"
+            );
+            assert_eq!(scheduler.stats().checkpoint_skip_storage, 1);
+            assert!(scheduler.take_evictions().is_empty());
+            assert!(scheduler.cache.checkpoint(doc_a).is_ok());
+            assert!(scheduler.cache.checkpoint(doc_b).is_ok());
+            scheduler.cancel(handle).unwrap();
+
+            // Once doc_a ages enough that `512 / (1 + age) <= 32`, a newer request with the
+            // same 32-token terminal delta reaps doc_a freely.
+            for _ in 0..16 {
+                scheduler.cache.new_use_epoch().unwrap();
+            }
+            let mut newer_spec = super::super::tests::spec(544, 64);
+            newer_spec.prompt[..512].fill(202);
+            newer_spec.prompt[512..].fill(204);
+            let newer = scheduler.admit(newer_spec).unwrap();
+            assert_eq!(scheduler.request(newer).unwrap().prefix, Some(doc_b));
+            {
+                let req = scheduler.request_mut(newer).unwrap();
+                req.consumed_tokens = 544;
+                req.checkpoints.initial_prefill_ns = Some(500_000);
+            }
+            let row = scheduler
+                .allocate_terminal_capture(newer)
+                .unwrap()
+                .expect("aged anchor leaf must be reaped freely by a newer terminal endpoint");
+            assert_eq!(scheduler.take_evictions().len(), 1);
+            assert!(scheduler.cache.checkpoint(doc_a).is_err());
+            assert!(scheduler.cache.checkpoint(doc_b).is_ok());
+            scheduler.release_snapshot(row);
+            scheduler.cancel(newer).unwrap();
+        }
+    }
+
+    #[test]
+    fn short_terminal_endpoint_evicts_older_non_root_endpoint_keeping_parent_anchor_intact() {
+        let mut scheduler = super::super::tests::scheduler(2, 64, 3);
+        scheduler.enable_evictions();
+        linear_costs(&mut scheduler);
+        let doc_a = publish_test_checkpoint(&mut scheduler, None, 101, 512, RetentionRole::Anchor);
+        let reply_a = publish_test_checkpoint(
+            &mut scheduler,
+            Some(doc_a),
+            101,
+            640,
+            RetentionRole::Endpoint,
+        );
+        // Match real completion recency refresh: terminal Endpoint and its direct parent Anchor
+        // share the completion epoch so Endpoint ranks below Anchor at that epoch.
+        let reply_epoch = scheduler
+            .cache
+            .checkpoint(reply_a)
+            .unwrap()
+            .retention_rank()
+            .use_epoch;
+        scheduler.cache.touch(doc_a, reply_epoch).unwrap();
+        let doc_b = publish_test_checkpoint(&mut scheduler, None, 202, 512, RetentionRole::Anchor);
+        assert_eq!(scheduler.free_snapshot_count(), 0);
+
+        let mut spec = super::super::tests::spec(544, 64);
+        spec.prompt[..512].fill(202);
+        spec.prompt[512..].fill(203);
+        spec.message_boundaries = vec![512];
+        let handle = scheduler.admit(spec).unwrap();
+        assert_eq!(scheduler.request(handle).unwrap().prefix, Some(doc_b));
+        {
+            let req = scheduler.request_mut(handle).unwrap();
+            // Marginal gain is 32 tokens, smaller than reply_a's 128-token delta; LRU among
+            // non-root Endpoint leaves must still replace reply_a without touching doc_a.
+            req.consumed_tokens = 544;
+            req.checkpoints.initial_prefill_ns = Some(500_000);
+        }
+
+        let row = scheduler
+            .allocate_terminal_capture(handle)
+            .unwrap()
+            .expect("older non-root endpoint leaf must remain LRU-evictable");
+        assert_eq!(scheduler.stats().checkpoint_skip_storage, 0);
+        assert_eq!(scheduler.take_evictions().len(), 1);
+        assert!(scheduler.cache.checkpoint(reply_a).is_err());
+        assert!(scheduler.cache.checkpoint(doc_a).is_ok());
+        assert!(scheduler.cache.checkpoint(doc_b).is_ok());
+        scheduler.release_snapshot(row);
+        scheduler.cancel(handle).unwrap();
+    }
+
+    #[test]
+    fn long_terminal_endpoint_evicts_smaller_older_anchor_leaf() {
+        let mut scheduler = super::super::tests::scheduler(2, 64, 2);
+        scheduler.enable_evictions();
+        linear_costs(&mut scheduler);
+        let short_doc =
+            publish_test_checkpoint(&mut scheduler, None, 101, 128, RetentionRole::Anchor);
+        let active_doc =
+            publish_test_checkpoint(&mut scheduler, None, 202, 512, RetentionRole::Anchor);
+        assert_eq!(scheduler.free_snapshot_count(), 0);
+
+        let mut spec = super::super::tests::spec(512, 512);
+        spec.prompt.fill(202);
+        spec.message_boundaries = vec![512];
+        let handle = scheduler.admit(spec).unwrap();
+        assert_eq!(scheduler.request(handle).unwrap().prefix, Some(active_doc));
+        {
+            let req = scheduler.request_mut(handle).unwrap();
+            // Marginal gain is 512 tokens >= short_doc's 128-token root anchor.
+            req.consumed_tokens = 1024;
+            req.checkpoints.initial_prefill_ns = Some(500_000);
+        }
+
+        let row = scheduler
+            .allocate_terminal_capture(handle)
+            .unwrap()
+            .expect("terminal gain exceeding older anchor leaf must allow eviction");
+        assert_eq!(scheduler.stats().checkpoint_skip_storage, 0);
+        assert_eq!(scheduler.take_evictions().len(), 1);
+        assert!(scheduler.cache.checkpoint(short_doc).is_err());
+        assert!(scheduler.cache.checkpoint(active_doc).is_ok());
+        scheduler.release_snapshot(row);
+        scheduler.cancel(handle).unwrap();
+    }
+
+    #[test]
+    fn multi_victim_terminal_capture_enforces_cumulative_protected_token_budget_atomically() {
+        // Need 5 free pages for running decoder headroom; each anchor holds 3 pages (192 tokens),
+        // so freeing enough pages requires evicting BOTH anchors (384 protected tokens total).
+        let mut scheduler = super::super::tests::scheduler(3, 14, 3);
+        scheduler.enable_evictions();
+        linear_costs(&mut scheduler);
+        let anchor_0 =
+            publish_test_checkpoint(&mut scheduler, None, 101, 192, RetentionRole::Anchor);
+        let anchor_1 =
+            publish_test_checkpoint(&mut scheduler, None, 202, 192, RetentionRole::Anchor);
+        let active =
+            publish_test_checkpoint(&mut scheduler, None, 303, 128, RetentionRole::Anchor);
+        assert_eq!(scheduler.free_snapshot_count(), 0);
+        // 14 total pages - 3 - 3 - 2 = 6 free pages left.
+
+        let mut growing = super::super::tests::spec(64, 400);
+        growing.prompt.fill(404);
+        growing.growable_output = true;
+        let decoder = scheduler.admit(growing).unwrap();
+        {
+            let req = scheduler.request_mut(decoder).unwrap();
+            req.phase = RequestPhase::Decode;
+            // Needs 5 additional pages beyond its 2 reserved pages at decode_horizon=1.
+            req.scheduled_consumed = 383;
+        }
+        assert_eq!(scheduler.decode_growth_pages(), 5);
+        // Drain remaining free pages into the live request so 0 free pages remain before eviction.
+        let mut spec = super::super::tests::spec(128, 256);
+        spec.prompt.fill(303);
+        spec.message_boundaries = vec![128];
+        let handle = scheduler.admit(spec).unwrap();
+        assert_eq!(scheduler.request(handle).unwrap().prefix, Some(active));
+        assert_eq!(scheduler.free_pages.len(), 0);
+
+        // Epochs: anchor_0=1 (age 4 -> 192/5 = 38), anchor_1=2 (age 3 -> 192/4 = 48),
+        // cumulative age-discounted protected cost = 86 tokens.
+        // Gain = 64 tokens covers anchor_0 (38) but not both (86 > 64): must decline atomically.
+        {
+            let req = scheduler.request_mut(handle).unwrap();
+            req.consumed_tokens = 128 + 64;
+            req.checkpoints.initial_prefill_ns = Some(500_000);
+        }
+        assert!(
+            scheduler
+                .allocate_terminal_capture(handle)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(scheduler.stats().checkpoint_skip_storage, 1);
+        assert!(scheduler.take_evictions().is_empty());
+        assert!(scheduler.cache.checkpoint(anchor_0).is_ok());
+        assert!(scheduler.cache.checkpoint(anchor_1).is_ok());
+
+        // Gain = 86 tokens: covers the exact cumulative age-discounted cost (38 + 48) and frees 6 >= 5 pages.
+        scheduler.request_mut(handle).unwrap().consumed_tokens = 128 + 86;
+        let row = scheduler
+            .allocate_terminal_capture(handle)
+            .unwrap()
+            .expect("cumulative gain covering both anchors must succeed");
+        assert_eq!(scheduler.take_evictions().len(), 2);
+        assert!(scheduler.cache.checkpoint(anchor_0).is_err());
+        assert!(scheduler.cache.checkpoint(anchor_1).is_err());
+        scheduler.release_snapshot(row);
+        scheduler.cancel(handle).unwrap();
+        scheduler.cancel(decoder).unwrap();
+    }
+
+    #[test]
+    fn compacted_root_endpoint_leaf_is_protected_by_its_full_token_span() {
+        let mut scheduler = super::super::tests::scheduler(2, 64, 3);
+        scheduler.enable_evictions();
+        linear_costs(&mut scheduler);
+        let root_anchor =
+            publish_test_checkpoint(&mut scheduler, None, 101, 512, RetentionRole::Anchor);
+        let child_endpoint = publish_test_checkpoint(
+            &mut scheduler,
+            Some(root_anchor),
+            101,
+            576,
+            RetentionRole::Endpoint,
+        );
+        // Compact root_anchor into child_endpoint so child_endpoint becomes a root Endpoint leaf
+        // owning all 576 tokens (9 pages).
+        let retired = scheduler.cache.evict_checkpoint(root_anchor).unwrap();
+        let update = scheduler.cache.advance_completed(scheduler.completed).unwrap();
+        scheduler.apply_completion(update);
+        assert_eq!(retired.heir, Some(child_endpoint));
+        assert_eq!(
+            scheduler.cache.checkpoint(child_endpoint).unwrap().parent(),
+            None
+        );
+
+        let active_doc =
+            publish_test_checkpoint(&mut scheduler, None, 202, 512, RetentionRole::Anchor);
+        // Occupy the remaining free snapshot row with a pinned dummy checkpoint or reserve it.
+        let held = scheduler.reserve_snapshot(0).unwrap();
+        assert_eq!(scheduler.free_snapshot_count(), 0);
+
+        let mut spec = super::super::tests::spec(512, 64);
+        spec.prompt.fill(202);
+        let handle = scheduler.admit(spec).unwrap();
+        assert_eq!(scheduler.request(handle).unwrap().prefix, Some(active_doc));
+        {
+            let req = scheduler.request_mut(handle).unwrap();
+            req.consumed_tokens = 512 + 64;
+            req.checkpoints.initial_prefill_ns = Some(500_000);
+        }
+
+        assert!(
+            scheduler
+                .allocate_terminal_capture(handle)
+                .unwrap()
+                .is_none(),
+            "short terminal endpoint must not evict a compacted root endpoint holding 576 tokens"
+        );
+        assert!(scheduler.cache.checkpoint(child_endpoint).is_ok());
+        scheduler.release_snapshot(held);
+        scheduler.cancel(handle).unwrap();
+    }
+
+    #[test]
+    fn prompt_end_endpoint_respects_marginal_gain_and_decode_headroom() {
+        // Part A: a 16-token prompt-end Endpoint past a 512-token Anchor must not evict
+        // another resident 512-token Anchor leaf, while keeping the Anchor cut itself.
+        let mut scheduler = super::super::tests::scheduler(2, 64, 2);
+        linear_costs(&mut scheduler);
+        let doc_a = publish_test_checkpoint(&mut scheduler, None, 101, 512, RetentionRole::Anchor);
+        let doc_b = publish_test_checkpoint(&mut scheduler, None, 202, 512, RetentionRole::Anchor);
+        assert_eq!(scheduler.free_snapshot_count(), 0);
+
+        let mut spec = super::super::tests::spec(528, 16);
+        spec.prompt.fill(303);
+        spec.message_boundaries = vec![512];
+        let handle = scheduler.admit(spec).unwrap();
+        let (selected, _, _) =
+            scheduler.checkpoint_selection(scheduler.request(handle).unwrap());
+        let endpoints: Vec<_> = selected
+            .cuts
+            .iter()
+            .map(|cut| (cut.endpoint, cut.role))
+            .collect();
+        assert_eq!(
+            endpoints,
+            vec![(512, RetentionRole::Anchor)],
+            "16-token prompt-end endpoint must be skipped when only 512-token anchors can be evicted"
+        );
+        assert!(scheduler.cache.checkpoint(doc_a).is_ok());
+        assert!(scheduler.cache.checkpoint(doc_b).is_ok());
+        scheduler.cancel(handle).unwrap();
+
+        // Part B: terminal capture preserves running decode headroom on aliased free rows.
+        let mut s = super::super::tests::scheduler(2, 5, 1);
+        s.share_snapshot_pages(&[4..5]).unwrap();
+        let mut req_spec = super::super::tests::spec(64, 1);
+        req_spec.message_boundaries = vec![32];
+        let pending = s.admit(req_spec).unwrap();
+        let mut growing = super::super::tests::spec(60, 400);
+        growing.growable_output = true;
+        let decoder = s.admit(growing).unwrap();
+        {
+            let req = s.request_mut(decoder).unwrap();
+            req.phase = RequestPhase::Decode;
+            req.scheduled_consumed = 127;
+        }
+        assert_eq!(s.decode_growth_pages(), 1);
+        assert_eq!(s.available_snapshot(0), Some(SnapshotId(0)));
+        assert!(s.available_snapshot(1).is_none());
+        assert_eq!(s.allocate_terminal_capture(pending).unwrap(), None);
+        assert_eq!(s.stats().checkpoint_skip_storage, 1);
+        assert!(s.free_pages.contains(&PageId(4)));
+        s.cancel(decoder).unwrap();
+        let row = s.allocate_terminal_capture(pending).unwrap().unwrap();
+        assert_eq!(s.stats().checkpoint_skip_storage, 1);
+        s.release_snapshot(row);
+        s.cancel(pending).unwrap();
     }
 }

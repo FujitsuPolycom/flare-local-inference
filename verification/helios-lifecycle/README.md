@@ -259,6 +259,13 @@ checkpoint survival after cancellation. A separate guard test checks oldest-firs
 revocation and overlapping backing aliases through the production allocator and
 revocation helper. Guard setup in that test assigns allocated rows directly to
 live requests; it does not exercise optional-cut selection.
+`terminal_reservations_match_lifecycle_model` additionally checks ordinary
+terminal allocation (`allocate_terminal_capture` across spare-row reservation,
+protected-anchor refusal, aged-anchor reaping, large-gain anchor eviction, and
+non-root endpoint replacement) alongside early finish and preemption against
+`TerminalDestination` in `CheckpointReservation.tla`. `check.py --mutations`
+verifies that removing the protected-token budget check in `helios/src/cache.rs`
+fails this suite.
 
 A 15-integer projection contains submitted/completed fences, the live-request
 mask, and each row's phase, request owner, retention fence, and observed GPU-use

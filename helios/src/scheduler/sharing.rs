@@ -168,10 +168,15 @@ impl RequestScheduler {
                     && !request.preempted
             })
             .map(|request| {
-                self.pages_through(request, request.scheduled_consumed + self.decode_horizon())
-                    .saturating_sub(request.reserved_pages.len())
+                self.pages_through(
+                    request,
+                    request
+                        .scheduled_consumed
+                        .saturating_add(self.decode_horizon()),
+                )
+                .saturating_sub(request.reserved_pages.len())
             })
-            .sum()
+            .fold(0usize, usize::saturating_add)
     }
 
     /// Whether pinning `id` for an export still leaves room for every running

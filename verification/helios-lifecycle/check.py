@@ -293,6 +293,12 @@ def main():
                 ("lost inherited fence", "child.last_use = child.last_use.max(node.last_use).max(node.ready_after);",
                  "child.last_use = child.last_use;", "compaction lost inherited last-use fence"),
             ])
+            check_mutations(cargo, ROOT / "helios/src/cache.rs", CHECKS[7][1], [
+                ("unbounded endpoint leaf eviction",
+                 "let tokens = self.protected_eviction_tokens(node, rank);",
+                 "let tokens = 0;",
+                 "short terminal endpoint must not evict a larger protected anchor leaf"),
+            ])
             check_mutations(cargo, ROOT / "helios/src/offload/transfer.rs", CHECKS[3][1], [
                 ("premature transfer aggregation", "if pending.remaining > 0 {", "if pending.remaining > 1 {",
                  "accepted rank replies must retain pending ownership until the final reply"),

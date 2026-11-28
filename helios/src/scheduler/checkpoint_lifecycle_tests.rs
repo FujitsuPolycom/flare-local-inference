@@ -273,3 +273,191 @@ fn unused_anchor_guards_revoke_oldest_first_without_cancelling_requests() {
     assert_eq!(scheduler.stats().snapshot_backing_pages, 0);
     assert!(!scheduler.revoke_unused_anchor_guards());
 }
+
+#[test]
+fn terminal_reservations_match_lifecycle_model() {
+    #[derive(Clone, Copy)]
+    enum Case {
+        SpareFreeRow,
+        ProtectedAnchorRefused,
+        AgedAnchorReaped,
+        LargeGainEvictsAnchor,
+        NonRootEndpointEvicted,
+        EarlyFinish,
+        Preempt,
+    }
+
+    for case in [
+        Case::SpareFreeRow,
+        Case::ProtectedAnchorRefused,
+        Case::AgedAnchorReaped,
+        Case::LargeGainEvictsAnchor,
+        Case::NonRootEndpointEvicted,
+        Case::EarlyFinish,
+        Case::Preempt,
+    ] {
+        let mut s = tests::scheduler(2, 64, 3);
+        s.enable_evictions();
+        let mut observation = Observation {
+            origin: 0,
+            owners: [0; 3],
+            uses: [0; 3],
+            published: vec![],
+        };
+
+        let publish_row = |s: &mut RequestScheduler,
+                           obs: &mut Observation,
+                           parent: Option<CheckpointId>,
+                           fill: u32,
+                           tokens: u64,
+                           role: RetentionRole| {
+            let mut history = PrefixHistory::new([9; 32]);
+            if let Some(parent_id) = parent {
+                let parent_len = s.cache.checkpoint(parent_id).unwrap().prefix().consumed_tokens
+                    as usize;
+                history.append(&vec![fill; parent_len], &[]).unwrap();
+                history
+                    .append(&vec![fill + 1; tokens as usize - parent_len], &[])
+                    .unwrap();
+            } else {
+                history.append(&vec![fill; tokens as usize], &[]).unwrap();
+            }
+            let parent_pages = parent.map_or(0, |id| {
+                s.cache.checkpoint(id).unwrap().prefix().consumed_tokens as usize / 64
+            });
+            let pages: Vec<_> = (0..(tokens as usize / 64 - parent_pages))
+                .map(|_| s.free_pages.pop_first().unwrap())
+                .collect();
+            let snapshot = s.reserve_snapshot(0).unwrap();
+            let epoch = s.cache.new_use_epoch().unwrap();
+            let id = s
+                .cache
+                .publish_with_retention(
+                    &history,
+                    &Publication {
+                        parent,
+                        consumed_tokens: tokens,
+                        tail_pages: pages,
+                        snapshot: StateSnapshot {
+                            id: snapshot,
+                            consumed_tokens: tokens,
+                        },
+                        ready_after: Fence(0),
+                    },
+                    role,
+                    epoch,
+                )
+                .unwrap()
+                .id();
+            obs.published.push((id, 2));
+            id
+        };
+
+        let active_anchor = match case {
+            Case::SpareFreeRow => {
+                publish_row(&mut s, &mut observation, None, 100, 128, RetentionRole::Anchor);
+                publish_row(&mut s, &mut observation, None, 200, 128, RetentionRole::Anchor)
+            }
+            Case::NonRootEndpointEvicted => {
+                let doc =
+                    publish_row(&mut s, &mut observation, None, 100, 128, RetentionRole::Anchor);
+                let reply = publish_row(
+                    &mut s,
+                    &mut observation,
+                    Some(doc),
+                    100,
+                    192,
+                    RetentionRole::Endpoint,
+                );
+                let reply_epoch = s
+                    .cache
+                    .checkpoint(reply)
+                    .unwrap()
+                    .retention_rank()
+                    .use_epoch;
+                s.cache.touch(doc, reply_epoch).unwrap();
+                publish_row(&mut s, &mut observation, None, 200, 128, RetentionRole::Anchor)
+            }
+            Case::ProtectedAnchorRefused
+            | Case::AgedAnchorReaped
+            | Case::LargeGainEvictsAnchor
+            | Case::EarlyFinish
+            | Case::Preempt => {
+                publish_row(&mut s, &mut observation, None, 100, 128, RetentionRole::Anchor);
+                publish_row(&mut s, &mut observation, None, 150, 128, RetentionRole::Anchor);
+                publish_row(&mut s, &mut observation, None, 200, 128, RetentionRole::Anchor)
+            }
+        };
+
+        if matches!(case, Case::AgedAnchorReaped) {
+            for _ in 0..8 {
+                s.cache.new_use_epoch().unwrap();
+            }
+        }
+
+        let mut spec = tests::spec(128, 128);
+        spec.prompt.fill(200);
+        spec.message_boundaries = vec![128];
+        spec.growable_output = matches!(case, Case::EarlyFinish | Case::Preempt);
+        let h = s.admit(spec).unwrap();
+        assert_eq!(s.request(h).unwrap().prefix, Some(active_anchor));
+        s.request_mut(h).unwrap().checkpoints.productive_decode_ns = 500_000;
+        let before = observation.project(&s);
+        let row = match case {
+            Case::SpareFreeRow
+            | Case::ProtectedAnchorRefused
+            | Case::AgedAnchorReaped
+            | Case::NonRootEndpointEvicted => {
+                // Row 0 is 128 tokens: at age 3, cost = 128/4 = 32 > 16 (refused);
+                // after aging 8 epochs (age 11), cost = 128/12 = 10 <= 16 (reaped).
+                s.request_mut(h).unwrap().consumed_tokens = 128 + 16;
+                s.allocate_terminal_capture(h).unwrap()
+            }
+            Case::LargeGainEvictsAnchor => {
+                s.request_mut(h).unwrap().consumed_tokens = 128 + 64;
+                s.allocate_terminal_capture(h).unwrap()
+            }
+            Case::EarlyFinish | Case::Preempt => {
+                let req = s.request_mut(h).unwrap();
+                req.phase = RequestPhase::Decode;
+                req.consumed_tokens = 128 + 32;
+                req.scheduled_consumed = 128 + 32;
+                let prompt_page = req.reserved_pages.pop().unwrap();
+                req.private_pages.push(prompt_page);
+                if matches!(case, Case::Preempt) {
+                    s.preempt_newest().unwrap();
+                } else {
+                    s.finish_early(h, false).unwrap();
+                }
+                s.request(h).unwrap().terminal_snapshot
+            }
+        };
+
+        let expect_skip = matches!(case, Case::ProtectedAnchorRefused);
+        let expect_evict = !matches!(case, Case::SpareFreeRow | Case::ProtectedAnchorRefused);
+        assert_eq!(
+            row.is_none(),
+            expect_skip,
+            "short terminal endpoint must not evict a larger protected anchor leaf"
+        );
+        assert_eq!(s.stats().checkpoint_skip_storage, u64::from(expect_skip));
+        assert_eq!(s.take_evictions().len(), usize::from(expect_evict));
+
+        let mut after = observation.project(&s);
+        if let Some(id) = row {
+            assert!(!s.free_snapshots.contains(&id));
+            let start = 3 + 4 * id.0 as usize;
+            assert_eq!(after[start], 0, "reserved row still has a previous owner");
+            after[start..start + 4].copy_from_slice(&[2, h.slot as u64 + 1, 0, 0]);
+        }
+        edge(
+            before,
+            [
+                if expect_evict { 19 } else { 18 },
+                h.slot as u64 + 1,
+                row.map_or(0, |id| id.0 as u64 + 1),
+            ],
+            after,
+        );
+    }
+}

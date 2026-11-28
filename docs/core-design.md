@@ -1556,8 +1556,23 @@ The global allocator compares victims for both snapshot rows and physical page
 backing. A removable checkpoint is an unpinned leaf or an ancestor with exactly
 one child and no direct request pin. Fenced retirement and alias ownership still
 control when its resources can be reused. Optional capture cannot displace an
-equal or higher retention rank. Mandatory execution resources can reclaim any
-eligible rank and revoke unused anchor guards. Host, disk, and remote-store
+equal or higher retention rank. Optional `Anchor` and `Message` captures reclaim lower-rank victims strictly by
+demand-recency order. Optional `Endpoint` captures (prompt-end and ordinary
+terminal endpoints) use the same demand-recency order while bounding cumulative
+protected victim destruction by their marginal token gain beyond their
+already-resident parent checkpoint (or full consumed length when no parent is
+resident): role-preserving single-child interior compactions (`child.role >=
+ancestor.role`, or any `Endpoint` interior compaction) and older non-root
+`Endpoint` leaves remain eligible at zero protected cost, while evicting
+higher-role (`Anchor`, `Message`) or root leaves—or compacting a higher-role
+ancestor into a strictly lower-role child—charges the age-discounted span
+`leaf_tokens / (1 + age)` (where `age` is the demand-epoch distance
+`rank.use_epoch - victim.accessed`). Recent large prefixes are therefore
+preserved against small terminal deltas while older anchors decay and remain
+freely reclaimable by newer requests. Early finish and preemption under
+page pressure still use mandatory reclamation rather than the optional terminal
+capture budget. Mandatory execution resources can reclaim any eligible rank and
+revoke unused anchor guards. Host, disk, and remote-store
 retention keep their independent eviction policies. Local copy-out checks GPU
 headroom before pinning a checkpoint chain for transfer.
 

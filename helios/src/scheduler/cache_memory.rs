@@ -21,6 +21,7 @@ pub(super) struct SnapshotQuote {
     witness: Vec<SnapshotId>,
     keep_pages: usize,
     rank: crate::cache::RetentionRank,
+    protected_token_budget: Option<u64>,
 }
 
 // Counts pages visited by select_snapshots; read only by the work-bound test.
@@ -252,9 +253,26 @@ impl RequestScheduler {
         keep_pages: usize,
         rank: crate::cache::RetentionRank,
     ) -> Option<SnapshotQuote> {
-        self.quote_snapshots_preserving(rows, rows, keep_pages, rank)
+        self.quote_snapshots_with_budget(rows, keep_pages, rank, None)
     }
 
+    pub(super) fn quote_snapshots_with_budget(
+        &self,
+        rows: usize,
+        keep_pages: usize,
+        rank: crate::cache::RetentionRank,
+        protected_token_budget: Option<u64>,
+    ) -> Option<SnapshotQuote> {
+        self.quote_snapshots_preserving_with_budget(
+            rows,
+            rows,
+            keep_pages,
+            rank,
+            protected_token_budget,
+        )
+    }
+
+    #[cfg(test)]
     pub(super) fn quote_snapshots_preserving(
         &self,
         rows: usize,
@@ -262,16 +280,44 @@ impl RequestScheduler {
         keep_pages: usize,
         rank: crate::cache::RetentionRank,
     ) -> Option<SnapshotQuote> {
+        self.quote_snapshots_preserving_with_budget(rows, planned_rows, keep_pages, rank, None)
+    }
+
+    pub(super) fn quote_snapshots_preserving_with_budget(
+        &self,
+        rows: usize,
+        planned_rows: usize,
+        keep_pages: usize,
+        rank: crate::cache::RetentionRank,
+        protected_token_budget: Option<u64>,
+    ) -> Option<SnapshotQuote> {
         if rows > planned_rows {
             return None;
         }
         if rows == planned_rows {
-            return self.simulate_snapshot_quote(rows, keep_pages, rank, None);
+            return self.simulate_snapshot_quote(
+                rows,
+                keep_pages,
+                rank,
+                protected_token_budget,
+                None,
+            );
         }
-        let future = self.simulate_snapshot_quote(planned_rows, keep_pages, rank, None)?;
+        let future = self.simulate_snapshot_quote(
+            planned_rows,
+            keep_pages,
+            rank,
+            protected_token_budget,
+            None,
+        )?;
         let candidates = future.snapshots.iter().copied().collect();
-        let mut current =
-            self.simulate_snapshot_quote(rows, keep_pages, rank, Some(&candidates))?;
+        let mut current = self.simulate_snapshot_quote(
+            rows,
+            keep_pages,
+            rank,
+            protected_token_budget,
+            Some(&candidates),
+        )?;
         current.planned_rows = planned_rows;
         current.witness = future.snapshots;
         Some(current)
@@ -282,6 +328,7 @@ impl RequestScheduler {
         rows: usize,
         keep_pages: usize,
         rank: crate::cache::RetentionRank,
+        protected_token_budget: Option<u64>,
         allowed: Option<&BTreeSet<SnapshotId>>,
     ) -> Option<SnapshotQuote> {
         #[cfg(test)]
@@ -292,6 +339,7 @@ impl RequestScheduler {
         let mut free_snapshots = self.free_snapshots.clone();
         let mut refs = self.page_snapshot_refs.clone();
         let mut victims = Vec::new();
+        let mut remaining_budget = protected_token_budget;
         loop {
             let candidates =
                 allowed.map(|allowed| free_snapshots.intersection(allowed).copied().collect());
@@ -310,9 +358,14 @@ impl RequestScheduler {
                     planned_rows: rows,
                     keep_pages,
                     rank,
+                    protected_token_budget,
                 });
             }
-            let id = cache.eviction_candidate(Some(rank), true)?;
+            let (id, spent) =
+                cache.eviction_candidate_within_budget(Some(rank), true, remaining_budget)?;
+            if let Some(budget) = remaining_budget.as_mut() {
+                *budget = budget.saturating_sub(spent);
+            }
             cache.evict_checkpoint(id).ok()?;
             victims.push(id);
             let reusable = cache.advance_completed(self.completed).ok()?.reusable;
@@ -357,11 +410,12 @@ impl RequestScheduler {
         quote: &SnapshotQuote,
     ) -> Result<Option<Vec<SnapshotId>>> {
         if self
-            .quote_snapshots_preserving(
+            .quote_snapshots_preserving_with_budget(
                 quote.snapshots.len(),
                 quote.planned_rows,
                 quote.keep_pages,
                 quote.rank,
+                quote.protected_token_budget,
             )
             .as_ref()
             != Some(quote)
@@ -1063,6 +1117,7 @@ mod tests {
                     planned_rows: rows,
                     keep_pages,
                     rank,
+                    protected_token_budget: None,
                 });
             }
             let id = cache.eviction_candidate(Some(rank), true)?;

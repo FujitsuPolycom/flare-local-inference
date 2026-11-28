@@ -615,11 +615,41 @@ impl PrefixCheckpointCache {
         })
     }
 
-    pub(crate) fn eviction_candidate(
+    /// Age-discounted protected token cost incurred if `node` is evicted by an optional capture
+    /// of `rank`. Role-preserving single-child compactions (`child.role >= node.role`, or
+    /// `node.role == Endpoint`) preserve all cached KV pages and reusable boundaries (0), and
+    /// evicting a non-root `Endpoint` leaf preserves its parent prefix (0). Evicting a
+    /// higher-role (`Anchor`, `Message`) leaf, a root leaf, or compacting a higher-role ancestor
+    /// into a strictly lower-role child charges `leaf_tokens / (1 + age)` where `age =
+    /// rank.use_epoch - node.accessed`.
+    fn protected_eviction_tokens(&self, node: &Checkpoint, rank: RetentionRank) -> u64 {
+        if node.child_count != 0 {
+            let child_preserves_role = self
+                .nodes
+                .values()
+                .find(|child| child.parent == Some(node.id))
+                .is_some_and(|child| child.role >= node.role);
+            if child_preserves_role || node.role == RetentionRole::Endpoint {
+                return 0;
+            }
+        } else if node.role == RetentionRole::Endpoint && node.parent.is_some() {
+            return 0;
+        }
+        let parent_tokens = node
+            .parent
+            .and_then(|parent| self.nodes.get(&parent))
+            .map_or(0, |parent| parent.prefix.consumed_tokens);
+        let leaf_tokens = node.prefix.consumed_tokens.saturating_sub(parent_tokens);
+        let age = rank.use_epoch.saturating_sub(node.accessed);
+        leaf_tokens / age.saturating_add(1)
+    }
+
+    pub(crate) fn eviction_candidate_within_budget(
         &self,
         below: Option<RetentionRank>,
         immediate: bool,
-    ) -> Option<CheckpointId> {
+        protected_token_budget: Option<u64>,
+    ) -> Option<(CheckpointId, u64)> {
         self.eviction_candidates()
             .filter(|node| {
                 below.is_none_or(|rank| {
@@ -627,8 +657,30 @@ impl PrefixCheckpointCache {
                 })
             })
             .filter(|node| !immediate || node.last_use.max(node.ready_after) <= self.completed)
-            .min_by_key(|node| (node.retention_rank(), node.id))
-            .map(|node| node.id)
+            .filter_map(|node| {
+                let cost = match (below, protected_token_budget) {
+                    (Some(rank), Some(budget)) => {
+                        let tokens = self.protected_eviction_tokens(node, rank);
+                        if tokens > budget {
+                            return None;
+                        }
+                        tokens
+                    }
+                    _ => 0,
+                };
+                Some((node, cost))
+            })
+            .min_by_key(|(node, _)| (node.retention_rank(), node.id))
+            .map(|(node, cost)| (node.id, cost))
+    }
+
+    pub(crate) fn eviction_candidate(
+        &self,
+        below: Option<RetentionRank>,
+        immediate: bool,
+    ) -> Option<CheckpointId> {
+        self.eviction_candidate_within_budget(below, immediate, None)
+            .map(|(id, _)| id)
     }
 
     pub(crate) fn evict_checkpoint(&mut self, id: CheckpointId) -> Result<RetiredResources> {

@@ -41,6 +41,19 @@ ReserveExtra(before, after, request, row) ==
     /\ before.rows[row].phase = Free
     /\ after = [before EXCEPT !.rows[row] = [phase |-> Armed, owner |-> request, fence |-> 0]]
 
+\* Terminal allocation after GPU work drains, including early finish and marginal-value
+\* eviction gating. The eviction branch reclaims one eligible published row whose GPU use
+\* has completed.
+TerminalDestination(before, after, request, row, canEvict) ==
+    /\ request \in before.live
+    /\ Captures(before, request) = {}
+    /\ IF row = 0 THEN after = before
+       ELSE \/ ReserveExtra(before, after, request, row)
+            \/ /\ canEvict
+               /\ before.rows[row].phase = Published
+               /\ before.uses[row] <= before.completed
+               /\ after = [before EXCEPT !.rows[row] = [phase |-> Armed, owner |-> request, fence |-> 0]]
+
 Produce(before, after, row) ==
     /\ before.rows[row].phase = Armed
     /\ before.rows[row].fence = 0
@@ -149,6 +162,8 @@ Next == (\E request \in Requests, row \in Rows : ReserveGuard(state, state', req
      \/ (\E request \in Requests : CancelAndReclaim(state, state', request))
      \/ CompleteAndReclaim(state, state')
      \/ (\E row \in Rows : ReleaseGuard(state, state', row))
+     \/ (\E request \in Requests, row \in Rows \cup {0}, canEvict \in BOOLEAN :
+              TerminalDestination(state, state', request, row, canEvict))
      \/ UNCHANGED state
 
 TypeOK == /\ state.live \subseteq Requests
@@ -197,6 +212,8 @@ AllowedEdge(edge) ==
          [] action[1] = 15 -> CancelAndReclaim(before, after, action[2])
          [] action[1] = 16 -> CompleteAndReclaim(before, after)
          [] action[1] = 17 -> ReleaseGuard(before, after, action[3])
+         [] action[1] = 18 -> TerminalDestination(before, after, action[2], action[3], FALSE)
+         [] action[1] = 19 -> TerminalDestination(before, after, action[2], action[3], TRUE)
          [] OTHER -> FALSE
 
 Spec == Init /\ [][Next]_state

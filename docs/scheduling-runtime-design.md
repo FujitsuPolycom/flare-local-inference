@@ -570,7 +570,14 @@ optional captures; mandatory execution
 may revoke an unused guard. Armed destinations and in-flight copies retain their
 rows through GPU completion and cancellation. The alias-aware global allocator
 uses demand recency, checkpoint role, and endpoint length to compare eligible
-victims. See [complete-state checkpoint ownership](core-design.md#exact-endpoint-capture)
+victims; optional `Endpoint` captures additionally bound cumulative
+age-discounted protected victim cost (`leaf_tokens / (1 + age)` for
+higher-role/root leaves and role-destroying compactions) by their marginal token
+gain beyond their resident parent, while leaving role-preserving single-child
+compactions and older non-root `Endpoint` leaves eligible at zero protected
+cost. Early finish under page pressure may
+reclaim storage directly for the decoder state. See
+[complete-state checkpoint ownership](core-design.md#exact-endpoint-capture)
 for publication, preemption accounting, and retention rules.
 
 Feedback-dependent candidates remain visible while ordinary work is queued.

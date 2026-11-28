@@ -5793,3 +5793,272 @@ fn cold_scored_prefill_checkpoint_cuts_and_atomic_spans_use_natural_fit_discover
     );
     assert_eq!(span_sched.request(h).unwrap().consumed_tokens, 20_000);
 }
+
+fn retention_engine(pages: u32, snapshots: u32) -> RequestScheduler {
+    let mut s = RequestScheduler::new(
+        [19; 32],
+        SchedulerLimits {
+            max_active: 2,
+            request_slots: 2,
+            max_sequence_tokens: 16_384,
+            prefill_chunk_size: 512,
+            pages,
+            snapshots,
+        },
+        SchedulerCapabilities {
+            completion_token_capacity: 16,
+            vocabulary: 1024,
+            page_tokens: 64,
+            vision: crate::model::VisionCapabilities::disabled(),
+            draft_pages_per_request: 0,
+            completion_inputs: vec![],
+            speculative_allocations: vec![],
+            state_rows_per_request: None,
+        },
+    )
+    .unwrap();
+    s.prefill_graphs(&[64, 128, 256, 512]).unwrap();
+    let mut graphs = super::tests::duration_graphs(2);
+    for g in &mut graphs {
+        g.estimated_duration_ns = match g.kind {
+            GraphKind::Prefill => 2 * MS + g.token_capacity as u64 * MS / 64,
+            GraphKind::Decode => 10 * MS,
+            GraphKind::Snapshot => MS,
+            _ => MS / 10,
+        };
+    }
+    s.measured_graph_durations(&graphs).unwrap();
+    s
+}
+
+/// Drives one request end-to-end through `admit`, `plan`, `commit`, `complete`, and `finish`,
+/// returning `(admission_reused_tokens, emitted_tokens)`.
+fn run_turn_to_completion(
+    s: &mut RequestScheduler,
+    prompt: Vec<u32>,
+    message_boundaries: Vec<usize>,
+    max_new_tokens: u32,
+) -> (u64, Vec<u32>) {
+    let h = s
+        .admit(RequestSpec {
+            prompt,
+            message_boundaries,
+            conditioning: vec![],
+            max_new_tokens,
+            grammar_constrained: false,
+            host_stops: false,
+            prompt_logprobs: false,
+            growable_output: false,
+        })
+        .unwrap();
+    let reused = s.request(h).unwrap().admission_reused_tokens;
+    let mut emitted = Vec::new();
+    while s.request(h).is_ok() {
+        let plan = s.plan().expect("active request must make progress");
+        let fence = Fence(s.submitted.0 + 1);
+        s.commit(&plan, fence).unwrap();
+        let dur = plan.estimated_duration_ns();
+        s.advance_to(s.now_ns + dur).unwrap();
+        let records = completion_records(s, &plan, fence, 0);
+        let tokens = s.complete(fence, &records, gpu_time(dur)).unwrap();
+        for token in tokens {
+            if token.request == h {
+                emitted.push(token.token);
+            }
+            s.published_output(token.request, fence).unwrap();
+        }
+        if s.request(h)
+            .is_ok_and(|r| r.phase == RequestPhase::Finishing && r.pending == 0)
+        {
+            s.finish(h).unwrap();
+        }
+    }
+    (reused, emitted)
+}
+
+#[test]
+fn policy_reverse_order_large_document_revisits_preserve_anchors_under_short_answers() {
+    // 12-snapshot pool serving 8 distinct 1,536-token document+question requests (Anchor at
+    // prompt end 1,536, short 24-token JSON reply). Under pure-LRU terminal eviction, 12 rows
+    // hold only 6 documents (6 anchors + 6 terminal endpoints). With age-discounted marginal-value
+    // budgeting on Endpoint captures, short 24-token replies skip recent 1,536-token Anchors and
+    // evict older Endpoint leaves instead, preserving 7/8 document Anchors on reverse revisit
+    // while still letting doc 7's Anchor reap doc 0's oldest Anchor by LRU.
+    let mut s = retention_engine(256, 12);
+    let docs: Vec<Vec<u32>> = (0..8u32)
+        .map(|i| {
+            let mut d = vec![100 + i; 1_536];
+            d[0] = 500 + i;
+            d
+        })
+        .collect();
+
+    for doc in &docs {
+        let (reused, emitted) = run_turn_to_completion(&mut s, doc.clone(), vec![1_536], 25);
+        assert_eq!(reused, 0);
+        assert_eq!(emitted.len(), 25);
+    }
+
+    let mut full_doc_hits = 0usize;
+    for (i, doc) in docs.iter().enumerate().rev() {
+        let mut prompt = doc.clone();
+        prompt.extend(vec![800 + i as u32; 32]);
+        let (reused, _) = run_turn_to_completion(&mut s, prompt, vec![1_536], 25);
+        if reused == 1_536 {
+            full_doc_hits += 1;
+        }
+    }
+    assert!(
+        full_doc_hits >= 7,
+        "expected at least 7/8 document anchors to survive short 24-token terminal captures, got {full_doc_hits}/8"
+    );
+}
+
+#[test]
+fn policy_steady_state_multiturn_chat_retains_terminal_checkpoints_without_starvation() {
+    // 3 interleaved multi-turn chat sessions over 6 turns each (18 turns total) in a small
+    // 8-snapshot pool that fills completely by turn 2. Active sessions must keep reusing prior
+    // turns' 128-token assistant replies in steady state via interior compaction and Endpoint LRU.
+    let mut s = retention_engine(512, 8);
+    let mut histories: Vec<Vec<u32>> = (0..3u32)
+        .map(|session| vec![100 + session; 128])
+        .collect();
+    let mut boundaries: Vec<Vec<usize>> = vec![vec![128]; 3];
+
+    let mut steady_state_terminal_hits = 0usize;
+    for turn in 0..6u32 {
+        for session in 0..3usize {
+            let mut prompt = histories[session].clone();
+            let user_msg = vec![200 + turn * 10 + session as u32; 64];
+            prompt.extend(&user_msg);
+            let mut msg_bounds = boundaries[session].clone();
+            msg_bounds.push(prompt.len());
+            let prior_consumed = histories[session].len() as u64;
+
+            let (reused, emitted) = run_turn_to_completion(&mut s, prompt.clone(), msg_bounds.clone(), 129);
+            assert_eq!(emitted.len(), 129);
+            if turn >= 3 {
+                // Terminal capture saves prompt + first 128 emitted tokens (excluding final pending token).
+                let expected_terminal = prior_consumed - 1;
+                assert_eq!(
+                    reused, expected_terminal,
+                    "steady-state turn {turn} of session {session} must reuse prior 128-token reply"
+                );
+                steady_state_terminal_hits += 1;
+            }
+            // Append full emitted assistant reply for the next turn's history.
+            prompt.extend(&emitted);
+            histories[session] = prompt;
+            boundaries[session] = msg_bounds;
+        }
+    }
+    assert_eq!(steady_state_terminal_hits, 9);
+}
+
+#[test]
+fn policy_regime_shift_ages_out_old_large_documents_for_newer_chat_workload() {
+    // Phase 1 loads 4 distinct 1,536-token documents into a 6-snapshot pool.
+    // Phase 2 shifts to 16 newer 256-token chats with 64-token replies, followed by a 2-turn
+    // conversation. Old Phase-1 documents must age out cleanly rather than pinning the pool.
+    let mut s = retention_engine(512, 6);
+    let old_docs: Vec<Vec<u32>> = (0..4u32)
+        .map(|i| vec![100 + i; 1_536])
+        .collect();
+    for (i, doc) in old_docs.iter().enumerate() {
+        let mut prompt = doc.clone();
+        prompt.extend(vec![300 + i as u32; 32]);
+        let (reused, _) = run_turn_to_completion(&mut s, prompt, vec![1_536], 17);
+        assert_eq!(reused, 0);
+    }
+
+    for i in 0..16u32 {
+        let prompt = vec![400 + i; 256];
+        let _ = run_turn_to_completion(&mut s, prompt, vec![224], 65);
+    }
+
+    // Old Phase-1 documents should have aged out and been reaped by the newer workload.
+    let mut surviving_old = 0usize;
+    for doc in &old_docs {
+        let mut history = PrefixHistory::new([19; 32]);
+        history.append(doc, &[]).unwrap();
+        if s.cache.lookup(&history).unwrap().checkpoint.is_some() {
+            surviving_old += 1;
+        }
+    }
+    assert_eq!(
+        surviving_old, 0,
+        "stale Phase-1 document anchors must age out and be reaped by newer traffic"
+    );
+
+    // A fresh multi-turn conversation in Phase 2 must retain its 64-token terminal reply.
+    let turn1_prompt = vec![900; 256];
+    let (reused1, emitted1) = run_turn_to_completion(&mut s, turn1_prompt.clone(), vec![256], 65);
+    assert_eq!(reused1, 0);
+    let mut turn2_prompt = turn1_prompt;
+    turn2_prompt.extend(&emitted1);
+    turn2_prompt.extend(vec![901; 32]);
+    let (reused2, _) = run_turn_to_completion(&mut s, turn2_prompt, vec![256, 353], 33);
+    assert_eq!(
+        reused2,
+        256 + 64,
+        "Phase-2 multi-turn continuation must restore full prompt plus 64-token reply"
+    );
+}
+
+#[test]
+fn policy_long_reasoning_reply_reclaims_stale_short_anchors_for_next_turn() {
+    // 5-snapshot pool: 4 rows hold older trivial 128-token short-chat Anchors.
+    // A new reasoning turn uses the 5th row for its 256-token Anchor and generates 256 consumed
+    // reasoning tokens; its terminal capture must outweigh and reap the oldest 128-token Anchor
+    // so Turn 2 restores all 512 tokens instead of re-prefilling 256 reasoning tokens.
+    let mut s = retention_engine(512, 5);
+    for i in 0..4u32 {
+        let prompt = vec![100 + i; 128];
+        let _ = run_turn_to_completion(&mut s, prompt, vec![128], 1);
+    }
+
+    let turn1_prompt = vec![500; 256];
+    let (reused1, emitted1) = run_turn_to_completion(&mut s, turn1_prompt.clone(), vec![256], 257);
+    assert_eq!(reused1, 0);
+    assert_eq!(emitted1.len(), 257);
+
+    let mut turn2_prompt = turn1_prompt;
+    turn2_prompt.extend(&emitted1);
+    turn2_prompt.extend(vec![501; 32]);
+    let (reused2, _) = run_turn_to_completion(&mut s, turn2_prompt, vec![256, 545], 17);
+    assert_eq!(
+        reused2, 512,
+        "Turn 2 must restore prompt (256) plus full reasoning output (256)"
+    );
+}
+
+#[test]
+fn policy_hot_document_anchors_survive_burst_of_short_single_turn_noise() {
+    // 6-snapshot pool: 3 hot 2,048-token shared documents (Anchor at 2,048, 16-token reply)
+    // fill all 6 rows (A0, T0, A1, T1, A2, T2). A one-off short 128-token chat arrives: its
+    // Anchor evicts T0 by LRU, and then its 16-token terminal Endpoint must NOT evict A0
+    // (2,048 / (1 + age) > 16), evicting T1 instead so all 3 hot 2,048-token documents survive.
+    // Re-visiting each hot document between further noisy short chats keeps all 3 hot Anchors
+    // intact while short noisy terminal replies rotate through Endpoint rows.
+    let mut s = retention_engine(512, 6);
+    let hot_docs: Vec<Vec<u32>> = (0..3u32)
+        .map(|i| vec![100 + i; 2_048])
+        .collect();
+    for doc in &hot_docs {
+        let _ = run_turn_to_completion(&mut s, doc.clone(), vec![2_048], 17);
+    }
+
+    // One noisy short chat: Anchor evicts T0, 16-token terminal evicts T1 rather than A0.
+    let _ = run_turn_to_completion(&mut s, vec![400; 128], vec![128], 17);
+
+    // Every hot 2,048-token document survives and hits its full Anchor prefix.
+    for (i, doc) in hot_docs.iter().enumerate() {
+        let mut prompt = doc.clone();
+        prompt.extend(vec![600 + i as u32; 32]);
+        let (reused, _) = run_turn_to_completion(&mut s, prompt, vec![2_048], 17);
+        assert_eq!(
+            reused, 2_048,
+            "hot 2,048-token document {i} must survive a short-reply single-turn interruption"
+        );
+    }
+}
