@@ -231,6 +231,7 @@ class RootSource:
                 held.validate()
                 release_read_pages(descriptor)
                 entries.append(dict(path=name, bytes=size, header_bytes=header, sha256=digest.hexdigest()))
+            self._header_bytes = {entry["path"]: entry["header_bytes"] for entry in entries}
             self.catalog = dict(repository=checkpoint.repository, revision=checkpoint.revision,
                                 name=self.snapshot.name, files=entries)
             if len(_json(self.catalog)) > BLOCK_BYTES:
@@ -247,7 +248,11 @@ class RootSource:
         if len(raw) != extent:
             raise ConnectionError("checkpoint source read was truncated")
         held.validate()
-        result = b"".join(raw[index * stride:index * stride + width] for index in range(rows))
+        if rows == 1 or stride == width:
+            result = raw
+        else:
+            view = memoryview(raw)
+            result = b"".join(view[index * stride:index * stride + width] for index in range(rows))
         release_read_pages(held.descriptor, offset, extent)
         return result
 
@@ -295,9 +300,9 @@ class SourceServer:
                 elif kind == "read":
                     fields = message["read"]
                     data = self.source.read(**fields)
-                    self.stats["payload_bytes" if fields["name"].endswith(".safetensors") and
-                               fields["offset"] >= next(e["header_bytes"] for e in self.source.catalog["files"]
-                                                       if e["path"] == fields["name"]) else "metadata_bytes"] += len(data)
+                    header_bytes = self.source._header_bytes[fields["name"]]
+                    self.stats["payload_bytes" if header_bytes is not None and fields["offset"] >= header_bytes
+                               else "metadata_bytes"] += len(data)
                     self.stats["requests"] += 1
                     channel.send("data", data)
                 else:

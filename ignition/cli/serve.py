@@ -120,6 +120,15 @@ def _check_host_shape(args) -> None:
         raise UsageError(error)
 
 
+def _skip_weight_export_flags(args) -> tuple[bool, bool]:
+    from ignition.preparation.core_snapshot import _OPTIONS
+
+    active = _OPTIONS.get()
+    no_weights = bool(getattr(args, "no_weights", False) or (active is not None and active.no_weights))
+    reuse_weights = bool(getattr(args, "reuse_weights", False) or (active is not None and active.reuse_weights is not None))
+    return no_weights, reuse_weights
+
+
 def export(args) -> int:
     from ignition.preparation.core_snapshot import export_options
     from .publishing import validate_repository
@@ -176,27 +185,59 @@ def _export_hosts(args):
     if not model.cached(hub_cache):
         raise UsageError(f"{model.checkpoint.alias} is not cached; a single-host export downloads it")
     parameters = resolve_parameters(model, args, configuration, multi_host=True)
+    core_cache = configuration.directory("core_cache")
+    export_staging = configuration.directory("export_staging")
+    no_weights, reuse_weights = _skip_weight_export_flags(args)
+    if args.ranks in model.recipe.checkpoint_tensor_parallel(model.checkpoint):
+        planned_weights = model.recipe.weights_bytes(model.checkpoint, args.ranks, parameters)
+        planned_graphs = model.recipe.costs(args.ranks, parameters.speculation, model.checkpoint).graph_bytes
+        planning.check_export_disk_space(
+            None,
+            model.model_id,
+            checkpoint=model.checkpoint,
+            core_cache=core_cache,
+            export_staging=export_staging,
+            no_weights=no_weights,
+            reuse_weights=reuse_weights,
+            world_size=args.ranks,
+            weights_bytes=planned_weights,
+            graph_bytes=planned_graphs,
+        )
     host = Host.discover()
     selected = planning.parse_gpus(args.gpus or "0")
     if len(selected) != 1 or selected[0] >= len(host.gpus):
         raise UsageError("multi-host ranks each use one GPU; --gpus names this host's")
     local = (host.gpus[selected[0]],)
+    local_storage = planning.probe_export_storage(core_cache, export_staging)
     rendezvous = HostRendezvous(args.rendezvous, args.ranks, identity=source_identity(),
-                                topology=local_topology(local[0]),
+                                topology=local_topology(local[0], storage=local_storage),
                                 checkpoint_fabric=_checkpoint_fabric(args),
                                 checkpoint_token_file=configuration.get("preparation.checkpoint_token_file").value)
-    with phase(progress, "Wait for tensor-parallel hosts") as stage:
-        topologies = rendezvous.accept(report=stage.update)
-    gpus = tuple(topology_gpu(topology, index) for index, topology in enumerate(topologies))
-    plan = planning.plan(
-        model.recipe,
-        model.checkpoint,
-        gpus,
-        selected=tuple(range(len(gpus))),
-        parameters=parameters,
-        reserve_bytes=configuration.reserve_bytes,
-        explicit_flags=explicit_flags_from_args(args),
-    )
+    try:
+        with phase(progress, "Wait for tensor-parallel hosts") as stage:
+            topologies = rendezvous.accept(report=stage.update)
+        gpus = tuple(topology_gpu(topology, index) for index, topology in enumerate(topologies))
+        plan = planning.plan(
+            model.recipe,
+            model.checkpoint,
+            gpus,
+            selected=tuple(range(len(gpus))),
+            parameters=parameters,
+            reserve_bytes=configuration.reserve_bytes,
+            explicit_flags=explicit_flags_from_args(args),
+        )
+        planning.check_export_disk_space(
+            plan,
+            model.model_id,
+            core_cache=core_cache,
+            export_staging=export_staging,
+            no_weights=no_weights,
+            reuse_weights=reuse_weights,
+            topologies=topologies,
+        )
+    except BaseException:
+        rendezvous.abort()
+        raise
     plan = replace(plan, hub_cache=hub_cache)
     environment.apply(configuration, local, plan.recipe.b12x_environment)
     options = _server_options(configuration, model, plan)
@@ -270,6 +311,15 @@ def _prepare(args):
         if plan.tuning_gpus:
             parts.append("tuning GPUs " + planning.format_gpus(gpu.index for gpu in plan.tuning_gpus))
         stage.update(" · ".join(parts))
+    no_weights, reuse_weights = _skip_weight_export_flags(args)
+    planning.check_export_disk_space(
+        plan,
+        model.model_id,
+        core_cache=configuration.directory("core_cache"),
+        export_staging=configuration.directory("export_staging"),
+        no_weights=no_weights,
+        reuse_weights=reuse_weights,
+    )
     if args.config is None and not configuration.exists:
         configuration.write_initial(model.checkpoint.alias, plan.concurrency)
     if not cached:
@@ -541,10 +591,13 @@ def join(args) -> int:
     gpu = host.gpus[args.gpu]
     environment.apply(configuration, (gpu,))
     identity = source_identity()
+    core_cache = configuration.directory("core_cache")
+    export_staging = configuration.directory("export_staging")
+    local_storage = planning.probe_export_storage(core_cache, export_staging)
     control, executor = knock(args.rendezvous, args.rank, args.ranks, identity=identity,
-                              topology=local_topology(gpu), report=progress)
+                              topology=local_topology(gpu, storage=local_storage), report=progress)
     serve_peer(control, executor, args.rank, args.ranks, hub_cache=hub_cache, progress=progress,
-               export_staging=configuration.directory("export_staging"), identity=identity,
-               core_cache=configuration.directory("core_cache"),
+               export_staging=export_staging, identity=identity,
+               core_cache=core_cache,
                checkpoint_token_file=configuration.get("preparation.checkpoint_token_file").value)
     return 0

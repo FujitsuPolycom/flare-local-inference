@@ -10,7 +10,7 @@ use super::{
     archive::{self, container_header},
     io::{self, Identity, IoBudget, Source},
 };
-use sha2::{Digest, Sha256};
+use ring::digest::{Context, SHA256};
 use std::{
     collections::{BTreeMap, VecDeque},
     fs::File,
@@ -319,7 +319,7 @@ fn verify_handle_checked(
             return Err("invalid cached blob length".into());
         }
         let source = Source::from_file(file.clone(), 0, size)?;
-        let mut digest = Sha256::new();
+        let mut digest = Context::new(&SHA256);
         let scan = budget.scan(&source, |bytes| {
             digest.update(bytes);
             Ok(())
@@ -330,7 +330,7 @@ fn verify_handle_checked(
             continue;
         }
         scan?;
-        if <[u8; 32]>::from(digest.finalize()) != expected {
+        if digest.finish().as_ref() != expected.as_slice() {
             return Err("cached blob content does not match its hash".into());
         }
         return Ok(after);
@@ -391,6 +391,12 @@ fn decode_digest(text: &str) -> Result<[u8; 32]> {
 mod tests {
     use super::*;
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    fn sha256(bytes: &[u8]) -> [u8; 32] {
+        ring::digest::digest(&SHA256, bytes)
+            .as_ref()
+            .try_into()
+            .unwrap()
+    }
     fn directory() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "flare-blob-{}-{}",
@@ -406,7 +412,7 @@ mod tests {
         let store = BlobStore::new(&directory, IoBudget::for_ranks(1).unwrap()).unwrap();
         let mut contents = container_header(3, 0, "flare-data").unwrap();
         contents.extend_from_slice(b"abc");
-        let expected: [u8; 32] = Sha256::digest(&contents).into();
+        let expected: [u8; 32] = sha256(&contents);
         let name = format!("{}.safetensors", hex(&expected));
         std::fs::write(store.root.join(&name), contents).unwrap();
         let mut calls = 0;
@@ -482,7 +488,7 @@ mod tests {
         assert_eq!(std::fs::read_dir(&store.root).unwrap().count(), 0);
         let mut contents = container_header(3, 0, "flare-data").unwrap();
         contents.extend_from_slice(b"abc");
-        let name = format!("{}.safetensors", hex(&Sha256::digest(&contents)));
+        let name = format!("{}.safetensors", hex(&sha256(&contents)));
         contents[4096] = b'x';
         std::fs::write(store.root.join(name), contents).unwrap();
         assert!(
@@ -547,7 +553,7 @@ mod tests {
         let directory = directory();
         let path = directory.join("payload");
         std::fs::write(&path, b"abc").unwrap();
-        let expected = Sha256::digest(b"abc").into();
+        let expected = sha256(b"abc");
         let budget = IoBudget::for_ranks(1).unwrap();
         let file = Arc::new(io::open_read(&path).unwrap());
         let mut attempts = 0;
@@ -585,7 +591,7 @@ mod tests {
         let file = Arc::new(io::open_read(&path).unwrap());
         let error = verify_handle_checked(
             file.clone(),
-            Sha256::digest(b"abc").into(),
+            sha256(b"abc"),
             3,
             &budget,
             |attempt, _| {
@@ -637,7 +643,7 @@ mod tests {
         let store = BlobStore::new(&directory, IoBudget::for_ranks(1).unwrap()).unwrap();
         let mut valid = container_header(3, 0, "flare-data").unwrap();
         valid.extend_from_slice(b"abc");
-        let name = format!("{}.safetensors", hex(&Sha256::digest(&valid)));
+        let name = format!("{}.safetensors", hex(&sha256(&valid)));
         let source_path = directory.join("source");
         std::fs::write(&source_path, &valid).unwrap();
         valid[4096] = b'x';
