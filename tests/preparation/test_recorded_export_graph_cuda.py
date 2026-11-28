@@ -82,9 +82,9 @@ def check_export(tmp_path):
                 recorder=images.native, owners=(bundle, storage))
             package.write(path, bundle.graphs, execution=manifest, sources=True)
             index, _ = read_sources(path)
-            assert index.ranks[0].graphs[0].flags == 1
-            assert index.ranks[0].graphs[0].node_count > 0
-            assert {value.name for value in index.ranks[0].graphs} == {"decode", "tune"}
+            flags_by_name = {value.name: value.flags for value in index.ranks[0].graphs}
+            assert flags_by_name == {"decode": 8, "tune": 1}
+            assert all(value.node_count > 0 for value in index.ranks[0].graphs)
             graph.reset()
             graph.reset()
             tuner.reset()
