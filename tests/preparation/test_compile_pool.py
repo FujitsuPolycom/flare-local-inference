@@ -385,6 +385,7 @@ def test_compile_pool_sizes_workers_from_free_device_memory(monkeypatch, request
 @pytest.mark.parametrize("integrated,workers,threads", [(False, 2, 1), (True, 1, 1)])
 def test_compiler_reuses_its_budgeted_worker_pool(monkeypatch, tmp_path, integrated, workers, threads):
     from concurrent.futures import Future
+    import torch._inductor.async_compile  # noqa: F401
     from torch._inductor.compile_worker import subproc_pool
     from ignition.preparation import compile_pool, host_memory
 
@@ -556,3 +557,453 @@ def test_compiler_does_not_serialize_preparation_session_resources(recorded):
         assert session.resource is token
     finally:
         context.reset(token)
+
+
+def test_peak_rss_bytes_reports_process_memory():
+    from ignition.preparation.compile_pool import _peak_rss_bytes
+
+    assert _peak_rss_bytes() > (1 << 20)
+
+
+def _simulate_host(monkeypatch, available, *, free=30 << 30, cpus=16):
+    from ignition.preparation import compile_pool, host_memory
+
+    state = {"available": available, "free": free}
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (state["free"], 32 << 30))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=False))
+    monkeypatch.setattr(host_memory, "available_bytes", lambda: state["available"])
+    monkeypatch.setattr(compile_pool, "cpu_workers",
+                        lambda requested=None, *, pools=1: max(1, (requested or cpus) // pools))
+    return state
+
+
+def test_worker_pool_grows_by_completed_waves_within_host_budget(monkeypatch):
+    from ignition.preparation import compile_pool
+
+    state = _simulate_host(monkeypatch, 31 << 30)
+    # 31 GiB minus 8 GiB headroom cannot hold a 32 GiB forward; the minimum allowance keeps one worker.
+    pool = compile_pool.CompilePool("cuda:0")
+    assert (pool.workers, pool.max_workers) == (1, 16)
+    state["available"] = 29 << 30
+    # A 2 GiB peak costs 2.5 GiB with margin, so 23 GiB of pre-spawn budget caps growth at nine workers.
+    assert pool.observe_worker_rss(2 << 30) == 2
+    assert pool.observe_worker_rss(2 << 30) == 4
+    # A two-worker increment requires two completions before doubling again.
+    assert pool.observe_worker_rss(2 << 30) == 4
+    assert pool.observe_worker_rss(2 << 30) == 8
+    for _ in range(3):
+        assert pool.observe_worker_rss(2 << 30) == 8
+    assert pool.observe_worker_rss(2 << 30) == 9
+    assert pool.observe_worker_rss(2 << 30) == 9
+    # A later heavy forward shrinks the admitted concurrency back to the host's safe ceiling.
+    assert pool.observe_worker_rss(16 << 30) == 1
+
+
+def test_multi_rank_host_pools_partition_host_memory_without_oversubscribing(monkeypatch):
+    from ignition.preparation import compile_pool
+
+    state = _simulate_host(monkeypatch, 56 << 30, cpus=16)
+    pools = [compile_pool.CompilePool("cuda:0", workers=1, max_workers=4, host_pools=4,
+                                      host_available=56 << 30)
+             for _ in range(4)]
+    state["available"] = 28 << 30
+    # 20 GiB live remainder above 8 GiB headroom fits four 5 GiB workers total: one extra per rank.
+    assert [pool.observe_worker_rss(4 << 30) for pool in pools] == [2, 2, 2, 2]
+    # 48 GiB total pre-spawn budget above headroom caps four pools at two 5 GiB workers each (40 GiB).
+    for pool in pools:
+        assert pool.observe_worker_rss(4 << 30) == 2
+        assert pool.observe_worker_rss(4 << 30) == 2
+
+
+def test_huge_reported_peak_keeps_the_pool_at_one_worker(monkeypatch):
+    from ignition.preparation import compile_pool
+
+    state = _simulate_host(monkeypatch, 31 << 30)
+    pool = compile_pool.CompilePool("cuda:0")
+    state["available"] = 26 << 30
+    assert pool.observe_worker_rss(28 << 30) == 1
+    assert pool.peak_worker_rss == 28 << 30
+
+
+def test_explicit_compile_workers_bounds_peak_rss_growth(monkeypatch):
+    from ignition.preparation import compile_pool
+
+    state = _simulate_host(monkeypatch, 72 << 30)
+    pool = compile_pool.CompilePool("cuda:0", compile_workers=2)
+    assert (pool.workers, pool.max_workers) == (2, 2)
+    state["available"] = 200 << 30
+    assert pool.observe_worker_rss(1 << 30) == 2
+
+    # When 32 GiB startup admission clamps below an explicit compile_workers=8, measured RSS grows up to 8.
+    state["available"] = 72 << 30
+    capped = compile_pool.CompilePool("cuda:0", compile_workers=8)
+    assert (capped.workers, capped.max_workers) == (2, 8)
+    state["available"] = 64 << 30
+    assert capped.observe_worker_rss(4 << 30) == 4
+    assert capped.observe_worker_rss(4 << 30) == 4
+    assert capped.observe_worker_rss(4 << 30) == 8
+    for _ in range(5):
+        assert capped.observe_worker_rss(4 << 30) == 8
+    # Remaining work caps growth when fewer forwards remain than the next wave.
+    state["available"] = 72 << 30
+    tail = compile_pool.CompilePool("cuda:0", compile_workers=8)
+    assert tail.observe_worker_rss(4 << 30, remaining=3) == 3
+
+
+def test_worker_growth_adds_pool_shards_and_shutdown_closes_each(monkeypatch, tmp_path):
+    from concurrent.futures import Future
+    import torch._inductor.async_compile  # noqa: F401
+    from torch._inductor.compile_worker import subproc_pool
+    from ignition.preparation import compile_pool
+
+    state = _simulate_host(monkeypatch, 31 << 30)
+    executors = []
+
+    class Executor:
+        def __init__(self, count, *, kind=None, mp_context=None):
+            self.count, self.calls, self.closed, self.fail_next = count, [], False, False
+            executors.append(self)
+
+        def submit(self, function, *arguments):
+            if self.fail_next:
+                self.fail_next = False
+                raise RuntimeError("executor rejected submission")
+            future = Future()
+            self.calls.append((arguments, future))
+            return future
+
+        def shutdown(self):
+            self.closed = True
+
+    monkeypatch.setattr(subproc_pool, "SubprocPool", Executor)
+    monkeypatch.setattr(compile_pool, "ProcessPoolExecutor", Executor)
+    with compile_pool.CompilePool("cuda:0") as pool:
+        first = pool.submit_payload("first", tmp_path / "first.bin")
+        assert [executor.count for executor in executors] == [1]
+        assert pool.pool is executors[0]
+        state["available"] = 26 << 30
+        assert pool.observe_worker_rss(4 << 30) == 2
+        second = pool.submit_payload("second", tmp_path / "second.bin")
+        # The first shard is fully busy, so the expanded capacity starts a second shard.
+        assert [executor.count for executor in executors] == [1, 1]
+        first.set_result(1 << 20)
+        second.set_result(1 << 20)
+        executors[0].fail_next = True
+        with pytest.raises(RuntimeError, match="executor rejected submission"):
+            pool.submit_payload("failed", tmp_path / "failed.bin")
+        assert pool._shard_pending == [0, 0]
+        third = pool.submit_payload("third", tmp_path / "third.bin")
+        fourth = pool.submit_payload("fourth", tmp_path / "fourth.bin")
+        # Released slots take the next forwards, one per shard.
+        assert [executor.calls[0][0][0] for executor in executors] == ["first", "second"]
+        assert [executor.calls[1][0][0] for executor in executors] == ["third", "fourth"]
+        third.set_result(1 << 20)
+        fourth.set_result(1 << 20)
+    assert all(executor.closed for executor in executors)
+
+
+def test_shutdown_closes_remaining_shards_when_one_raises(monkeypatch, tmp_path):
+    from concurrent.futures import Future
+    import torch._inductor.async_compile  # noqa: F401
+    from torch._inductor.compile_worker import subproc_pool
+    from ignition.preparation import compile_pool
+
+    state = _simulate_host(monkeypatch, 31 << 30)
+    executors = []
+
+    class Executor:
+        def __init__(self, count, *, kind=None, mp_context=None):
+            self.calls, self.closed = [], False
+            executors.append(self)
+
+        def submit(self, function, *arguments):
+            future = Future()
+            self.calls.append((arguments, future))
+            return future
+
+        def shutdown(self):
+            self.closed = True
+            if self is executors[1]:
+                raise RuntimeError("shutdown failed")
+
+    monkeypatch.setattr(subproc_pool, "SubprocPool", Executor)
+    monkeypatch.setattr(compile_pool, "ProcessPoolExecutor", Executor)
+    pool = compile_pool.CompilePool("cuda:0")
+    pool.submit_payload("first", tmp_path / "first.bin")
+    state["available"] = 26 << 30
+    pool.observe_worker_rss(4 << 30)
+    pool.submit_payload("second", tmp_path / "second.bin")
+    with pytest.raises(RuntimeError, match="shutdown failed"):
+        pool.__exit__(None, None, None)
+    assert all(executor.closed for executor in executors)
+
+
+def test_compiler_resources_reclaims_cached_allocator_segments_when_cuda_initialized(monkeypatch):
+    from ignition.preparation import compile_pool, host_memory
+
+    gib = 1 << 30
+    state = {"free": round(2.65 * gib), "available": 64 * gib}
+    events = []
+
+    def empty_cache():
+        events.append("empty_cache")
+        state["free"] = round(11.4 * gib)
+        state["available"] = 72 * gib
+
+    def available_bytes():
+        events.append("available_bytes")
+        return state["available"]
+
+    def mem_get_info(device):
+        events.append("mem_get_info")
+        return state["free"], 96 * gib
+
+    monkeypatch.setitem(compile_pool._OPTIONS, "compile_threads", 16)
+    monkeypatch.setattr(compile_pool, "cpu_workers", lambda requested=None: requested or 16)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=False))
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+    monkeypatch.setattr(host_memory, "available_bytes", available_bytes)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", mem_get_info)
+
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+    uninitialized = compile_pool.compiler_resources("cuda:0")
+    assert events == ["available_bytes", "mem_get_info"]
+    assert (uninitialized.capacity, uninitialized.max_capacity, uninitialized.available) == (2, 2, 64 * gib)
+
+    events.clear()
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    initialized = compile_pool.compiler_resources("cuda:0")
+    assert events == ["empty_cache", "available_bytes", "mem_get_info"]
+    assert (initialized.capacity, initialized.max_capacity, initialized.available) == (8, 11, 72 * gib)
+
+    state["free"] = round(2.65 * gib)
+    explicit = compile_pool.compiler_resources("cuda:0", compile_workers=16)
+    assert (explicit.capacity, explicit.max_capacity) == (11, 11)
+
+
+def test_observe_worker_rss_counts_spawned_shards_once_and_respects_external_vram_drop(monkeypatch, tmp_path):
+    from concurrent.futures import Future
+    import torch._inductor.async_compile  # noqa: F401
+    from torch._inductor.compile_worker import subproc_pool
+    from ignition.preparation import compile_pool
+
+    gib = 1 << 30
+    worker_vram = round(0.8 * gib)
+    state = _simulate_host(monkeypatch, 31 * gib, free=round(4.5 * gib), cpus=16)
+    executors = []
+
+    class Executor:
+        def __init__(self, count, *, kind=None, mp_context=None):
+            self.count, self.calls, self.closed = count, [], False
+            state["free"] -= count * worker_vram
+            executors.append(self)
+
+        def submit(self, function, *arguments):
+            future = Future()
+            self.calls.append((arguments, future))
+            return future
+
+        def shutdown(self):
+            self.closed = True
+
+    monkeypatch.setattr(subproc_pool, "SubprocPool", Executor)
+    monkeypatch.setattr(compile_pool, "ProcessPoolExecutor", Executor)
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+
+    with compile_pool.CompilePool("cuda:0") as pool:
+        assert (pool.workers, pool.max_workers) == (1, 4)
+        state["available"] = 29 * gib
+
+        # Wave 1 spawns 1 worker: live free VRAM drops 4.5 -> 3.7 GiB.
+        first = pool.submit_payload("w1", tmp_path / "w1.bin")
+        assert state["free"] == round(3.7 * gib)
+        first.set_result(2 * gib)
+        assert pool.observe_worker_rss(2 * gib) == 2
+
+        # Wave 2 spawns 1 additional worker: live free VRAM drops 3.7 -> 2.9 GiB.
+        second = pool.submit_payload("w2", tmp_path / "w2.bin")
+        third = pool.submit_payload("w3", tmp_path / "w3.bin")
+        assert state["free"] == round(2.9 * gib)
+        second.set_result(2 * gib)
+        assert pool.observe_worker_rss(2 * gib) == 4
+        third.set_result(2 * gib)
+
+        # Wave 3 spawns 2 additional workers: live free VRAM drops 2.9 -> 1.3 GiB.
+        wave3 = [pool.submit_payload(f"w{index}", tmp_path / f"w{index}.bin") for index in range(4, 8)]
+        assert [executor.count for executor in executors] == [1, 1, 2]
+        assert abs(state["free"] - round(1.3 * gib)) <= 1
+        for future in wave3:
+            future.set_result(2 * gib)
+            assert pool.observe_worker_rss(2 * gib) == 4
+
+    executors.clear()
+    state["available"] = 31 * gib
+    state["free"] = round(4.5 * gib)
+    with compile_pool.CompilePool("cuda:0") as constrained:
+        state["available"] = 29 * gib
+        first = constrained.submit_payload("c1", tmp_path / "c1.bin")
+        first.set_result(2 * gib)
+        assert constrained.observe_worker_rss(2 * gib) == 2
+
+        second = constrained.submit_payload("c2", tmp_path / "c2.bin")
+        third = constrained.submit_payload("c3", tmp_path / "c3.bin")
+        assert [executor.count for executor in executors] == [1, 1]
+        # External GPU occupancy drops live free VRAM below 1 GiB after two shards have started.
+        state["free"] = round(0.7 * gib)
+        second.set_result(2 * gib)
+        assert constrained.observe_worker_rss(2 * gib) == 2
+        third.set_result(2 * gib)
+        assert constrained.observe_worker_rss(2 * gib) == 2
+
+        # When free VRAM recovers for growth and then drops externally before additional shards spawn,
+        # concurrency shrinks back to the already-spawned shard capacity.
+        state["free"] = round(2.9 * gib)
+        assert constrained.observe_worker_rss(2 * gib) == 4
+        state["free"] = round(0.7 * gib)
+        assert constrained.observe_worker_rss(2 * gib) == 2
+
+
+def test_compile_pool_reconfigure_expands_in_place_and_validates_arguments(monkeypatch, tmp_path):
+    from concurrent.futures import Future
+    import torch._inductor.async_compile  # noqa: F401
+    from torch._inductor.compile_worker import subproc_pool
+    from ignition.preparation import compile_pool
+
+    gib = 1 << 30
+    state = _simulate_host(monkeypatch, 56 * gib, free=20 * gib, cpus=32)
+    executors = []
+
+    class Executor:
+        def __init__(self, count, *, kind=None, mp_context=None):
+            self.count, self.calls, self.closed = count, [], False
+            executors.append(self)
+
+        def submit(self, function, *arguments):
+            future = Future()
+            self.calls.append((arguments, future))
+            return future
+
+        def shutdown(self):
+            self.closed = True
+
+    monkeypatch.setattr(subproc_pool, "SubprocPool", Executor)
+    monkeypatch.setattr(compile_pool, "ProcessPoolExecutor", Executor)
+
+    with compile_pool.CompilePool(
+        "cuda:0", workers=1, max_workers=1, host_pools=2, host_available=56 * gib
+    ) as pool:
+        probe = pool.submit_payload("probe", tmp_path / "probe.bin")
+        assert [executor.count for executor in executors] == [1]
+        probe.set_result(2 * gib)
+        assert pool.observe_worker_rss(2 * gib) == 1
+
+        for bad_pools in (0, -1, True, 1.5, None):
+            with pytest.raises(ValueError, match="host_pools must be a positive integer"):
+                pool.reconfigure(workers=2, max_workers=4, host_pools=bad_pools)
+        for bad_workers in (0, -1, True, 2.0, None):
+            with pytest.raises(ValueError, match="positive admitted worker count"):
+                pool.reconfigure(workers=bad_workers, max_workers=4, host_pools=4)
+        for bad_max in (2, 0, True, 3.5, None):
+            with pytest.raises(ValueError, match="maximum must cover its admitted worker count"):
+                pool.reconfigure(workers=3, max_workers=bad_max, host_pools=4)
+        assert (pool.workers, pool.max_workers, pool.host_pools) == (1, 1, 2)
+
+        pool.reconfigure(workers=3, max_workers=6, host_pools=4)
+        assert (pool.workers, pool.max_workers, pool.host_pools) == (3, 6, 4)
+        assert pool.pool is executors[0] and not executors[0].closed
+        assert len(executors) == 1
+
+        in_flight = [pool.submit_payload(f"job{index}", tmp_path / f"job{index}.bin") for index in range(4)]
+        assert [executor.count for executor in executors] == [1, 2]
+        assert not executors[0].closed and not executors[1].closed
+
+        state["available"] = 48 * gib
+        in_flight[0].set_result(2 * gib)
+        # Two slots were added beyond the existing 1-worker shard, so the wave needs two completions.
+        assert pool.observe_worker_rss(2 * gib) == 3
+        in_flight[1].set_result(2 * gib)
+        # Reconfigured host_pools=4 partitions the 48 GiB host budget above 8 GiB headroom into 4 workers per pool.
+        assert pool.observe_worker_rss(2 * gib) == 4
+        for future in in_flight[2:]:
+            future.set_result(2 * gib)
+    assert all(executor.closed for executor in executors)
+
+    shrunk = compile_pool.CompilePool("cuda:0", workers=4, max_workers=4, host_pools=1, host_available=56 * gib)
+    shrunk.reconfigure(workers=2, max_workers=6, host_pools=4)
+    assert shrunk.observe_worker_rss(20 * gib) == 2
+
+    # Default reconfigure updates the floor to `workers`, while an explicit `min_workers=1`
+    # lets post-probe pools shrink back down to 1 if a subsequent forward spikes host RSS.
+    pinned = compile_pool.CompilePool("cuda:0", workers=1, max_workers=1, host_pools=2, host_available=56 * gib)
+    pinned.reconfigure(workers=4, max_workers=4, host_pools=4)
+    assert pinned.observe_worker_rss(20 * gib) == 4
+
+    shrinkable = compile_pool.CompilePool("cuda:0", workers=4, max_workers=4, min_workers=1,
+                                          host_pools=4, host_available=56 * gib)
+    assert shrinkable.observe_worker_rss(20 * gib) == 1
+    reconfigured_shrinkable = compile_pool.CompilePool("cuda:0", workers=1, max_workers=1,
+                                                       host_pools=2, host_available=56 * gib)
+    reconfigured_shrinkable.reconfigure(workers=4, max_workers=4, host_pools=4, min_workers=1)
+    assert reconfigured_shrinkable.observe_worker_rss(20 * gib) == 1
+    for bad_min in (0, -1, 5, True, 1.5):
+        with pytest.raises(ValueError, match="minimum must be between 1"):
+            reconfigured_shrinkable.reconfigure(workers=4, max_workers=4, host_pools=4, min_workers=bad_min)
+
+
+def test_post_probe_sized_resources_preserve_minimum_worker_floor(monkeypatch):
+    from dataclasses import replace
+    from ignition.preparation import compile_pool, host_memory
+
+    gib = 1 << 30
+    monkeypatch.setitem(compile_pool._OPTIONS, "compile_threads", 16)
+    monkeypatch.setattr(compile_pool, "cpu_workers", lambda requested=None: requested or 16)
+
+    # Heavy probe RSS (50 GiB with margin) on a discrete-GPU host with 24 GiB available (16 GiB above headroom):
+    # initial admission granted 1 worker under the 2 GiB minimum allowance, and post-probe sizing must keep 1 worker.
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=False))
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (40 * gib, 80 * gib))
+    monkeypatch.setattr(host_memory, "available_bytes", lambda: 24 * gib)
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+    base_discrete = [compile_pool.compiler_resources("cuda:0") for _ in range(4)]
+    assert compile_pool.allocate_workers(base_discrete, [5] * 4, ["host"] * 4) == [1, 0, 0, 0]
+    heavy_sized = [replace(res, worker_bytes=50 * gib) for res in base_discrete]
+    assert compile_pool.allocate_workers(heavy_sized, [4, 5, 5, 5], ["host"] * 4) == [1, 0, 0, 0]
+
+    # Light probe RSS (4 GiB + 2 GiB shared device = 6 GiB) on an integrated GPU whose remaining memory (3 GiB)
+    # is below the 4 GiB minimum (2 GiB host + 2 GiB shared device) must still reject instead of underflowing.
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=True))
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (11 * gib, 128 * gib))
+    monkeypatch.setattr(host_memory, "available_bytes", lambda: 11 * gib)
+    base_integrated = [compile_pool.compiler_resources("cuda:0") for _ in range(2)]
+    light_sized = [replace(res, worker_bytes=6 * gib) for res in base_integrated]
+    with pytest.raises(MemoryError, match="no capacity"):
+        compile_pool.allocate_workers(light_sized, [4, 4], ["spark"] * 2)
+
+
+def test_integrated_gpu_small_forward_rss_does_not_oversubscribe_unified_memory(monkeypatch):
+    from ignition.preparation import compile_pool, host_memory
+
+    gib = 1 << 30
+    state = {"available": round(16.4 * gib), "free": round(12.4 * gib)}
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (state["free"], 122 * gib))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=True))
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+    monkeypatch.setattr(host_memory, "available_bytes", lambda: state["available"])
+    monkeypatch.setattr(compile_pool, "cpu_workers", lambda requested=None, *, pools=1: max(1, (requested or 20) // pools))
+
+    # After graph measurement on GB10 (~108 GiB outside PyTorch, ~16.4 GiB MemAvailable above 0),
+    # a small 1.3 GiB vision forward must not grow concurrency past 1 worker into unified-memory OOM.
+    constrained = compile_pool.CompilePool("cuda:0", headroom_bytes=1 * gib)
+    assert constrained.workers == 1
+    state["available"] = round(12.1 * gib)
+    assert constrained.observe_worker_rss(round(1.3 * gib)) == 1
+
+    # Before KV/graph capture on GB10 (~44 GiB MemAvailable), unified memory comfortably scales to 4 workers.
+    state["available"] = 44 * gib
+    state["free"] = 44 * gib
+    spacious = compile_pool.CompilePool("cuda:0", headroom_bytes=1 * gib)
+    assert spacious.workers == 1
+    state["available"] = 40 * gib
+    assert spacious.observe_worker_rss(round(1.3 * gib)) == 2
+    assert spacious.observe_worker_rss(round(1.3 * gib)) == 4
+    assert spacious.observe_worker_rss(round(1.3 * gib)) == 4

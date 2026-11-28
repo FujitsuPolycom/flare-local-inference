@@ -370,6 +370,7 @@ def test_frozen_restore_ignores_conflicting_enabled_local_cache(tmp_path, monkey
     fresh = ArithmeticForward()
     restored = cache.prepare(fresh, name='decode', signature=signature)
     assert restored.cache_hit
+    assert probes[-1].winners.keys() == winners.keys()
     for identity, encoded in probes[-1].winners.items():
         expected, actual = pickle.loads(winners[identity]), pickle.loads(encoded)
         assert actual._flare_config_state == expected._flare_config_state
@@ -601,18 +602,29 @@ def test_distributed_catalog_reconciles_real_conflicting_candidates(
             local = {key: tuner for key, _, tuner in bindings.values()}
             choices = self._gather({key: vars(inductor_tuning._selected(tuner).config)
                                    for key, tuner in local.items()})
-            if rank == 1 and not self.winners:
-                for key in sorted(local.keys() & choices[0].keys()):
-                    alternatives = [data for data in self.candidates[key]
-                                    if vars(pickle.loads(data).config) != choices[0][key]]
-                    if alternatives:
-                        # Seed a conflicting valid compiled cache choice; the production
-                        # boundary must replace it with the canonical rank's measured winner.
-                        inductor_tuning._install(local[key], alternatives[0])
-                        self.injected += 1
-                        break
-                assert self.injected == 1, 'fixture requires a real multi-candidate kernel'
+            owners = (dict(self._active_owners) if self._active_owners is not None
+                      else self._assign_owners(local.keys()))
+            target = None
+            if not self.winners:
+                for key in sorted(choices[0].keys() & choices[1].keys()):
+                    owner = owners[key]
+                    peer = 1 - owner
+                    if rank == peer:
+                        alternatives = [data for data in self.candidates[key]
+                                        if vars(pickle.loads(data).config) != choices[owner][key]]
+                        if alternatives:
+                            # Seed a conflicting valid compiled cache choice; the production
+                            # boundary must replace it with the owning rank's measured winner.
+                            inductor_tuning._install(local[key], alternatives[0])
+                            self.injected += 1
+                            target = key, choices[owner][key]
+                            break
+                injected = self._gather(self.injected)
+                assert sum(injected) >= 1, 'fixture requires a real shared multi-candidate kernel'
             super()._reconcile(bindings)
+            if target is not None:
+                key, expected = target
+                assert vars(inductor_tuning._selected(local[key]).config) == expected
 
     monkeypatch.setattr(inductor_tuning, 'InductorSelections', Probe)
     cache = ForwardCache(namespace={'model': 'shared-owner-tuning'},

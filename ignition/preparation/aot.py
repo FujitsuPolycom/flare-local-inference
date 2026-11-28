@@ -7,16 +7,17 @@
 import hashlib
 import importlib
 import inspect
+import io
 import operator
 import os
 import pickle
 import sys
 import tempfile
 import zlib
-from concurrent.futures import FIRST_COMPLETED, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from threading import RLock
@@ -34,18 +35,133 @@ from ignition import runtime_patches
 
 from .compilation import (DEFAULT_CACHE_ROOT, _INVOCATIONS, _OPTIONS, _Invocation, _artifact_kernel_table,
                           _byte_storage, _compile_options, _storage_region, _lower_storage, _compiler_recursion)
-from .device_binding import bind_device, relocate_inductor, restore_device, restore_prepared_device
+from .device_binding import (bind_device, get_source_template, relocate_inductor, restore_device,
+                             restore_prepared_device)
 from .host_memory import release_unused
 
 _GUARD_LOCK = RLock()
 _GUARD_TENSOR_MODE = ContextVar("flare_guard_tensor_mode", default=None)
 _DEFERRED_BINDINGS = ContextVar("flare_deferred_bindings", default=False)
 _CHECK_BINDINGS = ContextVar("flare_check_bindings", default=False)
+_RETAIN_SERIALIZED_ARTIFACT = ContextVar("flare_retain_serialized_artifact", default=True)
+_DEFER_PORTABLE_COMPRESSION = ContextVar("flare_defer_portable_compression", default=False)
+_PREFETCHED_ARTIFACT_BYTES = ContextVar("flare_prefetched_artifact_bytes", default=None)
+
+
+class _RawPortableArtifact(bytes):
+    """Uncompressed pickled Inductor bundle retained only until warmup freezes and saves it."""
+
+
+def _write_compiled_with_digest(target, data):
+    from torch._inductor.codecache import write_atomic
+
+    write_atomic(target, data, True)
+    return target, hashlib.sha256(data).hexdigest()
+
+
+def _save_compiled_async(artifact, path, executor=None, futures=None):
+    serialize = getattr(type(artifact), "serialize", None)
+    if (executor is not None and futures is not None
+            and callable(serialize)
+            and type(artifact).__module__.startswith("torch.")
+            and "save_compiled_function" not in getattr(artifact, "__dict__", {})):
+        data = serialize(artifact).serialized_data
+        futures.append(executor.submit(_write_compiled_with_digest, str(path), data))
+        return
+    artifact.save_compiled_function(str(path))
+
+
+class _BytePrefetcher:
+    """Read upcoming compiled forward artifacts in the background with bounded lookahead."""
+
+    def __init__(self, items, *, window=2):
+        self._items = iter(items)
+        self._window = max(1, window)
+        self._executor = None
+        self._inflight = {}
+
+    def __enter__(self):
+        self._fill()
+        return self
+
+    def _fill(self):
+        while len(self._inflight) < self._window:
+            try:
+                key, path = next(self._items)
+            except StopIteration:
+                break
+            if key not in self._inflight:
+                if self._executor is None:
+                    self._executor = ThreadPoolExecutor(max_workers=min(2, self._window))
+                self._inflight[key] = self._executor.submit(Path(path).read_bytes)
+
+    def pop(self, key):
+        future = self._inflight.pop(key, None)
+        self._fill()
+        if future is None:
+            return None
+        try:
+            return future.result()
+        except OSError:
+            return None
+
+    def __exit__(self, *exc):
+        if self._executor is not None:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+
+
+def _deserialize_bundled_entry(entry):
+    from torch._functorch._aot_autograd import aot_autograd_result
+
+    impl = aot_autograd_result.deserialize_bundled_cache_entry
+    if (getattr(impl, "__module__", None) != "torch._functorch._aot_autograd.aot_autograd_result"
+            or getattr(impl, "__name__", None) != "deserialize_bundled_cache_entry"):
+        return impl(entry)
+    import copy
+    from torch._functorch._aot_autograd.runtime_wrappers import SerializableCompiledFunction, simple_wraps
+    from torch._inductor.cudagraph_utils import BoxedDeviceIndex
+    from torch._inductor.utils import BoxedBool
+    from torch._subclasses import FakeTensorMode
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+    entry.guards_expr = None
+    cudagraphs = BoxedBool(torch._inductor.config.triton.cudagraphs)
+    boxed_forward_device_index = BoxedDeviceIndex(None)
+    serializable_copy = copy.copy(entry)
+    if getattr(entry, "compiled_fw", None) is not None:
+        copied_fw = copy.copy(entry.compiled_fw)
+        if getattr(copied_fw, "result", None) is not None:
+            copied_graph = copy.copy(copied_fw.result)
+            if getattr(copied_graph, "_triton_bundle", None) is not None:
+                copied_graph._triton_bundle = replace(copied_graph._triton_bundle, kernel_artifacts=[])
+            copied_fw.result = copied_graph
+        serializable_copy.compiled_fw = copied_fw
+    context = torch._guards.TracingContext.try_get()
+    if context is None:
+        context = torch._guards.TracingContext(FakeTensorMode(shape_env=ShapeEnv()))
+    with torch._guards.tracing(context):
+        compiled_fn = entry.wrap_post_compile(
+            [],
+            entry.sanitized_aot_config,
+            {
+                "cudagraphs": cudagraphs,
+                "boxed_forward_device_index": boxed_forward_device_index,
+            },
+        )
+    compiled_fn = SerializableCompiledFunction(compiled_fn, lambda: serializable_copy)
+
+    @simple_wraps(compiled_fn)
+    def forward(*runtime_args):
+        return compiled_fn(list(runtime_args))
+
+    if not hasattr(compiled_fn, "serialize"):
+        raise AssertionError("compiled_fn must have serialize attribute")
+    forward.serialize = compiled_fn.serialize
+    return forward
 
 
 def _load_inductor(data, original, *, frozen=False):
     runtime_patches.apply()
-    from torch._functorch._aot_autograd.aot_autograd_result import deserialize_bundled_cache_entry
     from torch._functorch._aot_autograd.runtime_wrappers import SerializableCompiledFunction
     from torch._inductor.standalone_compile import AOTCompiledArtifact
 
@@ -62,8 +178,15 @@ def _load_inductor(data, original, *, frozen=False):
         for tuner in entry.compiled_fw.result._triton_bundle.static_autotuners:
             for result in tuner.kernel.compile_results:
                 _materialize_selected_cubin(result)
-    serialized = zlib.compress(pickle.dumps((entry, kernels, constants)), level=1)
-    compiled = deserialize_bundled_cache_entry(entry)
+    if not _RETAIN_SERIALIZED_ARTIFACT.get():
+        serialized = None
+    elif _DEFER_PORTABLE_COMPRESSION.get() and not frozen:
+        serialized = _RawPortableArtifact(
+            pickle.dumps((entry, kernels, constants), protocol=pickle.HIGHEST_PROTOCOL))
+    else:
+        serialized = zlib.compress(
+            pickle.dumps((entry, kernels, constants), protocol=pickle.HIGHEST_PROTOCOL), level=1)
+    compiled = _deserialize_bundled_entry(entry)
     serializer = getattr(compiled.serialize, "__self__", None)
     if (not isinstance(serializer, SerializableCompiledFunction)
             or getattr(compiled, "__wrapped__", None) is not serializer
@@ -452,20 +575,41 @@ class StorageBackend(SerializableCallable):
 
     @classmethod
     def serialize_compile_artifacts(cls, fn):
+        if fn._serialized_artifact is None and hasattr(fn.artifact, "_flare_graph"):
+            raise RuntimeError("portable serialized artifact was already released")
         with _artifact_kernel_table():
-            artifact = (fn.artifact.serialize() if fn._serialized_artifact is None
-                        else zlib.decompress(fn._serialized_artifact))
+            if fn._serialized_artifact is None:
+                artifact = fn.artifact.serialize()
+            elif isinstance(fn._serialized_artifact, _RawPortableArtifact):
+                artifact = bytes(fn._serialized_artifact)
+            else:
+                artifact = zlib.decompress(fn._serialized_artifact)
         calls = _serialized_invocations(fn.invocations)
         sizes = getattr(fn, "_cuda_allocation_sizes", None)
         if sizes is None:
             graph = getattr(fn.artifact, "_flare_graph", None)
             if graph is None:
-                entry, _, _ = pickle.loads(artifact)
+                entry, kernels, constants = pickle.loads(artifact)
                 graph = entry.compiled_fw.result
+                if fn._serialized_artifact is None:
+                    from torch._inductor.output_code import CompiledFxGraph
+                    from torch.utils._ordered_set import OrderedSet
+
+                    if isinstance(graph, CompiledFxGraph):
+                        graph.inductor_post_grad_graph_str = None
+                        graph.cache_linemap = None
+                        cuda_devices = {item[4] for item in fn.signature
+                                        if isinstance(item, tuple) and item[4].type == "cuda"}
+                        if len(cuda_devices) == 1:
+                            original_index = next(iter(cuda_devices)).index
+                            if graph.device_idxs == OrderedSet((original_index,)):
+                                get_source_template(graph, original_index)
+                        artifact = pickle.dumps((entry, kernels, constants), protocol=pickle.HIGHEST_PROTOCOL)
             sizes = tuple(int(size) for device, size in getattr(graph, "_flare_pool_sizes", ())
                           if device == "cuda")
             fn._cuda_allocation_sizes = sizes
-        return pickle.dumps((artifact, fn.inputs, calls, fn.signature, fn._tuning_frozen, sizes))
+        return pickle.dumps((artifact, fn.inputs, calls, fn.signature, fn._tuning_frozen, sizes),
+                            protocol=pickle.HIGHEST_PROTOCOL)
 
     @classmethod
     def deserialize_compile_artifacts(cls, data):
@@ -594,7 +738,8 @@ class BoundForward:
             if owner is None or id(owner) in visited:
                 continue
             visited.add(id(owner))
-            for field, value in (("source_code", ""), ("_triton_bundle", None), ("runnable_graph_str", ""),
+            for field, value in (("source_code", ""), ("_flare_source_template", None),
+                                 ("_triton_bundle", None), ("runnable_graph_str", ""),
                                  ("inductor_provenance_mapping_str", None),
                                  ("inductor_provenance_stack_traces_str", None)):
                 if hasattr(owner, field):
@@ -695,42 +840,207 @@ def _balance_compilations(counts, workers):
         assigned[idlest].append(assigned[busiest].pop())
 
 
-def _share_artifacts(owned, group, ranks):
+_HASH_CHUNK_BYTES = 4 << 20
+_SHARE_BATCH_BYTES = 64 << 20
+
+
+def _file_meta(path, known_digests=None):
+    target = Path(path)
+    if known_digests is not None and path in known_digests:
+        return target.stat().st_size, known_digests[path]
+    digest = hashlib.sha256()
+    size = 0
+    with target.open("rb") as file:
+        while chunk := file.read(_HASH_CHUNK_BYTES):
+            size += len(chunk)
+            digest.update(chunk)
+    return size, digest.hexdigest()
+
+
+def _write_shared_file(path, slab, offset, size):
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=target.parent, suffix=".tmp", delete=False) as file:
+        temporary = Path(file.name)
+        try:
+            if size:
+                file.write(memoryview(slab.numpy())[offset:offset + size])
+            file.close()
+            os.replace(temporary, target)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+
+
+def _share_artifacts(owned, group, ranks, *, known_digests=None, hosts=None):
     """Copy every rank's compiled forwards to ranks on other hosts, which load them by the same path.
 
-    `owned[i]` lists the artifacts rank `ranks[i]` compiled. Each rank keeps its own cache
-    directory; a rank receives only artifacts it lacks or whose contents differ from their
-    compiler's.
+    `owned[i]` lists the artifacts rank `ranks[i]` compiled. Each host keeps its own cache
+    directory; when `hosts` names each rank's host, only the first rank on each host checks and
+    writes shared files on that host's filesystem.
     """
     import torch.distributed as dist
 
     me = ranks.index(dist.get_rank())
-    digests = [None] * len(ranks)
-    dist.all_gather_object(digests, {path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
-                                     for path in owned[me]}, group=group)
+    local_paths = list(dict.fromkeys(owned[me]))
+    hash_workers = min(8, os.cpu_count() or 1)
+    local_manifest = {}
+    meta_error = None
+    try:
+        if len(local_paths) <= 1 or hash_workers <= 1:
+            local_manifest = {path: _file_meta(path, known_digests) for path in local_paths}
+        else:
+            with ThreadPoolExecutor(max_workers=min(hash_workers, len(local_paths))) as pool:
+                local_manifest = dict(
+                    zip(local_paths, pool.map(lambda path: _file_meta(path, known_digests), local_paths), strict=True))
+    except Exception as failure:
+        meta_error = f"{type(failure).__name__}: {failure}"
+    gathered_manifests = [None] * len(ranks)
+    dist.all_gather_object(gathered_manifests, (local_manifest, meta_error), group=group)
+    meta_failures = [(ranks[index], failure) for index, (_, failure) in enumerate(gathered_manifests)
+                     if failure is not None]
+    if meta_failures:
+        raise RuntimeError(f"compiled forward artifact manifest collection failed: {meta_failures}")
+    manifests = [compiled for compiled, _ in gathered_manifests]
 
-    def current(path, digest):
+    owners_by_path = {}
+    for index, compiled in enumerate(manifests):
+        for path, meta in compiled.items():
+            previous = owners_by_path.get(path)
+            if previous is None:
+                owners_by_path[path] = (index, meta)
+            elif previous[1] != meta:
+                raise RuntimeError(f"conflicting compiled forward artifacts for {path}")
+
+    if hosts is not None and len(hosts) != len(ranks):
+        raise ValueError("hosts must match ranks when sharing compiled forward artifacts")
+    host_leader = hosts is None or hosts.index(hosts[me]) == me
+    same_host_manifest = dict(local_manifest)
+    if hosts is not None:
+        for index, compiled in enumerate(manifests):
+            if hosts[index] == hosts[me]:
+                same_host_manifest.update(compiled)
+
+    def current(item):
+        path, (expected_size, expected_digest) = item
+        if same_host_manifest.get(path) == (expected_size, expected_digest):
+            return True
         try:
-            return hashlib.sha256(Path(path).read_bytes()).hexdigest() == digest
+            target = Path(path)
+            if target.stat().st_size != expected_size:
+                return False
+            digest = hashlib.sha256()
+            with target.open("rb") as file:
+                while chunk := file.read(_HASH_CHUNK_BYTES):
+                    digest.update(chunk)
+            return digest.hexdigest() == expected_digest
         except OSError:
             return False
 
-    missing = {path for index, compiled in enumerate(digests) if index != me
-               for path, digest in compiled.items() if not current(path, digest)}
+    if host_leader:
+        checks = [
+            (path, meta)
+            for path, (owner_index, meta) in owners_by_path.items()
+            if owner_index != me and (hosts is None or hosts[owner_index] != hosts[me])
+        ]
+        if len(checks) <= 1 or hash_workers <= 1:
+            results = [current(item) for item in checks]
+        else:
+            with ThreadPoolExecutor(max_workers=min(hash_workers, len(checks))) as pool:
+                results = list(pool.map(current, checks))
+        missing = {path for (path, _), ok in zip(checks, results, strict=True) if not ok}
+    else:
+        missing = set()
     wanted = [None] * len(ranks)
     dist.all_gather_object(wanted, sorted(missing), group=group)
     wanted = set().union(*wanted)
-    for index, compiled in enumerate(digests):
-        for path in sorted(wanted.intersection(compiled)):
-            payload = [Path(path).read_bytes() if index == me else None]
-            dist.broadcast_object_list(payload, src=ranks[index], group=group)
-            if path in missing:
-                target = Path(path)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with tempfile.NamedTemporaryFile(dir=target.parent, suffix=".tmp", delete=False) as file:
-                    file.write(payload[0])
-                os.replace(file.name, target)
-                missing.discard(path)
+    if not wanted:
+        return
+
+    transfer_error = None
+    write_error = None
+    in_flight_batches = []
+
+    def drain_batch(batch_futures):
+        nonlocal write_error
+        for future in batch_futures:
+            try:
+                future.result()
+            except Exception as failure:
+                if write_error is None:
+                    write_error = f"{type(failure).__name__}: {failure}"
+
+    with ThreadPoolExecutor(max_workers=4) as write_pool:
+        try:
+            for index, compiled in enumerate(manifests):
+                paths = sorted(
+                    path for path in wanted.intersection(compiled)
+                    if owners_by_path[path][0] == index
+                )
+                if not paths:
+                    continue
+                batches = []
+                batch = []
+                batch_bytes = 0
+                for path in paths:
+                    size, _ = compiled[path]
+                    if batch and batch_bytes + size > _SHARE_BATCH_BYTES:
+                        batches.append((batch, batch_bytes))
+                        batch = []
+                        batch_bytes = 0
+                    batch.append((path, size))
+                    batch_bytes += size
+                if batch:
+                    batches.append((batch, batch_bytes))
+
+                for items, total_bytes in batches:
+                    limit = 0 if total_bytes > _SHARE_BATCH_BYTES else 1
+                    while len(in_flight_batches) > limit:
+                        drain_batch(in_flight_batches.pop(0))
+                    slab = torch.zeros(1 + total_bytes, dtype=torch.uint8)
+                    if index == me:
+                        try:
+                            view = memoryview(slab.numpy())[1:]
+                            offset = 0
+                            for path, size in items:
+                                with Path(path).open("rb") as file:
+                                    if size:
+                                        read = 0
+                                        target_view = view[offset:offset + size]
+                                        while read < size:
+                                            count = file.readinto(target_view[read:])
+                                            if not count:
+                                                raise OSError(
+                                                    f"truncated read while sharing {path}: {read} of {size} bytes")
+                                            read += count
+                                        offset += size
+                        except Exception as failure:
+                            slab[0] = 1
+                            if transfer_error is None:
+                                transfer_error = f"{type(failure).__name__}: {failure}"
+                    dist.broadcast(slab, src=ranks[index], group=group)
+
+                    batch_futures = []
+                    if int(slab[0].item()) == 0 and write_error is None:
+                        offset = 0
+                        for path, size in items:
+                            if path in missing:
+                                batch_futures.append(write_pool.submit(_write_shared_file, path, slab, 1 + offset, size))
+                                missing.discard(path)
+                            offset += size
+                    if batch_futures:
+                        in_flight_batches.append(batch_futures)
+                        if total_bytes > _SHARE_BATCH_BYTES:
+                            drain_batch(in_flight_batches.pop(0))
+        finally:
+            while in_flight_batches:
+                drain_batch(in_flight_batches.pop(0))
+
+    errors = [None] * len(ranks)
+    dist.all_gather_object(errors, transfer_error or write_error, group=group)
+    failures = [(ranks[index], failure) for index, failure in enumerate(errors) if failure is not None]
+    if failures:
+        raise RuntimeError(f"compiled forward artifact sharing failed: {failures}")
 
 
 class ForwardCache:
@@ -822,22 +1132,28 @@ class ForwardCache:
                       before_run):
         from ignition.progress import phase
         from .compile_pool import CompilePool
-        from .inductor_tuning import InductorSelections
+        from .inductor_tuning import InductorSelections, _uses_default_portable_freeze
 
         if coordinator is not None:
             return self._prepare_ranks(functions, signatures, coordinator, progress=progress,
                                        materialize=materialize, warmup=warmup, before_run=before_run)
         selections = InductorSelections(self.device, lock_gpu_clocks=self.lock_gpu_clocks,
                                         source_identity=self.root.name)
+        default_freeze = _uses_default_portable_freeze(selections)
         compiled, loaded, paths, pending = {}, {}, {}, []
+        release_unused()
         with phase(progress, "Compile model forwards", total=len(functions)) as stage, CompilePool(self.device,
                 headroom_bytes=self.headroom_bytes, options=self.options, compile_workers=self.compile_workers) as compiler:
+            unsubmitted = len(functions)
+
             def finish():
                 name, bound, path = _completed(pending)
                 try:
                     with _guard_code_cache(self.root / 'guards'):
                         if bound.pending is not None:
-                            bound.pending.result()
+                            rss = bound.pending.result()
+                            if rss is not None:
+                                compiler.observe_worker_rss(rss, remaining=unsubmitted + len(pending))
                         elif materialize is None and bound.cache_hit:
                             loaded[name] = bound
                         paths[name] = path
@@ -846,12 +1162,13 @@ class ForwardCache:
                 stage.update(advance=1)
 
             for name, forward in functions.items():
+                unsubmitted -= 1
                 with _guard_code_cache(self.root / 'guards'):
                     bound, path = self._prepare(forward, name=name, signature=signatures[name], compiler=compiler,
                                                 deferred=materialize is not None,
                                                 before_run=None if before_run is None else lambda name=name: before_run(name))
                 pending.append((name, bound, path))
-                if len(pending) >= compiler.workers:
+                while len(pending) >= compiler.workers:
                     finish()
             while pending:
                 finish()
@@ -867,7 +1184,11 @@ class ForwardCache:
             ordered_names = allocation_order(functions, sizes)
         else:
             ordered_names = tuple(functions)
-        with phase(progress, "Warm compiled forwards", total=len(functions)) as stage:
+        prefetch_items = [(name, paths[name]) for name in ordered_names if name not in loaded]
+        with (phase(progress, "Warm compiled forwards", total=len(functions)) as stage,
+              ThreadPoolExecutor(max_workers=2) as save_executor,
+              _BytePrefetcher(prefetch_items) as prefetcher):
+            save_futures = []
             for name in ordered_names:
                 forward = functions[name]
                 try:
@@ -875,6 +1196,8 @@ class ForwardCache:
                         if name in loaded:
                             bound = loaded.pop(name)
                         else:
+                            defer_token = _DEFER_PORTABLE_COMPRESSION.set(default_freeze)
+                            prefetch_token = _PREFETCHED_ARTIFACT_BYTES.set(prefetcher.pop(name))
                             try:
                                 bound = self._load(forward, paths[name], required=True,
                                                    before_run=None if before_run is None else lambda name=name: before_run(name))
@@ -885,9 +1208,14 @@ class ForwardCache:
                             else:
                                 if materialize is None:
                                     bound.cache_hit = False
+                            finally:
+                                _PREFETCHED_ARTIFACT_BYTES.reset(prefetch_token)
+                                _DEFER_PORTABLE_COMPRESSION.reset(defer_token)
                         compiled[name] = self._warm(bound, paths[name], name=name, progress=None,
-                                                   selections=selections, warmup=warmup,
-                                                   before_run=None if before_run is None else lambda name=name: before_run(name))
+                                                    selections=selections, warmup=warmup,
+                                                    before_run=None if before_run is None else lambda name=name: before_run(name),
+                                                    release_unchanged=True, save_executor=save_executor,
+                                                    save_futures=save_futures)
                         compiled[name].prepare_capture()
                         selections.release(compiled[name])
                         release_unused(generation=0)
@@ -896,6 +1224,13 @@ class ForwardCache:
                         raise RuntimeError(f"failed to prepare compiled forward {name}") from error
                     raise
                 stage.update(advance=1)
+            for future in save_futures:
+                try:
+                    future.result()
+                except Exception as error:
+                    if materialize is None:
+                        raise RuntimeError("failed to save compiled forward") from error
+                    raise
         release_unused()
         return compiled
 
@@ -905,16 +1240,17 @@ class ForwardCache:
 
         Compiled forwards serve every rank, so the catalog compiles once: each forward variant a
         rank selects through `compilation_variant` compiles on a rank that selects it, from that
-        rank's own forward, unless an idle rank on the same host borrows it and compiles it from
-        the owner's traced forward metadata. Compiler pools are budgeted for the host's ranks.
-        Ranks on one host share its cache directory; a rank on another host receives the
-        artifacts it lacks from the ranks that compiled them. Every rank then binds the same
-        artifacts.
+        rank's own forward, unless an idle rank on the same or another host borrows it and
+        compiles it from the owner's traced forward metadata. Compiler pools are budgeted for each
+        host's ranks. Ranks on one host share its cache directory; ranks on other hosts receive
+        the artifacts they lack from the ranks whose disks hold them. Every rank then binds the
+        same artifacts.
         """
         import torch.distributed as dist
         from ignition.progress import phase
-        from .compile_pool import CompilePool, allocate_workers, compiler_resources
-        from .inductor_tuning import InductorSelections
+        from . import host_memory
+        from .compile_pool import CompilePool, allocate_workers, compiler_resources, cpu_workers
+        from .inductor_tuning import InductorSelections, _unchanged_frozen, _uses_default_portable_freeze
 
         group, ranks = coordinator.group, coordinator.ranks
         share = ranks.index(dist.get_rank())
@@ -925,7 +1261,9 @@ class ForwardCache:
             raise RuntimeError("ranks prepared different forward catalogs")
         compilers = _variant_compilers(selections)
         work = [(name, variant, functions[name]) for (name, variant), compiler in compilers.items() if compiler == share]
-        selected, outcome, error, compiler, paths, lent, sent = {}, (None, None), None, None, {}, set(), []
+        selected, outcome, error, compiler, paths, lent, sent = {}, (None, None, None), None, None, {}, set(), []
+        sent_files = []
+        local_compiled = []
         loans = []
         with ExitStack() as scope:
             stage = scope.enter_context(phase(progress, "Compile model forwards", total=len(work)))
@@ -961,6 +1299,33 @@ class ForwardCache:
                 error = error or f"{type(failure).__name__}: {failure}"
             demand = [None] * len(ranks)
             dist.all_gather_object(demand, (len(missing), resources, error), group=group)
+
+            def pool_bounds(active_workers):
+                host = coordinator.hosts[share]
+                members = [index for index, name in enumerate(coordinator.hosts) if name == host]
+                host_pools = sum(1 for index in members if active_workers[index] > 0)
+                host_available = min(demand[index][1].available for index in members)
+                local_resources = demand[share][1]
+                device_cap = (local_resources.capacity if local_resources.max_capacity is None
+                              else local_resources.max_capacity)
+                if local_resources.worker_bytes > host_memory.FORWARD_WORKER_BYTES:
+                    device_cap //= host_pools
+                if self.compile_workers is not None and self.compile_workers < host_pools:
+                    cpus = 1
+                elif host_pools == 1:
+                    cpus = cpu_workers(self.compile_workers)
+                else:
+                    cpus = cpu_workers(self.compile_workers, pools=host_pools)
+                max_workers = max(active_workers[share], min(cpus, device_cap))
+                return host_pools, host_available, max_workers
+
+            counts = []
+            workers = []
+            probe_hosts = set()
+            probe_host_rss = {}
+            probe_assigned = [[] for _ in ranks]
+            probe_consumed = [0] * len(ranks)
+            probe_done = set()
             try:
                 failures = [(rank, failure) for rank, (_, _, failure) in zip(ranks, demand) if failure is not None]
                 if failures:
@@ -968,41 +1333,220 @@ class ForwardCache:
                 counts = [count for count, _, _ in demand]
                 workers = allocate_workers([resources for _, resources, _ in demand], counts, coordinator.hosts)
                 stage.update(f"{sum(workers)} compiler workers; per rank {workers}")
-                assigned = [[] for _ in ranks]
                 for host in dict.fromkeys(coordinator.hosts):
                     members = [index for index, name in enumerate(coordinator.hosts) if name == host]
-                    if not any(counts[index] for index in members):
-                        continue
-                    local = _balance_compilations([counts[index] for index in members],
-                                                  [workers[index] for index in members])
-                    for borrower, forwards in zip(members, local):
-                        assigned[borrower] = [(members[owner], index) for owner, index in forwards]
-                if workers[share]:
-                    compiler = compiler_scope.enter_context(CompilePool(
-                        self.device, options=self.options, workers=workers[share]))
-                loans = [(borrower, missing[index]) for borrower, forwards in enumerate(assigned)
-                         for owner, index in forwards if owner == share and borrower != share]
-                lent = {work[index][:2] for _, index in loans}
-                from .forward_metadata import dumps
+                    host_jobs = sum(counts[index] for index in members)
+                    host_workers = sum(workers[index] for index in members)
+                    host_limit = min(demand[index][1].limit for index in members)
+                    if (host_workers > 0
+                            and host_jobs > host_workers
+                            and host_workers < host_limit
+                            and any(workers[index] == 0 and demand[index][1].capacity > 0 for index in members)):
+                        probe_hosts.add(host)
+                        for member in members:
+                            if not workers[member]:
+                                continue
+                            own_take = min(workers[member], counts[member] - probe_consumed[member])
+                            for offset in range(own_take):
+                                probe_assigned[member].append((member, probe_consumed[member] + offset))
+                            probe_consumed[member] += own_take
+                        for member in members:
+                            need = workers[member] - len(probe_assigned[member])
+                            if need <= 0:
+                                continue
+                            for donor in members:
+                                if need <= 0:
+                                    break
+                                available_jobs = counts[donor] - probe_consumed[donor]
+                                if available_jobs <= 0:
+                                    continue
+                                take = min(need, available_jobs)
+                                for offset in range(take):
+                                    probe_assigned[member].append((donor, probe_consumed[donor] + offset))
+                                probe_consumed[donor] += take
+                                need -= take
+            except Exception as failure:
+                error = error or f"{type(failure).__name__}: {failure}"
+            if probe_hosts:
+                # When the conservative startup estimate leaves capable GPUs without workers on a host,
+                # run one wave on the admitted ranks first to measure actual worker RSS and admit idle GPUs.
+                probe_error = None
+                probe_sent = []
+                probe_lent = set()
+                try:
+                    if probe_assigned[share]:
+                        host_pools, host_available, max_workers = pool_bounds(workers)
+                        compiler = compiler_scope.enter_context(CompilePool(
+                            self.device, options=self.options, workers=workers[share],
+                            headroom_bytes=self.headroom_bytes, max_workers=max_workers,
+                            host_pools=host_pools, host_available=host_available))
+                    probe_loans = [
+                        (borrower, missing[local_idx])
+                        for borrower, forwards in enumerate(probe_assigned)
+                        for owner, local_idx in forwards
+                        if owner == share and borrower != share
+                    ]
+                    probe_lent = {work[index][:2] for _, index in probe_loans}
+                    if probe_loans:
+                        from .forward_metadata import dumps
 
-                if loans:
-                    jobs = self.root / 'lent'
-                    jobs.mkdir(parents=True, exist_ok=True)
-                    for borrower, index in loans:
-                        name, variant, forward = work[index]
-                        path = self._path(forward, name=f"{name}.{variant}", signature=signatures[name])
-                        job = jobs / f"{path.stem}.forward"
-                        with tempfile.NamedTemporaryFile(dir=jobs, suffix='.tmp', delete=False) as file:
-                            temporary = Path(file.name)
+                        jobs = self.root / 'lent'
+                        jobs.mkdir(parents=True, exist_ok=True)
+                        for borrower, index in probe_loans:
+                            name, variant, forward = work[index]
+                            path = self._path(forward, name=f"{name}.{variant}", signature=signatures[name])
+                            job = jobs / f"{path.stem}.probe.forward"
+                            with tempfile.NamedTemporaryFile(dir=jobs, suffix='.tmp', delete=False) as file:
+                                temporary = Path(file.name)
                             try:
-                                pickle.dump((dumps(forward), str(path)), file)
-                                file.close()
+                                with temporary.open('wb') as file:
+                                    pickle.dump((dumps(forward), str(path)), file)
                                 os.replace(temporary, job)
                             finally:
                                 temporary.unlink(missing_ok=True)
-                        sent.append((borrower, str(job)))
-                        # The borrower compiles it before every rank gathers the outcome below.
-                        paths[name, variant] = str(path), True
+                            probe_sent.append((borrower, str(job)))
+                            paths[name, variant] = str(path), True
+                except Exception as failure:
+                    probe_error = f"{type(failure).__name__}: {failure}"
+                probe_mailed = [None] * len(ranks)
+                dist.all_gather_object(probe_mailed, probe_sent, group=group)
+                probe_borrowed = [job for jobs in probe_mailed for borrower, job in jobs if borrower == share]
+                probe_peak_rss = 0
+                try:
+                    if probe_error is not None:
+                        raise RuntimeError(probe_error)
+                    probe_pending = []
+                    for owner, local_idx in probe_assigned[share]:
+                        if owner != share:
+                            continue
+                        index = missing[local_idx]
+                        name, variant, forward = work[index]
+                        path = self._path(forward, name=f"{name}.{variant}", signature=signatures[name])
+                        bound = BoundForward(None, forward, False, compiler.submit(forward, path))
+                        probe_pending.append((name, variant, bound, path))
+                    for job in probe_borrowed:
+                        with open(job, 'rb') as file:
+                            payload, path = pickle.load(file)
+                        os.unlink(job)
+                        future = compiler.submit_payload(payload, Path(path))
+                        probe_pending.append((None, None, BoundForward(None, None, False, future), path))
+                    while probe_pending:
+                        name, variant, bound, path = _completed(probe_pending)
+                        rss = bound.pending.result()
+                        if rss is not None and rss > probe_peak_rss:
+                            probe_peak_rss = int(rss)
+                        local_compiled.append(str(path))
+                        if name is not None:
+                            paths[name, variant] = str(path), True
+                            stage.update(advance=1)
+                except Exception as failure:
+                    probe_error = probe_error or f"{type(failure).__name__}: {failure}"
+                probe_results = [None] * len(ranks)
+                dist.all_gather_object(probe_results, (probe_peak_rss, probe_error), group=group)
+                for _, job in probe_sent:
+                    Path(job).unlink(missing_ok=True)
+                probe_failures = [(rank, failure) for rank, (_, failure) in zip(ranks, probe_results)
+                                  if failure is not None]
+                if probe_failures:
+                    try:
+                        compiler_scope.close()
+                    except Exception as failure:
+                        probe_failures.append((ranks[share], f"{type(failure).__name__}: {failure}"))
+                    raise RuntimeError(f"forward compilation failed: {probe_failures}")
+                stage.update(advance=len(probe_lent))
+                probe_done = set(missing[:probe_consumed[share]])
+                missing = missing[probe_consumed[share]:]
+                counts = [count - consumed for count, consumed in zip(counts, probe_consumed)]
+                try:
+                    sized_resources = [item for _, item, _ in demand]
+                    for host in probe_hosts:
+                        members = [index for index, name in enumerate(coordinator.hosts) if name == host]
+                        max_host_rss = max(probe_results[index][0] for index in members)
+                        if max_host_rss > 0:
+                            probe_host_rss[host] = int(max_host_rss)
+                            measured_unit = max(host_memory._WORKER_BYTES, (max_host_rss * 5 + 3) // 4)
+                            for index in members:
+                                orig_res = demand[index][1]
+                                sized_resources[index] = replace(
+                                    orig_res,
+                                    worker_bytes=measured_unit + (orig_res.worker_bytes - host_memory.FORWARD_WORKER_BYTES),
+                                )
+                    workers = allocate_workers(sized_resources, counts, coordinator.hosts)
+                    stage.update(f"{sum(workers)} compiler workers; per rank {workers}")
+                except Exception as failure:
+                    error = error or f"{type(failure).__name__}: {failure}"
+            try:
+                if error is None:
+                    assigned = [[] for _ in ranks]
+                    for host in dict.fromkeys(coordinator.hosts):
+                        members = [index for index, name in enumerate(coordinator.hosts) if name == host]
+                        if not any(counts[index] for index in members):
+                            continue
+                        local = _balance_compilations([counts[index] for index in members],
+                                                      [workers[index] for index in members])
+                        for borrower, forwards in zip(members, local):
+                            assigned[borrower] = [(members[owner], index) for owner, index in forwards]
+                    if coordinator.spans_hosts and any(workers) and any(counts):
+                        able = [rank for rank, count in enumerate(workers) if count]
+
+                        def finish_wave(rank, extra=0):
+                            held = len(assigned[rank]) + extra
+                            return -(-held // workers[rank]) if workers[rank] else float("inf") if held else 0
+
+                        while True:
+                            busiest = max(range(len(ranks)), key=lambda rank: (finish_wave(rank), -rank))
+                            idlest = min(able, key=lambda rank: (finish_wave(rank, 1), rank))
+                            if finish_wave(idlest, 1) >= finish_wave(busiest):
+                                break
+                            assigned[idlest].append(assigned[busiest].pop())
+                    if workers[share] and assigned[share]:
+                        host_pools, host_available, max_workers = pool_bounds(workers)
+                        local_host = coordinator.hosts[share]
+                        min_workers = 1 if local_host in probe_hosts else None
+                        if compiler is None:
+                            compiler = compiler_scope.enter_context(CompilePool(
+                                self.device, options=self.options, workers=workers[share],
+                                headroom_bytes=self.headroom_bytes, max_workers=max_workers,
+                                min_workers=min_workers, host_pools=host_pools, host_available=host_available))
+                        else:
+                            compiler.reconfigure(
+                                workers=workers[share], max_workers=max_workers,
+                                host_pools=host_pools, min_workers=min_workers)
+                        if local_host in probe_host_rss and hasattr(compiler, "peak_worker_rss"):
+                            compiler.peak_worker_rss = max(compiler.peak_worker_rss, probe_host_rss[local_host])
+                    elif compiler is not None:
+                        compiler_scope.close()
+                        compiler = None
+                    loans = [(borrower, missing[index]) for borrower, forwards in enumerate(assigned)
+                             for owner, index in forwards if owner == share and borrower != share]
+                    lent = {work[index][:2] for _, index in loans}
+                    from .forward_metadata import dumps
+
+                    if loans:
+                        jobs = None
+                        for borrower, index in loans:
+                            name, variant, forward = work[index]
+                            path = self._path(forward, name=f"{name}.{variant}", signature=signatures[name])
+                            payload = dumps(forward)
+                            if coordinator.hosts[borrower] == coordinator.hosts[share]:
+                                if jobs is None:
+                                    jobs = self.root / 'lent'
+                                    jobs.mkdir(parents=True, exist_ok=True)
+                                job = jobs / f"{path.stem}.forward"
+                                with tempfile.NamedTemporaryFile(dir=jobs, suffix='.tmp', delete=False) as file:
+                                    temporary = Path(file.name)
+                                try:
+                                    with temporary.open('wb') as file:
+                                        pickle.dump((payload, str(path)), file)
+                                    os.replace(temporary, job)
+                                finally:
+                                    temporary.unlink(missing_ok=True)
+                                sent.append((borrower, ("file", str(job))))
+                                sent_files.append(str(job))
+                            else:
+                                sent.append((borrower, ("payload", payload, str(path))))
+                            # The borrower compiles it before every rank gathers the outcome below.
+                            paths[name, variant] = str(path), True
             except Exception as failure:
                 error = error or f"{type(failure).__name__}: {failure}"
             mailed = [None] * len(ranks)
@@ -1012,65 +1556,78 @@ class ForwardCache:
                 if error is not None:
                     raise RuntimeError(error)
                 pending = []
+                unsubmitted_compiles = sum(
+                    1 for index, (name, variant, _) in enumerate(work)
+                    if index not in probe_done and (name, variant) not in lent and index not in restored
+                ) + len(borrowed)
 
                 def finish():
                     name, variant, bound, path = _completed(pending)
                     if bound.pending is not None:
-                        bound.pending.result()
+                        rss = bound.pending.result()
+                        if rss is not None:
+                            in_flight = sum(1 for item in pending if item[2].pending is not None)
+                            compiler.observe_worker_rss(rss, remaining=unsubmitted_compiles + in_flight)
                     elif materialize is None:
                         # Restored and bound to this rank's own forward already.
                         selected[name] = bound
+                    local_compiled.append(str(path))
                     if name is not None:
                         # Each forward's path, and whether this launch compiled it rather than restoring it.
                         paths[name, variant] = str(path), bound.pending is not None
                         stage.update(advance=1)
 
                 for index, (name, variant, forward) in enumerate(work):
-                    if (name, variant) in lent:
+                    if index in probe_done or (name, variant) in lent:
                         continue
                     if index in restored:
                         bound, path = restored[index]
                     else:
+                        unsubmitted_compiles -= 1
                         path = self._path(forward, name=f"{name}.{variant}", signature=signatures[name])
                         bound = BoundForward(None, forward, False, compiler.submit(forward, path))
                     pending.append((name, variant, bound, path))
-                    if compiler is not None and len(pending) >= compiler.workers:
+                    while compiler is not None and len(pending) >= compiler.workers:
                         finish()
-                for job in borrowed:
-                    with open(job, 'rb') as file:
-                        payload, path = pickle.load(file)
-                    os.unlink(job)
+                for item in borrowed:
+                    unsubmitted_compiles -= 1
+                    if item[0] == "file":
+                        _, job = item
+                        with open(job, 'rb') as file:
+                            payload, path = pickle.load(file)
+                        os.unlink(job)
+                    else:
+                        _, payload, path = item
                     future = compiler.submit_payload(payload, Path(path))
                     pending.append((None, None, BoundForward(None, None, False, future), path))
-                    if len(pending) >= compiler.workers:
+                    while len(pending) >= compiler.workers:
                         finish()
                 while pending:
                     finish()
-                outcome = paths, None
+                outcome = paths, sorted(set(local_compiled)), None
             except Exception as failure:
-                outcome = None, f"{type(failure).__name__}: {failure}"
+                outcome = None, None, f"{type(failure).__name__}: {failure}"
             try:
                 compiler_scope.close()
             except Exception as failure:
-                outcome = None, outcome[1] or f"{type(failure).__name__}: {failure}"
+                outcome = None, None, outcome[2] or f"{type(failure).__name__}: {failure}"
             outcomes = [None] * len(ranks)
             dist.all_gather_object(outcomes, outcome, group=group)
-            for _, job in sent:
+            for job in sent_files:
                 Path(job).unlink(missing_ok=True)
             # Raise inside the phase so it ends as failed rather than complete. Every rank holds the same
             # outcomes, so every rank raises here and none skips a collective.
-            failures = [(index, failure) for index, (_, failure) in zip(ranks, outcomes) if failure is not None]
+            failures = [(index, failure) for index, (_, _, failure) in zip(ranks, outcomes) if failure is not None]
             if failures:
                 raise RuntimeError(f"forward compilation failed: {failures}")
             # Forwards lent to other ranks are complete once every rank reports.
             stage.update(advance=len(lent))
         restored.clear()
         bound = None
-        paths = {key: value for compiled, _ in outcomes for key, value in compiled.items()}
-        # Ranks on one host compiled into its cache directory; only other hosts lack their shares.
+        paths = {key: value for compiled, _, _ in outcomes for key, value in compiled.items()}
+        # Ranks on one host share its cache directory; ranks on other hosts receive every artifact from the rank holding it.
         if coordinator.spans_hosts:
-            _share_artifacts([sorted({path for path, _ in compiled.values()}) for compiled, _ in outcomes],
-                             group, ranks)
+            _share_artifacts([local for _, local, _ in outcomes], group, ranks, hosts=coordinator.hosts)
         error, sizes = None, None
         try:
             release_unused()
@@ -1090,26 +1647,49 @@ class ForwardCache:
         ordered_names = allocation_order(functions, sizes, coordinator)
         selections = InductorSelections(self.device, coordinator=coordinator,
                                         lock_gpu_clocks=self.lock_gpu_clocks, source_identity=self.root.name)
+        default_freeze = _uses_default_portable_freeze(selections)
         published, released = [], 0
-        with phase(progress, "Load and warm compiled forwards", total=len(functions)) as stage:
+        saved_digests = {}
+        prefetch_items = [
+            (name, paths[name, getattr(functions[name], "compilation_variant", "shared")][0])
+            for name in ordered_names if name not in selected
+        ]
+        with (phase(progress, "Load and warm compiled forwards", total=len(functions)) as stage,
+              ThreadPoolExecutor(max_workers=2) as save_executor,
+              _BytePrefetcher(prefetch_items) as prefetcher):
+            save_futures = []
+            post_failure = None
             for name in ordered_names:
                 forward = functions[name]
-                failure = None
-                try:
-                    if name not in selected:
-                        path, compiled = paths[name, getattr(forward, "compilation_variant", "shared")]
-                        with _guard_code_cache(self.root / 'guards'):
-                            selected[name] = self._load(forward, Path(path), required=True,
-                                before_run=None if before_run is None else lambda name=name: before_run(name))
-                        selected[name].cache_hit = not compiled
-                    bound = selected[name]
-                    selections.register(bound)
-                except Exception as error:
-                    import traceback
+                variant = getattr(forward, "compilation_variant", "shared")
+                owns_variant = compilers[name, variant] == share
+                load_failure = None
+                bound = None
+                if post_failure is None:
+                    try:
+                        if name not in selected:
+                            path, compiled = paths[name, variant]
+                            token = _RETAIN_SERIALIZED_ARTIFACT.set(owns_variant or not default_freeze)
+                            defer_token = _DEFER_PORTABLE_COMPRESSION.set(owns_variant and default_freeze)
+                            prefetch_token = _PREFETCHED_ARTIFACT_BYTES.set(prefetcher.pop(name))
+                            try:
+                                with _guard_code_cache(self.root / 'guards'):
+                                    selected[name] = self._load(
+                                        forward, Path(path), required=True,
+                                        before_run=None if before_run is None else lambda name=name: before_run(name))
+                            finally:
+                                _PREFETCHED_ARTIFACT_BYTES.reset(prefetch_token)
+                                _DEFER_PORTABLE_COMPRESSION.reset(defer_token)
+                                _RETAIN_SERIALIZED_ARTIFACT.reset(token)
+                            selected[name].cache_hit = not compiled
+                        bound = selected[name]
+                        selections.register(bound)
+                    except Exception as error:
+                        import traceback
 
-                    traceback.print_exc(limit=-40)
-                    failure = f"{name}: {type(error).__name__}: {error}"
-                selections._check(failure)
+                        traceback.print_exc(limit=-40)
+                        load_failure = f"{name}: {type(error).__name__}: {error}"
+                selections._check(post_failure or load_failure)
                 coordinator.barrier(f"compiled warmup {name}", ranks)
                 try:
                     selections.warm(bound, warmup,
@@ -1117,25 +1697,44 @@ class ForwardCache:
                 except Exception as error:
                     error.add_note(f"Warming compiled forward {name!r}")
                     raise
-                failure = None
                 try:
+                    unchanged = bound.cache_hit and _unchanged_frozen(selections, bound)
+                    if (not owns_variant or unchanged) and default_freeze:
+                        serialized = getattr(bound.backend, "_serialized_artifact", None)
+                        if serialized is not None:
+                            released += len(serialized)
+                            bound.backend._serialized_artifact = None
                     selections.freeze(bound)
-                    variant = getattr(forward, 'compilation_variant', 'shared')
-                    if compilers[name, variant] == share:
+                    if not owns_variant or unchanged:
+                        serialized = getattr(bound.backend, "_serialized_artifact", None)
+                        if serialized is not None:
+                            released += len(serialized)
+                            bound.backend._serialized_artifact = None
+                    if owns_variant and not unchanged:
                         path, _ = paths[name, variant]
-                        bound.artifact.save_compiled_function(path)
+                        _save_compiled_async(bound.artifact, path, save_executor, save_futures)
                         published.append(path)
                     released += bound.prepare_capture()
                     selections.release(bound)
                     release_unused(generation=0)
                 except Exception as error:
-                    failure = f"{name}: {type(error).__name__}: {error}"
-                selections._check(failure)
+                    post_failure = f"{name}: {type(error).__name__}: {error}"
                 stage.update(advance=1)
+            for future in save_futures:
+                try:
+                    saved = future.result()
+                    if saved is not None:
+                        saved_path, saved_digest = saved
+                        saved_digests[saved_path] = saved_digest
+                except Exception as error:
+                    if post_failure is None:
+                        post_failure = f"{type(error).__name__}: {error}"
+            selections._check(post_failure)
             stage.update(f"{released >> 20} MiB portable state released; guards and kernel owners retained")
         release_unused()
         if coordinator.spans_hosts:
-            _share_artifacts(selections._gather(published), group, ranks)
+            _share_artifacts(selections._gather(published), group, ranks,
+                             known_digests=saved_digests, hosts=coordinator.hosts)
         return selected
 
     def _allocation_sizes(self, path):
@@ -1150,8 +1749,14 @@ class ForwardCache:
         return sizes
 
     def _load(self, forward, path, *, required=False, before_run=None):
+        prefetched = _PREFETCHED_ARTIFACT_BYTES.get()
+        if prefetched is not None:
+            _PREFETCHED_ARTIFACT_BYTES.set(None)
+            stream = io.BytesIO(prefetched)
+        else:
+            stream = Path(path).open('rb')
         with bind_device(self.device, freeze_tuning=self.options.get(
-                'triton.autotune_at_compile_time', False)), path.open('rb') as file:
+                'triton.autotune_at_compile_time', False)), stream as file:
             artifact = torch.compiler.load_compiled_function(file)
         # Bound forwards remain live for the complete catalog. Collect young
         # deserialization temporaries here; scan the retained heap once at each
@@ -1191,9 +1796,12 @@ class ForwardCache:
         if report is not None:
             report("restoring compiled forward")
         token = _DEFERRED_BINDINGS.set(deferred)
+        serialized_token = _RETAIN_SERIALIZED_ARTIFACT.set(
+            _RETAIN_SERIALIZED_ARTIFACT.get() and not deferred)
         try:
             bound = self._load(forward, path, before_run=before_run)
         finally:
+            _RETAIN_SERIALIZED_ARTIFACT.reset(serialized_token)
             _DEFERRED_BINDINGS.reset(token)
         if report is not None:
             report("checking compiled bindings")
@@ -1214,18 +1822,19 @@ class ForwardCache:
         return BoundForward(aot_forward(forward, options=self.options), forward, False), path
 
     def _warm(self, bound, path, *, name, progress=None, selections=None, warmup=nullcontext,
-              before_run=None):
+              before_run=None, release_unchanged=False, save_executor=None, save_futures=None):
         def report(operation):
             if progress is not None:
                 progress.update(f"{name} · {operation}")
 
-        from .inductor_tuning import InductorSelections
+        from .inductor_tuning import InductorSelections, _unchanged_frozen
 
         if selections is None:
             selections = InductorSelections(self.device, lock_gpu_clocks=self.lock_gpu_clocks,
                                         source_identity=self.root.name)
         path.parent.mkdir(parents=True, exist_ok=True)
-        if not hasattr(bound.artifact._artifacts.compiled_fn.artifact, '_flare_graph'):
+        rewritten = not hasattr(bound.artifact._artifacts.compiled_fn.artifact, '_flare_graph')
+        if rewritten:
             bound.artifact.save_compiled_function(str(path))
             cached = bound.cache_hit
             bound = self._load(bound.owner, path, required=True, before_run=before_run)
@@ -1233,7 +1842,11 @@ class ForwardCache:
         report("warming restored forward" if bound.cache_hit else "warming compiled forward")
         selections.register(bound)
         selections.warm(bound, warmup, before_run=before_run)
+        unchanged = bound.cache_hit and not rewritten and _unchanged_frozen(selections, bound)
         selections.freeze(bound)
-        report("saving compiled forward")
-        bound.artifact.save_compiled_function(str(path))
+        if release_unchanged and unchanged and getattr(bound.backend, "_serialized_artifact", None) is not None:
+            bound.backend._serialized_artifact = None
+        if not unchanged:
+            report("saving compiled forward")
+            _save_compiled_async(bound.artifact, path, save_executor, save_futures)
         return bound

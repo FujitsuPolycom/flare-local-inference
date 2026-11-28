@@ -224,6 +224,22 @@ class StoredTuner:
     is_statically_launchable = CachingAutotuner.is_statically_launchable
 
 
+@dataclass
+class StoredKernel:
+    cubin_raw: bytes
+    n_regs: int = 64
+
+
+class PicklableJIT:
+    fn = None
+    __globals__ = None
+    used_global_vals = None
+
+    @staticmethod
+    def repr(_self):
+        return "restored_reduction"
+
+
 @pytest.mark.parametrize("target", [0, 1])
 def test_artifact_binding_freezes_an_unpickled_entry_before_deserialization(monkeypatch, target):
     import importlib
@@ -312,3 +328,361 @@ def test_effective_last_snapshot_preserves_the_tuned_winner(monkeypatch):
     assert len(initial.compile_results) == 2
     with pytest.raises(ValueError, match="unresolved"):
         _freeze_tuning_winners(SimpleNamespace(static_autotuners=snapshots[::-1]))
+
+
+def test_source_template_relocates_and_registers_without_reparsing(monkeypatch):
+    from torch._inductor.async_compile import CompiledTritonKernels
+    from torch._inductor.codecache import code_hash
+    from torch._inductor.output_code import CompiledFxGraph
+    from torch.utils._ordered_set import OrderedSet
+    from ignition.preparation import device_binding
+    from ignition.preparation.device_binding import bind_device, build_source_template, relocate_inductor
+    from ignition.preparation.inductor_tuning import InductorSelections
+
+    DeviceProps = namedtuple("DeviceProps", ["index"])
+    tuner, _ = restored_reduction(monkeypatch)
+    tuner.compile_results[0].compile_meta["device"] = 0
+    tuner.compile_results[0].kernel.cubin_raw = b"cubin-bytes"
+    tuner._make_launchers()
+
+    stored = StoredTuner()
+    stored.compile_results = tuner.compile_results
+    stored.inductor_meta = tuner.inductor_meta
+    stored.triton_meta = {"device": 0}
+    stored.device_props = DeviceProps(0)
+
+    kernel_source = "device = DeviceProperties(index=0)\nstream0 = get_raw_stream(0)\n"
+    wrapper_source = (
+        "import torch\n"
+        "torch.cuda.set_device(0)\n"
+        "with torch.cuda._DeviceGuard(0):\n"
+        "    stream0 = get_raw_stream(0)\n"
+        "kernel = async_compile.triton('reduction', " + repr(kernel_source) + ")\n"
+    )
+    template = build_source_template(wrapper_source, 0)
+
+    graph = CompiledFxGraph.__new__(CompiledFxGraph)
+    graph.compiled_fn_runner = None
+    graph.source_code = wrapper_source
+    graph.cache_key = code_hash(wrapper_source)
+    graph.device_idxs = OrderedSet((0,))
+    graph._flare_source_template = template
+    graph._triton_bundle = StoredBundle(
+        static_autotuners=[StoredEntry(CompiledTritonKernels.key(kernel_source), stored, "restored_reduction")],
+        kernel_artifacts=[StoredArtifact(0)],
+    )
+    entry = SimpleNamespace(compiled_fw=SimpleNamespace(result=graph), compiled_bw=None)
+
+    def forbid_reparse(*args, **kwargs):
+        raise AssertionError("cached _SourceTemplate should not rebuild or reparse generated AST")
+
+    monkeypatch.setattr(device_binding, "build_source_template", forbid_reparse)
+
+    with bind_device("cuda:3", freeze_tuning=True):
+        relocate_inductor(entry, torch.device("cuda", 0))
+
+    assert "torch.cuda.set_device(3)" in graph.source_code
+    assert "torch.cuda._DeviceGuard(3)" in graph.source_code
+    assert "index=3" in graph.source_code
+    assert graph.device_idxs == OrderedSet((3,))
+    assert graph._flare_source_template.current_device == 3
+
+    fake_code = compile("def call(args):\n    return args\n", f"/tmp/{graph.cache_key}.py", "exec")
+    namespace = {"kernel": tuner}
+    exec(fake_code, namespace)
+    graph.current_callable = namespace["call"]
+
+    backend = SimpleNamespace(
+        artifact=SimpleNamespace(_flare_graph=graph),
+        _serialized_artifact=None,
+        _tuning_frozen=True,
+        signature=(),
+        inputs=[],
+        invocations=[],
+    )
+    bound = SimpleNamespace(backend=backend, owner=SimpleNamespace(), execution_identity=None)
+    selections = InductorSelections(torch.device("cuda", 3), source_identity="unit")
+    selections.register(bound)
+    selections.freeze(bound)
+    assert bound.execution_identity is not None
+    assert len(selections.forwards[id(bound)][2]) == 1
+
+
+def test_source_template_handles_unicode_separators_utf8_same_line_assignments_and_same_length_mutation():
+    from torch._inductor.output_code import CompiledFxGraph
+    from ignition.preparation.device_binding import (
+        _device_source,
+        build_source_template,
+        get_source_template,
+    )
+
+    kernel_a = "# formfeed \x0c and unicode sep \u2028 αβγ\r\ndevice = DeviceProperties(index=0); s = get_raw_stream(0)\n"
+    kernel_b = "x = 'Ω'; stream = get_raw_stream(0)\n"
+    wrapper = (
+        "# comment with \x0b \x0c \x85 \u2028 \u2029 and UTF-8 🚀\n"
+        "label = 'αβγ'; torch.cuda.set_device(0)\r\n"
+        "k_first = async_compile.triton('k_first', " + repr(kernel_a) + "); "
+        "k_second = async_compile.triton('k_second', " + repr(kernel_b) + ")\n"
+    )
+    template = build_source_template(wrapper, 0)
+    assert [name for name, _, _ in template.assigned_kernels] == ["k_first", "k_second"]
+    assert template.invalid_kernel_assignment is False
+    rendered = template.render(2)
+    assert "label = 'αβγ'; torch.cuda.set_device(2)" in rendered
+    assert "DeviceProperties(index=2); s = get_raw_stream(2)" in rendered
+    assert "x = 'Ω'; stream = get_raw_stream(2)" in rendered
+    assert _device_source(wrapper, 0, 2) == rendered
+
+    unassigned = "async_compile.triton('orphan', 'get_raw_stream(0)')\n"
+    assert build_source_template(unassigned, 0).invalid_kernel_assignment is True
+
+    graph = CompiledFxGraph.__new__(CompiledFxGraph)
+    graph.compiled_fn_runner = None
+    graph.source_code = "tag = 'aaaa'\ntorch.cuda.set_device(0)\n"
+    first = get_source_template(graph, 0)
+    assert get_source_template(graph, 0) is first
+    # Mutating source_code to a distinct string of identical character length must rebuild the template.
+    graph.source_code = "tag = 'bbbb'\ntorch.cuda.set_device(0)\n"
+    assert len(graph.source_code) == len("tag = 'aaaa'\ntorch.cuda.set_device(0)\n")
+    second = get_source_template(graph, 0)
+    assert second is not first
+    assert "tag = 'bbbb'" in second.render(1)
+
+
+def test_relocate_inductor_drops_unreferenced_candidates_and_rejects_named_unbound_kernels(monkeypatch):
+    from torch._inductor.async_compile import CompiledTritonKernels
+    from torch._inductor.codecache import code_hash
+    from torch._inductor.output_code import CompiledFxGraph
+    from torch.utils._ordered_set import OrderedSet
+
+    tuner, _ = restored_reduction(monkeypatch)
+    tuner.compile_results[0].compile_meta["device"] = 0
+    stored = StoredTuner()
+    stored.compile_results = tuner.compile_results
+    stored.inductor_meta = tuner.inductor_meta
+    stored.triton_meta = {"device": 0}
+    stored.device_props = DeviceProperties(0)
+
+    orphan = StoredTuner()
+    orphan.compile_results = tuner.compile_results
+    orphan.inductor_meta = {"kernel_name": "UNREFERENCED_TEMPLATE"}
+    orphan.triton_meta = {"device": 0}
+    orphan.device_props = DeviceProperties(0)
+
+    kernel_source = "device = DeviceProperties(index=0)\n"
+    wrapper_source = (
+        "torch.cuda.set_device(0)\n"
+        "kernel = async_compile.triton('restored_reduction', " + repr(kernel_source) + ")\n"
+    )
+
+    graph = CompiledFxGraph.__new__(CompiledFxGraph)
+    graph.compiled_fn_runner = None
+    graph.source_code = wrapper_source
+    graph.cache_key = code_hash(wrapper_source)
+    graph.device_idxs = OrderedSet((0,))
+    graph._triton_bundle = StoredBundle(
+        static_autotuners=[
+            StoredEntry(CompiledTritonKernels.key(kernel_source), stored, "restored_reduction"),
+            StoredEntry("epilogue-candidate-key", orphan, "UNREFERENCED_TEMPLATE"),
+        ],
+        kernel_artifacts=[StoredArtifact(0)],
+    )
+    entry = SimpleNamespace(compiled_fw=SimpleNamespace(result=graph), compiled_bw=None)
+    with bind_device("cuda:1"):
+        relocate_inductor(entry, torch.device("cuda", 0))
+    assert len(graph._triton_bundle.static_autotuners) == 1
+    assert graph._triton_bundle.static_autotuners[0].kernel_name == "restored_reduction"
+
+    bad_graph = CompiledFxGraph.__new__(CompiledFxGraph)
+    bad_graph.compiled_fn_runner = None
+    bad_graph.source_code = wrapper_source
+    bad_graph.cache_key = code_hash(wrapper_source)
+    bad_graph.device_idxs = OrderedSet((0,))
+    bad_graph._triton_bundle = StoredBundle(
+        static_autotuners=[
+            StoredEntry("mismatched-key", stored, "restored_reduction"),
+        ],
+        kernel_artifacts=[StoredArtifact(0)],
+    )
+    bad_entry = SimpleNamespace(compiled_fw=SimpleNamespace(result=bad_graph), compiled_bw=None)
+    with bind_device("cuda:1"):
+        with pytest.raises(ValueError, match="unbound static Inductor kernels"):
+            relocate_inductor(bad_entry, torch.device("cuda", 0))
+
+
+def test_custom_inductor_selections_subclass_reads_zlib_portable_artifact_in_freeze(tmp_path, monkeypatch):
+    import zlib
+    from concurrent.futures import Future
+    from torch._inductor.async_compile import CompiledTritonKernels
+    from torch._inductor.codecache import code_hash
+    from torch._inductor.output_code import CompiledFxGraph
+    from torch.utils._ordered_set import OrderedSet
+    from ignition.preparation import aot, compile_pool, inductor_tuning
+    from ignition.preparation.aot import BoundForward, ForwardCache, StorageBackend, _BindingsChecked, _CHECK_BINDINGS
+    from ignition.preparation.device_binding import build_source_template
+    from ignition.preparation.inductor_tuning import _uses_default_portable_freeze
+
+    tuner, _ = restored_reduction(monkeypatch)
+    if not hasattr(CachingAutotuner, "_prune_compile_results_to_launcher"):
+        monkeypatch.setattr(CachingAutotuner, "_prune_compile_results_to_launcher",
+                            lambda self, launcher: None, raising=False)
+    tuner.fn = PicklableJIT()
+    tuner.benchmark_failure_reasons = {}
+    tuner.device_props = DeviceProperties(0)
+    tuner.compile_results[0].compile_meta["device"] = 0
+    tuner.compile_results[0].kernel = StoredKernel(b"cubin-bytes")
+    tuner._make_launchers()
+    for local_hook in ("_precompile_worker", "_ensure_kernel_loaded", "_precompile_config", "_make_launchers"):
+        tuner.__dict__.pop(local_hook, None)
+
+    kernel_source = "device = DeviceProperties(index=0)\nstream0 = get_raw_stream(0)\n"
+    wrapper_source = (
+        "import torch\n"
+        "torch.cuda.set_device(0)\n"
+        "kernel = async_compile.triton('restored_reduction', " + repr(kernel_source) + ")\n"
+    )
+    kernel_key = CompiledTritonKernels.key(kernel_source)
+
+    saved_targets = []
+
+    def make_bound(*, frozen, cache_hit):
+        stored = StoredTuner()
+        stored_result = copy.copy(tuner.compile_results[0])
+        if frozen:
+            stored_result._flare_config_state = copy.deepcopy(vars(stored_result.config))
+        stored.compile_results = [stored_result]
+        stored.inductor_meta = dict(tuner.inductor_meta, dynamic_scale_rblock=False)
+        stored.triton_meta = {"device": 0}
+        stored.device_props = DeviceProperties(0)
+
+        graph = CompiledFxGraph.__new__(CompiledFxGraph)
+        graph.compiled_fn_runner = None
+        graph.source_code = wrapper_source
+        graph.cache_key = code_hash(wrapper_source)
+        graph.device_idxs = OrderedSet((0,))
+        graph._flare_source_template = build_source_template(wrapper_source, 0)
+        graph._triton_bundle = StoredBundle(
+            static_autotuners=[StoredEntry(kernel_key, stored, "restored_reduction")],
+            kernel_artifacts=[],
+        )
+        fake_code = compile("def call(args):\n    return args\n", f"/tmp/{graph.cache_key}.py", "exec")
+        namespace = {"kernel": tuner}
+        exec(fake_code, namespace)
+        graph.current_callable = namespace["call"]
+
+        portable_graph = SimpleNamespace(
+            _triton_bundle=StoredBundle(
+                static_autotuners=[StoredEntry(kernel_key, stored, "restored_reduction")],
+                kernel_artifacts=[],
+            )
+        )
+        entry = SimpleNamespace(compiled_fw=SimpleNamespace(result=portable_graph), compiled_bw=None)
+        raw = pickle.dumps((entry, {}, {}), protocol=pickle.HIGHEST_PROTOCOL)
+        serialized = (
+            aot._RawPortableArtifact(raw)
+            if aot._DEFER_PORTABLE_COMPRESSION.get() and not frozen
+            else zlib.compress(raw, level=1)
+        )
+        backend = StorageBackend.__new__(StorageBackend)
+        backend.artifact = SimpleNamespace(_flare_graph=graph)
+        backend._serialized_artifact = serialized
+        backend._tuning_frozen = frozen
+        backend._cuda_allocation_sizes = (1024,)
+        backend.signature = ()
+        backend.inputs = []
+        backend.invocations = []
+
+        class FakeArtifact:
+            def __init__(self):
+                self._artifacts = SimpleNamespace(compiled_fn=backend)
+
+            def __call__(self, owner):
+                if _CHECK_BINDINGS.get():
+                    raise _BindingsChecked
+                return None
+
+            def save_compiled_function(self, target):
+                saved_targets.append(str(target))
+                Path(target).write_bytes(b"saved-compiled-forward")
+
+        from pathlib import Path
+        return BoundForward(FakeArtifact(), SimpleNamespace(), cache_hit)
+
+    default_selections = inductor_tuning.InductorSelections(torch.device("cuda", 0), source_identity="unit")
+    assert _uses_default_portable_freeze(default_selections) is True
+
+    freeze_checks = []
+
+    class Probe(inductor_tuning.InductorSelections):
+        def freeze(self, bound):
+            super().freeze(bound)
+            payload = bound.backend._serialized_artifact
+            assert type(payload) is bytes
+            entry, _, _ = pickle.loads(zlib.decompress(payload))
+            assert len(entry.compiled_fw.result._triton_bundle.static_autotuners) == 1
+            freeze_checks.append(bound.cache_hit)
+
+    monkeypatch.setattr(inductor_tuning, "InductorSelections", Probe)
+    assert _uses_default_portable_freeze(inductor_tuning.InductorSelections(torch.device("cuda", 0))) is False
+
+    class DummyPool:
+        workers = 1
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def observe_worker_rss(self, *args, **kwargs):
+            return 1
+
+    monkeypatch.setattr(compile_pool, "CompilePool", DummyPool)
+    monkeypatch.setattr(aot, "release_unused", lambda **_: None)
+    monkeypatch.setattr(aot, "_guard_code_cache", lambda _root: aot.nullcontext())
+    monkeypatch.setattr(BoundForward, "prepare_capture", lambda self: 0)
+
+    cache = ForwardCache.__new__(ForwardCache)
+    cache.device = torch.device("cuda", 0)
+    cache.headroom_bytes = 0
+    cache.compile_workers = 1
+    cache.lock_gpu_clocks = False
+    cache.options = {"triton.autotune_at_compile_time": True}
+    cache.root = tmp_path
+
+    artifact_path = tmp_path / "reduce.bin"
+    owner = SimpleNamespace()
+
+    def fake_prepare_cold(forward, *, name, signature, compiler=None, progress=None, deferred=False, before_run=None):
+        done = Future()
+        done.set_result(1 << 20)
+        artifact_path.write_bytes(b"cold-compiled")
+        return BoundForward(None, forward, False, done), artifact_path
+
+    monkeypatch.setattr(cache, "_prepare", fake_prepare_cold)
+    monkeypatch.setattr(cache, "_load", lambda forward, path, **_: make_bound(frozen=False, cache_hit=False))
+    monkeypatch.setattr(Probe, "warm", lambda self, bound, warmup, before_run=None: None)
+
+    cold = cache._prepare_many(
+        {"reduce": owner}, {"reduce": "sig"},
+        progress=None, coordinator=None, materialize=None, warmup=aot.nullcontext, before_run=None,
+    )["reduce"]
+    assert not cold.cache_hit
+    assert freeze_checks == [False]
+
+    warm_bound = make_bound(frozen=True, cache_hit=True)
+    monkeypatch.setattr(
+        cache, "_prepare",
+        lambda forward, *, name, signature, **_: (warm_bound, artifact_path),
+    )
+    restored = cache._prepare_many(
+        {"reduce": owner}, {"reduce": "sig"},
+        progress=None, coordinator=None, materialize=None, warmup=aot.nullcontext, before_run=None,
+    )["reduce"]
+    assert restored.cache_hit
+    assert freeze_checks == [False, True]
+    assert saved_targets == [str(artifact_path)]
+    assert warm_bound.backend._serialized_artifact is None
