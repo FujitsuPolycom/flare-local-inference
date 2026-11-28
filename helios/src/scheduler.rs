@@ -2900,6 +2900,11 @@ impl RequestScheduler {
                     request.terminal_snapshot = Some(snapshot);
                 }
                 request.phase = RequestPhase::Snapshot;
+                // A capture whose resume retires the request starts terminal retirement; mid-request
+                // boundary captures resume generation and must leave the start time at EOS.
+                if matches!(resume, RequestPhase::Snapshot | RequestPhase::Finishing) {
+                    request.accounting.terminal_since_ns.get_or_insert(now_ns);
+                }
             } else if request.phase == RequestPhase::Snapshot {
                 request.phase = RequestPhase::Finishing;
             }

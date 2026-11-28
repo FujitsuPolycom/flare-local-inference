@@ -3393,6 +3393,114 @@ fn terminal_age_starts_at_eos_and_survives_an_already_queued_decode() {
 }
 
 #[test]
+fn retiring_boundary_capture_stamps_terminal_start_and_resuming_capture_leaves_it_unset() {
+    // Only capacity 512 splits into non-terminal Prefill / TerminalPrefill (window = 256).
+    let mut s = engine_with_terminal_prefill(&[512]);
+    // Start with an expensive Snapshot estimate so chunk 0 skips the optional message cut at 768
+    // and selects non-terminal Prefill(512), setting deferred_prefill.
+    set_cost(&mut s, GraphKind::Snapshot, 1, 1, 10 * MS);
+
+    let handle = s
+        .admit(RequestSpec {
+            prompt: vec![1; 1024],
+            message_boundaries: vec![768, 1024],
+            conditioning: vec![],
+            max_new_tokens: 1,
+            grammar_constrained: false,
+            host_stops: false,
+            prompt_logprobs: false,
+            growable_output: false,
+        })
+        .unwrap();
+    initialize(&mut s, handle);
+
+    let first = s.plan().unwrap();
+    assert_eq!(
+        (first.kind, first.token_capacity, first.lanes[0].tokens),
+        (GraphKind::Prefill, 512, 512)
+    );
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&first, fence).unwrap();
+    complete(&mut s, &first, fence, 0, false);
+    assert!(s.request(handle).unwrap().deferred_prefill);
+
+    // Once Snapshot timing drops within the checkpoint budget, chunk 1 cuts at message boundary
+    // 768 (256 tokens, outside the terminal catalog), so both remaining chunks run regular
+    // Prefill(256) with deferred_prefill still set.
+    set_cost(&mut s, GraphKind::Snapshot, 1, 1, MS / 10);
+
+    let second = s.plan().unwrap();
+    assert_eq!(
+        (second.kind, second.token_capacity, second.lanes[0].tokens),
+        (GraphKind::Prefill, 256, 256)
+    );
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&second, fence).unwrap();
+    complete(&mut s, &second, fence, 0, false);
+    // Mid-request message boundary capture resumes Prefill and must not stamp terminal_since_ns.
+    let request = s.request(handle).unwrap();
+    assert_eq!(request.phase, RequestPhase::Snapshot);
+    assert_eq!(request.boundary_capture.unwrap().resume, RequestPhase::Prefill);
+    assert_eq!(request.accounting.terminal_since_ns, None);
+
+    let msg_snap = s.plan().unwrap();
+    assert_eq!(msg_snap.kind, GraphKind::Snapshot);
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&msg_snap, fence).unwrap();
+    complete(&mut s, &msg_snap, fence, 0, false);
+    assert!(s.request(handle).unwrap().deferred_prefill);
+
+    // Final prefill finishes max_new_tokens=1 while deferred_prefill is still set, so phase
+    // derivation yields Finishing while the armed prompt capture transitions into Snapshot.
+    let third = s.plan().unwrap();
+    assert_eq!(
+        (third.kind, third.token_capacity, third.lanes[0].tokens),
+        (GraphKind::Prefill, 256, 256)
+    );
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&third, fence).unwrap();
+    s.advance_to(s.now_ns + 5 * MS).unwrap();
+    complete(&mut s, &third, fence, 0, false);
+
+    let since = s.now_ns;
+    let request = s.request(handle).unwrap();
+    assert_eq!(request.phase, RequestPhase::Snapshot);
+    assert_eq!(
+        request.boundary_capture.unwrap().resume,
+        RequestPhase::Finishing
+    );
+
+    s.advance_to(since + 5 * MS).unwrap();
+    assert_eq!(s.lane_values(0).0[handle.slot as usize].age_ms, 5.0);
+    assert_eq!(
+        s.request(handle).unwrap().accounting.terminal_since_ns,
+        Some(since)
+    );
+    let snap = s.plan().unwrap();
+    assert_eq!(snap.kind, GraphKind::Snapshot);
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&snap, fence).unwrap();
+    let records = completion_records(&s, &snap, fence, 0);
+    s.complete(fence, &records, Default::default()).unwrap();
+    assert_eq!(s.request(handle).unwrap().phase, RequestPhase::Finishing);
+    assert!(s.finish(handle).unwrap().is_some());
+
+    // A prompt boundary capture that resumes Decode must also leave terminal_since_ns unset.
+    let continuing = add(&mut s, 2, 256, 8);
+    initialize(&mut s, continuing);
+    let prefill = s.plan().unwrap();
+    assert_eq!(prefill.kind, GraphKind::Prefill);
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&prefill, fence).unwrap();
+    complete(&mut s, &prefill, fence, 0, false);
+    let request = s.request(continuing).unwrap();
+    assert_eq!(request.phase, RequestPhase::Snapshot);
+    assert_eq!(request.boundary_capture.unwrap().resume, RequestPhase::Decode);
+    assert_eq!(request.accounting.terminal_since_ns, None);
+    assert_eq!(s.plan().unwrap().kind, GraphKind::Snapshot);
+}
+
+#[test]
 fn terminal_cohort_matches_exhaustive_common_utility_scoring() {
     let mut s = engine(4, false);
     s.configure_policy(PolicyConfig::throughput()).unwrap();
