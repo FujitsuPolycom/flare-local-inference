@@ -84,6 +84,8 @@ def _snapshot_cached(snapshot: Path) -> bool:
         index_path = snapshot / "model.safetensors.index.json"
         if not index_path.exists() and (snapshot / "model.safetensors").is_file():
             return (snapshot / "model.safetensors").stat().st_size > 0
+        if not index_path.exists() and any(p.is_file() and p.stat().st_size > 0 for p in snapshot.glob("*.gguf")):
+            return True
         index = json.loads(index_path.read_text())
         return all((snapshot / shard).is_file() for shard in set(index["weight_map"].values()))
     except (OSError, ValueError, KeyError, AttributeError, TypeError):

@@ -14,16 +14,19 @@ use crate::{
 
 use super::{ExecutionManifest, GraphKind, DEFAULT_COMPLETION_TOKEN_CAPACITY, REQUEST_LANES, COMPLETION_METADATA_FIELDS, ReadinessIntervals};
 
-/// Frame-completion wake for threads that would otherwise poll a running frame in a
-/// `sched_yield` loop. On Linux aarch64 cores with FEAT_WFxT (HWCAP2_WFXT, e.g. the Cortex-X925/A725
-/// cores of GB10), the copy stream writes each frame's fence to a mapped host word right after
-/// the frame's `transferred` event, and [`GraphExecutor::park`] waits in WFET with the exclusive
-/// monitor armed on that word. The event query in [`GraphExecutor::poll`] stays the only
-/// completion signal; the word can only end a park early, best effort (it relies on the GPU's
-/// write to the coherent mapped word clearing the monitor). `PARK_LIMIT_US` is the longest
-/// intentional wait per park; scheduling can add to it.
+/// Frame-completion wake for integrated GPUs whose CPU and GPU share a SoC power budget.
+/// Discrete GPUs keep the lowest-latency spin-yield loop without parking. On Linux integrated
+/// aarch64 SoCs with FEAT_WFxT (HWCAP2_WFXT, e.g. GB10), the copy stream writes each frame's
+/// fence to a mapped host word right after the frame's `transferred` event, and
+/// [`GraphExecutor::park`] waits in WFET with the exclusive monitor armed on that word. On Linux
+/// integrated SoCs without FEAT_WFxT (e.g. Jetson Orin), [`GraphExecutor::park`] uses per-graph
+/// GPU execution duration to sleep in bounded OS `nanosleep` intervals during the body of a frame
+/// (so Linux `schedutil` can lower CPU frequency instead of starving the GPU on shared power),
+/// switching to a low-latency landing wait right before predicted completion (hardware WFE on
+/// aarch64 `EVTSTRM` SoCs, or spin-yield otherwise). The event query in [`GraphExecutor::poll`]
+/// stays the only completion signal; the wake word can only end a wait early, best effort.
+#[cfg_attr(not(all(target_arch = "aarch64", target_os = "linux")), allow(dead_code))]
 struct CompletionWake {
-    #[cfg_attr(not(all(target_arch = "aarch64", target_os = "linux")), allow(dead_code))]
     word: PinnedHost,
     device: usize,
 }
@@ -32,12 +35,19 @@ struct CompletionWake {
 mod host_wait {
     use std::sync::OnceLock;
 
+    const HWCAP_EVTSTRM: libc::c_ulong = 1 << 11;
     const HWCAP2_WFXT: libc::c_ulong = 1 << 31;
 
-    pub(super) fn available() -> bool {
+    pub(super) fn wfxt_available() -> bool {
         static AVAILABLE: OnceLock<bool> = OnceLock::new();
         // SAFETY: getauxval reads the process auxiliary vector and has no preconditions.
         *AVAILABLE.get_or_init(|| unsafe { libc::getauxval(libc::AT_HWCAP2) } & HWCAP2_WFXT != 0)
+    }
+
+    pub(super) fn evtstrm_available() -> bool {
+        static AVAILABLE: OnceLock<bool> = OnceLock::new();
+        // SAFETY: getauxval reads the process auxiliary vector and has no preconditions.
+        *AVAILABLE.get_or_init(|| unsafe { libc::getauxval(libc::AT_HWCAP) } & HWCAP_EVTSTRM != 0)
     }
 
     pub(super) fn ticks() -> u64 {
@@ -59,7 +69,7 @@ mod host_wait {
     ///
     /// # Safety
     /// `word` must point to a live, 4-byte aligned u32 in coherent memory, and WFxT must be available.
-    pub(super) unsafe fn wait_change(word: *const u32, old: u32, deadline: u64) {
+    pub(super) unsafe fn wait_change_wfet(word: *const u32, old: u32, deadline: u64) {
         unsafe {
             std::arch::asm!(
                 "sevl",
@@ -77,13 +87,128 @@ mod host_wait {
             );
         }
     }
+
+    /// Park until `word` may differ from `old` or the architectural event stream wakes the core.
+    ///
+    /// # Safety
+    /// `word` must point to a live, 4-byte aligned u32 in coherent memory, and EVTSTRM must be
+    /// available so WFE wakes periodically even if a store does not clear the local monitor.
+    pub(super) unsafe fn wait_change_wfe(word: *const u32, old: u32) {
+        unsafe {
+            std::arch::asm!(
+                "sevl",
+                "wfe",
+                "ldxr {tmp:w}, [{word}]",
+                "eor {tmp:w}, {tmp:w}, {old:w}",
+                "cbnz {tmp:w}, 2f",
+                "wfe",
+                "2:",
+                word = in(reg) word,
+                old = in(reg) old,
+                tmp = out(reg) _,
+                options(nostack),
+            );
+        }
+    }
 }
 
-/// Longest intentional wait per park. The GPU's wake-word write may end it early; anything that
-/// cannot touch the word (a peer's socket message, a new request, a deadline check) waits for the
-/// deadline, GB10's ~100-130 us WFE event stream, or a spurious wake, whichever comes first.
+/// Longest intentional wait per park in WFET on FEAT_WFxT cores (DGX Spark / GB10).
+/// Anything that cannot touch the wake word (a peer's socket message, a new request, a deadline
+/// check) waits for this deadline, GB10's ~100-130 us WFE event stream, or a spurious wake.
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-const PARK_LIMIT_US: u64 = 100;
+const WFET_PARK_LIMIT_US: u64 = 100;
+
+/// Minimum sleep duration worth issuing a Linux `nanosleep` syscall given 50 us default timer slack.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const PARK_MIN_SLEEP_US: u64 = 100;
+/// Wake this many microseconds before predicted GPU completion to enter the landing wait.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const PARK_LANDING_US: u64 = 600;
+/// Upper bound per OS sleep so incoming requests, cancellations, and peer messages stay responsive
+/// and sudden frame-time drops are observed promptly in [`GraphExecutor::poll`].
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const PARK_MAX_SLEEP_US: u64 = 500;
+/// Return to bounded OS sleep if a frame runs this many microseconds past its predicted duration.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const PARK_OVERSHOOT_CAP_US: u64 = 1_000;
+/// Bounded OS sleep step for unmeasured graphs and frames that run past the landing window.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const PARK_FALLBACK_SLEEP_US: u64 = 250;
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParkAction {
+    /// Put the thread to sleep in `TASK_INTERRUPTIBLE` so Linux `schedutil` can lower CPU clocks.
+    Sleep(std::time::Duration),
+    /// Enter the low-latency completion landing wait (WFE on aarch64 EVTSTRM, spin-yield otherwise).
+    Land,
+}
+
+/// Update a graph's conservative GPU duration estimate in nanoseconds.
+/// Adapts faster downward (1/2) than upward (1/4) so predictive sleeps wake before GPU completion
+/// even when frame time drops on shorter chunks or smaller contexts.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn update_duration_estimate(estimate_ns: u64, observed_ns: u64) -> u64 {
+    if observed_ns == 0 {
+        return estimate_ns;
+    }
+    if estimate_ns == 0 {
+        return observed_ns;
+    }
+    if observed_ns < estimate_ns {
+        estimate_ns - (estimate_ns - observed_ns) / 2
+    } else {
+        estimate_ns + (observed_ns - estimate_ns) / 4
+    }
+}
+
+/// Choose between a bounded OS sleep and the low-latency landing wait on an integrated SoC.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn decide_park(elapsed_us: u64, expected_us: u64) -> ParkAction {
+    if expected_us == 0 {
+        return ParkAction::Sleep(std::time::Duration::from_micros(PARK_FALLBACK_SLEEP_US));
+    }
+    if let Some(until_landing) = expected_us
+        .saturating_sub(PARK_LANDING_US)
+        .checked_sub(elapsed_us)
+    {
+        if until_landing >= PARK_MIN_SLEEP_US {
+            return ParkAction::Sleep(std::time::Duration::from_micros(
+                until_landing.min(PARK_MAX_SLEEP_US),
+            ));
+        }
+    }
+    if elapsed_us > expected_us.saturating_add(PARK_OVERSHOOT_CAP_US) {
+        return ParkAction::Sleep(std::time::Duration::from_micros(PARK_FALLBACK_SLEEP_US));
+    }
+    ParkAction::Land
+}
+
+enum ParkMode {
+    /// Discrete GPUs and non-Linux hosts keep zero-overhead spin-yield polling.
+    Spin,
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    Wfet(CompletionWake),
+    #[cfg(target_os = "linux")]
+    Predictive {
+        #[cfg(target_arch = "aarch64")]
+        wfe_wake: Option<CompletionWake>,
+    },
+}
+
+impl ParkMode {
+    fn wake(&self) -> Option<&CompletionWake> {
+        match self {
+            Self::Spin => None,
+            #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+            Self::Wfet(wake) => Some(wake),
+            #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+            Self::Predictive { wfe_wake } => wfe_wake.as_ref(),
+            #[cfg(all(not(target_arch = "aarch64"), target_os = "linux"))]
+            Self::Predictive {} => None,
+        }
+    }
+}
 
 pub struct Upload<'a> {
     pub buffer: &'a str,
@@ -448,7 +573,7 @@ struct Resources {
     frames: [Frame; 2],
     engram: Option<crate::engram::Transfers>,
     input_copies: InputCopyBatches,
-    wake: Option<CompletionWake>,
+    park_mode: ParkMode,
 }
 
 /// Thread-bound executor over one borrowed prepared model and its CUDA context.
@@ -461,6 +586,10 @@ pub struct GraphExecutor {
     startup_ready: bool,
     next_sequence: u64,
     completed: Fence,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    graph_duration_ns: Vec<u64>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    last_completion_at: Option<Instant>,
     poison: Option<Error>,
     shutdown: Option<Shutdown>,
     _thread_bound: PhantomData<Rc<()>>,
@@ -538,18 +667,46 @@ impl GraphExecutor {
             })
         };
         let frames = [frame()?, frame()?];
-        #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-        let wake = if host_wait::available() {
-            let word = copy.mapped_host_buffer(64)?;
-            let device = copy.mapped_address(&word)?;
-            static ANNOUNCED: std::sync::Once = std::sync::Once::new();
-            ANNOUNCED.call_once(|| eprintln!("[flare] frame completion wait: WFET"));
-            Some(CompletionWake { word, device })
+        let graph_count = manifest.graphs.len();
+        #[cfg(target_os = "linux")]
+        let park_mode = if model.is_integrated(manifest.device)? {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if host_wait::wfxt_available() {
+                    let word = copy.mapped_host_buffer(64)?;
+                    let device = copy.mapped_address(&word)?;
+                    ParkMode::Wfet(CompletionWake { word, device })
+                } else {
+                    let wfe_wake = if host_wait::evtstrm_available() {
+                        let word = copy.mapped_host_buffer(64)?;
+                        let device = copy.mapped_address(&word)?;
+                        Some(CompletionWake { word, device })
+                    } else {
+                        None
+                    };
+                    ParkMode::Predictive { wfe_wake }
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                ParkMode::Predictive {}
+            }
         } else {
-            None
+            ParkMode::Spin
         };
-        #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
-        let wake = None;
+        #[cfg(not(target_os = "linux"))]
+        let park_mode = ParkMode::Spin;
+        #[cfg(target_os = "linux")]
+        let graph_duration_ns = if matches!(park_mode, ParkMode::Predictive { .. }) {
+            vec![0; graph_count]
+        } else {
+            Vec::new()
+        };
+        #[cfg(not(target_os = "linux"))]
+        let graph_duration_ns = {
+            let _ = graph_count;
+            Vec::new()
+        };
         let engram = manifest
             .engram
             .clone()
@@ -564,13 +721,15 @@ impl GraphExecutor {
                 frames,
                 engram,
                 input_copies: InputCopyBatches::new(upload_capacity.saturating_add(2)),
-                wake,
+                park_mode,
             }),
             resolved_uploads: Vec::with_capacity(upload_capacity),
             startup_next: 0,
             startup_ready: false,
             next_sequence: 1,
             completed: Fence(0),
+            graph_duration_ns,
+            last_completion_at: None,
             poison: None,
             shutdown: None,
             _thread_bound: PhantomData,
@@ -700,37 +859,90 @@ impl GraphExecutor {
             && (!grammar_constrained
                 || resources.frames.iter().all(|frame| frame.pending.is_none()))
     }
-    /// Wait briefly for the oldest pending frame instead of yielding the CPU. Returns false,
-    /// without waiting, when no frame is pending, the wake word already reached the frame, or
-    /// this CPU has no WFxT; the caller then keeps its own polling step.
+    /// On integrated Linux SoCs, wait briefly for the oldest pending frame so the CPU does not
+    /// burn shared SoC power in a `sched_yield` spin loop. Discrete GPUs and non-Linux hosts
+    /// return `false` immediately to preserve minimum-latency spin-yield polling.
     pub fn park(&self) -> bool {
-        #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+        #[cfg(target_os = "linux")]
         {
             let Some(resources) = self.resources.as_ref() else { return false };
-            let Some(wake) = resources.wake.as_ref() else { return false };
-            let Some(target) = resources
+            if matches!(resources.park_mode, ParkMode::Spin) {
+                return false;
+            }
+            let Some(pending) = resources
                 .frames
                 .iter()
                 .filter_map(|frame| frame.pending.as_ref())
-                .map(|pending| pending.fence.0)
-                .min()
+                .min_by_key(|pending| pending.fence)
             else {
                 return false;
             };
-            let word = wake.word.address() as *const u32;
-            // SAFETY: The mapped word is live, aligned and written only by the copy stream.
-            let seen = unsafe { std::sync::atomic::AtomicU32::from_ptr(word as *mut u32) }
-                .load(std::sync::atomic::Ordering::Acquire);
-            if (seen.wrapping_sub(target as u32) as i32) >= 0 {
-                return false;
+            match &resources.park_mode {
+                ParkMode::Spin => false,
+                #[cfg(target_arch = "aarch64")]
+                ParkMode::Wfet(wake) => {
+                    let word = wake.word.address() as *const u32;
+                    // SAFETY: The mapped word is live, aligned and written only by the copy stream.
+                    let seen = unsafe { std::sync::atomic::AtomicU32::from_ptr(word as *mut u32) }
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    if (seen.wrapping_sub(pending.fence.0 as u32) as i32) >= 0 {
+                        return false;
+                    }
+                    let deadline = host_wait::ticks()
+                        + host_wait::frequency() * WFET_PARK_LIMIT_US / 1_000_000;
+                    // SAFETY: `Wfet` is constructed only when HWCAP2_WFXT is available.
+                    unsafe { host_wait::wait_change_wfet(word, seen, deadline) };
+                    true
+                }
+                ParkMode::Predictive {
+                    #[cfg(target_arch = "aarch64")]
+                    wfe_wake,
+                } => {
+                    // For a frame pipelined behind an earlier frame, GPU execution begins once
+                    // the earlier frame finishes rather than when this frame was queued.
+                    let gpu_start = match self.last_completion_at {
+                        Some(completed) if completed > pending.dispatched => completed,
+                        _ => pending.dispatched,
+                    };
+                    let elapsed_us = gpu_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
+                    let expected_us = self
+                        .graph_duration_ns
+                        .get(pending.graph_index)
+                        .copied()
+                        .unwrap_or(0)
+                        / 1_000;
+                    match decide_park(elapsed_us, expected_us) {
+                        ParkAction::Sleep(duration) => {
+                            std::thread::sleep(duration);
+                            true
+                        }
+                        ParkAction::Land => {
+                            #[cfg(target_arch = "aarch64")]
+                            if let Some(wake) = wfe_wake.as_ref() {
+                                let word = wake.word.address() as *const u32;
+                                // SAFETY: The mapped word is live, aligned and written only by the copy stream.
+                                let seen = unsafe {
+                                    std::sync::atomic::AtomicU32::from_ptr(word as *mut u32)
+                                }
+                                .load(std::sync::atomic::Ordering::Acquire);
+                                if (seen.wrapping_sub(pending.fence.0 as u32) as i32) >= 0 {
+                                    return false;
+                                }
+                                // SAFETY: `wfe_wake` is constructed only when HWCAP_EVTSTRM is available.
+                                unsafe { host_wait::wait_change_wfe(word, seen) };
+                                return true;
+                            }
+                            false
+                        }
+                    }
+                }
             }
-            let deadline = host_wait::ticks() + host_wait::frequency() * PARK_LIMIT_US / 1_000_000;
-            // SAFETY: As above; `available` gated the creation of `wake`.
-            unsafe { host_wait::wait_change(word, seen, deadline) };
-            true
         }
-        #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
-        false
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = &self.resources;
+            false
+        }
     }
 
     pub fn outstanding(&self) -> usize {
@@ -935,7 +1147,7 @@ impl GraphExecutor {
                 }
             }
             resources.copy.record(&frame.transferred)?;
-            if let Some(wake) = &resources.wake {
+            if let Some(wake) = resources.park_mode.wake() {
                 // SAFETY: Resources retain the mapped word until close drains both streams.
                 unsafe { resources.copy.write_value(wake.device, fence.0 as u32) }?;
             }
@@ -1046,6 +1258,11 @@ impl GraphExecutor {
                 return Err(error);
             }
         };
+        #[cfg(target_os = "linux")]
+        if let Some(slot) = self.graph_duration_ns.get_mut(pending.graph_index) {
+            self.last_completion_at = Some(Instant::now());
+            *slot = update_duration_estimate(*slot, elapsed_ns);
+        }
         let readiness = if crate::engram::consumes(self.manifest.graphs[pending.graph_index].kind) {
             frame.readiness.as_ref().map(|readback| {
                 // SAFETY: The frame's transfer event completed before decoding its retained readback.
@@ -1792,5 +2009,43 @@ mod confidence_tests {
                 .check("cuCtxDestroy_v2", (driver.context_destroy)(context))
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn duration_estimate_adapts_faster_downward_than_upward() {
+        assert_eq!(update_duration_estimate(0, 0), 0);
+        assert_eq!(update_duration_estimate(0, 10_000), 10_000);
+        assert_eq!(update_duration_estimate(10_000, 0), 10_000);
+        // Shorter observation moves halfway down immediately.
+        assert_eq!(update_duration_estimate(10_000, 6_000), 8_000);
+        // Longer observation moves one quarter upward.
+        assert_eq!(update_duration_estimate(10_000, 14_000), 11_000);
+    }
+
+    #[test]
+    fn predictive_park_cruises_lands_and_bounds_overshoot_on_integrated_socs() {
+        // Unmeasured integrated SoC frame sleeps in bounded steps rather than burning shared power.
+        assert_eq!(
+            decide_park(0, 0),
+            ParkAction::Sleep(std::time::Duration::from_micros(PARK_FALLBACK_SLEEP_US))
+        );
+        // Sub-landing frame enters the low-latency landing wait immediately.
+        assert_eq!(decide_park(0, 500), ParkAction::Land);
+        // 120 ms frame sleeps in 500 us chunks until 600 us before predicted completion, then lands.
+        assert_eq!(
+            decide_park(0, 120_000),
+            ParkAction::Sleep(std::time::Duration::from_micros(PARK_MAX_SLEEP_US))
+        );
+        assert_eq!(
+            decide_park(119_250, 120_000),
+            ParkAction::Sleep(std::time::Duration::from_micros(150))
+        );
+        assert_eq!(decide_park(119_350, 120_000), ParkAction::Land);
+        assert_eq!(decide_park(120_500, 120_000), ParkAction::Land);
+        // Overshoot past expected + PARK_OVERSHOOT_CAP_US falls back to bounded sleep.
+        assert_eq!(
+            decide_park(121_001, 120_000),
+            ParkAction::Sleep(std::time::Duration::from_micros(PARK_FALLBACK_SLEEP_US))
+        );
     }
 }

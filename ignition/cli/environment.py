@@ -40,7 +40,9 @@ def apply(configuration, gpus, b12x=()) -> None:
     os.environ.update({
         # Preserve explicitly selected dependency roots in Inductor subprocesses.
         "TORCH_CUSTOM_PYTHONPATH": os.pathsep.join(sys.path),
-        "CUDA_VISIBLE_DEVICES": ",".join(gpu.uuid for gpu in gpus),
+        "CUDA_VISIBLE_DEVICES": ",".join(
+            gpu.uuid if gpu.uuid.startswith("GPU-") else str(gpu.index) for gpu in gpus
+        ),
         "HF_HUB_CACHE": str(configuration.directory("hub_cache")),
         "B12X_COMPILE_CACHE_DIR": str(kernel_cache / "b12x"),
         "FLASHINFER_WORKSPACE_BASE": str(flashinfer_workspace(kernel_cache)),
@@ -50,6 +52,8 @@ def apply(configuration, gpus, b12x=()) -> None:
     })
     # cuTile discovers its compiler bundle independently of the native toolkit.
     cuda = configuration.directory("cuda")
+    if cuda is None and os.name != "nt" and Path("/usr/local/cuda").is_dir():
+        cuda = Path("/usr/local/cuda")
     if cuda is not None:
         os.environ["CUDA_HOME"] = str(cuda)
         if os.name == "nt":
@@ -58,4 +62,13 @@ def apply(configuration, gpus, b12x=()) -> None:
             for path in (cuda / "bin", cuda / "bin/x64", cuda / "lib/x64"):
                 if path.is_dir():
                     _DLL_DIRECTORIES.append(os.add_dll_directory(str(path)))
+        else:
+            ptxas = cuda / "bin/ptxas"
+            if ptxas.is_file() and "TRITON_PTXAS_PATH" not in os.environ:
+                os.environ["TRITON_PTXAS_PATH"] = str(ptxas)
+            include = cuda / "include"
+            if include.is_dir():
+                cpath = os.environ.get("CPATH", "")
+                if str(include) not in cpath.split(os.pathsep):
+                    os.environ["CPATH"] = f"{include}{os.pathsep}{cpath}" if cpath else str(include)
     runtime_patches.apply()

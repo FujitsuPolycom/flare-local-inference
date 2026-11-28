@@ -2114,6 +2114,14 @@ fn current_platform(cuda: &Cuda) -> ExportResult<Option<String>> {
         }
         Ok(value as c_uint)
     };
+    let integrated = attribute("cuDeviceGetAttribute", 18, b"cuDeviceGetAttribute\0")?;
+    if integrated != 0 {
+        let major = attribute("cuDeviceGetAttribute", 75, b"cuDeviceGetAttribute\0")?;
+        let minor = attribute("cuDeviceGetAttribute", 76, b"cuDeviceGetAttribute\0")?;
+        if let Some(platform) = helios_core::core::naming::platform_from_capability(major, minor) {
+            return Ok(Some(platform.to_string()));
+        }
+    }
     // 33/34/50 are the PCI bus, slot, and domain of the device location; the
     // NVML product id comes from that device's PCI information, never from
     // these attributes.

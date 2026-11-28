@@ -318,15 +318,20 @@ extern "C" fn flare_core_initialize_window(
         let host_base = window_host_base(base, extent, world)?;
         let extent_bytes = extent as usize;
         let driver = Driver::load()?;
-        let (mut address, mut granularity, mut gpudirect) = (0, 0, 0);
+        let (mut address, mut granularity, mut gpudirect, mut integrated) = (0, 0, 0, 0);
         unsafe {
+            driver.check(
+                "cuDeviceGetAttribute(INTEGRATED)",
+                (driver.device_attribute)(&mut integrated, 18, device),
+            )?;
             driver.check(
                 "cuDeviceGetAttribute(GPU_DIRECT_RDMA_SUPPORTED)",
                 (driver.device_attribute)(&mut gpudirect, 116, device),
             )?;
+            let gpudirect_rdma = gpudirect != 0 && integrated == 0;
             driver.check(
                 "cuMemGetAllocationGranularity",
-                (driver.granularity)(&mut granularity, &properties(device, gpudirect != 0), 0),
+                (driver.granularity)(&mut granularity, &properties(device, gpudirect_rdma), 0),
             )?;
             let granule = granularity as u64;
             let two_granules = granule
@@ -371,7 +376,7 @@ extern "C" fn flare_core_initialize_window(
             driver,
             device,
             granularity,
-            gpudirect: gpudirect != 0,
+            gpudirect: gpudirect != 0 && integrated == 0,
             host_base: host_base + u64::from(rank) * EXTENT as u64,
             free: vec![(base + u64::from(rank) * extent, extent_bytes / 2)],
             mappings: BTreeMap::new(),

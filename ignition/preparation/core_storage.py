@@ -63,7 +63,12 @@ class CoreStorage:
             self.DEVICE_BASE, self.RESERVATION_BYTES = base, extent
         properties = torch.cuda.get_device_properties(device)
         self.integrated = properties.is_integrated
-        self._persistent_total_bytes = properties.total_memory
+        if device_window is None and self.integrated and (properties.major, properties.minor) == (8, 7):
+            # Jetson Orin (GA10B) exposes a 128 GiB CUDA VMM address window (below 0x20_0000_0000).
+            self.EXTERNAL_FLOOR = 0x300000000
+            self.DEVICE_BASE = 0x1200000000
+            self.RESERVATION_BYTES = 48 << 30
+        self._persistent_total_bytes = min(properties.total_memory, self.RESERVATION_BYTES // 4)
         self._retention_scope = False
         self._retention_pool = None
         window = (self.DEVICE_BASE, self.RESERVATION_BYTES)
@@ -93,7 +98,7 @@ class CoreStorage:
         self.granularity = layout["granularity"]
         gpudirect = C.c_int()
         self.cuda.call("cuDeviceGetAttribute", C.byref(gpudirect), C.c_int(116), C.c_int(device))
-        self.gpudirect = bool(gpudirect.value)
+        self.gpudirect = bool(gpudirect.value) and not self.integrated
         self.HOST_BASE = layout["host_base"]
         self._host_cursor = self.HOST_BASE
         self.low_reservations = []

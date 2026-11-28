@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Platforms a core may be named for. These are the NVIDIA device
 /// identifiers Flare already uses for revisions, not SM architecture names.
-pub const PLATFORMS: [&str; 4] = ["ga102", "gb10", "gb202", "gb300"];
+pub const PLATFORMS: [&str; 5] = ["ga102", "ga10b", "gb10", "gb202", "gb300"];
 
 /// Platform for one NVIDIA PCI id in NVML's `device<<16 | vendor` layout.
 ///
@@ -47,6 +47,16 @@ pub fn platform_from_pci(pci_id: u32) -> Option<&'static str> {
         return Some("ga102");
     }
     GB202_DEVICES.contains(&device).then_some("gb202")
+}
+
+/// Platform for integrated Tegra GPUs that have no PCI device ID in NVML.
+///
+/// Compute capability 8.7 uniquely identifies the NVIDIA Orin (GA10B) GPU.
+pub fn platform_from_capability(major: u32, minor: u32) -> Option<&'static str> {
+    match (major, minor) {
+        (8, 7) => Some("ga10b"),
+        _ => None,
+    }
 }
 
 /// UTC `YYYYMMDDHHMM` for one instant, without external crates.
@@ -209,6 +219,9 @@ mod tests {
         assert_eq!(platform_from_pci(0x2e06_1af4), None);
         assert_eq!(platform_from_pci(0x2e07_10de), None);
         assert_eq!(platform_from_pci(0x1e02_10de), None);
+        assert_eq!(platform_from_capability(8, 7), Some("ga10b"));
+        assert_eq!(platform_from_capability(12, 1), None);
+        assert_eq!(platform_from_capability(8, 6), None);
     }
 
     #[test]

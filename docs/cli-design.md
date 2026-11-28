@@ -848,27 +848,27 @@ under the shared policy in every mode.
 
 `--memory-limit 30g` budgets at most 30 GiB for Flare on each selected GPU,
 including loaded weights, graph and kernel setup, scratch, execution state,
-caches, and runtime headroom. `--memory-limit -30g` leaves at least 30 GiB free
-at startup, in addition to mandatory engine headroom. `--memory-limit 0.8`
-uses 80% of CUDA-visible total memory as Flare's occupied budget; it is not
-80% of the memory currently free. Other processes still constrain the actual
-available supply. Lowercase and uppercase size suffixes use binary units,
-including `G`, `GB`, and `GiB`; occupied and reserve sizes require a suffix.
-Bare numbers must be greater than zero and at most one. Zero, negative
-fractions, nonfinite values, and overflowing sizes are rejected. Both
+and caches. `--memory-limit -30g` leaves 30 GiB free at startup.
+`--memory-limit 0.8` uses 80% of CUDA-visible total memory as Flare's occupied
+budget; it is not 80% of the memory currently free. Other processes still
+constrain the actual available supply. Lowercase and uppercase size suffixes
+use binary units, including `G`, `GB`, and `GiB`; occupied and reserve sizes
+require a suffix. Bare numbers must be greater than zero and at most one. Zero,
+negative fractions, nonfinite values, and overflowing sizes are rejected. Both
 `--memory-limit -30g` and `--memory-limit=-30g` work.
 
-An explicit memory flag replaces the core's serving reserve; the two are
-never subtracted together. Without a flag, an explicitly configured `[memory] reserve`
-replaces the exported reserve; an absent setting preserves the core value.
-Integrated GPUs also count resident host tables, embedding row caches, and
-prefix-cache host pools in the same physical budget. Shared host memory
-is charged once per host. The driver margin, host allowance, and
-system headroom apply under every limit. An occupied cap smaller than known fixed
-resources fails before loading those resources. The loader reconciles observed
-startup consumption after graph upload and before allocating cache backing.
-Discrete occupied/fraction limits use NVIDIA NVML to observe memory before
-CUDA context creation; Linux integrated devices use `MemAvailable` instead.
+An explicit memory flag or configured `[memory] reserve` replaces the default
+serving reserve, driver margin, and integrated-GPU host and system reserves; no
+additional hidden reserve is subtracted on top of an explicit limit. Without an
+explicit limit, the core's serving reserve, driver margin, and (on integrated
+GPUs) host allowance and system headroom apply. Integrated GPUs also count
+resident host tables, embedding row caches, and prefix-cache host pools in the
+same physical budget. Shared host memory is charged once per host. An occupied
+cap smaller than known fixed resources fails before loading those resources.
+The loader reconciles observed startup consumption after graph upload and before
+allocating cache backing. Discrete occupied/fraction limits use NVIDIA NVML to
+observe memory before CUDA context creation; Linux integrated devices use
+`MemAvailable` instead.
 
 These are startup sizing budgets, not OS-enforced quotas. Pools stay fixed
 during serving; Flare does not resize them as other processes allocate memory.

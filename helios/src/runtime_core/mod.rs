@@ -1028,17 +1028,92 @@ impl NativeResources {
                                 width: *width,
                                 height: *height,
                             };
-                            driver.check(
-                                "cuGraphAddMemsetNode",
-                                (driver.graph_memset)(
-                                    &mut result,
-                                    handle,
-                                    null(),
-                                    0,
-                                    &params,
-                                    graph_context,
-                                ),
-                            )?;
+                            let status = (driver.graph_memset)(
+                                &mut result,
+                                handle,
+                                null(),
+                                0,
+                                &params,
+                                graph_context,
+                            );
+                            if status == 1 {
+                                // Tegra CUDA 12.6 rejects VMM addresses in cuGraphAddMemsetNode
+                                // directly, but accepts the same memset captured as a child graph.
+                                let mut stream = null_mut();
+                                driver.check("cuStreamCreate", (driver.stream_create)(&mut stream, 1))?;
+                                let mut child = null_mut();
+                                let captured = (|| -> Result<()> {
+                                    driver.check(
+                                        "cuStreamBeginCapture_v2",
+                                        (driver.stream_begin_capture)(stream, 2),
+                                    )?;
+                                    let memset_status = if params.height <= 1 {
+                                        match params.element_size {
+                                            1 => (driver.memset_d8_async)(
+                                                params.destination,
+                                                params.value as u8,
+                                                params.width,
+                                                stream,
+                                            ),
+                                            2 => (driver.memset_d16_async)(
+                                                params.destination,
+                                                params.value as u16,
+                                                params.width,
+                                                stream,
+                                            ),
+                                            4 => (driver.memset_d32_async)(
+                                                params.destination,
+                                                params.value,
+                                                params.width,
+                                                stream,
+                                            ),
+                                            _ => 1,
+                                        }
+                                    } else {
+                                        match params.element_size {
+                                            1 => (driver.memset_d2d8_async)(
+                                                params.destination,
+                                                params.pitch,
+                                                params.value as u8,
+                                                params.width,
+                                                params.height,
+                                                stream,
+                                            ),
+                                            2 => (driver.memset_d2d16_async)(
+                                                params.destination,
+                                                params.pitch,
+                                                params.value as u16,
+                                                params.width,
+                                                params.height,
+                                                stream,
+                                            ),
+                                            4 => (driver.memset_d2d32_async)(
+                                                params.destination,
+                                                params.pitch,
+                                                params.value,
+                                                params.width,
+                                                params.height,
+                                                stream,
+                                            ),
+                                            _ => 1,
+                                        }
+                                    };
+                                    let end_status = (driver.stream_end_capture)(stream, &mut child);
+                                    driver.check("cuMemsetAsync(graph capture)", memset_status)?;
+                                    driver.check("cuStreamEndCapture", end_status)?;
+                                    driver.check(
+                                        "cuGraphAddChildGraphNode",
+                                        (driver.graph_child)(&mut result, handle, null(), 0, child),
+                                    )
+                                })();
+                                if !child.is_null() {
+                                    let _ = (driver.graph_destroy)(child);
+                                }
+                                let _ = (driver.stream_destroy)(stream);
+                                captured?;
+                            } else {
+                                driver.check("cuGraphAddMemsetNode", status)?;
+                            }
                         }
                         Node::Empty => {
                             driver.check(

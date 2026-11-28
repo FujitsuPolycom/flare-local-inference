@@ -157,11 +157,10 @@ pub fn enumerate() -> Result<Vec<Gpu>, Failure> {
                 _pci_subsystem_id: 0,
                 _bus_id: [0; 32],
             };
-            check(
-                &describe,
-                "nvmlDeviceGetPciInfo_v3",
-                get_pci(device, &mut pci),
-            )?;
+            let pci_code = get_pci(device, &mut pci);
+            if pci_code != NOT_SUPPORTED {
+                check(&describe, "nvmlDeviceGetPciInfo_v3", pci_code)?;
+            }
             let (mut major, mut minor) = (0, 0);
             check(
                 &describe,
@@ -223,6 +222,7 @@ pub fn enumerate() -> Result<Vec<Gpu>, Failure> {
 /// `sm{major}{minor}`.
 pub fn capability_revision(major: i32, minor: i32) -> String {
     match (major, minor) {
+        (8, 7) => "ga10b".into(),
         (12, 1) => "gb10".into(),
         (12, 0) => "gb202".into(),
         (10, 3) => "gb300".into(),
@@ -298,12 +298,7 @@ fn revision(pci_device_id: u32, major: c_int, minor: c_int) -> String {
     if let Some(revision) = platform(pci_device_id) {
         return revision.into();
     }
-    match (major, minor) {
-        (12, 1) => "gb10".into(),
-        (12, 0) => "gb202".into(),
-        (10, 3) => "gb300".into(),
-        _ => format!("sm{major}{minor}"),
-    }
+    capability_revision(major, minor)
 }
 
 /// The PCI ID table of `crate::hardware`, which selects a revision before compute capability.

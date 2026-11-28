@@ -265,12 +265,20 @@ driver! {
     stream_query: "cuStreamQuery"(Handle);
     stream_sync: "cuStreamSynchronize"(Handle);
     stream_destroy: "cuStreamDestroy_v2"(Handle);
+    stream_begin_capture: "cuStreamBeginCapture_v2"(Handle, c_int);
+    stream_end_capture: "cuStreamEndCapture"(Handle, *mut Handle);
     event_create: "cuEventCreate"(*mut Handle, c_uint);
     event_record: "cuEventRecord"(Handle, Handle);
     event_sync: "cuEventSynchronize"(Handle);
     event_destroy: "cuEventDestroy_v2"(Handle);
     download: "cuMemcpyDtoH_v2"(*mut c_void, u64, usize);
     zero: "cuMemsetD8_v2"(u64, u8, usize);
+    memset_d8_async: "cuMemsetD8Async"(u64, u8, usize, Handle);
+    memset_d16_async: "cuMemsetD16Async"(u64, u16, usize, Handle);
+    memset_d32_async: "cuMemsetD32Async"(u64, c_uint, usize, Handle);
+    memset_d2d8_async: "cuMemsetD2D8Async"(u64, usize, u8, usize, usize, Handle);
+    memset_d2d16_async: "cuMemsetD2D16Async"(u64, usize, u16, usize, usize, Handle);
+    memset_d2d32_async: "cuMemsetD2D32Async"(u64, usize, c_uint, usize, usize, Handle);
     module_load: "cuModuleLoadData"(*mut Handle, *const c_void);
     module_global: "cuModuleGetGlobal_v2"(*mut u64, *mut usize, Handle, *const c_char);
     module_unload: "cuModuleUnload"(Handle);
@@ -289,6 +297,7 @@ driver! {
     graph_memset: "cuGraphAddMemsetNode"(*mut Handle, Handle, *const Handle, usize, *const MemsetParams, Handle);
     graph_copy: "cuGraphAddMemcpyNode"(*mut Handle, Handle, *const Handle, usize, *const CopyParams, Handle);
     graph_empty: "cuGraphAddEmptyNode"(*mut Handle, Handle, *const Handle, usize);
+    graph_child: "cuGraphAddChildGraphNode"(*mut Handle, Handle, *const Handle, usize, Handle);
     graph_event_wait: "cuGraphAddEventWaitNode"(*mut Handle, Handle, *const Handle, usize, Handle);
     graph_attribute: "cuGraphKernelNodeSetAttribute"(Handle, c_int, *const c_void);
     graph_edges: "cuGraphAddDependencies_v2"(Handle, *const Handle, *const Handle, *const [u8; 8], usize);

@@ -102,7 +102,11 @@ def _publisher(configuration, args, model=None, hub_cache=None):
     from ignition.preparation.model_card import model_license
     from ignition.preparation.checkpoint import inspect_indexed_checkpoint
     try:
-        metadata = inspect_indexed_checkpoint(model.snapshot(hub_cache)).metadata_path
+        snapshot = model.snapshot(hub_cache)
+        try:
+            metadata = inspect_indexed_checkpoint(snapshot).metadata_path
+        except FileNotFoundError:
+            metadata = snapshot
         license = model_license(metadata,
                                 None if model.directory is not None else model.checkpoint.repository,
                                 model.checkpoint.revision)

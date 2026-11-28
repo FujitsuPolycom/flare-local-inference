@@ -20,6 +20,12 @@ fn platform(pci_id: u32) -> Option<&'static str> {
     flare_helios::core::naming::platform_from_pci(pci_id)
 }
 
+fn platform_from_capability(major: u32, minor: u32) -> Option<&'static str> {
+    flare_helios::core::naming::platform_from_capability(major, minor)
+}
+
+const NVML_ERROR_NOT_SUPPORTED: c_int = 3;
+
 pub fn detect(count: usize) -> Result<&'static str> {
     let inherited = std::env::var("CUDA_VISIBLE_DEVICES").ok();
     let indices: Vec<_> = (0..count as i32).collect();
@@ -60,6 +66,11 @@ pub fn detect(count: usize) -> Result<&'static str> {
             let get_pci = library.get::<unsafe extern "C" fn(Device, *mut PciInfo) -> c_int>(
                 b"nvmlDeviceGetPciInfo_v3\0",
             )?;
+            let get_capability = library
+                .get::<unsafe extern "C" fn(Device, *mut c_int, *mut c_int) -> c_int>(
+                    b"nvmlDeviceGetCudaComputeCapability\0",
+                )
+                .ok();
             let mut selected = None;
             for entry in visible.split(',') {
                 let mut device = std::ptr::null_mut();
@@ -91,13 +102,29 @@ pub fn detect(count: usize) -> Result<&'static str> {
                     device = candidates[unique_uuid(entry, &candidates)?].1;
                 }
                 let mut pci: PciInfo = std::mem::zeroed();
-                check("nvmlDeviceGetPciInfo_v3", get_pci(device, &mut pci))?;
-                let detected = platform(pci.device_id).ok_or_else(|| {
-                    format!(
-                        "GPU {entry} has unsupported PCI ID {:#010x}; specify --revision",
-                        pci.device_id
-                    )
-                })?;
+                let pci_status = get_pci(device, &mut pci);
+                let detected = if pci_status == NVML_ERROR_NOT_SUPPORTED {
+                    let (mut major, mut minor) = (0, 0);
+                    let capability = get_capability.as_ref().and_then(|query| {
+                        (query(device, &mut major, &mut minor) == 0 && major > 0 && minor >= 0)
+                            .then_some((major as u32, minor as u32))
+                    });
+                    capability
+                        .and_then(|(major, minor)| platform_from_capability(major, minor))
+                        .ok_or_else(|| {
+                            format!(
+                                "GPU {entry} does not report a PCI ID and has unsupported compute capability; specify --revision"
+                            )
+                        })?
+                } else {
+                    check("nvmlDeviceGetPciInfo_v3", pci_status)?;
+                    platform(pci.device_id).ok_or_else(|| {
+                        format!(
+                            "GPU {entry} has unsupported PCI ID {:#010x}; specify --revision",
+                            pci.device_id
+                        )
+                    })?
+                };
                 if selected.is_some_and(|value| value != detected) {
                     return Err(
                         "selected GPUs span multiple platforms; select one platform or specify --revision"
@@ -223,6 +250,10 @@ pub fn inventory() -> Result<Vec<GpuInfo>> {
                 let platform = (pci_fn(device, &mut pci) == 0)
                     .then(|| platform(pci.device_id))
                     .flatten()
+                    .or_else(|| {
+                        architecture
+                            .and_then(|[major, minor]| platform_from_capability(major, minor))
+                    })
                     .map(str::to_owned);
                 // NVML also enumerates accelerators without CUDA capability or a supported GPU identity.
                 if architecture.is_none() && platform.is_none() {

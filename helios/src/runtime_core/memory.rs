@@ -180,11 +180,20 @@ fn headroom(config: &serde_json::Value) -> Result<u64> {
         .ok_or_else(|| invalid("memory reserve overflows the device budget"))
 }
 
+fn integrated_host_bytes(total: u64) -> u64 {
+    if total <= (16u64 << 30) {
+        64 << 20
+    } else {
+        INTEGRATED_HOST_BYTES.min(total / 32)
+    }
+}
+
 /// Memory caches may use on one rank: free memory less the headroom, and on an integrated GPU
-/// also the server's later host allocations and a twentieth of memory for the system.
-fn budget(free: u64, total: u64, headroom: u64, integrated: bool) -> u64 {
-    let host = if integrated {
-        INTEGRATED_HOST_BYTES + total / INTEGRATED_SYSTEM_SHARE
+/// also the server's later host allocations and a twentieth of memory for the system when using
+/// the default reserve. An explicit memory limit removes those implicit reserves.
+fn budget(free: u64, total: u64, headroom: u64, integrated: bool, explicit_limit: bool) -> u64 {
+    let host = if integrated && !explicit_limit {
+        integrated_host_bytes(total) + total / INTEGRATED_SYSTEM_SHARE
     } else {
         0
     };
@@ -245,30 +254,25 @@ fn limited_budget(
 ) -> Result<u64> {
     let headroom = match limit {
         None => default_headroom,
-        Some(MemoryLimit::Reserve(reserve)) => reserve
-            .checked_add(HEADROOM_BYTES)
-            .ok_or_else(|| invalid("memory reserve overflows the device budget"))?,
-        Some(_) => HEADROOM_BYTES,
+        Some(MemoryLimit::Reserve(reserve)) => reserve,
+        Some(_) => 0,
     };
     let available = budget(
         memory.free.min(memory.total),
         memory.total,
         headroom,
         integrated,
+        limit.is_some(),
     )
     .saturating_sub(future);
     let Some(cap) = limit.and_then(|limit| limit.occupied_bytes(memory.total)) else {
         return Ok(available);
     };
-    // System headroom is unoccupied memory, whereas the server's later host allocations
-    // and driver allowance are part of its occupied budget.
     let required = loaded
         .checked_add(future)
-        .and_then(|n| n.checked_add(HEADROOM_BYTES))
-        .and_then(|n| n.checked_add(if integrated { INTEGRATED_HOST_BYTES } else { 0 }))
         .ok_or_else(|| invalid("loaded memory footprint overflows the device budget"))?;
     let remaining = cap.checked_sub(required).ok_or_else(|| invalid(format!(
-        "memory limit is {cap} bytes, but loaded model resources and runtime headroom require {required} bytes"
+        "memory limit is {cap} bytes, but loaded model resources require {required} bytes"
     )))?;
     Ok(available.min(remaining))
 }
@@ -1376,11 +1380,13 @@ mod tests {
     #[test]
     fn integrated_gpus_keep_host_memory_for_the_server_beyond_the_reserve() {
         let gib = 1u64 << 30;
-        assert_eq!(budget(40 * gib, 120 * gib, 5 * gib, false), 35 * gib);
+        assert_eq!(budget(40 * gib, 120 * gib, 5 * gib, false, false), 35 * gib);
         // Two GiB for the server and a twentieth of memory for the system.
-        assert_eq!(budget(40 * gib, 120 * gib, 5 * gib, true), 27 * gib);
-        assert_eq!(budget(40 * gib, 120 * gib, 0, true), 32 * gib);
-        assert_eq!(budget(6 * gib, 120 * gib, 0, true), 0);
+        assert_eq!(budget(40 * gib, 120 * gib, 5 * gib, true, false), 27 * gib);
+        assert_eq!(budget(40 * gib, 120 * gib, 0, true, false), 32 * gib);
+        assert_eq!(budget(6 * gib, 120 * gib, 0, true, false), 0);
+        // Explicit memory limit drops both the host server bytes and the 5% system reserve.
+        assert_eq!(budget(40 * gib, 120 * gib, 5 * gib, true, true), 35 * gib);
     }
 
     #[test]
@@ -1395,7 +1401,7 @@ mod tests {
             limited_budget(memory, 20 * gib, None, legacy, false, 0).unwrap(),
             35 * gib - HEADROOM_BYTES
         );
-        // An explicit flag replaces the core reserve, including for occupied limits.
+        // An explicit limit replaces the default reserve without adding hidden headroom.
         assert_eq!(
             limited_budget(
                 memory,
@@ -1406,7 +1412,7 @@ mod tests {
                 gib
             )
             .unwrap(),
-            9 * gib - HEADROOM_BYTES
+            9 * gib
         );
         assert_eq!(
             limited_budget(
@@ -1418,7 +1424,7 @@ mod tests {
                 0
             )
             .unwrap(),
-            30 * gib - HEADROOM_BYTES
+            30 * gib
         );
         assert_eq!(
             limited_budget(
@@ -1430,7 +1436,7 @@ mod tests {
                 0
             )
             .unwrap(),
-            30 * gib - HEADROOM_BYTES
+            30 * gib
         );
         // Other processes still bound the physical supply, even when our cap is larger.
         let busy = MemorySnapshot {
@@ -1447,9 +1453,9 @@ mod tests {
                 0
             )
             .unwrap(),
-            gib - HEADROOM_BYTES
+            gib
         );
-        assert!(
+        assert_eq!(
             limited_budget(
                 memory,
                 30 * gib,
@@ -1458,29 +1464,41 @@ mod tests {
                 false,
                 0
             )
-            .is_err()
+            .unwrap(),
+            0
         );
         assert!(
             limited_budget(
                 memory,
-                0,
-                Some(MemoryLimit::Reserve(u64::MAX)),
+                30 * gib,
+                Some(MemoryLimit::Bytes(30 * gib - 1)),
                 legacy,
                 false,
                 0
             )
             .is_err()
         );
+        assert!(
+            limited_budget(
+                memory,
+                u64::MAX,
+                Some(MemoryLimit::Bytes(u64::MAX)),
+                legacy,
+                false,
+                1
+            )
+            .is_err()
+        );
     }
 
     #[test]
-    fn integrated_budgets_charge_later_host_allocations_once() {
+    fn integrated_budgets_charge_later_host_allocations_only_by_default() {
         let gib = 1u64 << 30;
         let memory = MemorySnapshot {
             free: 60 * gib,
             total: 100 * gib,
         };
-        // 20 GiB loaded + 2 GiB server host allowance + 8 GiB offload + driver headroom.
+        // Explicit limit uses exact loaded + future allocations without hidden reserves.
         assert_eq!(
             limited_budget(
                 memory,
@@ -1491,9 +1509,9 @@ mod tests {
                 8 * gib
             )
             .unwrap(),
-            10 * gib - HEADROOM_BYTES
+            12 * gib
         );
-        // Without an occupied cap, retain the five-percent system margin too.
+        // Without an explicit limit, retain default headroom, host allowance, and the 5% system share.
         assert_eq!(
             limited_budget(memory, 20 * gib, None, HEADROOM_BYTES, true, 8 * gib).unwrap(),
             45 * gib - HEADROOM_BYTES
@@ -1830,21 +1848,14 @@ mod tests {
                 limited_budget(
                     memory,
                     loaded,
-                    Some(MemoryLimit::Bytes(loaded)),
+                    Some(MemoryLimit::Bytes(loaded.saturating_sub(1))),
                     0,
                     owner.integrated,
                     0
                 )
                 .is_err()
             );
-            let cap = loaded
-                + HEADROOM_BYTES
-                + (16 << 20)
-                + if owner.integrated {
-                    INTEGRATED_HOST_BYTES
-                } else {
-                    0
-                };
+            let cap = loaded + (16 << 20);
             assert_eq!(
                 limited_budget(
                     memory,

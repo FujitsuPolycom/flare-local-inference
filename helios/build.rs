@@ -14,6 +14,7 @@ fn main() {
         // contracts, graph selection, frontend settings, and engine placement.
         let mut runtime = prost_build::Config::new();
         runtime
+            .protoc_arg("--experimental_allow_proto3_optional")
             .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
             .file_descriptor_set_path(out.join("runtime_core_descriptor.bin"))
             .field_attribute(".flare.runtime.ModelIndex.preparation", "#[serde(default)]")
@@ -56,6 +57,7 @@ fn main() {
         // instead of restating them.
         let mut core = prost_build::Config::new();
         core
+            .protoc_arg("--experimental_allow_proto3_optional")
             .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
             .field_attribute(".flare.core.DeploymentBody.preparation", "#[serde(default)]")
             .extern_path(".flare.runtime", "crate::runtime_core::wire")

@@ -34,8 +34,8 @@ MINIMUM_REQUEST_TOKENS = 8192
 # Each exchange can retain prompt and terminal checkpoints; snapshot slots have
 # virtual capacity for about four recent exchanges per concurrent request.
 CACHE_STATES_PER_REQUEST = 8
-SUPPORTED_CAPABILITIES = ((10, 3), (12, 0), (12, 1))
-SUPPORTED_ARCHITECTURES = "SM103, SM120, or SM121"
+SUPPORTED_CAPABILITIES = ((8, 7), (10, 3), (12, 0), (12, 1))
+SUPPORTED_ARCHITECTURES = "SM87, SM103, SM120, or SM121"
 _GIB = 1 << 30
 
 
@@ -78,8 +78,12 @@ def discover_gpus() -> tuple[Gpu, ...]:
                     if shared is not None:
                         total, free = shared
             except nvml.NotSupportedError:
-                # GB10 has no framebuffer for NVML to report; it allocates from system memory.
-                total, free = _integrated_memory(nvml.device_get_pci_info_v3(handle).bus_id)
+                # Integrated GPUs (GB10, Jetson Orin) allocate from system memory and may not expose PCI info.
+                try:
+                    bus_id = nvml.device_get_pci_info_v3(handle).bus_id
+                except nvml.NotSupportedError:
+                    bus_id = None
+                total, free = _integrated_memory(bus_id, index=index)
             gpus.append(Gpu(index, nvml.device_get_name(handle), nvml.device_get_uuid(handle), total,
                             free, capability))
         return tuple(gpus)
@@ -87,7 +91,7 @@ def discover_gpus() -> tuple[Gpu, ...]:
         nvml.shutdown()
 
 
-def _integrated_memory(bus_id: str, *, required=True) -> tuple[int, int] | None:
+def _integrated_memory(bus_id: str | None, *, required=True, index: int | None = None) -> tuple[int, int] | None:
     """Query shared DRAM on Linux or the dedicated-plus-shared CUDA budget on Windows."""
     from cuda.bindings import driver
 
@@ -98,11 +102,17 @@ def _integrated_memory(bus_id: str, *, required=True) -> tuple[int, int] | None:
         return values[0] if len(values) == 1 else tuple(values) if values else None
 
     checked(driver.cuInit, 0)
-    device = checked(driver.cuDeviceGetByPCIBusId, bus_id.encode())
+    if bus_id is not None:
+        device = checked(driver.cuDeviceGetByPCIBusId, bus_id.encode())
+    elif index is not None:
+        device = checked(driver.cuDeviceGet, index)
+    else:
+        raise CapacityError("cannot identify integrated GPU without PCI bus ID or device index")
     if not checked(driver.cuDeviceGetAttribute, driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_INTEGRATED, device):
         if not required:
             return None
-        raise CapacityError(f"GPU {bus_id} does not report device memory and is not an integrated GPU")
+        label = bus_id if bus_id is not None else f"index {index}"
+        raise CapacityError(f"GPU {label} does not report device memory and is not an integrated GPU")
     if os.name == "nt":
         context = checked(driver.cuDevicePrimaryCtxRetain, device)
         try:

@@ -142,6 +142,9 @@ struct AccessDescriptor {
 const SOURCE_ORDER_STREAM: c_int = 1;
 /// `CU_MEMHOSTREGISTER_PORTABLE`: the registration is visible to every context.
 const HOST_REGISTER_PORTABLE: c_uint = 0x1;
+/// `CU_DEVICE_ATTRIBUTE_INTEGRATED`: 1 when the GPU shares host memory and SoC power.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const ATTRIBUTE_INTEGRATED: c_int = 18;
 /// `CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID`: the host NUMA node closest to the device, or -1.
 const ATTRIBUTE_HOST_NUMA_ID: c_int = 134;
 /// `CU_MEM_ALLOCATION_TYPE_PINNED`.
@@ -200,7 +203,7 @@ struct Driver {
     #[cfg(feature = "runtime-core")]
     device_uuid: DeviceUuid,
     event_synchronize: StreamOperation,
-    memcpy_batch: MemcpyBatch,
+    memcpy_batch: Option<MemcpyBatch>,
     address_reserve: AddressReserve,
     address_free: AddressFree,
     memory_create: MemoryCreate,
@@ -274,7 +277,10 @@ impl Driver {
                 #[cfg(feature = "runtime-core")]
                 device_uuid: symbol!("cuDeviceGetUuid"),
                 event_synchronize: symbol!("cuEventSynchronize"),
-                memcpy_batch: symbol!("cuMemcpyBatchAsync_v2"),
+                memcpy_batch: library
+                    .get::<MemcpyBatch>(b"cuMemcpyBatchAsync_v2\0")
+                    .ok()
+                    .map(|f| *f),
                 address_reserve: symbol!("cuMemAddressReserve"),
                 address_free: symbol!("cuMemAddressFree"),
                 memory_create: symbol!("cuMemCreate"),
@@ -708,6 +714,17 @@ impl Stream {
         })
     }
 
+    /// Report whether `device` is integrated with host memory and SoC power.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn is_integrated(&self, device: i32) -> Result<bool> {
+        let mut integrated = 0;
+        // SAFETY: `device` is a valid CUDA device ordinal and `integrated` is a valid output pointer.
+        self.driver.check("cuDeviceGetAttribute(INTEGRATED)", unsafe {
+            (self.driver.device_attribute)(&mut integrated, ATTRIBUTE_INTEGRATED, device)
+        })?;
+        Ok(integrated != 0)
+    }
+
     /// A stream at the lowest priority the context supports, for copies that
     /// must yield to model work.
     pub(crate) fn open_lowest_priority(context: usize, expected_device: i32) -> Result<Self> {
@@ -748,27 +765,37 @@ impl Stream {
         if sizes.is_empty() {
             return Ok(());
         }
-        let attributes = CopyAttributes {
-            source_order: SOURCE_ORDER_STREAM,
-            source_location: [0; 2],
-            destination_location: [0; 2],
-            flags: 0,
-        };
-        let first_entry = [0usize];
-        // SAFETY: The arrays have equal validated lengths, the single attribute
-        // applies from entry 0, and the caller guarantees every range's lifetime.
-        self.driver.check("cuMemcpyBatchAsync_v2", unsafe {
-            (self.driver.memcpy_batch)(
-                destinations.as_ptr(),
-                sources.as_ptr(),
-                sizes.as_ptr(),
-                sizes.len(),
-                &attributes,
-                first_entry.as_ptr(),
-                1,
-                self.handle as Handle,
-            )
-        })
+        if let Some(memcpy_batch) = self.driver.memcpy_batch {
+            let attributes = CopyAttributes {
+                source_order: SOURCE_ORDER_STREAM,
+                source_location: [0; 2],
+                destination_location: [0; 2],
+                flags: 0,
+            };
+            let first_entry = [0usize];
+            // SAFETY: The arrays have equal validated lengths, the single attribute
+            // applies from entry 0, and the caller guarantees every range's lifetime.
+            return self.driver.check("cuMemcpyBatchAsync_v2", unsafe {
+                memcpy_batch(
+                    destinations.as_ptr(),
+                    sources.as_ptr(),
+                    sizes.as_ptr(),
+                    sizes.len(),
+                    &attributes,
+                    first_entry.as_ptr(),
+                    1,
+                    self.handle as Handle,
+                )
+            });
+        }
+        // Fallback for CUDA < 13.0 drivers (e.g. JetPack 6 / CUDA 12.6 on Jetson Orin)
+        // where cuMemcpyBatchAsync_v2 is absent: issue individual stream-ordered async copies.
+        for ((&dst, &src), &size) in destinations.iter().zip(sources.iter()).zip(sizes.iter()) {
+            self.driver.check("cuMemcpyDtoDAsync_v2", unsafe {
+                (self.driver.copy_dtod)(dst, src, size, self.handle as Handle)
+            })?;
+        }
+        Ok(())
     }
 
     pub(crate) fn launch(&self, graph: usize) -> Result<()> {
