@@ -700,9 +700,12 @@ The controls use the core's captured snapshot graphs and require no re-export.
 `--scheduler-checkpoint-extra-work-fraction FRACTION` bounds optional checkpoint
 work relative to productive request work. The default is `0.05`; values must be
 finite and in `[0,1]`. It overrides
-`[server] scheduler_checkpoint_extra_work_fraction`. The scheduler always considers
-the last eligible message endpoint as a best-effort conversation anchor, even
-when timing estimates are unavailable or the fraction is zero. Earlier messages
+`[server] scheduler_checkpoint_extra_work_fraction`. With a nonzero fraction, the
+scheduler considers the last eligible message endpoint as a best-effort
+conversation anchor even when timing estimates are unavailable; when the fraction
+is zero, an interior message endpoint is used as the anchor only when splitting
+prefill there adds zero predicted prefill work, and otherwise the prompt end acts
+as the anchor. Zero snapshot capacity disables all checkpoint cuts. Earlier messages
 and a distinct prompt end consume the fraction of estimated uncached prefill
 work; a distinct terminal endpoint earns its allowance from completed productive
 decode. Extra work includes snapshot copies and additional prefill caused by
