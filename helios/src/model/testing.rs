@@ -279,7 +279,8 @@ pub fn manifest(config: &ModelConfig) -> ExecutionManifest {
                 RequestSlot if b.buffer == "row_slot_ids" || b.buffer == "admission_slots" => {
                     Dtype::Int32
                 }
-                CopyTokenCount | CopyGrammarMask | CopyGrammarCount | QueryLength | LiveRows
+                CopyTokenCount | CopyGrammarMask | CopyGrammarCount | QueryLength
+                | PromptLookaheadLength | LiveRows
                 | SampleEnabled | SamplingTopK | EosCount | PromptHistogram | GrammarMask
                 | GrammarEnabled | ImageFeatureIndex | ImageFeatureSlot | PageTable => Dtype::Int32,
                 Constant

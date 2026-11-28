@@ -742,9 +742,22 @@ impl NativeModel {
                 !engram.is_empty(),
                 model.ranks.iter().any(|rank| rank.integrated),
             );
+            let embedding_table_prefetch = options.embedding_prefetch(embedding_table_cache_bytes);
+            let prefetch_queue_bytes = if embedding_table_prefetch {
+                engram.iter().try_fold(0u64, |total, (index, _)| {
+                    total
+                        .checked_add(crate::engram::prefetch_queue_bytes(index)?)
+                        .ok_or_else(|| {
+                            invalid("embedding prefetch queue exceeds the memory budget")
+                        })
+                })?
+            } else {
+                0
+            };
             let embedding_host_bytes = resident_bytes
                 .checked_add(staging_bytes)
                 .and_then(|bytes| bytes.checked_add(embedding_table_cache_bytes))
+                .and_then(|bytes| bytes.checked_add(prefetch_queue_bytes))
                 .ok_or_else(|| {
                     invalid("embedding tables, staging, and row cache exceed the memory budget")
                 })?;
@@ -836,6 +849,10 @@ impl NativeModel {
                         }
                     }
                 }
+                let has_prefetch_mailbox = engram
+                    .iter()
+                    .flat_map(|(index, _)| &index.tables)
+                    .any(|table| table.prefetch.is_some());
                 let mut bindings = Vec::new();
                 for ((index, ranks), tokens) in engram.into_iter().zip(engram_tokens) {
                     let first = ranks[0];
@@ -850,6 +867,7 @@ impl NativeModel {
                         group_budget,
                         options.embedding_workers(),
                         embedding_table_resident_scales,
+                        embedding_table_prefetch,
                     )?;
                     for (delivery_rank, local) in ranks.into_iter().enumerate() {
                         bindings.push((local, shared.clone(), delivery_rank));
@@ -873,11 +891,16 @@ impl NativeModel {
                     .filter(|(_, rank)| *rank == 0)
                     .map(|(shared, _)| shared.cache_bytes())
                     .sum();
+                let prefetch_note = if embedding_table_prefetch && has_prefetch_mailbox {
+                    " · lookahead prefetch"
+                } else {
+                    ""
+                };
                 phase.finish(if cache_bytes == 0 {
                     label.to_owned()
                 } else {
                     format!(
-                        "{label} · {:.0} MiB row cache",
+                        "{label} · {:.0} MiB row cache{prefetch_note}",
                         cache_bytes as f64 / (1u64 << 20) as f64
                     )
                 });

@@ -5397,6 +5397,7 @@ mod tests {
                         hash_buffer: "h".into(),
                         ready_event: "e".into(),
                         request_buffer: "r".into(),
+                        prefetch_buffer: "p".into(),
                         encoding: wire::engram_table::Encoding::Fp8E4m3E8m0 as i32,
                         global_scale: 1.0,
                         shards: vec![],
@@ -5458,6 +5459,7 @@ mod tests {
                         hash_buffer: "h".into(),
                         ready_event: "e".into(),
                         request_buffer: "r".into(),
+                        prefetch_buffer: "p".into(),
                         encoding: wire::engram_table::Encoding::Fp8E4m3E8m0 as i32,
                         global_scale: 1.0,
                         shards: vec![],
@@ -5534,6 +5536,7 @@ mod tests {
                         hash_buffer: "h".into(),
                         ready_event: "e".into(),
                         request_buffer: "r".into(),
+                        prefetch_buffer: "p".into(),
                         encoding: wire::engram_table::Encoding::Fp8E4m3E8m0 as i32,
                         global_scale: 1.0,
                         shards,
@@ -8521,6 +8524,7 @@ mod tests {
         assert!(table.weights.is_none());
         assert!(table.scales.is_none());
         assert_eq!(table.request_buffer, "r");
+        assert_eq!(table.prefetch_buffer, "p");
         assert_eq!(table.shards.len(), 2);
         let catalog = selected.catalog().clone();
         let files = metadata

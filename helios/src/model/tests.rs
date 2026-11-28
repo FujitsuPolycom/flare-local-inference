@@ -1750,3 +1750,378 @@ fn committed_generation_cursors_require_feedback_while_unused_prompt_positions_d
         }
     }
 }
+
+#[test]
+fn prompt_lookahead_contract_validation_rejects_malformed_bindings() {
+    let base_with_lookahead = || {
+        let mut cfg = config();
+        for graph in &mut cfg.contract.graphs {
+            if graph.kind == GraphOperation::Prefill {
+                graph.inputs.push(testing::binding(
+                    "lookahead_token_ids",
+                    ValueSource::PromptLookaheadToken,
+                    InputIndexing::PackedToken,
+                    0,
+                    0,
+                ));
+                graph.inputs.push(testing::binding(
+                    "lookahead_query_lengths",
+                    ValueSource::PromptLookaheadLength,
+                    InputIndexing::SubmissionRow,
+                    0,
+                    0,
+                ));
+            }
+        }
+        let m = manifest(&cfg);
+        (cfg, m)
+    };
+    let (ok_cfg, ok_manifest) = base_with_lookahead();
+    assert!(Inputs::new(&ok_cfg, &ok_manifest).is_ok());
+
+    // Unpaired lookahead token without length must reject.
+    let (mut bad_cfg, bad_manifest) = base_with_lookahead();
+    for graph in &mut bad_cfg.contract.graphs {
+        if graph.kind == GraphOperation::Prefill {
+            graph
+                .inputs
+                .retain(|b| b.source != ValueSource::PromptLookaheadLength);
+        }
+    }
+    assert!(Inputs::new(&bad_cfg, &bad_manifest).is_err());
+
+    // Lookahead on a decode graph must reject.
+    let mut decode_cfg = config();
+    for graph in &mut decode_cfg.contract.graphs {
+        if graph.kind == GraphOperation::Decode {
+            graph.inputs.push(testing::binding(
+                "lookahead_token_ids",
+                ValueSource::PromptLookaheadToken,
+                InputIndexing::PackedToken,
+                0,
+                0,
+            ));
+            graph.inputs.push(testing::binding(
+                "lookahead_query_lengths",
+                ValueSource::PromptLookaheadLength,
+                InputIndexing::SubmissionRow,
+                0,
+                0,
+            ));
+        }
+    }
+    let decode_manifest = manifest(&decode_cfg);
+    assert!(Inputs::new(&decode_cfg, &decode_manifest).is_err());
+
+    // Wrong buffer name, non-zero padding, or non-Int32 length dtype must reject.
+    let (mut bad_name_cfg, _) = base_with_lookahead();
+    for graph in &mut bad_name_cfg.contract.graphs {
+        if let Some(b) = graph
+            .inputs
+            .iter_mut()
+            .find(|b| b.source == ValueSource::PromptLookaheadToken)
+        {
+            b.buffer = "wrong_lookahead_name".into();
+        }
+    }
+    let bad_name_manifest = manifest(&bad_name_cfg);
+    assert!(Inputs::new(&bad_name_cfg, &bad_name_manifest).is_err());
+
+    let (mut bad_pad_cfg, bad_pad_manifest) = base_with_lookahead();
+    for graph in &mut bad_pad_cfg.contract.graphs {
+        if let Some(b) = graph
+            .inputs
+            .iter_mut()
+            .find(|b| b.source == ValueSource::PromptLookaheadToken)
+        {
+            b.padding = -1;
+        }
+    }
+    assert!(Inputs::new(&bad_pad_cfg, &bad_pad_manifest).is_err());
+
+    let (bad_dtype_cfg, mut bad_dtype_manifest) = base_with_lookahead();
+    bad_dtype_manifest
+        .buffers
+        .iter_mut()
+        .find(|b| b.name == "lookahead_query_lengths")
+        .unwrap()
+        .dtype = crate::execution::Dtype::Int64;
+    assert!(Inputs::new(&bad_dtype_cfg, &bad_dtype_manifest).is_err());
+}
+
+#[test]
+fn prompt_lookahead_packing_distributes_budget_across_single_multi_and_mixed_lanes() {
+    use crate::scheduler::{MixedStep, ScheduledLane, ScheduledStep};
+
+    let mut cfg = config();
+    for graph in &mut cfg.contract.graphs {
+        if graph.kind == GraphOperation::Prefill {
+            graph.inputs.push(testing::binding(
+                "lookahead_token_ids",
+                ValueSource::PromptLookaheadToken,
+                InputIndexing::PackedToken,
+                0,
+                0,
+            ));
+            graph.inputs.push(testing::binding(
+                "lookahead_query_lengths",
+                ValueSource::PromptLookaheadLength,
+                InputIndexing::SubmissionRow,
+                0,
+                0,
+            ));
+        }
+    }
+    let mut m = mixed_manifest(&mut cfg, 1);
+    for graph in &mut cfg.contract.graphs {
+        if graph.kind == GraphOperation::Mixed
+            && !graph
+                .inputs
+                .iter()
+                .any(|b| b.source == ValueSource::PromptLookaheadToken)
+        {
+            graph.inputs.push(testing::binding(
+                "lookahead_token_ids",
+                ValueSource::PromptLookaheadToken,
+                InputIndexing::PackedToken,
+                0,
+                0,
+            ));
+            graph.inputs.push(testing::binding(
+                "lookahead_query_lengths",
+                ValueSource::PromptLookaheadLength,
+                InputIndexing::SubmissionRow,
+                0,
+                0,
+            ));
+        }
+    }
+    for g in &mut m.graphs {
+        if g.kind == GraphKind::Mixed {
+            for name in ["lookahead_token_ids", "lookahead_query_lengths"] {
+                if !g.input_bindings.iter().any(|b| b.buffer_name == name) {
+                    let b = m.buffers.iter().find(|b| b.name == name).unwrap();
+                    g.input_bindings.push(crate::execution::InputBinding {
+                        buffer_name: b.name.clone(),
+                        host_offset: 0,
+                        nbytes: b.nbytes,
+                    });
+                }
+            }
+        }
+    }
+    let prefill_graph = m
+        .graphs
+        .iter()
+        .find(|g| g.kind == GraphKind::Prefill && g.batch_capacity >= 2)
+        .unwrap()
+        .clone();
+    let mixed_graph = m
+        .graphs
+        .iter()
+        .find(|g| g.kind == GraphKind::Mixed && g.batch_capacity == 2 && g.prefill_capacity == 64)
+        .unwrap()
+        .clone();
+    let mut inputs = Inputs::new(&cfg, &m).unwrap();
+    let mut scheduler = RequestScheduler::new(
+        cfg.identity,
+        cfg.limits,
+        scheduler_capabilities(&cfg),
+    )
+    .unwrap();
+    scheduler.mixed_graphs(&[(2, 1, 64), (2, 1, 128)]).unwrap();
+    scheduler.measured_graph_durations(&m.graphs).unwrap();
+
+    let mut admissions: [Option<Admission>; 4] = std::array::from_fn(|_| None);
+    let mut admit = |scheduler: &mut RequestScheduler, start_tok: u32, count: usize| {
+        let prompt: Vec<u32> = (start_tok..start_tok + count as u32).collect();
+        let h = scheduler
+            .admit(RequestSpec {
+                prompt: prompt.clone(),
+                message_boundaries: vec![],
+                conditioning: vec![],
+                max_new_tokens: 16,
+                grammar_constrained: false,
+                host_stops: false,
+                prompt_logprobs: false,
+                growable_output: false,
+            })
+            .unwrap();
+        admissions[h.slot as usize] = Some(Admission {
+            handle: h,
+            sampling: SamplingParameters::default(),
+            max_new_tokens: 16,
+            prompt,
+            data: PromptData {
+                positions: (0..count).map(|p| [p as i64; 3]).collect(),
+                vision_token_indices: vec![-1; count],
+                ..Default::default()
+            },
+            grammar_mask: None,
+            ignore_eos: false,
+            prompt_logprobs: false,
+        });
+        h
+    };
+    let a = admit(&mut scheduler, 1000, 900);
+    let b = admit(&mut scheduler, 2000, 356);
+    let c = admit(&mut scheduler, 3000, 64);
+
+    let read_i32 = |uploads: &[crate::execution::Upload<'_>], name: &str| -> Vec<i32> {
+        let u = uploads.iter().find(|u| u.buffer == name).unwrap();
+        u.bytes
+            .chunks_exact(4)
+            .map(|chunk| i32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect()
+    };
+    let read_i64 = |uploads: &[crate::execution::Upload<'_>], name: &str| -> Vec<i64> {
+        let mut out = Vec::new();
+        for u in uploads.iter().filter(|u| u.buffer == name) {
+            out.extend(
+                u.bytes
+                    .chunks_exact(8)
+                    .map(|chunk| i64::from_le_bytes(chunk.try_into().unwrap())),
+            );
+        }
+        out
+    };
+
+    // 1. Single prefill lane (tokens=300, remaining=600, lookahead capacity=512) -> full 512 tokens.
+    let single = ScheduledStep {
+        draft_tokens: 0,
+        kind: GraphKind::Prefill,
+        batch_capacity: prefill_graph.batch_capacity,
+        token_capacity: prefill_graph.token_capacity,
+        packed_token_capacity: prefill_graph.packed_token_capacity,
+        mixed: None,
+        lanes: vec![ScheduledLane {
+            request: a,
+            start_position: 0,
+            tokens: 300,
+        }],
+        requires_feedback: false,
+    };
+    pack_inputs(&mut inputs, &cfg, &scheduler, &single, &admissions).unwrap();
+    let ups = inputs.uploads();
+    assert_eq!(read_i32(&ups, "lookahead_query_lengths"), vec![512, 0, 0, 0]);
+    let toks = read_i64(&ups, "lookahead_token_ids");
+    assert_eq!(toks, (1300i64..1812).collect::<Vec<_>>());
+
+    // 2. Single prefill lane at tail (zero remaining) -> 0 lookahead tokens.
+    let tail = ScheduledStep {
+        draft_tokens: 0,
+        kind: GraphKind::Prefill,
+        batch_capacity: prefill_graph.batch_capacity,
+        token_capacity: prefill_graph.token_capacity,
+        packed_token_capacity: prefill_graph.packed_token_capacity,
+        mixed: None,
+        lanes: vec![ScheduledLane {
+            request: c,
+            start_position: 0,
+            tokens: 64,
+        }],
+        requires_feedback: false,
+    };
+    pack_inputs(&mut inputs, &cfg, &scheduler, &tail, &admissions).unwrap();
+    let ups = inputs.uploads();
+    assert_eq!(read_i32(&ups, "lookahead_query_lengths"), vec![0, 0, 0, 0]);
+    assert!(read_i64(&ups, "lookahead_token_ids").is_empty());
+
+    // 3. Multi-lane prefill (two 256-token lanes, capacity=512): lane 0 caps at lane.tokens=256
+    //    (not remaining=644), lane 1 caps at remaining=100.
+    let multi = ScheduledStep {
+        draft_tokens: 0,
+        kind: GraphKind::Prefill,
+        batch_capacity: prefill_graph.batch_capacity,
+        token_capacity: prefill_graph.token_capacity,
+        packed_token_capacity: prefill_graph.packed_token_capacity,
+        mixed: None,
+        lanes: vec![
+            ScheduledLane {
+                request: a,
+                start_position: 0,
+                tokens: 256,
+            },
+            ScheduledLane {
+                request: b,
+                start_position: 0,
+                tokens: 256,
+            },
+        ],
+        requires_feedback: false,
+    };
+    pack_inputs(&mut inputs, &cfg, &scheduler, &multi, &admissions).unwrap();
+    let ups = inputs.uploads();
+    assert_eq!(read_i32(&ups, "lookahead_query_lengths"), vec![256, 100, 0, 0]);
+    let mut expected: Vec<i64> = (1256..1512).collect();
+    expected.extend(2256..2356);
+    assert_eq!(read_i64(&ups, "lookahead_token_ids"), expected);
+
+    // 4. Transition `c` into decode phase and `a` into prefill phase, then pack a mixed step.
+    for (fence, kind, consumed, generated, token) in [
+        (1, GraphKind::Init, 0, 0, -1),
+        (2, GraphKind::Prefill, 64, 1, 3000),
+        (3, GraphKind::Snapshot, 64, 1, -1),
+    ] {
+        let plan = scheduler.phase_plan(kind, Some(c));
+        scheduler.commit(&plan, Fence(fence)).unwrap();
+        let mut records = vec![CompletionRecord::default(); 4];
+        records[c.slot as usize] = CompletionRecord {
+            generation: c.generation as i64,
+            submission_sequence: fence as i64,
+            consumed_tokens: consumed,
+            generated_tokens: generated,
+            token_id: token,
+            status: 1,
+            ..Default::default()
+        };
+        scheduler
+            .complete(Fence(fence), &records, Default::default())
+            .unwrap();
+    }
+    let init_a = scheduler.phase_plan(GraphKind::Init, Some(a));
+    scheduler.commit(&init_a, Fence(4)).unwrap();
+    let mut records = vec![CompletionRecord::default(); 4];
+    records[a.slot as usize] = CompletionRecord {
+        generation: a.generation as i64,
+        submission_sequence: 4,
+        token_id: -1,
+        status: 1,
+        ..Default::default()
+    };
+    scheduler
+        .complete(Fence(4), &records, Default::default())
+        .unwrap();
+    let mixed = ScheduledStep {
+        draft_tokens: 0,
+        kind: GraphKind::Mixed,
+        batch_capacity: mixed_graph.batch_capacity,
+        token_capacity: mixed_graph.token_capacity,
+        packed_token_capacity: mixed_graph.packed_token_capacity,
+        mixed: Some(MixedStep {
+            prefill_capacity: 64,
+            prefill_row: Some(1),
+            speculative: false,
+        }),
+        lanes: vec![
+            ScheduledLane {
+                request: c,
+                start_position: 64,
+                tokens: 1,
+            },
+            ScheduledLane {
+                request: a,
+                start_position: 0,
+                tokens: 64,
+            },
+        ],
+        requires_feedback: false,
+    };
+    pack_inputs(&mut inputs, &cfg, &scheduler, &mixed, &admissions).unwrap();
+    let ups = inputs.uploads();
+    assert_eq!(read_i32(&ups, "lookahead_query_lengths"), vec![0, 512, 0, 0]);
+    assert_eq!(
+        read_i64(&ups, "lookahead_token_ids"),
+        (1064i64..1576).collect::<Vec<_>>()
+    );
+}

@@ -97,8 +97,8 @@ registered transport destination and an enum-selected source:
 
 | Sources | Values supplied by shared packing |
 |---|---|
-| Request identity and lane geometry | Slot, generation, live-row count, query length, speculative prefix ceiling, sampling decision, and mixed prefill row |
-| Tokens and positions | Prompt tokens, scored-prefill target tokens, completed pending token, prompt positions, image feature/context indices, and image feature slot |
+| Request identity and lane geometry | Slot, generation, live-row count, query length, lookahead query length, speculative prefix ceiling, sampling decision, and mixed prefill row |
+| Tokens and positions | Prompt tokens, prompt lookahead tokens, scored-prefill target tokens, completed pending token, prompt positions, image feature/context indices, and image feature slot |
 | Cache bindings | Page tables, live state rows, restore source, snapshot destination, and consumed-token endpoints |
 | Admission sampling | Seed bits, sampling parameters, output limit, EOS IDs, full prompt histogram, and grammar mask |
 | Copied proposals | Candidate IDs, count, generation, consumed endpoint, and per-position grammar masks |
@@ -111,6 +111,18 @@ padding across the request capacity. Packed-token indices follow each lane's
 actual token count. Integer offsets and padding are declared separately.
 Omitted transfers retain device bytes; scratch buffers need no host value source.
 The execution transport owns frame index and submission sequence.
+
+Prefill-capable graphs (`PREFILL`, `TERMINAL_PREFILL`, `SCORED_PREFILL`, `MIXED`)
+may optionally declare the paired advisory lookahead inputs
+`PROMPT_LOOKAHEAD_TOKEN` (`ValueSource` 41, `lookahead_token_ids`, `PACKED_TOKEN`,
+zero offset and zero padding) and `PROMPT_LOOKAHEAD_LENGTH` (`ValueSource` 42,
+`lookahead_query_lengths`, `Int32`, `SUBMISSION_ROW`, zero offset and zero
+padding). For each active prefill lane, shared packing supplies the remaining
+prompt tokens immediately following the current chunk within the lookahead token
+buffer's capacity (giving a single active prefill lane up to the full capacity
+and bounding each lane in a multi-lane prefill batch by its current chunk length
+and remaining budget). Lanes with no following chunk and non-prefill lanes in
+mixed steps receive zero length.
 
 `GraphContract.tuned_bindings` names persistent buffers populated by captured
 startup tuning graphs. Each binding declares the buffer and its producer graph

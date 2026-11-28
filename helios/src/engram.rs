@@ -46,6 +46,8 @@ pub(crate) struct Stats {
     disk_submit_ns: AtomicU64,
     disk_wait_ns: AtomicU64,
     disk_complete_ns: AtomicU64,
+    prefetch_rows_loaded: AtomicU64,
+    prefetch_errors: AtomicU64,
 }
 
 impl Stats {
@@ -142,6 +144,18 @@ impl Stats {
                 "Cumulative worker wall time processing disk completions and copying rows, excluding completion waits.",
                 &self.disk_complete_ns,
             ),
+            (
+                "prefetch_rows_loaded_total",
+                "counter",
+                "Row-cache misses loaded from disk by advisory warming before a real gather requested them.",
+                &self.prefetch_rows_loaded,
+            ),
+            (
+                "prefetch_errors_total",
+                "counter",
+                "Disk errors ignored by advisory warming; real gathers still report storage failures.",
+                &self.prefetch_errors,
+            ),
         ] {
             let _ = writeln!(
                 text,
@@ -168,6 +182,7 @@ pub(crate) struct Table {
     pub(crate) hashes: String,
     pub(crate) event: String,
     pub(crate) request: Option<String>,
+    pub(crate) prefetch: Option<(String, usize)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -193,6 +208,20 @@ pub(crate) fn staging_bytes(index: &Index, max_tokens: usize) -> Result<u64> {
     })
 }
 
+pub(crate) fn prefetch_queue_bytes(index: &Index) -> Result<u64> {
+    index.tables.iter().try_fold(0u64, |total, table| {
+        let queue = table
+            .prefetch
+            .as_ref()
+            .map_or(0u64, |&(_, cap)| cap as u64)
+            .checked_mul(std::mem::size_of::<i64>() as u64)
+            .ok_or("embedding prefetch queue exceeds the memory budget")?;
+        total
+            .checked_add(queue)
+            .ok_or_else(|| "embedding prefetch queue exceeds the memory budget".into())
+    })
+}
+
 struct Staging {
     data: PinnedHost,
     ready: PinnedHost,
@@ -204,6 +233,39 @@ impl Staging {
             .store(generation, Ordering::Release);
     }
 }
+#[derive(Clone, Copy)]
+struct AdvisoryMailbox {
+    address: usize,
+    count: usize,
+    flag: usize,
+    max_rows: usize,
+}
+
+impl AdvisoryMailbox {
+    /// Snapshot advisory row IDs published for `sequence` into `out`.
+    ///
+    /// Safety relies on the reader-thread serialization: this copy completes before
+    /// `buffers.signal(job.generation)` releases the consuming graph, and every participating
+    /// rank must retire that graph before the next submission can launch the producer and
+    /// overwrite the mapped-host mailbox. The mailbox is not separately registered in
+    /// `State::prepare`/`finish`; `CachedReader::warm` clamps every copied ID against plane
+    /// bounds and drops negatives.
+    fn snapshot(self, sequence: u64, out: &mut Vec<i64>) {
+        out.clear();
+        let ready = unsafe { &*(self.flag as *const AtomicU64) };
+        if ready.load(Ordering::Acquire) != sequence {
+            return;
+        }
+        let raw_count = unsafe { std::ptr::read_volatile(self.count as *const i64) };
+        if raw_count <= 0 {
+            return;
+        }
+        let count = (raw_count as usize).min(self.max_rows);
+        let slice = unsafe { std::slice::from_raw_parts(self.address as *const i64, count) };
+        out.extend_from_slice(slice);
+    }
+}
+
 enum Requests {
     Host(Vec<i64>),
     Device {
@@ -211,6 +273,7 @@ enum Requests {
         flag: usize,
         sequence: u64,
         rows: usize,
+        advisory: Option<AdvisoryMailbox>,
     },
 }
 impl Requests {
@@ -218,6 +281,18 @@ impl Requests {
         match self {
             Self::Host(ids) => ids.len(),
             Self::Device { rows, .. } => *rows,
+        }
+    }
+    fn is_ready(&self, cancelled: &AtomicBool) -> bool {
+        if cancelled.load(Ordering::Acquire) {
+            return true;
+        }
+        match self {
+            Self::Host(_) => true,
+            Self::Device { flag, sequence, .. } => {
+                let ready = unsafe { &*(*flag as *const AtomicU64) };
+                ready.load(Ordering::Acquire) == *sequence
+            }
         }
     }
     fn read(self, cancelled: &AtomicBool) -> Result<Vec<i64>> {
@@ -228,6 +303,7 @@ impl Requests {
                 flag,
                 sequence,
                 rows,
+                ..
             } => {
                 let ready = unsafe { &*(flag as *const AtomicU64) };
                 while ready.load(Ordering::Acquire) != sequence {
@@ -242,6 +318,46 @@ impl Requests {
     }
 }
 const STAGING_FRAMES: usize = 2;
+/// Rows warmed per advisory disk micro-batch before re-checking for a ready real gather.
+const WARM_BATCH_ROWS: usize = 1024;
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReaderAction {
+    Gather,
+    Warm,
+    WaitReady,
+    BlockRecv,
+    Exit,
+}
+
+fn next_reader_action(
+    held: &mut Option<Job>,
+    receiver: &mpsc::Receiver<Job>,
+    has_warm_work: bool,
+    cancelled: &AtomicBool,
+) -> ReaderAction {
+    if held.is_none() {
+        match receiver.try_recv() {
+            Ok(job) => *held = Some(job),
+            Err(mpsc::TryRecvError::Disconnected) => return ReaderAction::Exit,
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+    if held
+        .as_ref()
+        .is_some_and(|job| job.requests.is_ready(cancelled))
+    {
+        return ReaderAction::Gather;
+    }
+    if has_warm_work && !cancelled.load(Ordering::Acquire) {
+        return ReaderAction::Warm;
+    }
+    if held.is_some() {
+        ReaderAction::WaitReady
+    } else {
+        ReaderAction::BlockRecv
+    }
+}
 
 struct Job {
     frame: usize,
@@ -345,6 +461,7 @@ impl Shared {
         cache_bytes: u64,
         workers: usize,
         resident_scales: bool,
+        prefetch: bool,
     ) -> Result<Arc<Self>> {
         if storage == Storage::Ram && cache_bytes != 0 {
             return Err("embedding row cache requires disk table storage".into());
@@ -379,7 +496,16 @@ impl Shared {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        Self::with_readers(index, readers, ranks, max_tokens, context, device, stats)
+        Self::with_readers(
+            index,
+            readers,
+            ranks,
+            max_tokens,
+            context,
+            device,
+            stats,
+            prefetch,
+        )
     }
 
     fn with_readers(
@@ -390,6 +516,7 @@ impl Shared {
         context: usize,
         device: i32,
         stats: Arc<Stats>,
+        prefetch: bool,
     ) -> Result<Arc<Self>> {
         if ranks == 0 || ranks > 16 || max_tokens == 0 || readers.len() != index.tables.len() {
             return Err("invalid embedding delivery geometry".into());
@@ -417,34 +544,90 @@ impl Shared {
             let row_bytes = planes.iter().map(|p| p.row_bytes).sum::<usize>();
             let cancelled = Arc::new(AtomicBool::new(false));
             let stop = cancelled.clone();
+            let prefetch_cap = if prefetch {
+                table.prefetch.as_ref().map_or(0, |&(_, cap)| cap)
+            } else {
+                0
+            };
             let worker = thread::Builder::new()
                 .name(format!("flare-{}", table.event))
                 .spawn(move || {
-                    while let Ok(job) = receiver.recv() {
-                        // Each frame stays owned until every rank retires its consuming graph.
-                        // The reader alone writes its data before publishing the ready flag.
-                        let buffers = &buffers[job.frame];
-                        let output = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                buffers.data.address() as *mut u8,
-                                job.requests.rows() * row_bytes,
-                            )
-                        };
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            if stop.load(Ordering::Acquire) {
-                                return Err("n-gram request cancelled".into());
+                    let mut held: Option<Job> = None;
+                    let mut pending_warm: Vec<i64> = Vec::with_capacity(prefetch_cap);
+                    let mut warm_cursor = 0usize;
+                    loop {
+                        match next_reader_action(
+                            &mut held,
+                            &receiver,
+                            warm_cursor < pending_warm.len(),
+                            &stop,
+                        ) {
+                            ReaderAction::Gather => {
+                                let job = held.take().unwrap();
+                                // Any unconsumed advisory tail from the previous step is superseded.
+                                pending_warm.clear();
+                                warm_cursor = 0;
+                                // Each frame stays owned until every rank retires its consuming graph.
+                                // The reader alone writes its data before publishing the ready flag.
+                                let buffers = &buffers[job.frame];
+                                let advisory = match job.requests {
+                                    Requests::Device {
+                                        sequence,
+                                        advisory: Some(mailbox),
+                                        ..
+                                    } if prefetch_cap != 0 => Some((sequence, mailbox)),
+                                    _ => None,
+                                };
+                                let output = unsafe {
+                                    std::slice::from_raw_parts_mut(
+                                        buffers.data.address() as *mut u8,
+                                        job.requests.rows() * row_bytes,
+                                    )
+                                };
+                                let result = std::panic::catch_unwind(
+                                    std::panic::AssertUnwindSafe(|| {
+                                        if stop.load(Ordering::Acquire) {
+                                            return Err("n-gram request cancelled".into());
+                                        }
+                                        let ids = job.requests.read(&stop)?;
+                                        reader.gather(&planes, &ids, output)
+                                    }),
+                                )
+                                .unwrap_or_else(|_| Err("Engram reader panicked".into()));
+                                if let Err(error) = result {
+                                    output.fill(0);
+                                    *buffers.error.lock().unwrap() = Some(error);
+                                    stop.store(true, Ordering::Release);
+                                } else if let Some((sequence, mailbox)) = advisory {
+                                    // Snapshot the step's lookahead IDs before signalling the ready
+                                    // flag so the GPU graph cannot advance and overwrite the mailbox.
+                                    mailbox.snapshot(sequence, &mut pending_warm);
+                                    warm_cursor = 0;
+                                }
+                                // Release failed reads too, so graph shutdown can drain before reporting the error.
+                                buffers.signal(job.generation);
                             }
-                            let ids = job.requests.read(&stop)?;
-                            reader.gather(&planes, &ids, output)
-                        }))
-                        .unwrap_or_else(|_| Err("Engram reader panicked".into()));
-                        if let Err(error) = result {
-                            output.fill(0);
-                            *buffers.error.lock().unwrap() = Some(error);
-                            stop.store(true, Ordering::Release);
+                            ReaderAction::Warm => {
+                                let end = (warm_cursor + WARM_BATCH_ROWS).min(pending_warm.len());
+                                // Advisory warming is best-effort and never poisons a staging frame.
+                                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                                    || reader.warm(&planes, &pending_warm[warm_cursor..end]),
+                                ));
+                                warm_cursor = end;
+                                if warm_cursor >= pending_warm.len() {
+                                    pending_warm.clear();
+                                    warm_cursor = 0;
+                                }
+                            }
+                            ReaderAction::WaitReady => {
+                                std::hint::spin_loop();
+                            }
+                            ReaderAction::BlockRecv => match receiver.recv() {
+                                Ok(job) => held = Some(job),
+                                Err(_) => break,
+                            },
+                            ReaderAction::Exit => break,
                         }
-                        // Release failed reads too, so graph shutdown can drain before reporting the error.
-                        buffers.signal(job.generation);
                     }
                 })
                 .map_err(|e| format!("start Engram reader: {e}"))?;
@@ -557,6 +740,7 @@ struct Transfer {
     scales: usize,
     event: usize,
     request: Option<(usize, usize)>,
+    prefetch: Option<AdvisoryMailbox>,
 }
 pub(crate) struct Transfers {
     binding: Binding,
@@ -585,13 +769,30 @@ impl Transfers {
             {
                 *flag = stream.mapped_address(&staging.ready)?;
             }
+            let resolve_mailbox = |name: &str| -> Result<(usize, usize)> {
+                let buffer = manifest.buffer(name)?;
+                let address = stream.host_address(buffer.address, buffer.nbytes)?;
+                Ok((address, buffer.nbytes))
+            };
             let request = table
                 .request
-                .as_ref()
+                .as_deref()
                 .map(|name| {
-                    let buffer = manifest.buffer(name)?;
-                    let address = stream.host_address(buffer.address, buffer.nbytes)?;
-                    Ok::<_, Error>((address, address + buffer.nbytes - 8))
+                    let (address, nbytes) = resolve_mailbox(name)?;
+                    Ok::<_, Error>((address, address + nbytes - 8))
+                })
+                .transpose()?;
+            let prefetch = table
+                .prefetch
+                .as_ref()
+                .map(|(name, max_rows)| {
+                    let (address, nbytes) = resolve_mailbox(name)?;
+                    Ok::<_, Error>(AdvisoryMailbox {
+                        address,
+                        count: address + nbytes - 16,
+                        flag: address + nbytes - 8,
+                        max_rows: *max_rows,
+                    })
                 })
                 .transpose()?;
             layers.push(Transfer {
@@ -601,6 +802,7 @@ impl Transfers {
                 scales: manifest.buffer(&table.scales)?.address,
                 event: binding.events[i],
                 request,
+                prefetch,
             });
         }
         Ok(Self { binding, layers })
@@ -654,6 +856,7 @@ impl Transfers {
                     flag,
                     sequence,
                     rows: tokens * heads,
+                    advisory: transfer.prefetch,
                 }
             } else {
                 let upload = uploads
@@ -743,6 +946,7 @@ mod tests {
                 Plane { file: 0, offset: 1024, nbytes: 128, row_bytes: 8 }],
             heads: 4, weights: "weights".into(), scales: "scales".into(),
             hashes: "hashes".into(), event: "ready".into(), request: None,
+            prefetch: None,
         };
         let index = Index { tables: vec![table.clone(), table] };
         assert_eq!(staging_bytes(&index, 128).unwrap(), 2 * 2 * (128 * 4 * (64 + 8) + 4));
@@ -797,6 +1001,7 @@ mod tests {
             flag: &flag as *const AtomicU64 as usize,
             sequence: 7,
             rows: ids.len(),
+            advisory: None,
         };
         thread::scope(|scope| {
             let worker = scope.spawn(|| request().read(&cancelled));
@@ -806,5 +1011,104 @@ mod tests {
         flag.store(0, Ordering::Release);
         cancelled.store(true, Ordering::Release);
         assert!(request().read(&cancelled).is_err());
+    }
+
+    #[test]
+    fn advisory_mailbox_snapshot_validates_sequence_and_clamps_row_count() {
+        let storage = [11i64, 22, 33, 44, 3, 9];
+        let mailbox = AdvisoryMailbox {
+            address: storage.as_ptr() as usize,
+            count: unsafe { storage.as_ptr().add(4) } as usize,
+            flag: unsafe { storage.as_ptr().add(5) } as usize,
+            max_rows: 4,
+        };
+        let mut out = vec![99];
+        // Mismatched sequence yields empty snapshot.
+        mailbox.snapshot(8, &mut out);
+        assert!(out.is_empty());
+        // Matching sequence copies exact count.
+        mailbox.snapshot(9, &mut out);
+        assert_eq!(out, vec![11, 22, 33]);
+        // Excessive count is clamped to max_rows.
+        unsafe { std::ptr::write_volatile(mailbox.count as *mut i64, 999) };
+        mailbox.snapshot(9, &mut out);
+        assert_eq!(out, vec![11, 22, 33, 44]);
+        // Non-positive count yields empty snapshot.
+        unsafe { std::ptr::write_volatile(mailbox.count as *mut i64, 0) };
+        mailbox.snapshot(9, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn reader_action_prefers_ready_or_cancelled_gather_over_advisory_warming() {
+        let ids = [3i64, 7];
+        let flag = AtomicU64::new(0);
+        let cancelled = AtomicBool::new(false);
+        let (sender, receiver) = mpsc::sync_channel::<Job>(STAGING_FRAMES);
+        let mut held = None;
+
+        // Idle with advisory work warms immediately.
+        assert_eq!(
+            next_reader_action(&mut held, &receiver, true, &cancelled),
+            ReaderAction::Warm
+        );
+        // Enqueue an unpublished device job: reader holds it and yields to warming.
+        sender
+            .send(Job {
+                frame: 0,
+                generation: 1,
+                requests: Requests::Device {
+                    address: ids.as_ptr() as usize,
+                    flag: &flag as *const AtomicU64 as usize,
+                    sequence: 5,
+                    rows: ids.len(),
+                    advisory: None,
+                },
+            })
+            .unwrap();
+        assert_eq!(
+            next_reader_action(&mut held, &receiver, true, &cancelled),
+            ReaderAction::Warm
+        );
+        assert!(held.is_some());
+        // Once published, the held gather immediately outranks warming.
+        flag.store(5, Ordering::Release);
+        assert_eq!(
+            next_reader_action(&mut held, &receiver, true, &cancelled),
+            ReaderAction::Gather
+        );
+        held = None;
+
+        // An unpublished held job must still yield Gather when cancelled so its frame releases.
+        flag.store(0, Ordering::Release);
+        sender
+            .send(Job {
+                frame: 1,
+                generation: 2,
+                requests: Requests::Device {
+                    address: ids.as_ptr() as usize,
+                    flag: &flag as *const AtomicU64 as usize,
+                    sequence: 6,
+                    rows: ids.len(),
+                    advisory: None,
+                },
+            })
+            .unwrap();
+        assert_eq!(
+            next_reader_action(&mut held, &receiver, false, &cancelled),
+            ReaderAction::WaitReady
+        );
+        cancelled.store(true, Ordering::Release);
+        assert_eq!(
+            next_reader_action(&mut held, &receiver, true, &cancelled),
+            ReaderAction::Gather
+        );
+        held = None;
+        // Disconnecting with nothing held exits cleanly.
+        drop(sender);
+        assert_eq!(
+            next_reader_action(&mut held, &receiver, true, &cancelled),
+            ReaderAction::Exit
+        );
     }
 }

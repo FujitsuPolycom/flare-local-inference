@@ -274,6 +274,9 @@ message EngramTable {
   // Disjoint row partitions owned by individual TP ranks. Empty retains the shared
   // weights/scales planes above. Partitioned tables publish partition-local row IDs.
   repeated EngramTableShard shards = 15;
+  // Optional mapped host int64 advisory row IDs followed by active row count and
+  // release-published submission sequence, used to warm host row caches ahead of the next step.
+  string prefetch_buffer = 16;
 }
 
 message EngramTableShard {

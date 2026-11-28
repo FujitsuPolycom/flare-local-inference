@@ -10,6 +10,25 @@ from ignition.preparation import runtime_core_pb2 as p
 
 def pack(layout, step):
     uploads = []
+    lookahead_lengths = [0] * len(step.lanes)
+    la_binding = next((b for b in layout.bindings[step.graph] if b["source"] == p.PROMPT_LOOKAHEAD_TOKEN), None)
+    if la_binding is not None:
+        la_cap = int(np.prod(layout.buffer_specs[la_binding["buffer"]][1]))
+        lane_prefill = [
+            step.kind in ("prefill", "terminal_prefill", "scored_prefill")
+            or (step.kind == "mixed" and getattr(lane, "prefill", False))
+            for lane in step.lanes
+        ]
+        prefill_count = sum(lane_prefill)
+        budget = la_cap
+        for row, lane in enumerate(step.lanes):
+            if not lane_prefill[row] or budget <= 0:
+                continue
+            end = lane.start + lane.tokens
+            rem = max(0, len(lane.request.prompt) - end)
+            take = min(rem, budget) if prefill_count == 1 else min(rem, lane.tokens, budget)
+            lookahead_lengths[row] = take
+            budget -= take
     for binding in layout.bindings[step.graph]:
         name, source, indexing = binding["buffer"], binding["source"], binding["indexing"]
         dtype, shape = layout.buffer_specs[name]
@@ -26,15 +45,26 @@ def pack(layout, step):
             continue
         padded = [binding["padding"]] * (layout.capacity * width) if indexing == p.SUBMISSION_ROW else None
         offset = 0
+        la_offset = 0
         for row, lane in enumerate(step.lanes):
             request = lane.request
-            destination = (request.slot if indexing == p.REQUEST_ROW else offset if indexing == p.PACKED_TOKEN else row) * width
+            destination = (
+                request.slot if indexing == p.REQUEST_ROW
+                else la_offset if indexing == p.PACKED_TOKEN and source == p.PROMPT_LOOKAHEAD_TOKEN
+                else offset if indexing == p.PACKED_TOKEN
+                else row
+            ) * width
             offset += lane.tokens
+            la_offset += lookahead_lengths[row]
             live_row = layout.state_row(request.slot)
             if source == p.CONSTANT: values = [0] * width
             elif source == p.REQUEST_SLOT: values = [request.slot]
             elif source == p.REQUEST_GENERATION: values = [request.generation]
             elif source in (p.QUERY_LENGTH, p.SPECULATIVE_PREFIX_LIMIT): values = [lane.tokens]
+            elif source == p.PROMPT_LOOKAHEAD_LENGTH: values = [lookahead_lengths[row]]
+            elif source == p.PROMPT_LOOKAHEAD_TOKEN:
+                take = lookahead_lengths[row]
+                values = request.prompt[lane.start + lane.tokens:lane.start + lane.tokens + take] if take > 0 else []
             elif source == p.SAMPLE_ENABLED: values = [int(step.kind not in ("prefill", "terminal_prefill") or lane.start + lane.tokens == len(request.prompt))]
             elif source == p.PROMPT_TOKEN: values = request.prompt[lane.start:lane.start + lane.tokens]
             elif source == p.PENDING_TOKEN: values = [request.pending_token]

@@ -15,25 +15,44 @@ from ignition.components.readiness import PreparedReadinessWait, wait_for_readin
 
 
 @triton.jit
-def _copy_requests(ids, mailbox, N: tl.constexpr, BLOCK: tl.constexpr):
+def _copy_requests(ids, live_rows, mailbox, N: tl.constexpr, BLOCK: tl.constexpr, HAS_LIMIT: tl.constexpr):
     row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    tl.store(mailbox + row, tl.load(ids + row, row < N, other=-1), row < N)
+    if HAS_LIMIT:
+        limit = tl.load(live_rows).to(tl.int64)
+        active = (row < N) & (row < limit)
+    else:
+        active = row < N
+    tl.store(mailbox + row, tl.load(ids + row, active, other=-1), active)
 
 
 @triton.jit
-def _publish(mailbox, sequence, FLAG: tl.constexpr):
+def _publish(mailbox, live_rows, sequence, FLAG: tl.constexpr, HAS_COUNT: tl.constexpr):
+    if HAS_COUNT:
+        tl.store(mailbox + (FLAG - 1), tl.load(live_rows).to(tl.int64))
     value = tl.load(sequence)
     tl.atomic_xchg(mailbox + FLAG, value, sem="release", scope="sys")
 
 
 @torch.library.custom_op("flare::publish_embedding_requests", mutates_args=("mailbox",))
 def publish_requests(ids: torch.Tensor, mailbox: torch.Tensor, sequence: torch.Tensor) -> None:
-    _copy_requests[(triton.cdiv(ids.numel(), 256),)](ids, mailbox, ids.numel(), 256)
-    _publish[(1,)](mailbox, sequence, mailbox.numel() - 1)
+    _copy_requests[(triton.cdiv(ids.numel(), 256),)](ids, mailbox, mailbox, ids.numel(), 256, False)
+    _publish[(1,)](mailbox, mailbox, sequence, mailbox.numel() - 1, False)
 
 
 @publish_requests.register_fake
 def _publish_requests_fake(ids, mailbox, sequence):
+    pass
+
+
+@torch.library.custom_op("flare::publish_advisory_embedding_requests", mutates_args=("mailbox",))
+def publish_advisory_requests(ids: torch.Tensor, live_rows: torch.Tensor, mailbox: torch.Tensor, sequence: torch.Tensor) -> None:
+    n = ids.numel()
+    _copy_requests[(triton.cdiv(n, 256),)](ids, live_rows, mailbox, n, 256, True)
+    _publish[(1,)](mailbox, live_rows, sequence, mailbox.numel() - 1, True)
+
+
+@publish_advisory_requests.register_fake
+def _publish_advisory_requests_fake(ids, live_rows, mailbox, sequence):
     pass
 
 
@@ -46,8 +65,8 @@ def _requests(token_ids: torch.Tensor, query_start: torch.Tensor, history: torch
     state = require_prepared(plan_from_handle(plan), "sequence.ple_embedding", ids.device)
     state.hash_state.run_tensors(token_ids, query_start, history, num_seqs, num_tokens,
         multipliers, primes, offsets, ids, requests, token_count=ids.shape[0])
-    _copy_requests[(triton.cdiv(ids.numel(), 256),)](ids, mailbox, ids.numel(), 256)
-    _publish[(1,)](mailbox, sequence, mailbox.numel() - 1)
+    _copy_requests[(triton.cdiv(ids.numel(), 256),)](ids, mailbox, mailbox, ids.numel(), 256, False)
+    _publish[(1,)](mailbox, mailbox, sequence, mailbox.numel() - 1, False)
 
 
 @_requests.register_fake

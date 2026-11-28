@@ -919,6 +919,60 @@ impl CachedReader {
         }
         Ok(())
     }
+
+    fn warm(&mut self, planes: &[Plane; 2], ids: &[i64]) -> Result<usize> {
+        let [weights, scales] = planes.map(|plane| plane.row_bytes);
+        let limit = planes[0].nbytes / weights;
+        let ids = &ids[..ids.len().min(self.max_rows)];
+        self.miss_ids.clear();
+        for &id in ids {
+            if id >= 0 && (id as usize) < limit {
+                self.miss_ids.push(id);
+            }
+        }
+        if self.miss_ids.is_empty() {
+            return Ok(0);
+        }
+        self.miss_ids.sort_unstable();
+        self.miss_ids.dedup();
+        let mut misses = 0usize;
+        for index in 0..self.miss_ids.len() {
+            let id = self.miss_ids[index];
+            if !self.cache.pin_if_present(id) {
+                self.miss_ids[misses] = id;
+                misses += 1;
+            }
+        }
+        self.miss_ids.truncate(misses);
+        if self.miss_ids.is_empty() {
+            return Ok(0);
+        }
+        let count = self.miss_ids.len();
+        self.disk.gather(
+            planes,
+            &self.miss_ids,
+            &mut self.miss_output[..count * (weights + scales)],
+        )?;
+        let mut added = 0u64;
+        let mut evicted = 0u64;
+        for (index, &id) in self.miss_ids.iter().enumerate() {
+            let w = &self.miss_output[index * weights..(index + 1) * weights];
+            let s = &self.miss_output
+                [count * weights + index * scales..count * weights + (index + 1) * scales];
+            let inserted = self.cache.insert_advisory(id, w, s);
+            added += u64::from(inserted.added);
+            evicted += u64::from(inserted.evicted);
+        }
+        self.disk
+            .stats
+            .resident_rows
+            .fetch_add(added, Ordering::Relaxed);
+        self.disk
+            .stats
+            .evictions
+            .fetch_add(evicted, Ordering::Relaxed);
+        Ok(count)
+    }
 }
 
 enum Data {
@@ -1068,6 +1122,25 @@ impl Reader {
             Ordering::Relaxed,
         );
         result
+    }
+
+    /// Fetch missing advisory row IDs into the host row cache without staging GPU output.
+    pub fn warm(&mut self, planes: &[Plane; 2], ids: &[i64]) -> Result<usize> {
+        let Data::Cached(reader) = &mut self.data else {
+            return Ok(0);
+        };
+        match reader.warm(planes, ids) {
+            Ok(loaded) => {
+                self.stats
+                    .prefetch_rows_loaded
+                    .fetch_add(loaded as u64, Ordering::Relaxed);
+                Ok(loaded)
+            }
+            Err(error) => {
+                self.stats.prefetch_errors.fetch_add(1, Ordering::Relaxed);
+                Err(error)
+            }
+        }
     }
 }
 
@@ -1778,5 +1851,73 @@ mod tests {
             .unwrap();
         assert!(reader.gather(&planes, &ids, &mut vec![0u8; expected.len()]).is_err());
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn advisory_warm_populates_row_cache_and_swallows_disk_errors_without_poisoning() {
+        let path = std::env::temp_dir().join(format!(
+            "helios-engram-warm-{}.bin",
+            std::process::id()
+        ));
+        let rows = 128;
+        let first = 4093;
+        let second = first + rows * 80 + 7;
+        let bytes: Vec<u8> = (0..second + rows * 10)
+            .map(|i| (i * 23 + i / 97) as u8)
+            .collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let planes = [
+            Plane {
+                file: 0,
+                offset: first as u64,
+                nbytes: rows * 80,
+                row_bytes: 80,
+            },
+            Plane {
+                file: 0,
+                offset: second as u64,
+                nbytes: rows * 10,
+                row_bytes: 10,
+            },
+        ];
+        let stats = Arc::new(Stats::default());
+        let mut reader = Reader::open(&path, &planes, false, 65536, 32, stats.clone()).unwrap();
+        // Warm deduplicates, ignores out-of-range/negative sentinels, and loads misses into cache.
+        let loaded = reader.warm(&planes, &[-1, 5, 19, 5, 999, 42]).unwrap();
+        assert_eq!(loaded, 3);
+        assert_eq!(stats.prefetch_rows_loaded.load(Ordering::Relaxed), 3);
+        let reads_after_warm = stats.disk_reads.load(Ordering::Relaxed);
+        assert!(reads_after_warm > 0);
+        // Subsequent real gather hits 100% in RowCache with zero additional disk reads.
+        let ids = [42, -1, 5, 19, 5];
+        let mut expected = Vec::new();
+        for plane in &planes {
+            for &id in &ids {
+                if id < 0 {
+                    expected.extend(std::iter::repeat_n(0, plane.row_bytes));
+                } else {
+                    let start = plane.offset as usize + id as usize * plane.row_bytes;
+                    expected.extend_from_slice(&bytes[start..start + plane.row_bytes]);
+                }
+            }
+        }
+        let mut actual = vec![0x5Au8; expected.len()];
+        reader.gather(&planes, &ids, &mut actual).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(stats.disk_reads.load(Ordering::Relaxed), reads_after_warm);
+        assert_eq!(stats.hits.load(Ordering::Relaxed), 3);
+        // A truncated file fails warm and bumps prefetch_errors without dropping warmed rows.
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        assert!(reader.warm(&planes, &[77]).is_err());
+        assert_eq!(stats.prefetch_errors.load(Ordering::Relaxed), 1);
+        let mut still_warm = vec![0u8; expected.len()];
+        reader.gather(&planes, &ids, &mut still_warm).unwrap();
+        assert_eq!(still_warm, expected);
+        std::fs::remove_file(path).unwrap();
     }
 }

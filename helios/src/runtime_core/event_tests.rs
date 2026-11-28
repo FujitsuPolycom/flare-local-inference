@@ -153,6 +153,7 @@ fn disk_cached_and_resident_tables_feed_native_b12x_graphs() {
             cache_bytes,
             1,
             resident_scales,
+            true,
         )
         .unwrap();
         assert!(shared.cache_bytes() <= cache_bytes);

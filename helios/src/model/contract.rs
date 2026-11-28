@@ -60,6 +60,7 @@ contract_enum!(ValueSource {
     GrammarEnabled = 30, CopyTokenIds = 31, CopyTokenCount = 32,
     CopyConsumedTokens = 33, CopyGeneration = 34, CopyGrammarMask = 35,
     CopyGrammarCount = 36, ImageTensor = 37, ImageFeatureSlot = 38, PromptTargetToken = 39, SpeculativePrefixLimit = 40,
+    PromptLookaheadToken = 41, PromptLookaheadLength = 42,
 });
 contract_enum!(InputIndexing { Scalar = 1, SubmissionRow = 2, RequestRow = 3, PackedToken = 4, ActiveRow = 5 });
 contract_enum!(StateAccessKind { Read = 1, Write = 2, ReadWrite = 3 });
@@ -491,6 +492,30 @@ impl PreparedContract {
                 || targets[0].padding != -1 || targets[0].buffer != "prompt_target_tokens"))
                 || (descriptor.kind != GraphKind::ScoredPrefill && !targets.is_empty()) {
                 return Err("prompt targets belong only to scored prefill graphs".into());
+            }
+            let la_tokens: Vec<_> = graph.inputs.iter().filter(|b| b.source == ValueSource::PromptLookaheadToken).collect();
+            let la_lengths: Vec<_> = graph.inputs.iter().filter(|b| b.source == ValueSource::PromptLookaheadLength).collect();
+            if !la_tokens.is_empty() || !la_lengths.is_empty() {
+                if !matches!(
+                    descriptor.kind,
+                    GraphKind::Prefill | GraphKind::TerminalPrefill | GraphKind::ScoredPrefill | GraphKind::Mixed
+                ) {
+                    return Err("prompt lookahead inputs belong only to prefill-capable graphs".into());
+                }
+                if la_tokens.len() != 1
+                    || la_lengths.len() != 1
+                    || la_tokens[0].buffer != "lookahead_token_ids"
+                    || la_tokens[0].indexing != InputIndexing::PackedToken
+                    || la_tokens[0].value_offset != 0
+                    || la_tokens[0].padding != 0
+                    || la_lengths[0].buffer != "lookahead_query_lengths"
+                    || la_lengths[0].indexing != InputIndexing::SubmissionRow
+                    || la_lengths[0].value_offset != 0
+                    || la_lengths[0].padding != 0
+                    || manifest.buffer(&la_lengths[0].buffer)?.dtype != crate::execution::Dtype::Int32
+                {
+                    return Err("prompt lookahead requires paired packed lookahead_token_ids and int32 submission-row lookahead_query_lengths bindings".into());
+                }
             }
             let mut destinations = std::collections::HashSet::new();
             for input in &graph.inputs {

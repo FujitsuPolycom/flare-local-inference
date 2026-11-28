@@ -448,6 +448,7 @@ fn rebind_engram(previous: &pwire::Engram, current: &super::wire::Engram) -> Res
         old.hash_buffer = new.hash_buffer.clone();
         old.ready_event = new.ready_event.clone();
         old.request_buffer = new.request_buffer.clone();
+        old.prefetch_buffer = new.prefetch_buffer.clone();
     }
     Ok(result)
 }

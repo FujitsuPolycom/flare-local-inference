@@ -24,6 +24,8 @@ pub struct LoadOptions {
     /// Keep original scale-plane bytes in host RAM while embedding weights remain on disk.
     /// When absent, enabled for disk tables on discrete GPUs.
     pub embedding_table_resident_scales: Option<bool>,
+    /// Disable advisory host row-cache warming from graph-published lookahead mailboxes.
+    pub no_embedding_table_prefetch: bool,
     /// Disk workers per table: four on Windows, one elsewhere. Share 128 slots and 8 MiB staging.
     pub embedding_table_workers: Option<usize>,
     pub max_concurrency: Option<usize>,
@@ -52,6 +54,12 @@ impl LoadOptions {
         has_tables
             && self.embedding_table_storage.unwrap_or_default() == crate::engram::Storage::Disk
             && self.embedding_table_resident_scales.unwrap_or(!integrated)
+    }
+
+    pub(super) fn embedding_prefetch(&self, cache_bytes: u64) -> bool {
+        cache_bytes != 0
+            && self.embedding_table_storage.unwrap_or_default() == crate::engram::Storage::Disk
+            && !self.no_embedding_table_prefetch
     }
 
     pub(super) fn embedding_cache_bytes(&self, has_tables: bool, integrated: bool) -> u64 {

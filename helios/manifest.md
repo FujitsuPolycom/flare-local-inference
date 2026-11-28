@@ -462,6 +462,20 @@ copy, model, and completion streams; their owners survive an unconfirmed drain.
 The core memory budget includes both host staging frames once per shared
 rank group.
 
+An `EngramTable` using GPU request delivery (`request_buffer`) may optionally
+declare `prefetch_buffer` (field `16`, buffer name up to 64 bytes, distinct from
+all other table bindings). When present, every rank must back `prefetch_buffer`
+with a 1-D `int64` `MappedHost` allocation of contiguous stride `[1]`, 8-byte
+aligned offset, rank-uniform length `shape[0]`, and `3 <= shape[0] <= max_staged_rows + 2`
+where `max_staged_rows = max_tokens * staged_heads`. Its layout is `[cap]` opaque
+row IDs (`cap = shape[0] - 2`) starting at the buffer base, followed by the active
+row count at `nbytes - 16` (`int64`) and the release-published submission sequence
+at `nbytes - 8` (`int64`). The reader snapshots the mailbox only after observing
+the step's synchronous `request_buffer` sequence and before signaling the staging
+ready flag, and accounts for the `cap * 8`-byte per-table host warm queue inside
+the core's host memory budget. Existing cores without `prefetch_buffer` load and
+serve unchanged without advisory warming.
+
 Graph declarations specify operation, sampling mode, B/D/W/P, confidence output
 extent, and mixed prefill extent. D describes actual captured proposal work,
 independent of W and P. The prepared contract's exact `QueryLength` binding or

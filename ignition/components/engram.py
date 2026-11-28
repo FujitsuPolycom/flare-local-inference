@@ -14,7 +14,7 @@ from b12x.preparation import PreparedCall
 from b12x.sequence import engram
 from b12x.sequence.engram._kernels import hash_op, lookup_op
 
-from ignition.components.ngram_delivery import publish_requests
+from ignition.components.ngram_delivery import publish_advisory_requests, publish_requests
 from ignition.components.readiness import PreparedReadinessWait, ReadinessTimings, wait_for_readiness
 from ignition.preparation.persistent import persistent_copy
 from ignition.preparation.tuning import declare
@@ -238,32 +238,46 @@ class PreparedEngramRequests:
         self.mask = self.slots = self.compressed = self.requests = self.full_hashes = self.args = None
         return self
 
-    def __call__(self, token_ids=None, starts=None, history=None, counts=None):
-        args = self.args
+    def _hash_window(self, token_ids, starts, history, counts, *, args=None, full_hashes=None, dest=None):
         if args is None:
             tokens, rows = token_ids.numel(), history.shape[0]
-            mask = torch.ones(tokens, dtype=torch.bool, device=token_ids.device)
-            slots = torch.arange(rows, dtype=torch.int32, device=token_ids.device)
-            compressed = torch.empty(tokens, dtype=torch.int64, device=token_ids.device)
-            requests = torch.empty(tokens, dtype=torch.int32, device=token_ids.device)
+            device = token_ids.device
+            mask = torch.ones(tokens, dtype=torch.bool, device=device)
+            slots = torch.arange(rows, dtype=torch.int32, device=device)
+            compressed = torch.empty(tokens, dtype=torch.int64, device=device)
+            requests = torch.empty(tokens, dtype=torch.int32, device=device)
             full_hashes = (
-                torch.empty((tokens, 24), dtype=torch.int64, device=token_ids.device)
-                if self.head_indices is not None else self.hashes
+                torch.empty((tokens, 24), dtype=torch.int64, device=device)
+                if self.head_indices is not None or dest is None else dest
             )
             args = (token_ids, mask, starts, slots, history, counts[1:], counts[:1],
                     full_hashes, compressed, requests, tokens)
-        else:
-            full_hashes = self.full_hashes
         hash_op(self.plan.handle, *args)
         selected = (
             torch.index_select(full_hashes, 1, self.head_indices)
-            if self.head_indices is not None else self.hashes
+            if self.head_indices is not None else full_hashes
         )
         if self.row_mapping is not None:
             # Preserve canonical hash geometry; remap only the storage rows of owned heads.
             start, end, destination = self.row_mapping.unbind(1)
             valid = (destination >= 0) & (selected >= start) & (selected < end)
-            self.hashes.copy_(torch.where(valid, selected - start + destination, -1))
-        elif self.head_indices is not None:
-            self.hashes.copy_(selected)
+            mapped = torch.where(valid, selected - start + destination, -1)
+        else:
+            mapped = selected
+        if dest is not None:
+            if self.row_mapping is not None or self.head_indices is not None:
+                dest.copy_(mapped)
+            return dest
+        return mapped.contiguous()
+
+    def __call__(self, token_ids=None, starts=None, history=None, counts=None):
+        self._hash_window(
+            token_ids, starts, history, counts,
+            args=self.args, full_hashes=self.full_hashes, dest=self.hashes,
+        )
         publish_requests(self.hashes, self.mailbox, self.sequence)
+
+    def publish_lookahead(self, token_ids, starts, history, counts, live_rows, mailbox):
+        """Hash an upcoming prompt window during graph capture and publish to an advisory mailbox."""
+        mapped = self._hash_window(token_ids, starts, history, counts)
+        publish_advisory_requests(mapped, live_rows, mailbox, self.sequence)

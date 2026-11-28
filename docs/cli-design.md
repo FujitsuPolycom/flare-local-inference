@@ -750,6 +750,7 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--embedding-table-storage disk\|ram` | PLE and Engram table storage; both modes deliver compact GPU rows | `disk` |
 | `--embedding-table-cache-size SIZE` | Per-host RAM budget for cached disk-backed PLE/Engram rows, including the index, usage counters and miss workspace; accepts sizes such as `1G` or `2GiB`; `0` disables | `4GiB` on discrete GPUs; `1GiB` on unified-memory GPUs such as DGX Spark |
 | `--embedding-table-resident-scales` / `--no-embedding-table-resident-scales` | Keep original embedding scale bytes in host RAM while weights remain on disk; adds to the row-cache budget | Enabled on discrete GPUs; disabled on unified-memory GPUs |
+| `--no-embedding-table-prefetch` | Disable advisory host row-cache warming from graph-published lookahead mailboxes on disk tables | Enabled for disk tables with a row cache when the core declares `prefetch_buffer` |
 | `--lossless-kv-compression off\|cpu\|gpu` | Lossless KV-cache checkpoint compression (`off` raw, `cpu` Zstd `ZKV1`, `gpu` core-embedded pure-CUDA rANS `GKV1`); see [prefix-cache-offload.md](prefix-cache-offload.md#0-lossless-kv-compression). | `[prefix_cache] compression`, otherwise `off` |
 | `--prefix-cache-memory SIZE` | Warm host memory for prefix checkpoints and prepared inputs, such as `16G`; `0` disables warm retention | `[prefix_cache] memory`, otherwise `0` |
 | `--prefix-cache-disk DIR` | Directory for prefix checkpoints and prepared inputs on disk | `[paths] prefix_cache`, otherwise disabled |
@@ -803,6 +804,16 @@ budget. This option needs no re-export and requires disk table storage;
 RAM table storage holds both planes in host memory. The metric
 `flare_engram_resident_scale_bytes` reports the scale allocation separately from
 the row cache.
+
+Disk-backed embedding tables with a nonzero row cache automatically enable
+advisory lookahead warming when the core declares per-table `prefetch_buffer`
+mailboxes. Each table reader snapshots opaque next-chunk row IDs published by
+the captured prefill graph before releasing `engram_ready` and warms the host
+row cache in bounded micro-batches while the GPU computes, yielding immediately
+to any ready or cancelled synchronous gather. Cores without `prefetch_buffer`
+load and serve unchanged without warming. Pass `--no-embedding-table-prefetch`
+to disable advisory warming explicitly. `/metrics` reports
+`flare_engram_prefetch_rows_loaded_total` and `flare_engram_prefetch_errors_total`.
 
 Ignition exports each recipe's canonical model name as its default serving
 alias, such as `DeepSeek-V4.1-Flash`. Checkpoint selectors such as

@@ -667,7 +667,14 @@ the cache does not alter that staging's consumer fences. Approximate usage count
 requested rows; recency breaks ties, and periodic count decay adapts to workload
 changes. Each server start creates an empty row cache; request gathers populate
 it without persistent cache files. `/metrics` exposes `flare_engram_` gather
-time, disk traffic, cache hits, misses, evictions, occupancy, capacity and bytes.
+time, disk traffic, cache hits, misses, evictions, occupancy, capacity, bytes,
+and advisory lookahead warming counters (`flare_engram_prefetch_rows_loaded_total`
+and `flare_engram_prefetch_errors_total`). When a disk-backed core declares
+per-table `prefetch_buffer` mailboxes and `--no-embedding-table-prefetch` is not
+set, each table reader snapshots next-chunk advisory row IDs before signaling
+`engram_ready` and warms the row cache between synchronous gathers, pinning
+warmed entries with a 1-bit flag until consumed or aged out after one cache
+turnover.
 
 ## Prefix checkpoint policy
 

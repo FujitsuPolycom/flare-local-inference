@@ -37,7 +37,9 @@ def text_inputs(kind):
                    b("vision_token_indices", p.IMAGE_FEATURE_INDEX, p.PACKED_TOKEN),
                    b("vision_feature_slot", p.IMAGE_FEATURE_SLOT, p.SCALAR, padding=-1),
                    b("vision_left", p.IMAGE_LEFT_CONTEXT, p.PACKED_TOKEN),
-                   b("vision_right", p.IMAGE_RIGHT_CONTEXT, p.PACKED_TOKEN)]
+                   b("vision_right", p.IMAGE_RIGHT_CONTEXT, p.PACKED_TOKEN),
+                   b("lookahead_token_ids", p.PROMPT_LOOKAHEAD_TOKEN, p.PACKED_TOKEN),
+                   b("lookahead_query_lengths", p.PROMPT_LOOKAHEAD_LENGTH)]
     if kind == "scored_prefill":
         values += [b("prompt_target_tokens", p.PROMPT_TARGET_TOKEN, p.PACKED_TOKEN, padding=-1)]
     if kind == "mixed":

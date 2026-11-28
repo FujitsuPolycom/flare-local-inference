@@ -949,6 +949,11 @@ pub struct ServingOptions {
     )]
     pub no_embedding_table_resident_scales: bool,
 
+    /// Disable advisory host row-cache warming from graph-published lookahead mailboxes
+    /// [default: enabled for disk tables with a row cache when the core declares prefetch mailboxes].
+    #[arg(long, help_heading = "Serving options")]
+    pub no_embedding_table_prefetch: bool,
+
     /// Disk workers per embedding table; shares a fixed I/O budget [default: 4 on Windows, 1 elsewhere].
     #[arg(long, value_name = "N", help_heading = "Advanced serving options",
         value_parser = PossibleValuesParser::new(["1", "2", "4", "8"]).map(|value| value.parse::<usize>().unwrap()))]
@@ -1198,6 +1203,9 @@ impl ServingOptions {
         if self.no_embedding_table_resident_scales {
             options.push("--no-embedding-table-resident-scales".into());
         }
+        if self.no_embedding_table_prefetch {
+            options.push("--no-embedding-table-prefetch".into());
+        }
         // Every rank keeps its own records under its host's directory; rank zero's store drives
         // all of them, so every rank needs the same settings.
         if let Some(bytes) = self.prefix_cache_memory {
@@ -1249,6 +1257,7 @@ impl ServingOptions {
             } else {
                 None
             },
+            no_embedding_table_prefetch: self.no_embedding_table_prefetch,
             embedding_table_workers: self.embedding_table_workers,
             max_concurrency: self.max_concurrency.map(NonZeroUsize::get),
             mtp_draft_tokens: self.mtp_draft_tokens,

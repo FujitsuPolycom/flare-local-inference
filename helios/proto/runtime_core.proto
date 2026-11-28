@@ -364,6 +364,10 @@ enum ValueSource {
   PROMPT_TARGET_TOKEN = 39;
   // Immutable per-request query-length ceiling for GPU-owned packed allocation.
   SPECULATIVE_PREFIX_LIMIT = 40;
+  // Prompt tokens immediately following each prefill lane's current chunk for graph-driven advisory prefetch.
+  PROMPT_LOOKAHEAD_TOKEN = 41;
+  // Number of valid lookahead tokens following each prefill lane's current chunk (zero when absent).
+  PROMPT_LOOKAHEAD_LENGTH = 42;
 }
 enum InputIndexing {
   INDEXING_UNSPECIFIED = 0;
@@ -656,6 +660,9 @@ message EngramTable {
   // Disjoint row partitions owned by individual TP ranks. Empty retains the shared
   // weights/scales planes above. Partitioned tables publish partition-local row IDs.
   repeated EngramTableShard shards = 15;
+  // Optional mapped host int64 advisory row IDs followed by active row count and
+  // release-published submission sequence, used to warm host row caches ahead of the next step.
+  string prefetch_buffer = 16;
 }
 message EngramTableShard {
   uint32 rank = 1;

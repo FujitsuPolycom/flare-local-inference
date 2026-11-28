@@ -124,6 +124,7 @@ impl Inputs {
                                 && matches!(graph.kind, GraphKind::Vision | GraphKind::Prefill | GraphKind::TerminalPrefill | GraphKind::ScoredPrefill | GraphKind::Mixed),
                             PageTable | LiveStateRows => binding.indexing == RequestRow,
                             PromptToken | PromptTargetToken
+                            | PromptLookaheadToken
                             | PromptAndPendingToken
                             | PromptPosition
                             | ImageFeatureIndex
@@ -406,6 +407,43 @@ impl Inputs {
                 }
             }
         }
+        let mut lookahead = [(0usize, 0usize); REQUEST_LANES];
+        if let Some(la_input) = graph
+            .inputs
+            .iter()
+            .find(|i| i.binding.source == ValueSource::PromptLookaheadToken)
+        {
+            let capacity = la_input.elements / la_input.width;
+            let prefill_lanes = frame
+                .step
+                .lanes
+                .iter()
+                .enumerate()
+                .filter(|(row, _)| frame.step.lane_kind(*row).is_prefill())
+                .count();
+            let mut budget = capacity;
+            for (row, lane) in frame.step.lanes.iter().enumerate() {
+                if !frame.step.lane_kind(row).is_prefill() || budget == 0 {
+                    continue;
+                }
+                let slot = lane.request.slot as usize;
+                let admission = frame.admissions[slot]
+                    .as_ref()
+                    .ok_or("missing packing admission")?;
+                let end = usize::try_from(lane.start_position)
+                    .map_err(|_| "prompt offset overflow")?
+                    .checked_add(lane.tokens)
+                    .ok_or("prompt extent overflow")?;
+                let remaining = admission.prompt.len().saturating_sub(end);
+                let take = if prefill_lanes == 1 {
+                    remaining.min(budget)
+                } else {
+                    remaining.min(lane.tokens).min(budget)
+                };
+                lookahead[row] = (end, take);
+                budget -= take;
+            }
+        }
         for input in &graph.inputs {
             let binding = &input.binding;
             if binding.source == ValueSource::PageTable {
@@ -461,7 +499,8 @@ impl Inputs {
                     binding.padding,
                 );
             }
-            let mut token_offset = 0;
+            let mut packed_offset = 0;
+            let is_lookahead_tokens = binding.source == ValueSource::PromptLookaheadToken;
             for (row, lane) in frame.step.lanes.iter().enumerate() {
                 let slot = lane.request.slot as usize;
                 let admission = frame.admissions[slot]
@@ -472,10 +511,14 @@ impl Inputs {
                 let destination = match binding.indexing {
                     InputIndexing::SubmissionRow | InputIndexing::ActiveRow => row * input.width,
                     InputIndexing::RequestRow => slot * input.width,
-                    InputIndexing::PackedToken => token_offset * input.width,
+                    InputIndexing::PackedToken => packed_offset * input.width,
                     InputIndexing::Scalar => unreachable!(),
                 };
-                token_offset += lane.tokens;
+                packed_offset += if is_lookahead_tokens {
+                    lookahead[row].1
+                } else {
+                    lane.tokens
+                };
                 if binding.source == ValueSource::SamplingParameters {
                     self.staging.put(
                         &binding.buffer,
@@ -542,6 +585,17 @@ impl Inputs {
                     RequestSlot => values.push(slot as i64),
                     RequestGeneration => values.push(lane.request.generation as i64),
                     QueryLength | SpeculativePrefixLimit => values.push(lane.tokens as i64),
+                    PromptLookaheadLength => values.push(lookahead[row].1 as i64),
+                    PromptLookaheadToken => {
+                        let (end, take) = lookahead[row];
+                        if take > 0 {
+                            values.extend(
+                                admission.prompt[end..end + take]
+                                    .iter()
+                                    .map(|t| *t as i64),
+                            );
+                        }
+                    }
                     SampleEnabled => values.push(frame.samples[row] as i64),
                     PromptTargetToken => {
                         for position in lane.start_position as usize + 1..=lane.start_position as usize + lane.tokens {

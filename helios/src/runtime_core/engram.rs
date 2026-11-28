@@ -153,6 +153,15 @@ pub(super) fn decode<F: super::payload::Files>(
         if gpu && !buffers.insert(table.request_buffer.clone()) {
             return Err(invalid("n-gram mailbox aliases another binding"));
         }
+        let has_prefetch = !table.prefetch_buffer.is_empty();
+        if has_prefetch {
+            if !gpu {
+                return Err(invalid("n-gram prefetch mailbox requires request delivery"));
+            }
+            if !buffers.insert(table.prefetch_buffer.clone()) {
+                return Err(invalid("n-gram prefetch mailbox aliases another binding"));
+            }
+        }
         let geometry = table
             .hash
             .ok_or_else(|| invalid("Engram table lacks hash geometry"))?;
@@ -199,6 +208,7 @@ pub(super) fn decode<F: super::payload::Files>(
         let compact_heads = (gpu && !table.shards.is_empty() && world > 1 && heads % world == 0)
             .then_some(heads / world);
         let mut table_heads = heads;
+        let mut prefetch_max_rows = 0usize;
         for core in cores {
             if !core.events.contains(&table.ready_event) {
                 return Err(invalid("rank lacks Engram readiness event"));
@@ -261,28 +271,55 @@ pub(super) fn decode<F: super::payload::Files>(
                     .ok_or_else(|| invalid("rank lacks Engram input buffer"))?;
                 validate_buffer(buffer, dtype, tokens * core_heads as u64, columns)?;
             }
-            if gpu {
-                let request = execution
+            let validate_mailbox = |name: &str, min_len: u64, max_len: Option<u64>, label: &str| {
+                let mailbox = execution
                     .buffers
                     .iter()
-                    .find(|b| b.name == table.request_buffer)
-                    .ok_or_else(|| invalid("rank lacks n-gram request mailbox"))?;
-                let reference = request
+                    .find(|b| b.name == name)
+                    .ok_or_else(|| invalid(format!("rank lacks {label}")))?;
+                let reference = mailbox
                     .reference
                     .as_ref()
-                    .ok_or_else(|| invalid("mailbox lacks storage"))?;
-                if request.dtype != "int64"
-                    || request.shape.len() != 1
-                    || request.strides != [1]
-                    || request.shape[0] < tokens * core_heads as u64 + 1
-                    || request.nbytes != request.shape[0] * 8
+                    .ok_or_else(|| invalid(format!("{label} lacks storage")))?;
+                if mailbox.dtype != "int64"
+                    || mailbox.shape.len() != 1
+                    || mailbox.strides != [1]
+                    || mailbox.shape[0] < min_len
+                    || max_len.is_some_and(|limit| mailbox.shape[0] > limit)
+                    || mailbox.nbytes != mailbox.shape[0] * 8
                     || !reference.offset.is_multiple_of(8)
                     || !core.allocations.iter().any(|a| {
                         a.name == reference.allocation && matches!(a.memory, Memory::MappedHost)
                     })
                 {
-                    return Err(invalid("invalid mapped n-gram mailbox"));
+                    return Err(invalid(format!("invalid mapped {label}")));
                 }
+                Ok(mailbox.shape[0])
+            };
+            let max_staged_rows = tokens
+                .checked_mul(core_heads as u64)
+                .ok_or_else(|| invalid("Engram staging row count overflow"))?;
+            if gpu {
+                validate_mailbox(
+                    &table.request_buffer,
+                    max_staged_rows + 1,
+                    None,
+                    "n-gram request mailbox",
+                )?;
+            }
+            if has_prefetch {
+                let len = validate_mailbox(
+                    &table.prefetch_buffer,
+                    3,
+                    Some(max_staged_rows + 2),
+                    "n-gram prefetch mailbox",
+                )?;
+                let cap = usize::try_from(len - 2)
+                    .map_err(|_| invalid("n-gram prefetch mailbox exceeds host range"))?;
+                if prefetch_max_rows != 0 && prefetch_max_rows != cap {
+                    return Err(invalid("ranks declare different n-gram prefetch capacities"));
+                }
+                prefetch_max_rows = cap;
             }
             for graph in execution.graphs.iter().filter(|g| {
                 matches!(
@@ -308,6 +345,7 @@ pub(super) fn decode<F: super::payload::Files>(
             hashes: table.hash_buffer,
             event: table.ready_event,
             request: gpu.then_some(table.request_buffer),
+            prefetch: has_prefetch.then_some((table.prefetch_buffer, prefetch_max_rows)),
         });
     }
     Ok(Index { tables })
@@ -613,5 +651,60 @@ mod tests {
         assert!(decode(unpart_catalog, &archive, &[unpart_core], 0, 4).is_err());
         let (host_catalog, host_core) = decode_fixture(4, 6, false, false);
         assert!(decode(host_catalog, &archive, &[host_core], 0, 1).is_err());
+    }
+
+    #[test]
+    fn prefetch_mailbox_validation_enforces_workspace_bound_and_rank_uniformity() {
+        let archive = StubFiles::new();
+        let make = |prefetch_len: u64| {
+            let (mut catalog, mut core) = decode_fixture(4, 6, true, true);
+            catalog.tables[0].prefetch_buffer = "engram_1_prefetch".into();
+            core.allocations.push(super::super::format::Allocation {
+                name: "prefetch_host".into(),
+                nbytes: (prefetch_len * 8) as usize,
+                alignment: 4096,
+                file: None,
+                data_spans: vec![],
+                sources: vec![],
+                relocations: vec![],
+                address: None,
+                memory: Memory::MappedHost,
+                sizing: None,
+            });
+            core.execution.as_mut().unwrap().buffers.push(wire::Buffer {
+                name: "engram_1_prefetch".into(),
+                dtype: "int64".into(),
+                shape: vec![prefetch_len],
+                strides: vec![1],
+                nbytes: prefetch_len * 8,
+                reference: Some(wire::Reference {
+                    allocation: "prefetch_host".into(),
+                    offset: 0,
+                }),
+            });
+            (catalog, core)
+        };
+        // Fixture has tokens = 128, staged_heads = 6 -> max_staged_rows = 768 -> max len = 770.
+        let (ok_cat, ok_core) = make(770);
+        let decoded = decode(ok_cat, &archive, &[ok_core], 0, 4).unwrap();
+        assert_eq!(
+            decoded.tables[0].prefetch,
+            Some(("engram_1_prefetch".into(), 768))
+        );
+        assert_eq!(crate::engram::prefetch_queue_bytes(&decoded).unwrap(), 768 * 8);
+
+        // Below minimum (3) and above workspace ceiling (max_staged_rows + 2 = 770) must reject.
+        for bad_len in [2, 771] {
+            let (bad_cat, bad_core) = make(bad_len);
+            assert!(
+                decode(bad_cat, &archive, &[bad_core], 0, 4).is_err(),
+                "expected rejection for prefetch_len={bad_len}"
+            );
+        }
+
+        // Different prefetch capacities across ranks must reject.
+        let (cat_a, core_a) = make(100);
+        let (_, core_b) = make(200);
+        assert!(decode(cat_a, &archive, &[core_a, core_b], 0, 4).is_err());
     }
 }

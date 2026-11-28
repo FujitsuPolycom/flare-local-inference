@@ -347,6 +347,14 @@ fn validate_engram(engram: &wire::Engram, ranks: u32, catalog: &Catalog) -> Resu
         }
         bounded_name(&table.weight_buffer, 64, "engram weight buffer")?;
         bounded_name(&table.scale_buffer, 64, "engram scale buffer")?;
+        if !table.prefetch_buffer.is_empty() {
+            if table.request_buffer.is_empty() {
+                return Err(invalid(
+                    "engram prefetch mailbox requires GPU request delivery",
+                ));
+            }
+            bounded_name(&table.prefetch_buffer, 64, "engram prefetch buffer")?;
+        }
         let hash = table
             .hash
             .as_ref()

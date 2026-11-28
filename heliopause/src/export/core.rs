@@ -1529,6 +1529,7 @@ fn core_engram(
             request_buffer: table.request_buffer.clone(),
             global_scale: table.global_scale,
             shards,
+            prefetch_buffer: table.prefetch_buffer.clone(),
         });
     }
     Ok(pwire::Engram {
@@ -4107,6 +4108,7 @@ mod payload_export_tests {
                     ready_event: "shared_ready".into(),
                     encoding: wire::engram_table::Encoding::Nvfp4E4m3Global as i32,
                     request_buffer: "shared_requests".into(),
+                    prefetch_buffer: String::new(),
                     global_scale: 1.0,
                     shards: vec![],
                 },
@@ -4130,6 +4132,7 @@ mod payload_export_tests {
                     ready_event: "partitioned_ready".into(),
                     encoding: wire::engram_table::Encoding::Fp8E4m3E8m0 as i32,
                     request_buffer: "partitioned_requests".into(),
+                    prefetch_buffer: String::new(),
                     global_scale: 1.0,
                     shards: vec![
                         wire::EngramTableShard {
@@ -4327,6 +4330,7 @@ mod payload_export_tests {
                 ready_event: "duplicate_ready".into(),
                 encoding: wire::engram_table::Encoding::Fp8E4m3E8m0 as i32,
                 request_buffer: "duplicate_requests".into(),
+                prefetch_buffer: String::new(),
                 global_scale: 1.0,
                 shards: vec![
                     wire::EngramTableShard {

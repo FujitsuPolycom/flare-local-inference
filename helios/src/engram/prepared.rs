@@ -123,6 +123,7 @@ impl PreparedTables {
                 hashes: source.hashes.clone(),
                 event: source.event.clone(),
                 request: source.request.clone(),
+                prefetch: None,
             });
         }
         Ok(Arc::new(Index { tables }))
@@ -288,6 +289,7 @@ impl PreparedTables {
                 manifest.context,
                 manifest.device,
                 stats,
+                false,
             )?,
             rank: 0,
             events: handles,

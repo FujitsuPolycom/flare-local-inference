@@ -2070,6 +2070,7 @@ fn build_loaded_descriptor<F: Fn(&crate::core::schema::wire::PayloadUse) -> Resu
                     ready_event: table.ready_event.clone(),
                     encoding: table.encoding,
                     request_buffer: table.request_buffer.clone(),
+                    prefetch_buffer: table.prefetch_buffer.clone(),
                     global_scale: table.global_scale,
                     // A rank-selective copy holds only the partitions of the ranks it verifies:
                     // keep every shard's geometry, but resolve planes only for those ranks.
