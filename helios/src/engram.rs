@@ -22,11 +22,12 @@ pub(crate) use reader::Plane;
 use std::fmt::Write;
 use std::{
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        Arc, Condvar, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 #[derive(Default)]
@@ -243,8 +244,89 @@ impl Requests {
 }
 const STAGING_FRAMES: usize = 2;
 
+/// Maximum time a later table (`ordinal > 0`) yields shared disk I/O to an
+/// active earliest-table (`ordinal == 0`) gather before proceeding unconditionally.
+const EARLY_IO_YIELD_MAX: Duration = Duration::from_millis(3);
+
+/// Process-wide count of earliest-table (`ordinal == 0`) disk gathers currently
+/// active so later tables across any local rank do not head-of-line block them
+/// on a shared NVMe device.
+static EARLY_IO_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+fn early_io_signal() -> &'static (Mutex<()>, Condvar) {
+    static SIGNAL: OnceLock<(Mutex<()>, Condvar)> = OnceLock::new();
+    SIGNAL.get_or_init(|| (Mutex::new(()), Condvar::new()))
+}
+
+fn advance_early_done(done: &Option<Arc<(Mutex<u64>, Condvar)>>, sequence: u64) {
+    if let Some(done) = done {
+        let mut seq = done.0.lock().unwrap();
+        if sequence > *seq {
+            *seq = sequence;
+        }
+        done.1.notify_all();
+    }
+}
+
+struct EarlyIoGuard {
+    done: Option<Arc<(Mutex<u64>, Condvar)>>,
+    sequence: u64,
+}
+
+impl EarlyIoGuard {
+    fn enter(done: Option<Arc<(Mutex<u64>, Condvar)>>, sequence: u64) -> Self {
+        EARLY_IO_ACTIVE.fetch_add(1, Ordering::AcqRel);
+        Self { done, sequence }
+    }
+}
+
+impl Drop for EarlyIoGuard {
+    fn drop(&mut self) {
+        advance_early_done(&self.done, self.sequence);
+        let prev = EARLY_IO_ACTIVE.fetch_sub(1, Ordering::AcqRel);
+        if prev == 1 {
+            let (lock, cv) = early_io_signal();
+            let _guard = lock.lock().unwrap();
+            cv.notify_all();
+        }
+    }
+}
+
+fn wait_for_early_io(done: Option<&Arc<(Mutex<u64>, Condvar)>>, sequence: u64) {
+    let deadline = Instant::now() + EARLY_IO_YIELD_MAX;
+    if let Some(done) = done {
+        let mut seq = done.0.lock().unwrap();
+        while *seq < sequence {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return;
+            };
+            let (next, timeout) = done.1.wait_timeout(seq, remaining).unwrap();
+            seq = next;
+            if timeout.timed_out() {
+                return;
+            }
+        }
+    }
+    if EARLY_IO_ACTIVE.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let (lock, cv) = early_io_signal();
+    let mut guard = lock.lock().unwrap();
+    while EARLY_IO_ACTIVE.load(Ordering::Acquire) > 0 {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return;
+        };
+        let (next, timeout) = cv.wait_timeout(guard, remaining).unwrap();
+        guard = next;
+        if timeout.timed_out() {
+            return;
+        }
+    }
+}
+
 struct Job {
     frame: usize,
+    sequence: u64,
     generation: u32,
     requests: Requests,
 }
@@ -379,9 +461,19 @@ impl Shared {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        Self::with_readers(index, readers, ranks, max_tokens, context, device, stats)
+        Self::with_readers(
+            index,
+            readers,
+            ranks,
+            max_tokens,
+            context,
+            device,
+            storage,
+            stats,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn with_readers(
         index: Arc<Index>,
         readers: Vec<reader::Reader>,
@@ -389,14 +481,17 @@ impl Shared {
         max_tokens: usize,
         context: usize,
         device: i32,
+        storage: Storage,
         stats: Arc<Stats>,
     ) -> Result<Arc<Self>> {
         if ranks == 0 || ranks > 16 || max_tokens == 0 || readers.len() != index.tables.len() {
             return Err("invalid embedding delivery geometry".into());
         }
         let stream = Stream::open(context, device)?;
+        let early_done = (index.tables.len() > 1 && storage == Storage::Disk)
+            .then(|| Arc::new((Mutex::new(0u64), Condvar::new())));
         let mut layers = Vec::new();
-        for (table, mut reader) in index.tables.iter().zip(readers) {
+        for (ordinal, (table, mut reader)) in index.tables.iter().zip(readers).enumerate() {
             let staging_bytes = table.staging_payload_bytes(max_tokens)?;
             let mut staging = Vec::with_capacity(STAGING_FRAMES);
             for _ in 0..STAGING_FRAMES {
@@ -417,6 +512,9 @@ impl Shared {
             let row_bytes = planes.iter().map(|p| p.row_bytes).sum::<usize>();
             let cancelled = Arc::new(AtomicBool::new(false));
             let stop = cancelled.clone();
+            let priority_done = early_done.clone();
+            let is_early_table = ordinal == 0;
+            let prioritize_disk = storage == Storage::Disk && early_done.is_some();
             let worker = thread::Builder::new()
                 .name(format!("flare-{}", table.event))
                 .spawn(move || {
@@ -430,21 +528,45 @@ impl Shared {
                                 job.requests.rows() * row_bytes,
                             )
                         };
+                        let late_gate = || {
+                            wait_for_early_io(priority_done.as_ref(), job.sequence);
+                        };
+                        let before_disk = (prioritize_disk && !is_early_table)
+                            .then_some(&late_gate as &dyn Fn());
+                        let mut early_guard: Option<EarlyIoGuard> = None;
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             if stop.load(Ordering::Acquire) {
                                 return Err("n-gram request cancelled".into());
                             }
                             let ids = job.requests.read(&stop)?;
-                            reader.gather(&planes, &ids, output)
+                            if prioritize_disk && is_early_table {
+                                early_guard = Some(EarlyIoGuard::enter(
+                                    priority_done.clone(),
+                                    job.sequence,
+                                ));
+                            }
+                            reader.gather_into_output(&planes, &ids, output, before_disk)
                         }))
                         .unwrap_or_else(|_| Err("Engram reader panicked".into()));
-                        if let Err(error) = result {
-                            output.fill(0);
-                            *buffers.error.lock().unwrap() = Some(error);
-                            stop.store(true, Ordering::Release);
-                        }
+                        let has_pending_misses = match result {
+                            Ok(pending) => pending,
+                            Err(error) => {
+                                output.fill(0);
+                                *buffers.error.lock().unwrap() = Some(error);
+                                stop.store(true, Ordering::Release);
+                                false
+                            }
+                        };
                         // Release failed reads too, so graph shutdown can drain before reporting the error.
                         buffers.signal(job.generation);
+                        if early_guard.is_some() {
+                            drop(early_guard);
+                        } else if prioritize_disk && is_early_table {
+                            advance_early_done(&priority_done, job.sequence);
+                        }
+                        if has_pending_misses {
+                            reader.commit_misses(&planes);
+                        }
                     }
                 })
                 .map_err(|e| format!("start Engram reader: {e}"))?;
@@ -517,6 +639,7 @@ impl Shared {
                 .unwrap()
                 .send(Job {
                     frame,
+                    sequence,
                     generation: state.generation,
                     requests,
                 })
@@ -806,5 +929,183 @@ mod tests {
         flag.store(0, Ordering::Release);
         cancelled.store(true, Ordering::Release);
         assert!(request().read(&cancelled).is_err());
+    }
+
+    #[test]
+    fn early_io_gate_releases_waiter_on_drop_and_bounds_timeout() {
+        let done = Arc::new((Mutex::new(0u64), Condvar::new()));
+        let guard = EarlyIoGuard::enter(Some(done.clone()), 5);
+        let released = Arc::new(AtomicBool::new(false));
+        let done_clone = done.clone();
+        let released_clone = released.clone();
+        let waiter = thread::spawn(move || {
+            wait_for_early_io(Some(&done_clone), 5);
+            released_clone.store(true, Ordering::Release);
+        });
+        thread::sleep(Duration::from_micros(200));
+        assert!(!released.load(Ordering::Acquire));
+        drop(guard);
+        waiter.join().unwrap();
+        assert!(released.load(Ordering::Acquire));
+        assert_eq!(*done.0.lock().unwrap(), 5);
+
+        // Process-wide EARLY_IO_ACTIVE blocks a waiter on another store even when
+        // its own sequence check is already satisfied, and releases immediately on drop.
+        let cross_rank = EarlyIoGuard::enter(None, 0);
+        let cross_released = Arc::new(AtomicBool::new(false));
+        let cross_released_clone = cross_released.clone();
+        let cross_waiter = thread::spawn(move || {
+            wait_for_early_io(None, 0);
+            cross_released_clone.store(true, Ordering::Release);
+        });
+        thread::sleep(Duration::from_micros(200));
+        assert!(!cross_released.load(Ordering::Acquire));
+        drop(cross_rank);
+        cross_waiter.join().unwrap();
+        assert!(cross_released.load(Ordering::Acquire));
+
+        // Missing earlier sequence cannot deadlock: bounded by EARLY_IO_YIELD_MAX.
+        let begin = Instant::now();
+        wait_for_early_io(Some(&done), 99);
+        assert!(begin.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn deferred_commit_populates_output_before_cache_insertion() {
+        let path = std::env::temp_dir().join(format!(
+            "helios-engram-deferred-{}.bin",
+            std::process::id()
+        ));
+        let rows = 64;
+        let bytes: Vec<u8> = (0..rows * (80 + 10))
+            .map(|i| ((i * 29 + 7) & 0xff) as u8)
+            .collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let planes = [
+            Plane {
+                file: 0,
+                offset: 0,
+                nbytes: rows * 80,
+                row_bytes: 80,
+            },
+            Plane {
+                file: 0,
+                offset: (rows * 80) as u64,
+                nbytes: rows * 10,
+                row_bytes: 10,
+            },
+        ];
+        let stats = Arc::new(Stats::default());
+        let file = Arc::new(crate::os::direct_file(&path, false).unwrap());
+        let mut reader = reader::Reader::from_files(
+            std::slice::from_ref(&file),
+            &planes,
+            false,
+            1 << 20,
+            16,
+            stats.clone(),
+            1,
+            false,
+        )
+        .unwrap();
+        let mut reference = reader::Reader::from_files(
+            std::slice::from_ref(&file),
+            &planes,
+            false,
+            1 << 20,
+            16,
+            Arc::default(),
+            1,
+            false,
+        )
+        .unwrap();
+        let ids = [3i64, 17, 3, -1];
+        let mut output = vec![0xa5u8; ids.len() * 90];
+        let gate_calls = AtomicUsize::new(0);
+        let gate = || {
+            gate_calls.fetch_add(1, Ordering::Relaxed);
+        };
+        let pending = reader
+            .gather_into_output(&planes, &ids, &mut output, Some(&gate))
+            .unwrap();
+        assert!(pending);
+        assert_eq!(gate_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.resident_rows.load(Ordering::Relaxed), 0);
+        let mut ref_output = vec![0x3cu8; ids.len() * 90];
+        reference.gather(&planes, &ids, &mut ref_output).unwrap();
+        assert_eq!(output, ref_output);
+        assert_eq!(&output[..80], &bytes[3 * 80..4 * 80]);
+        assert_eq!(&output[80..160], &bytes[17 * 80..18 * 80]);
+        assert_eq!(&output[160..240], &bytes[3 * 80..4 * 80]);
+        assert_eq!(&output[240..320], &[0u8; 80]);
+        assert_eq!(&output[320..330], &bytes[rows * 80 + 3 * 10..rows * 80 + 4 * 10]);
+        assert_eq!(&output[330..340], &bytes[rows * 80 + 17 * 10..rows * 80 + 18 * 10]);
+        assert_eq!(&output[340..350], &bytes[rows * 80 + 3 * 10..rows * 80 + 4 * 10]);
+        assert_eq!(&output[350..360], &[0u8; 10]);
+
+        reader.commit_misses(&planes);
+        assert_eq!(stats.resident_rows.load(Ordering::Relaxed), 2);
+        let reads_after_first = stats.disk_reads.load(Ordering::Relaxed);
+        let mut second = vec![0x5au8; ids.len() * 90];
+        assert!(
+            !reader
+                .gather_into_output(&planes, &ids, &mut second, Some(&gate))
+                .unwrap()
+        );
+        assert_eq!(gate_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(second, output);
+        assert_eq!(stats.disk_reads.load(Ordering::Relaxed), reads_after_first);
+
+        // Uncached disk readers invoke `before_disk` only when reading at least one row.
+        let mut uncached = reader::Reader::from_files(
+            std::slice::from_ref(&file),
+            &planes,
+            false,
+            0,
+            16,
+            Arc::default(),
+            1,
+            false,
+        )
+        .unwrap();
+        let disk_gate_calls = AtomicUsize::new(0);
+        let disk_gate = || {
+            disk_gate_calls.fetch_add(1, Ordering::Relaxed);
+        };
+        let mut padding_only = vec![0xffu8; 90];
+        assert!(
+            !uncached
+                .gather_into_output(&planes, &[-1], &mut padding_only, Some(&disk_gate))
+                .unwrap()
+        );
+        assert_eq!(padding_only, vec![0u8; 90]);
+        assert_eq!(disk_gate_calls.load(Ordering::Relaxed), 0);
+        let mut uncached_out = vec![0u8; ids.len() * 90];
+        assert!(
+            !uncached
+                .gather_into_output(&planes, &ids, &mut uncached_out, Some(&disk_gate))
+                .unwrap()
+        );
+        assert_eq!(disk_gate_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(uncached_out, output);
+
+        // A failed disk gather must clear pending misses so a subsequent commit_misses
+        // cannot insert incomplete bytes into the row cache.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        let mut failed = vec![0u8; 90];
+        assert!(
+            reader
+                .gather_into_output(&planes, &[25], &mut failed, None)
+                .is_err()
+        );
+        reader.commit_misses(&planes);
+        assert_eq!(stats.resident_rows.load(Ordering::Relaxed), 2);
+
+        std::fs::remove_file(path).unwrap();
     }
 }

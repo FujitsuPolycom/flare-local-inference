@@ -840,7 +840,16 @@ impl CachedReader {
         })
     }
 
-    fn gather(&mut self, planes: &[Plane; 2], ids: &[i64], output: &mut [u8]) -> Result<()> {
+    /// Populate `output` from cached hits and direct-I/O misses without inserting
+    /// misses into the row cache yet. Returns `true` when [`Self::commit_misses`]
+    /// must insert the fetched misses after the caller signals the consumer.
+    fn gather_into_output(
+        &mut self,
+        planes: &[Plane; 2],
+        ids: &[i64],
+        output: &mut [u8],
+        before_disk: Option<&dyn Fn()>,
+    ) -> Result<bool> {
         if ids.len() > self.max_rows {
             return Err("embedding gather exceeds the row cache workspace capacity".into());
         }
@@ -888,16 +897,21 @@ impl CachedReader {
             .misses
             .fetch_add(self.miss_ids.len() as u64, Ordering::Relaxed);
         if self.miss_ids.is_empty() {
-            return Ok(());
+            return Ok(false);
+        }
+        if let Some(gate) = before_disk {
+            gate();
         }
         let count = self.miss_ids.len();
-        self.disk.gather(
+        if let Err(error) = self.disk.gather(
             planes,
             &self.miss_ids,
             &mut self.miss_output[..count * (weights + scales)],
-        )?;
-        for (index, (&id, &(begin, end))) in self.miss_ids.iter().zip(&self.miss_groups).enumerate()
-        {
+        ) {
+            self.miss_ids.clear();
+            return Err(error);
+        }
+        for (index, &(begin, end)) in self.miss_groups.iter().enumerate() {
             let w = &self.miss_output[index * weights..(index + 1) * weights];
             let s = &self.miss_output
                 [count * weights + index * scales..count * weights + (index + 1) * scales];
@@ -906,6 +920,22 @@ impl CachedReader {
                 output[scale_base + row * scales..scale_base + (row + 1) * scales]
                     .copy_from_slice(s);
             }
+        }
+        Ok(true)
+    }
+
+    /// Insert misses fetched by the preceding successful [`Self::gather_into_output`]
+    /// into the row cache after the staging frame has been signaled.
+    fn commit_misses(&mut self, planes: &[Plane; 2]) {
+        let count = self.miss_ids.len();
+        if count == 0 {
+            return;
+        }
+        let [weights, scales] = planes.map(|plane| plane.row_bytes);
+        for (index, &id) in self.miss_ids.iter().enumerate() {
+            let w = &self.miss_output[index * weights..(index + 1) * weights];
+            let s = &self.miss_output
+                [count * weights + index * scales..count * weights + (index + 1) * scales];
             // Only complete successful disk gathers enter the immutable cache.
             let inserted = self.cache.insert(id, w, s);
             self.disk
@@ -917,7 +947,7 @@ impl CachedReader {
                 .evictions
                 .fetch_add(u64::from(inserted.evicted), Ordering::Relaxed);
         }
-        Ok(())
+        self.miss_ids.clear();
     }
 }
 
@@ -1037,7 +1067,23 @@ impl Reader {
             stats,
         }
     }
+    #[cfg(test)]
     pub fn gather(&mut self, planes: &[Plane; 2], ids: &[i64], output: &mut [u8]) -> Result<()> {
+        if self.gather_into_output(planes, ids, output, None)? {
+            self.commit_misses(planes);
+        }
+        Ok(())
+    }
+
+    /// Gather rows into `output` without inserting row-cache misses yet.
+    /// Call [`Self::commit_misses`] after signaling the consumer when this returns `Ok(true)`.
+    pub fn gather_into_output(
+        &mut self,
+        planes: &[Plane; 2],
+        ids: &[i64],
+        output: &mut [u8],
+        before_disk: Option<&dyn Fn()>,
+    ) -> Result<bool> {
         if output.len() != ids.len() * planes.iter().map(|p| p.row_bytes).sum::<usize>() {
             return Err("Engram staging size differs from row count".into());
         }
@@ -1051,15 +1097,22 @@ impl Reader {
         }
         let begin = Instant::now();
         let result = match &mut self.data {
-            Data::Disk(reader) => reader.gather(planes, ids, output),
-            Data::Cached(reader) => reader.gather(planes, ids, output),
+            Data::Disk(reader) => {
+                if let Some(gate) = before_disk
+                    && ids.iter().any(|&id| id >= 0)
+                {
+                    gate();
+                }
+                reader.gather(planes, ids, output).map(|()| false)
+            }
+            Data::Cached(reader) => reader.gather_into_output(planes, ids, output, before_disk),
             Data::Ram(data) => {
                 let mut base = 0;
                 for (plane, data) in planes.iter().zip(data) {
                     gather_resident(data, plane.row_bytes, ids, &mut output[base..]);
                     base += ids.len() * plane.row_bytes;
                 }
-                Ok(())
+                Ok(false)
             }
         };
         self.stats.gathers.fetch_add(1, Ordering::Relaxed);
@@ -1068,6 +1121,12 @@ impl Reader {
             Ordering::Relaxed,
         );
         result
+    }
+
+    pub fn commit_misses(&mut self, planes: &[Plane; 2]) {
+        if let Data::Cached(reader) = &mut self.data {
+            reader.commit_misses(planes);
+        }
     }
 }
 
