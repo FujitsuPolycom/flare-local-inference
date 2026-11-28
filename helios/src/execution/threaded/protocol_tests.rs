@@ -428,3 +428,90 @@ fn rank_coordinator_matches_model_partial_dispatch() {
         }
     }
 }
+
+#[test]
+fn rank_coordinator_matches_model_commit_before_blocking_local_collective() {
+    use std::sync::{
+        Arc, Barrier,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::thread;
+    use std::time::Duration;
+
+    const PEERS: usize = 3;
+    let collective = Arc::new(Barrier::new(PEERS + 1));
+    let sent = Arc::new(AtomicUsize::new(0));
+    let peers_entered = Arc::new(AtomicUsize::new(0));
+    let mut senders = Vec::with_capacity(PEERS);
+    let mut workers = Vec::with_capacity(PEERS);
+
+    for _ in 0..PEERS {
+        let (sender, receiver) = mpsc::channel::<(Fence, usize)>();
+        senders.push(sender);
+        let barrier = collective.clone();
+        let entered = peers_entered.clone();
+        workers.push(thread::spawn(move || {
+            let Ok(message) = receiver.recv_timeout(Duration::from_secs(5)) else {
+                return;
+            };
+            assert_eq!(message, (Fence(7), 1));
+            entered.fetch_add(1, Ordering::Release);
+            barrier.wait();
+        }));
+    }
+
+    let sent_send = sent.clone();
+    let sent_local = sent.clone();
+    let barrier_local = collective.clone();
+    commit_and_launch(
+        &mut senders,
+        |sender| {
+            sender
+                .send((Fence(7), 1))
+                .map_err(|_| invalid("rank disconnected"))?;
+            sent_send.fetch_add(1, Ordering::Release);
+            Ok(())
+        },
+        || {
+            assert_eq!(
+                sent_local.load(Ordering::Acquire),
+                PEERS,
+                "parallel commit must be dispatched to every peer before local CUDA submission"
+            );
+            barrier_local.wait();
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert_eq!(peers_entered.load(Ordering::Acquire), PEERS);
+
+    // Peer send failure must prevent local CUDA launch.
+    let (s0, r0) = mpsc::channel::<(Fence, usize)>();
+    let (s1, r1) = mpsc::channel::<(Fence, usize)>();
+    drop(r1);
+    let mut failing_senders = vec![s0, s1];
+    let mut local_called = false;
+    let err = commit_and_launch(
+        &mut failing_senders,
+        |sender| {
+            sender
+                .send((Fence(8), 0))
+                .map_err(|_| invalid("rank disconnected"))
+        },
+        || {
+            local_called = true;
+            Ok(())
+        },
+    );
+    error(err, "rank disconnected");
+    assert!(
+        !local_called,
+        "local submission must not run after peer commit dispatch fails"
+    );
+    assert_eq!(r0.try_recv().unwrap(), (Fence(8), 0));
+    drop(failing_senders);
+}

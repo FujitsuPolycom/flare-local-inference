@@ -155,22 +155,27 @@ mask. TLC checks observed helper transitions against `RankProtocol.AllowedEdge`.
 
 `DispatchRing.tla` checks `ThreadedExecutor`'s two-slot lock-free `DispatchRing`
 across three ranks (rank zero plus two peers) and three epochs, covering
-two-deep pipelining, backpressure cancellation, parity-slot reuse while an
-earlier committed frame remains in flight, peer validation failure during a
-pipelined second step, and in-flight drain before close. Invariants require
-every-peer readiness before commit (`CommitRequiresEveryPeer`), conflict-free
-parity-slot reuse (`SlotReuseSafe`), observation of committed decisions before
-drain (`NoStrandedCollective`), draining in-flight GPU work before peer close
-(`NoAbandonedInFlightWork`), and bounded ordered execution windows
-(`WindowAndOrder`).
+two-deep pipelining, explicit post-commit local CUDA launch (`LaunchingLocal`),
+backpressure cancellation, parity-slot reuse while an earlier committed frame
+remains in flight, peer validation failure during a pipelined second step,
+post-commit local submission failure, and in-flight drain before close.
+Invariants require every-peer readiness before commit (`CommitRequiresEveryPeer`),
+peer `Commit` publication before rank-zero local CUDA launch
+(`CommitBeforeLocalLaunch`), conflict-free parity-slot reuse (`SlotReuseSafe`),
+observation of committed decisions before drain (`NoStrandedCollective`),
+draining in-flight GPU work before peer close (`NoAbandonedInFlightWork`), and
+bounded ordered execution windows (`WindowAndOrder`).
 
-`execution::threaded::tests::dispatch_ring_matches_model_edges` drives the
-production `DispatchRing` atomics and `drain_outstanding_frames` helper across
-all reachable interleavings of two peers and three epochs, emitting an
+`execution::threaded::tests::dispatch_ring_matches_model_edges` drives both live
+multi-thread runs of the production `coordinate_step` orchestrator (including a
+blocking cross-rank collective barrier across all 18 model actions) and the
+complete reachable state graph of the `DispatchRing` atomics and
+`drain_outstanding_frames` helper across two peers and three epochs, emitting an
 18-integer projection checked against `DispatchRing.AllowedEdge`. Both TLA+
 model mutations and Rust source mutations in `check.py --mutations` verify that
-checking `drain` before `decision`, abandoning in-flight work on drain, or
-accepting partial peer readiness is caught immediately.
+checking `drain` before `decision`, abandoning in-flight work on drain, accepting
+partial peer readiness, or calling rank-zero local submission before publishing
+peer `Commit` is caught immediately.
 
 The commitment transition represents the marker set after successful peer
 dispatch and local submission. CPU exploration checks its eligibility predicate;
@@ -192,11 +197,16 @@ release assumes the runtime's external drain contract.
 Failure can also follow local enqueue; a failed submission does not imply that
 rank zero queued no work.
 
-The concrete channel test calls the production `dispatch_commit` helper with
-three real `mpsc` receivers. It checks success and disconnection at every send
-position, including the exact accepted prefix, propagated error, and absence of
-later sends. This is a channel-contract test; the dispatch model is not a
-refinement proof of the complete executor.
+The concrete channel tests call the production `dispatch_commit` and
+`commit_and_launch` helpers with three real `mpsc` receivers. They check success
+and disconnection at every send position, including the exact accepted prefix,
+propagated error, absence of later sends or local launch on peer failure, and
+that peer `Commit` dispatch completes before rank-zero local submission enters a
+blocking cross-rank collective barrier. The Rust mutation check in
+`check.py --mutations` additionally mutates `commit_and_launch` to run local
+submission before `dispatch_commit` and verifies the failure. These are
+channel-contract tests; the dispatch model is not a refinement proof of the
+complete executor.
 
 ## Prefix-checkpoint ownership
 

@@ -103,6 +103,15 @@ pub(crate) fn dispatch_commit<P>(
     Ok(())
 }
 
+pub(crate) fn commit_and_launch<P>(
+    peers: &mut [P],
+    send: impl FnMut(&mut P) -> Result<()>,
+    local_submit: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    dispatch_commit(peers, send)?;
+    local_submit()
+}
+
 pub(crate) fn pop_completed_front<P: PendingFrame>(pending: &mut VecDeque<P>) -> Option<P> {
     if !pending
         .front()

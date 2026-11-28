@@ -199,11 +199,14 @@ enum WaitPeersError {
 /// 2. Every peer thread validates its local upload layout, frame capacity, and rank-local
 ///    Engram staging state without launching CUDA work, drops its `&StepSlot` borrow, and
 ///    stores `epoch << 1` in its `peer_ack` slot.
-/// 3. Only after every peer acknowledges readiness does rank zero submit locally and publish
-///    `decision = (epoch << 1) | 1` (`Commit`). If any peer fails validation or exits, rank
+/// 3. Only after every peer acknowledges readiness and rank zero re-validates locally does rank
+///    zero publish `decision = (epoch << 1) | 1` (`Commit`) BEFORE calling `local.submit()`, so
+///    every rank launches multi-GPU collectives concurrently without rank zero blocking inside
+///    CUDA graph launch while peers wait for `Commit`. If any peer fails validation or exits, rank
 ///    zero requests drain without launching locally, preventing stranded collectives. If rank
-///    zero encounters `Ok(None)` backpressure, it publishes `decision = epoch << 1` (`Cancel`),
-///    waits for peers to acknowledge `(epoch << 1) | 1`, and returns `Ok(None)` without poisoning.
+///    zero encounters `Ok(None)` backpressure during pre-commit validation, it publishes
+///    `decision = epoch << 1` (`Cancel`), waits for peers to acknowledge `(epoch << 1) | 1`, and
+///    returns `Ok(None)` without poisoning.
 /// 4. Parity slot reuse (`slots[epoch & 1]` for `epoch >= 3`) is synchronized by
 ///    `wait_peer_acks(peer_count, (epoch - 1) << 1)`: every peer drops its `&StepSlot` borrow
 ///    for `epoch - 2` inside `executor.submit()` (or after observing `Cancel(epoch - 2)`) before
@@ -412,12 +415,12 @@ impl DispatchRing {
     }
 }
 
-/// Coordinate peer pre-launch validation, rank-zero submission, and commit/cancel over `ring`.
+/// Coordinate peer pre-launch validation, commit publication, and rank-zero submission over `ring`.
 ///
 /// # Safety
 /// Caller must be the sole producer and guarantee no peer still reads `ring.slots[*next_epoch & 1]`.
 #[allow(clippy::too_many_arguments)]
-unsafe fn coordinate_step<F>(
+unsafe fn coordinate_step<L, V, S>(
     ring: &DispatchRing,
     peer_count: usize,
     next_epoch: &mut u64,
@@ -427,10 +430,13 @@ unsafe fn coordinate_step<F>(
     uploads: &[Upload<'_>],
     timeout: Duration,
     on_peer_exit: impl FnOnce() -> Error,
-    local_submit: F,
+    local: &mut L,
+    local_validate: V,
+    local_submit: S,
 ) -> Result<Option<Fence>>
 where
-    F: FnOnce() -> Result<Option<Fence>>,
+    V: FnOnce(&mut L) -> Result<Option<Fence>>,
+    S: FnOnce(&mut L) -> Result<Option<Fence>>,
 {
     let epoch = *next_epoch;
     // SAFETY: Caller guarantees exclusive write access to `slots[epoch & 1]`.
@@ -448,11 +454,24 @@ where
             return Err(invalid("rank thread readiness deadline expired"));
         }
     }
-    match local_submit() {
+    match local_validate(local) {
         Ok(Some(local_fence)) if local_fence == fence => {
+            // Publish Commit before local CUDA launch so peer rank threads launch
+            // multi-GPU collectives concurrently with rank zero; calling local_submit()
+            // first deadlocks if cuGraphLaunch blocks on a collective while peers wait.
             ring.commit(epoch);
             *next_epoch += 1;
-            Ok(Some(fence))
+            match local_submit(local) {
+                Ok(Some(submitted)) if submitted == fence => Ok(Some(fence)),
+                Ok(_) => {
+                    ring.request_drain();
+                    Err(invalid("rank-zero fence changed after validation"))
+                }
+                Err(error) => {
+                    ring.request_drain();
+                    Err(error)
+                }
+            }
         }
         Ok(None) => {
             ring.cancel(epoch);
@@ -847,6 +866,7 @@ impl ThreadedExecutor {
         let queued = !self.pending.is_empty();
         let dispatched = Instant::now();
         let peers = &self.peers;
+        let local = &mut self.local;
         // SAFETY: Rank zero is the sole producer. For `next_epoch <= 2`, parity slot
         // `next_epoch & 1` has never been read by any peer. For `next_epoch >= 3`, advancing
         // past `next_epoch - 1` required `wait_peer_acks(peers.len(), (next_epoch - 1) << 1)`,
@@ -863,7 +883,9 @@ impl ThreadedExecutor {
                 uploads,
                 TIMEOUT,
                 || Self::surface_peer_error(peers),
-                || self.local.submit(graph, uploads, grammar),
+                local,
+                |exec| exec.validate_submission(graph, uploads, grammar),
+                |exec| exec.submit(graph, uploads, grammar),
             )
         };
         match coordinated {
@@ -1656,7 +1678,9 @@ mod tests {
                     &uploads,
                     Duration::from_secs(10),
                     || invalid("unexpected peer exit"),
-                    || Ok(Some(Fence(step))),
+                    &mut (),
+                    |_| Ok(Some(Fence(step))),
+                    |_| Ok(Some(Fence(step))),
                 )
                 .unwrap()
             };
@@ -1725,7 +1749,9 @@ mod tests {
                 &uploads,
                 Duration::from_secs(2),
                 || invalid("unexpected peer exit"),
-                || Ok(Some(Fence(1))),
+                &mut (),
+                |_| Ok(Some(Fence(1))),
+                |_| Ok(Some(Fence(1))),
             )
             .unwrap()
         };
@@ -1805,7 +1831,9 @@ mod tests {
                 &uploads,
                 Duration::from_secs(5),
                 || invalid("unexpected peer exit"),
-                || {
+                &mut (),
+                |_| Ok(Some(Fence(1))),
+                |_| {
                     local_launches += 1;
                     Ok(Some(Fence(1)))
                 },
@@ -1832,7 +1860,9 @@ mod tests {
                         .try_recv()
                         .unwrap_or_else(|_| invalid("rank thread disconnected"))
                 },
-                || {
+                &mut (),
+                |_| Ok(Some(Fence(2))),
+                |_| {
                     local_launches += 1;
                     Ok(Some(Fence(2)))
                 },
@@ -1917,7 +1947,9 @@ mod tests {
                     &uploads,
                     Duration::from_secs(5),
                     || invalid("unexpected peer exit"),
-                    || Ok(Some(Fence(1))),
+                    &mut (),
+                    |_| Ok(Some(Fence(1))),
+                    |_| Ok(Some(Fence(1))),
                 )
                 .unwrap()
             },
@@ -1930,8 +1962,8 @@ mod tests {
             );
         }
 
-        // Next attempt hits documented Ok(None) backpressure from local.submit: must cancel
-        // peers cleanly without poisoning and without launching Fence(2).
+        // Next attempt hits documented Ok(None) backpressure from pre-commit validation: must
+        // cancel peers cleanly without poisoning and without launching Fence(2).
         assert_eq!(
             unsafe {
                 coordinate_step(
@@ -1944,7 +1976,9 @@ mod tests {
                     &uploads,
                     Duration::from_secs(5),
                     || invalid("unexpected peer exit"),
-                    || Ok(None),
+                    &mut (),
+                    |_| Ok(None),
+                    |_| unreachable!("backpressure must cancel before local_submit"),
                 )
                 .unwrap()
             },
@@ -1967,7 +2001,9 @@ mod tests {
                     &uploads,
                     Duration::from_secs(5),
                     || invalid("unexpected peer exit"),
-                    || Ok(Some(Fence(2))),
+                    &mut (),
+                    |_| Ok(Some(Fence(2))),
+                    |_| Ok(Some(Fence(2))),
                 )
                 .unwrap()
             },
@@ -2151,7 +2187,7 @@ mod tests {
             unsafe {
                 coordinate_step(
                     &ring, PEERS, &mut next_epoch, Fence(1), 0, false, &u1,
-                    Duration::from_secs(5), || invalid("exit"), || Ok(Some(Fence(1))),
+                    Duration::from_secs(5), || invalid("exit"), &mut (), |_| Ok(Some(Fence(1))), |_| Ok(Some(Fence(1))),
                 )
                 .unwrap()
             },
@@ -2164,7 +2200,8 @@ mod tests {
             unsafe {
                 coordinate_step(
                     &ring, PEERS, &mut next_epoch, Fence(2), 1, false, &u2,
-                    Duration::from_secs(5), || invalid("exit"), || Ok(None),
+                    Duration::from_secs(5), || invalid("exit"), &mut (), |_| Ok(None),
+                    |_| unreachable!("backpressure must cancel before local_submit"),
                 )
                 .unwrap()
             },
@@ -2177,7 +2214,7 @@ mod tests {
             unsafe {
                 coordinate_step(
                     &ring, PEERS, &mut next_epoch, Fence(2), 2, false, &u3,
-                    Duration::from_secs(5), || invalid("exit"), || Ok(Some(Fence(2))),
+                    Duration::from_secs(5), || invalid("exit"), &mut (), |_| Ok(Some(Fence(2))), |_| Ok(Some(Fence(2))),
                 )
                 .unwrap()
             },
@@ -2198,12 +2235,78 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy, Eq, PartialEq, Hash)]
+    #[test]
+    fn coordinate_step_commits_peers_before_blocking_local_collective_launch() {
+        // Multi-GPU collective graphs (e.g., 16-GPU prefill) can block rank zero inside
+        // cuGraphLaunch when GPU 0 enters a collective and waits for peer GPUs while its
+        // pushbuffer drains. Peer Commit MUST already be published before local_submit runs
+        // so every rank enters the collective concurrently rather than deadlocking.
+        const PEERS: usize = 3;
+        let ring = Arc::new(DispatchRing::new(256, 4));
+        let collective = Arc::new(std::sync::Barrier::new(PEERS + 1));
+        let mut workers = Vec::with_capacity(PEERS);
+        for peer_id in 0..PEERS {
+            let peer_ring = ring.clone();
+            let barrier = collective.clone();
+            workers.push(thread::spawn(move || {
+                assert_eq!(peer_ring.wait_next(1), DispatchEvent::Step);
+                peer_ring.mark_peer_ready(peer_id, 1);
+                assert_eq!(
+                    peer_ring.wait_decision(1, Duration::from_secs(5)).unwrap(),
+                    DecisionEvent::Commit
+                );
+                // Simulate peer GPU entering the collective launched in executor.submit().
+                barrier.wait();
+                assert_eq!(peer_ring.wait_next(2), DispatchEvent::Drain);
+            }));
+        }
+        let data = 1u64.to_le_bytes();
+        let uploads = [Upload {
+            buffer: "tokens",
+            offset: 0,
+            bytes: &data,
+        }];
+        let mut next_epoch = 1u64;
+        let result = unsafe {
+            coordinate_step(
+                &ring,
+                PEERS,
+                &mut next_epoch,
+                Fence(1),
+                0,
+                false,
+                &uploads,
+                Duration::from_secs(5),
+                || invalid("unexpected peer exit"),
+                &mut (),
+                |_| Ok(Some(Fence(1))),
+                |_| {
+                    assert_eq!(
+                        ring.poll_decision(1),
+                        Some(DecisionEvent::Commit),
+                        "peer commit must be published before local CUDA submission"
+                    );
+                    // Blocks until every peer observed Commit and joined the collective.
+                    collective.wait();
+                    Ok(Some(Fence(1)))
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(result, Some(Fence(1)));
+        ring.request_drain();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
     enum ModelCoordPhase {
         Idle = 0,
         WaitingReady = 1,
         WaitingCancel = 2,
         Draining = 3,
+        LaunchingLocal = 4,
     }
 
     #[derive(Clone, Copy, Eq, PartialEq, Hash)]
@@ -2234,6 +2337,7 @@ mod tests {
         slot_write_conflict: bool,
         stranded_on_drain: bool,
         abandoned_in_flight: bool,
+        local_launch_before_commit: bool,
     }
 
     impl RingModelState {
@@ -2254,6 +2358,7 @@ mod tests {
                 slot_write_conflict: false,
                 stranded_on_drain: false,
                 abandoned_in_flight: false,
+                local_launch_before_commit: false,
             }
         }
 
@@ -2282,7 +2387,8 @@ mod tests {
         fn projection(&self) -> [usize; 18] {
             let flags = usize::from(self.slot_write_conflict)
                 | (usize::from(self.stranded_on_drain) << 1)
-                | (usize::from(self.abandoned_in_flight) << 2);
+                | (usize::from(self.abandoned_in_flight) << 2)
+                | (usize::from(self.local_launch_before_commit) << 3);
             [
                 self.prepare_epoch as usize,
                 (self.decision_word >> 1) as usize,
@@ -2313,6 +2419,491 @@ mod tests {
         }
     }
 
+    struct LiveRingTrace {
+        state: RingModelState,
+        edges: Vec<([usize; 18], [usize; 3], [usize; 18])>,
+        actions: HashSet<usize>,
+    }
+
+    impl LiveRingTrace {
+        fn new() -> Self {
+            Self {
+                state: RingModelState::initial(),
+                edges: Vec::new(),
+                actions: HashSet::new(),
+            }
+        }
+
+        fn record(&mut self, action: [usize; 3], update: impl FnOnce(&mut RingModelState)) {
+            let before = self.state.projection();
+            update(&mut self.state);
+            let after = self.state.projection();
+            self.actions.insert(action[0]);
+            self.edges.push((before, action, after));
+        }
+
+        fn observe_prepare(&mut self, ring: &DispatchRing) {
+            let prepared = ring.prepare_epoch.0.load(Ordering::Acquire);
+            if self.state.coord_phase == ModelCoordPhase::Idle
+                && prepared >= self.state.coord_epoch
+            {
+                let epoch = self.state.coord_epoch;
+                assert_eq!(prepared, epoch, "prepare_epoch must advance sequentially");
+                let slot = epoch & 1;
+                let conflict = (0..2).any(|p| self.state.peer_reads_slot(p, slot));
+                self.record([1, epoch as usize, 0], |st| {
+                    st.prepare_epoch = prepared;
+                    st.coord_phase = ModelCoordPhase::WaitingReady;
+                    if conflict {
+                        st.slot_write_conflict = true;
+                    }
+                });
+            }
+        }
+
+        fn observe_decision(&mut self, ring: &DispatchRing) {
+            let decision = ring.decision.0.load(Ordering::Acquire);
+            if self.state.coord_phase == ModelCoordPhase::WaitingReady
+                && (decision >> 1) >= self.state.coord_epoch
+            {
+                let epoch = self.state.coord_epoch;
+                if (decision & 1) != 0 {
+                    self.record([5, epoch as usize, 0], |st| {
+                        st.decision_word = decision;
+                        st.coord_phase = ModelCoordPhase::LaunchingLocal;
+                        st.committed |= 1 << (epoch - 1);
+                    });
+                } else {
+                    self.record([6, epoch as usize, 0], |st| {
+                        st.decision_word = decision;
+                        st.coord_phase = ModelCoordPhase::WaitingCancel;
+                    });
+                }
+            }
+        }
+
+        fn observe_drain(&mut self, ring: &DispatchRing) {
+            if ring.drain.0.load(Ordering::SeqCst) && !self.state.drain {
+                if self.state.coord_phase == ModelCoordPhase::LaunchingLocal {
+                    self.record([18, 0, 0], |st| {
+                        st.drain = true;
+                        st.coord_phase = ModelCoordPhase::Draining;
+                        st.coord_epoch += 1;
+                    });
+                } else {
+                    self.record([8, 0, 0], |st| {
+                        st.drain = true;
+                        st.coord_phase = ModelCoordPhase::Draining;
+                    });
+                }
+            }
+        }
+    }
+
+    fn record_production_coordinate_step_edges(
+        edges: &mut BTreeSet<([usize; 18], [usize; 3], [usize; 18])>,
+    ) {
+        let mut observed_actions = HashSet::new();
+        let data = 1u64.to_le_bytes();
+        let uploads = [Upload {
+            buffer: "tokens",
+            offset: 0,
+            bytes: &data,
+        }];
+
+        // Scenario A: production coordinate_step across epoch 1 Commit (with blocking
+        // 3-rank collective Barrier), epoch 2 Cancel (backpressure), and epoch 3 Commit
+        // followed by post-commit local_submit error -> Drain with in-flight frame drain.
+        {
+            let ring = Arc::new(DispatchRing::new(64, 4));
+            let trace = Arc::new(Mutex::new(LiveRingTrace::new()));
+            let collective = Arc::new(std::sync::Barrier::new(3));
+            let mut workers = Vec::with_capacity(2);
+            for peer in 0..2 {
+                let peer_ring = ring.clone();
+                let peer_trace = trace.clone();
+                let peer_barrier = collective.clone();
+                workers.push(thread::spawn(move || {
+                    let mut in_flight = VecDeque::new();
+                    let mut started = VecDeque::new();
+
+                    // Epoch 1: Step -> Ready -> Commit -> blocking collective -> SubmitCommitted.
+                    assert_eq!(peer_ring.wait_next(1), DispatchEvent::Step);
+                    {
+                        let mut tr = peer_trace.lock().unwrap();
+                        tr.observe_prepare(&peer_ring);
+                        tr.record([2, peer, 1], |st| {
+                            st.peer_phase[peer] = ModelPeerPhase::ReadingPrepare;
+                        });
+                        peer_ring.mark_peer_ready(peer, 1);
+                        let ack = peer_ring.peer_ack[peer].0.load(Ordering::Acquire);
+                        tr.record([3, peer, 1], |st| {
+                            st.peer_ack[peer] = ack;
+                            st.peer_phase[peer] = ModelPeerPhase::WaitingDecision;
+                        });
+                    }
+                    assert_eq!(
+                        peer_ring.wait_decision(1, Duration::from_secs(5)).unwrap(),
+                        DecisionEvent::Commit
+                    );
+                    {
+                        let mut tr = peer_trace.lock().unwrap();
+                        tr.observe_decision(&peer_ring);
+                        tr.record([9, peer, 0], |st| {
+                            st.peer_phase[peer] = ModelPeerPhase::ReadingCommit;
+                        });
+                    }
+                    peer_barrier.wait();
+                    {
+                        let mut tr = peer_trace.lock().unwrap();
+                        tr.record([12, peer, 1], |st| {
+                            st.peer_in_flight[peer] |= 1;
+                            st.peer_epoch[peer] += 1;
+                            st.peer_phase[peer] = ModelPeerPhase::WaitingStep;
+                        });
+                    }
+                    in_flight.push_back(1u64);
+                    started.push_back(Instant::now());
+
+                    // Epoch 2: Step -> Ready -> Cancel -> ack cancel.
+                    assert_eq!(peer_ring.wait_next(2), DispatchEvent::Step);
+                    {
+                        let mut tr = peer_trace.lock().unwrap();
+                        tr.observe_prepare(&peer_ring);
+                        tr.record([2, peer, 2], |st| {
+                            st.peer_phase[peer] = ModelPeerPhase::ReadingPrepare;
+                        });
+                        peer_ring.mark_peer_ready(peer, 2);
+                        let ack = peer_ring.peer_ack[peer].0.load(Ordering::Acquire);
+                        tr.record([3, peer, 2], |st| {
+                            st.peer_ack[peer] = ack;
+                            st.peer_phase[peer] = ModelPeerPhase::WaitingDecision;
+                        });
+                    }
+                    assert_eq!(
+                        peer_ring.wait_decision(2, Duration::from_secs(5)).unwrap(),
+                        DecisionEvent::Cancel
+                    );
+                    {
+                        let mut tr = peer_trace.lock().unwrap();
+                        tr.observe_decision(&peer_ring);
+                        peer_ring.mark_peer_cancelled(peer, 2);
+                        let ack = peer_ring.peer_ack[peer].0.load(Ordering::Acquire);
+                        tr.record([10, peer, 0], |st| {
+                            st.peer_ack[peer] = ack;
+                            st.peer_epoch[peer] += 1;
+                            st.peer_phase[peer] = ModelPeerPhase::WaitingStep;
+                        });
+                    }
+
+                    // Epoch 3 (reuses parity slot 1 while epoch 1 is in flight): Commit then Drain.
+                    assert_eq!(peer_ring.wait_next(3), DispatchEvent::Step);
+                    {
+                        let mut tr = peer_trace.lock().unwrap();
+                        tr.observe_prepare(&peer_ring);
+                        tr.record([2, peer, 3], |st| {
+                            st.peer_phase[peer] = ModelPeerPhase::ReadingPrepare;
+                        });
+                        peer_ring.mark_peer_ready(peer, 3);
+                        let ack = peer_ring.peer_ack[peer].0.load(Ordering::Acquire);
+                        tr.record([3, peer, 3], |st| {
+                            st.peer_ack[peer] = ack;
+                            st.peer_phase[peer] = ModelPeerPhase::WaitingDecision;
+                        });
+                    }
+                    assert_eq!(
+                        peer_ring.wait_decision(3, Duration::from_secs(5)).unwrap(),
+                        DecisionEvent::Commit
+                    );
+                    {
+                        let mut tr = peer_trace.lock().unwrap();
+                        tr.observe_decision(&peer_ring);
+                        tr.record([9, peer, 0], |st| {
+                            st.peer_phase[peer] = ModelPeerPhase::ReadingCommit;
+                        });
+                        tr.record([12, peer, 3], |st| {
+                            st.peer_in_flight[peer] |= 1 << 2;
+                            st.peer_epoch[peer] += 1;
+                            st.peer_phase[peer] = ModelPeerPhase::WaitingStep;
+                        });
+                    }
+                    in_flight.push_back(3u64);
+                    started.push_back(Instant::now());
+
+                    // Epoch 4: Drain observed after post-commit local_submit error; drain in-flight frames.
+                    assert_eq!(peer_ring.wait_next(4), DispatchEvent::Drain);
+                    {
+                        let mut tr = peer_trace.lock().unwrap();
+                        tr.observe_drain(&peer_ring);
+                        tr.record([13, peer, 4], |st| {
+                            st.peer_phase[peer] = ModelPeerPhase::Draining;
+                        });
+                    }
+                    drain_outstanding_frames(
+                        &mut in_flight,
+                        |pending| pending.len(),
+                        |pending| Ok(pending.pop_front()),
+                        &mut started,
+                        Duration::from_secs(5),
+                        |completed_epoch| {
+                            let mut tr = peer_trace.lock().unwrap();
+                            tr.record([14, peer, completed_epoch as usize], |st| {
+                                st.peer_in_flight[peer] &= !(1 << (completed_epoch - 1));
+                            });
+                        },
+                    )
+                    .unwrap();
+                    {
+                        let mut tr = peer_trace.lock().unwrap();
+                        tr.record([15, peer, 0], |st| {
+                            st.peer_phase[peer] = ModelPeerPhase::Closed;
+                        });
+                    }
+                }));
+            }
+
+            let mut next_epoch = 1u64;
+            // Epoch 1: Commit + blocking collective Barrier.
+            let res1 = unsafe {
+                coordinate_step(
+                    &ring,
+                    2,
+                    &mut next_epoch,
+                    Fence(1),
+                    0,
+                    false,
+                    &uploads,
+                    Duration::from_secs(5),
+                    || invalid("unexpected peer exit"),
+                    &mut (),
+                    |_| {
+                        assert!(
+                            (0..2).all(|p| ring.peer_ack[p].0.load(Ordering::Acquire) >= (1 << 1)),
+                            "commit must wait for every peer readiness"
+                        );
+                        Ok(Some(Fence(1)))
+                    },
+                    |_| {
+                        {
+                            let mut tr = trace.lock().unwrap();
+                            tr.observe_decision(&ring);
+                            let decision = ring.decision.0.load(Ordering::Acquire);
+                            if (decision >> 1) < 1 || (decision & 1) == 0 {
+                                tr.state.local_launch_before_commit = true;
+                            }
+                            assert!(
+                                !tr.state.local_launch_before_commit,
+                                "peer commit must be published before local CUDA submission"
+                            );
+                            assert_eq!(tr.state.coord_phase, ModelCoordPhase::LaunchingLocal);
+                        }
+                        collective.wait();
+                        {
+                            let mut tr = trace.lock().unwrap();
+                            tr.record([17, 1, 0], |st| {
+                                st.coord_phase = ModelCoordPhase::Idle;
+                                st.coord_epoch += 1;
+                                st.pending |= 1;
+                            });
+                        }
+                        Ok(Some(Fence(1)))
+                    },
+                )
+                .unwrap()
+            };
+            assert_eq!(res1, Some(Fence(1)));
+
+            // Epoch 2: Backpressure Cancel.
+            let res2 = unsafe {
+                coordinate_step(
+                    &ring,
+                    2,
+                    &mut next_epoch,
+                    Fence(2),
+                    1,
+                    false,
+                    &uploads,
+                    Duration::from_secs(5),
+                    || invalid("unexpected peer exit"),
+                    &mut (),
+                    |_| {
+                        assert!(
+                            (0..2).all(|p| ring.peer_ack[p].0.load(Ordering::Acquire) >= (2 << 1)),
+                            "commit must wait for every peer readiness"
+                        );
+                        Ok(None)
+                    },
+                    |_| unreachable!("backpressure must cancel before local_submit"),
+                )
+                .unwrap()
+            };
+            assert_eq!(res2, None);
+            {
+                let mut tr = trace.lock().unwrap();
+                tr.observe_decision(&ring);
+                assert_eq!(ring.poll_peer_acks(2, (2 << 1) | 1), Some(Ok(())));
+                tr.record([7, 2, 0], |st| {
+                    st.coord_phase = ModelCoordPhase::Idle;
+                    st.coord_epoch += 1;
+                });
+            }
+
+            // Epoch 3: Commit followed by post-commit local_submit error -> Drain.
+            let res3 = unsafe {
+                coordinate_step(
+                    &ring,
+                    2,
+                    &mut next_epoch,
+                    Fence(2),
+                    2,
+                    false,
+                    &uploads,
+                    Duration::from_secs(5),
+                    || invalid("unexpected peer exit"),
+                    &mut (),
+                    |_| {
+                        assert!(
+                            (0..2).all(|p| ring.peer_ack[p].0.load(Ordering::Acquire) >= (3 << 1)),
+                            "commit must wait for every peer readiness"
+                        );
+                        Ok(Some(Fence(2)))
+                    },
+                    |_| {
+                        let mut tr = trace.lock().unwrap();
+                        tr.observe_decision(&ring);
+                        let decision = ring.decision.0.load(Ordering::Acquire);
+                        if (decision >> 1) < 3 || (decision & 1) == 0 {
+                            tr.state.local_launch_before_commit = true;
+                        }
+                        assert!(
+                            !tr.state.local_launch_before_commit,
+                            "peer commit must be published before local CUDA submission"
+                        );
+                        Err(invalid("simulated post-commit local submit failure"))
+                    },
+                )
+            };
+            assert!(res3.is_err());
+            {
+                let mut tr = trace.lock().unwrap();
+                tr.observe_drain(&ring);
+            }
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            {
+                let mut tr = trace.lock().unwrap();
+                tr.record([16, 1, 0], |st| {
+                    st.pending &= !1;
+                });
+                observed_actions.extend(tr.actions.iter().copied());
+                edges.extend(tr.edges.iter().copied());
+            }
+        }
+
+        // Scenario B: production coordinate_step aborts with Drain when peer 0 fails validation.
+        {
+            let ring = Arc::new(DispatchRing::new(64, 4));
+            let trace = Arc::new(Mutex::new(LiveRingTrace::new()));
+            let peer1_ready = Arc::new(std::sync::Barrier::new(2));
+
+            let ring0 = ring.clone();
+            let trace0 = trace.clone();
+            let ready0 = peer1_ready.clone();
+            let w0 = thread::spawn(move || {
+                assert_eq!(ring0.wait_next(1), DispatchEvent::Step);
+                {
+                    let mut tr = trace0.lock().unwrap();
+                    tr.observe_prepare(&ring0);
+                    tr.record([2, 0, 1], |st| {
+                        st.peer_phase[0] = ModelPeerPhase::ReadingPrepare;
+                    });
+                }
+                // Let peer 1 enter WaitingDecision cleanly before peer 0 triggers peer exit.
+                ready0.wait();
+                {
+                    let mut tr = trace0.lock().unwrap();
+                    ring0.mark_peer_exited();
+                    let exited = ring0.peer_exited.0.load(Ordering::SeqCst);
+                    tr.record([4, 0, 1], |st| {
+                        st.peer_exited = exited;
+                        st.peer_phase[0] = ModelPeerPhase::Abandoned;
+                    });
+                }
+            });
+
+            let ring1 = ring.clone();
+            let trace1 = trace.clone();
+            let ready1 = peer1_ready.clone();
+            let w1 = thread::spawn(move || {
+                assert_eq!(ring1.wait_next(1), DispatchEvent::Step);
+                {
+                    let mut tr = trace1.lock().unwrap();
+                    tr.observe_prepare(&ring1);
+                    tr.record([2, 1, 1], |st| {
+                        st.peer_phase[1] = ModelPeerPhase::ReadingPrepare;
+                    });
+                    ring1.mark_peer_ready(1, 1);
+                    let ack = ring1.peer_ack[1].0.load(Ordering::Acquire);
+                    tr.record([3, 1, 1], |st| {
+                        st.peer_ack[1] = ack;
+                        st.peer_phase[1] = ModelPeerPhase::WaitingDecision;
+                    });
+                }
+                ready1.wait();
+                assert_eq!(
+                    ring1.wait_decision(1, Duration::from_secs(5)).unwrap(),
+                    DecisionEvent::Drain
+                );
+                {
+                    let mut tr = trace1.lock().unwrap();
+                    tr.observe_drain(&ring1);
+                    tr.record([11, 1, 0], |st| {
+                        st.peer_phase[1] = ModelPeerPhase::Draining;
+                    });
+                    tr.record([15, 1, 0], |st| {
+                        st.peer_phase[1] = ModelPeerPhase::Closed;
+                    });
+                }
+            });
+
+            let mut next_epoch = 1u64;
+            let err = unsafe {
+                coordinate_step(
+                    &ring,
+                    2,
+                    &mut next_epoch,
+                    Fence(1),
+                    0,
+                    false,
+                    &uploads,
+                    Duration::from_secs(5),
+                    || invalid("peer validation failed"),
+                    &mut (),
+                    |_| unreachable!("peer failure must abort before local validation"),
+                    |_| unreachable!("peer failure must abort before local submission"),
+                )
+            };
+            assert!(err.is_err());
+            {
+                let mut tr = trace.lock().unwrap();
+                tr.observe_drain(&ring);
+            }
+            w0.join().unwrap();
+            w1.join().unwrap();
+            let tr = trace.lock().unwrap();
+            observed_actions.extend(tr.actions.iter().copied());
+            edges.extend(tr.edges.iter().copied());
+        }
+
+        for required in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18] {
+            assert!(
+                observed_actions.contains(&required),
+                "production coordinate_step trace must exercise action {required}"
+            );
+        }
+    }
+
     #[test]
     fn dispatch_ring_matches_model_edges() {
         const MAX_EPOCHS: u64 = 3;
@@ -2339,6 +2930,10 @@ mod tests {
             assert!(
                 !state.abandoned_in_flight,
                 "surviving peer must drain in-flight work before closing"
+            );
+            assert!(
+                !state.local_launch_before_commit,
+                "peer commit must be published before local CUDA submission"
             );
             for e in 1..=MAX_EPOCHS {
                 if (state.committed & (1 << (e - 1))) != 0 {
@@ -2385,15 +2980,13 @@ mod tests {
                 ModelCoordPhase::WaitingReady => {
                     let ack_status = ring_ro.poll_peer_acks(2, state.coord_epoch << 1);
                     if matches!(ack_status, Some(Ok(()))) && !state.peer_exited {
-                        // 5. CoordCommit
+                        // 5. CoordCommit (publishes Commit to peers before local CUDA launch)
                         let mut after = state.clone();
                         let ring = after.hydrate_ring();
                         let epoch = after.coord_epoch;
                         ring.commit(epoch);
                         after.sync_from_ring(&ring);
-                        after.coord_phase = ModelCoordPhase::Idle;
-                        after.coord_epoch += 1;
-                        after.pending |= 1 << (epoch - 1);
+                        after.coord_phase = ModelCoordPhase::LaunchingLocal;
                         after.committed |= 1 << (epoch - 1);
                         emit(after, [5, epoch as usize, 0]);
 
@@ -2410,13 +3003,36 @@ mod tests {
                         && (matches!(ack_status, Some(Err(WaitPeersError::PeerExited)))
                             || matches!(ack_status, Some(Ok(()))))
                     {
-                        // 8. CoordRequestDrain (peer exited or local submit error before commit)
+                        // 8. CoordRequestDrain (peer exited or local validate error before commit)
                         let mut after = state.clone();
                         let ring = after.hydrate_ring();
                         ring.request_drain();
                         after.sync_from_ring(&ring);
                         after.coord_phase = ModelCoordPhase::Draining;
                         emit(after, [8, 0, 0]);
+                    }
+                }
+                ModelCoordPhase::LaunchingLocal => {
+                    if !state.drain {
+                        // 17. CoordLaunchLocal (local submit completes after peer Commit published)
+                        let mut after = state.clone();
+                        let epoch = after.coord_epoch;
+                        if (state.decision_word >> 1) < epoch || (state.decision_word & 1) == 0 {
+                            after.local_launch_before_commit = true;
+                        }
+                        after.coord_phase = ModelCoordPhase::Idle;
+                        after.coord_epoch += 1;
+                        after.pending |= 1 << (epoch - 1);
+                        emit(after, [17, epoch as usize, 0]);
+
+                        // 18. CoordLaunchLocalFail (local submit error after Commit requests drain)
+                        let mut after = state.clone();
+                        let ring = after.hydrate_ring();
+                        ring.request_drain();
+                        after.sync_from_ring(&ring);
+                        after.coord_phase = ModelCoordPhase::Draining;
+                        after.coord_epoch += 1;
+                        emit(after, [18, 0, 0]);
                     }
                 }
                 ModelCoordPhase::WaitingCancel => {
@@ -2603,6 +3219,7 @@ mod tests {
             observed_cancel_slot_reuse,
             "exploration must exercise parity slot reuse after cancel while prior frame is in flight"
         );
+        record_production_coordinate_step_edges(&mut edges);
         println!(
             "DISPATCH_RING_COUNTS states={} edges={}",
             states.len(),

@@ -6,7 +6,7 @@ VARIABLE state
 
 Peers == 0..(PeerCount - 1)
 Epochs == 1..MaxEpochs
-CoordPhases == {"Idle", "WaitingReady", "WaitingCancel", "Draining"}
+CoordPhases == {"Idle", "WaitingReady", "WaitingCancel", "Draining", "LaunchingLocal"}
 PeerPhases == {
     "WaitingStep", "ReadingPrepare", "WaitingDecision",
     "ReadingCommit", "Draining", "Closed", "Abandoned"
@@ -28,7 +28,8 @@ Initial == [
     peerInFlight |-> [p \in Peers |-> {}],
     slotWriteConflict |-> FALSE,
     strandedOnDrain |-> FALSE,
-    abandonedInFlight |-> FALSE
+    abandonedInFlight |-> FALSE,
+    localLaunchBeforeCommit |-> FALSE
 ]
 
 Init == state = Initial
@@ -80,10 +81,26 @@ CoordCommit(before, after) ==
     /\ after = [before EXCEPT
         !.decisionEpoch = before.coordEpoch,
         !.decisionCommit = TRUE,
-        !.coordPhase = "Idle",
-        !.coordEpoch = @ + 1,
-        !.pending = @ \cup {before.coordEpoch},
+        !.coordPhase = "LaunchingLocal",
         !.committed = @ \cup {before.coordEpoch}]
+
+CoordLaunchLocal(before, after) ==
+    /\ before.coordPhase = "LaunchingLocal"
+    /\ ~before.drain
+    /\ LET premature == (before.decisionEpoch < before.coordEpoch) \/ ~before.decisionCommit
+       IN after = [before EXCEPT
+           !.coordPhase = "Idle",
+           !.coordEpoch = @ + 1,
+           !.pending = @ \cup {before.coordEpoch},
+           !.localLaunchBeforeCommit = @ \/ premature]
+
+CoordLaunchLocalFail(before, after) ==
+    /\ before.coordPhase = "LaunchingLocal"
+    /\ ~before.drain
+    /\ after = [before EXCEPT
+        !.drain = TRUE,
+        !.coordPhase = "Draining",
+        !.coordEpoch = @ + 1]
 
 CoordCancel(before, after) ==
     /\ before.coordPhase = "WaitingReady"
@@ -171,6 +188,8 @@ Next ==
     \/ (\E p \in Peers : PeerValidateOk(state, state', p))
     \/ (\E p \in Peers : PeerValidateFail(state, state', p))
     \/ CoordCommit(state, state')
+    \/ CoordLaunchLocal(state, state')
+    \/ CoordLaunchLocalFail(state, state')
     \/ CoordCancel(state, state')
     \/ CoordCancelComplete(state, state')
     \/ CoordRequestDrain(state, state')
@@ -201,11 +220,14 @@ TypeOK ==
     /\ state.slotWriteConflict \in BOOLEAN
     /\ state.strandedOnDrain \in BOOLEAN
     /\ state.abandonedInFlight \in BOOLEAN
+    /\ state.localLaunchBeforeCommit \in BOOLEAN
 
 CommitRequiresEveryPeer ==
     \A e \in state.committed :
         \A p \in Peers :
             state.peerEpoch[p] > e \/ state.peerAck[p] >= 2 * e
+
+CommitBeforeLocalLaunch == ~state.localLaunchBeforeCommit
 
 SlotReuseSafe == ~state.slotWriteConflict
 
@@ -238,6 +260,7 @@ DecodeCoordPhase(code) ==
       [] code = 1 -> "WaitingReady"
       [] code = 2 -> "WaitingCancel"
       [] code = 3 -> "Draining"
+      [] code = 4 -> "LaunchingLocal"
 
 DecodePeerPhase(code) ==
     CASE code = 0 -> "WaitingStep"
@@ -266,7 +289,8 @@ Decode(vec) == [
     peerInFlight |-> [p \in Peers |-> IF p = 0 THEN DecodeMask(vec[13]) ELSE DecodeMask(vec[17])],
     slotWriteConflict |-> (vec[18] % 2) = 1,
     strandedOnDrain |-> ((vec[18] \div 2) % 2) = 1,
-    abandonedInFlight |-> ((vec[18] \div 4) % 2) = 1
+    abandonedInFlight |-> ((vec[18] \div 4) % 2) = 1,
+    localLaunchBeforeCommit |-> ((vec[18] \div 8) % 2) = 1
 ]
 
 AllowedEdge(edge) ==
@@ -289,5 +313,7 @@ AllowedEdge(edge) ==
          [] action[1] = 14 -> PeerCompleteFrame(before, after, action[2], action[3])
          [] action[1] = 15 -> PeerFinishDrain(before, after, action[2])
          [] action[1] = 16 -> CoordRetireFront(before, after, action[2])
+         [] action[1] = 17 -> CoordLaunchLocal(before, after)
+         [] action[1] = 18 -> CoordLaunchLocalFail(before, after)
          [] OTHER -> FALSE
 =============================================================================

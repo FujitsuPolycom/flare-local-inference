@@ -198,6 +198,14 @@ def main():
                  "    /\\ ~before.peerExited\n"
                  "    /\\ \\E p \\in Peers : before.peerAck[p] >= 2 * before.coordEpoch",
                  "CommitRequiresEveryPeer"),
+                ("DispatchRing",
+                 "        !.decisionEpoch = before.coordEpoch,\n"
+                 "        !.decisionCommit = TRUE,\n"
+                 "        !.coordPhase = \"LaunchingLocal\",",
+                 "        !.decisionEpoch = before.decisionEpoch,\n"
+                 "        !.decisionCommit = before.decisionCommit,\n"
+                 "        !.coordPhase = \"LaunchingLocal\",",
+                 "CommitBeforeLocalLaunch"),
                 ("CacheOwnership", "!.nodes[child][6] = Max(U(before, child), Max(U(before, n), R(before, n)))]",
                  "!.nodes[child][6] = U(before, child)]", "InheritedLastUse"),
                 ("Speculation", "Advance(st, ceiling) == Min(ceiling, Geometry(st)[7])",
@@ -228,6 +236,10 @@ def main():
                 ("ignored dispatch failure", "send(peer)?;",
                  "let _ = send(peer);",
                  "partial commit dispatch must report disconnected peer"),
+                ("parallel local submit before peer commit",
+                 "    dispatch_commit(peers, send)?;\n    local_submit()",
+                 "    local_submit()?;\n    dispatch_commit(peers, send)",
+                 "parallel commit must be dispatched to every peer before local CUDA submission"),
             ])
             check_mutations(cargo, ROOT / "helios/src/execution/threaded.rs", DISPATCH_RING_SUITE, [
                 ("drain before commit decision",
@@ -264,6 +276,18 @@ def main():
                  "if (0..peer_count).all(|index| self.peer_ack[index].0.load(Ordering::Acquire) >= target) {",
                  "if (0..peer_count).any(|index| self.peer_ack[index].0.load(Ordering::Acquire) >= target) {",
                  "commit must wait for every peer readiness"),
+                ("local submit before peer commit",
+                 "            ring.commit(epoch);\n"
+                 "            *next_epoch += 1;\n"
+                 "            match local_submit(local) {\n"
+                 "                Ok(Some(submitted)) if submitted == fence => Ok(Some(fence)),",
+                 "            match local_submit(local) {\n"
+                 "                Ok(Some(submitted)) if submitted == fence => {\n"
+                 "                    ring.commit(epoch);\n"
+                 "                    *next_epoch += 1;\n"
+                 "                    Ok(Some(fence))\n"
+                 "                }",
+                 "peer commit must be published before local CUDA submission"),
             ])
             check_mutations(cargo, ROOT / "helios/src/cache.rs", CHECKS[4][1], [
                 ("lost inherited fence", "child.last_use = child.last_use.max(node.last_use).max(node.ready_after);",

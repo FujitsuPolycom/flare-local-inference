@@ -186,7 +186,12 @@ compatibility, and serving benchmarks remain governed by principles 12 and 13.
    component and scheduler tests). `cargo check` does not substitute for
    `cargo test`. Tests must exercise the actual production entry points,
    validate rejection without partial mutation, and avoid mocks or source-text
-   checks that bypass runtime behavior.
+   checks that bypass runtime behavior. Changes to cross-rank dispatch or
+   transport coordination (`helios/src/execution/{threaded,parallel,roce}*`)
+   require a multi-thread CPU test with a blocking cross-rank barrier coupling
+   rank-zero local submission with peer commit handlers, proving that peer
+   `Commit` publication precedes rank-zero local CUDA launch even when local
+   submission blocks waiting for peer ranks.
 2. **Scheduling simulator and mathematical references.** Changes to graph
    selection, service pricing, timing estimation, refresh or exploration
    budgets, or cohort algorithms must be evaluated against the Python simulator
@@ -207,7 +212,12 @@ compatibility, and serving benchmarks remain governed by principles 12 and 13.
      (`python3 verification/helios-lifecycle/check.py`) whenever changing
      admission, fences, generations, cancellation, speculation accounting,
      cache compaction, snapshot aliases, response buffering or ownership,
-     offload aggregation, readiness, or rank coordination.
+     offload aggregation, readiness, or rank coordination. Observed-edge
+     conformance harnesses and mutation guards must execute the production
+     coordinator entry points (such as `coordinate_step` and
+     `commit_and_launch`), not only hand-written replays of low-level atomic or
+     channel primitives, and must model rank-zero local CUDA launch as a
+     distinct phase after peer commit publication.
    - Run the Kani sequential proofs
      (`cargo kani --manifest-path helios/Cargo.toml --lib`) whenever changing
      completion-vector validation, prepared completion contracts, state-view
@@ -239,6 +249,14 @@ compatibility, and serving benchmarks remain governed by principles 12 and 13.
   simulator sweep, TLA+ conformance run, or Kani proof unrun blocks commit and
   PR acceptance; noting it as a limitation does not make the omission
   acceptable.
+- **Multi-GPU collective execution is mandatory for TP dispatch and transport
+  changes.** Replacing or reordering cross-rank launch, commit, cancellation,
+  or drain paths in `helios/src/execution/{threaded,parallel,roce}*` requires
+  an explicit before/after cross-rank happens-before analysis and live
+  multi-GPU execution of real collective graphs (for example, serving a
+  multi-GPU exported core through `flare run`), not only independent per-rank
+  synthetic graphs. Disclosing busy or unavailable GPUs does not waive this
+  requirement for changes to TP execution paths.
 - Pure documentation and formatting edits require inspection and applicable
   existing checks; they do not require simulator, formal, or GPU runs.
 

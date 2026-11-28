@@ -86,9 +86,13 @@ idle peers parked on the ring's condition variable). Each peer observes
 `prepare_epoch`, validates its upload layout, frame capacity, and any rank-local
 Engram staging state without launching CUDA work, drops its slot borrow, and
 writes its cache-aligned readiness word. Only after every peer acknowledges
-readiness does rank zero submit locally and publish a `Commit` decision (or
-`Cancel` if rank zero encounters backpressure, leaving the executor unpoisoned,
-or `Drain` on peer or local error so no rank launches a stranded collective).
+readiness and rank zero re-validates locally does rank zero publish a `Commit`
+decision before calling `local.submit()`, so every rank enters multi-GPU
+collectives concurrently without rank zero blocking inside `cuGraphLaunch`
+while peers wait for `Commit`. If rank zero encounters pre-commit backpressure,
+it publishes `Cancel` and leaves the executor unpoisoned; on peer failure,
+pre-commit local error, or post-commit local submission error, it publishes
+`Drain`.
 Peers check `decision` for their current epoch before observing `drain`, so a
 step already committed on other ranks still launches on every surviving peer
 even when a pipelined next step fails and requests drain. On `Drain`, each peer

@@ -47,6 +47,12 @@ states are covered. Pruning on selected state fields does not establish exhausti
 coverage of the implementation's complete state. Mocks can isolate a contract,
 but cannot establish the behavior they replace.
 
+For tensor-parallel dispatch and transport coordinators, do not use trivial
+non-blocking closures as stand-ins for rank-zero CUDA submission. Couple
+rank-zero local submission and peer commit handlers through a blocking
+cross-rank `Barrier` so that any ordering where rank zero launches before
+publishing peer `Commit` deadlocks or fails immediately on CPU.
+
 ## Use Kani for sequential Rust properties
 
 Put harnesses behind `#[cfg(kani)]` beside the production module they verify.
@@ -81,8 +87,10 @@ release, and the commands are listed in
 
 Derive actions from actual ownership, message, enqueue, completion, and retirement
 boundaries. A serialized scheduler method can be one action. Sequential sends to
-several peers cannot become one atomic broadcast. Represent partial failure and
-work that remains outstanding after cancellation or poison.
+several peers cannot become one atomic broadcast, and publishing peer `Commit`
+cannot be folded with rank-zero local CUDA launch into one atomic action.
+Represent partial failure and work that remains outstanding after cancellation or
+poison.
 
 State safety invariants independently of the transition implementation. Check
 liveness only with explicit progress and fairness assumptions. Set finite bounds
@@ -92,7 +100,8 @@ finds a counterexample, unless source inspection demonstrates a modeling error.
 
 A successful TLC run verifies the bounded specification. A TLA+ specification is
 not automatically a proof of the Rust implementation. Connect it through tests
-that call production code and compare observed transitions with the same model
+that call the production coordinator entry points (not only low-level atomic or
+channel primitives) and compare observed transitions with the same model
 relations. Replay counterexamples against actual code. Checking generated traces
 is bounded conformance evidence; formal refinement requires establishing that
 every reachable implementation transition maps to an allowed specification
