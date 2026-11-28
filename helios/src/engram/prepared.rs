@@ -287,6 +287,7 @@ impl PreparedTables {
                 tokens,
                 manifest.context,
                 manifest.device,
+                super::Storage::Ram,
                 stats,
             )?,
             rank: 0,
