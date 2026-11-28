@@ -574,9 +574,13 @@ E <= alpha / (1 - alpha) * F + D.
 ```
 
 This permits one nonpreemptible overrun; the 5 ms credit cap is not a graph
-duration limit or a bound on individual request latency. Idle earns no credit
-and discards positive credit while retaining debt. Consequently, separate busy
-bursts shorter than 245 ms cannot fund a probe at the default settings.
+duration limit or a bound on individual request latency. By default in the
+simulator, idle earns no credit and discards positive credit while retaining
+debt, so separate busy bursts shorter than 245 ms cannot fund a probe at the
+default settings. Passing `--retain-idle-credit` (`retain_idle_credit = True`)
+retains bounded earned positive credit across idle gaps while preserving debt,
+matching Helios (`helios/src/scheduler/refresh.rs`), where idle intervals add
+neither credit nor ordinary duration and preserve the aggregate bound.
 
 An opportunity requires an alternative physical graph and sufficient credit;
 ungated policies omit the credit condition. The counter advances on commit
@@ -723,10 +727,15 @@ cost through normal service and needs no exploration allowance.
 This policy uses the cumulative estimator only for recorded statistics; no
 posterior, change detector, or request-delay ledger affects its decisions.
 With a 5 ms cap, allowances of 0.2% and 0.5% require respectively 2,495 ms and
-995 ms of ordinary service to fund the first stale remeasurement. Idle discards
-positive credit, so repeated shorter bursts can preserve stale estimates
-indefinitely. The aggregate exploration bound permits one graph-duration
-overrun and does not bound individual decode stalls.
+995 ms of ordinary service to fund the first stale remeasurement. Without
+`--retain-idle-credit`, idle discards positive credit so repeated shorter bursts
+can preserve stale estimates indefinitely; with `--retain-idle-credit` (as in
+Helios), bounded earned credit carries across idle while preserving negative
+debt and the aggregate exploration bound. Helios additionally excludes measured
+embedding-delivery readiness wait from timing-refresh credit and episode
+charges (falling back to unexcluded physical or wall time when the GPU interval
+does not exceed readiness wait). The aggregate exploration bound permits one
+graph-duration overrun and does not bound individual decode stalls.
 
 Retained EMA and greedy policies bootstrap only while no productive measured
 choice exists. They can leave other graphs unmeasured indefinitely. The `ttl`

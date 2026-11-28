@@ -1526,3 +1526,46 @@ def test_retained_refresh_allowance_covers_overdraw_invalid_timings_and_idle(alp
             now += 10_000
     assert s.probe_count >= 3
     assert s.invalid_observations > 0
+
+
+def test_retained_refresh_retain_idle_credit_recovers_across_short_bursts_without_starvation():
+    graphs = (
+        GraphSpec("incumbent", prefill_capacity=6144),
+        GraphSpec("large", prefill_capacity=8192),
+        GraphSpec("small", prefill_capacity=2048),
+    )
+    s = scheduler(
+        "retained-refresh", catalog=graphs, alpha=0.002, retain_idle_credit=True
+    )
+    # large is oldest stale (t=0, D=145ms > ttl/499 and slower than incumbent at 6144/100ms),
+    # so large re-expires during debt refill while small (t=1000, D=30ms) remains older and recovers.
+    seed(s, "large", 300, end=0.0)
+    seed(s, "small", 200, end=1_000.0)
+    seed(s, "incumbent", 100, end=31_000.0)
+    now = 31_000.0
+    probed = []
+    large_reexpired_before_small = False
+    op = 0
+    for _ in range(120):
+        # Short busy burst (~1,000 ms < 2,495 ms) separated by idle gaps.
+        for _ in range(10):
+            op += 1
+            decision = s.choose([view("p", 65_536)], now)
+            name = decision.action.graph.name
+            duration = {"incumbent": 100.0, "large": 145.0, "small": 30.0}[name]
+            if decision.category == "probe":
+                if name == "small" and now >= s._expires["large"]:
+                    large_reexpired_before_small = True
+                probed.append(name)
+            now = finish(s, decision, duration, op)
+            allowance = s.ordinary_ms * s.config.alpha / (1 - s.config.alpha)
+            assert s.probe_ms <= allowance + max(145.0, 30.0) + 1e-8
+        before_idle = s.credit_ms
+        s.idle()
+        assert s.credit_ms == before_idle
+        now += 500.0
+        if "small" in probed:
+            break
+    assert probed[:2] == ["large", "small"]
+    assert large_reexpired_before_small
+    assert s.choose([view("p", 65_536)], now).action.graph.name == "small"

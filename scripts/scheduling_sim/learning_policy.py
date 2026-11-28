@@ -44,6 +44,7 @@ class PolicyConfig:
     initial_discovery: str = "productive"
     mean_estimator: str = "arithmetic"
     partial_blocks: bool = False
+    retain_idle_credit: bool = False
 
     def __post_init__(self):
         if self.policy not in POLICIES or self.estimator not in ("cumulative", "regime", "log-regime"):
@@ -79,6 +80,8 @@ class PolicyConfig:
             raise ValueError("operational mean must be arithmetic or ema")
         if type(self.partial_blocks) is not bool:
             raise ValueError("partial timing blocks must be a boolean")
+        if type(self.retain_idle_credit) is not bool:
+            raise ValueError("retain_idle_credit must be a boolean")
         if self.policy == "retained-refresh" and (not self.funded or self.estimator != "cumulative"):
             raise ValueError("retained-refresh requires funding and the cumulative timing estimator")
         if self.policy == "retained-refresh" and (self.probe_harm_ms is not None or self.harm_alpha is not None):
@@ -668,7 +671,8 @@ class LearningScheduler:
     def idle(self):
         if self._inflight is not None or self._planned is not None:
             raise ValueError("idle requires no planned or executing operation")
-        self.credit_ms = min(0.0, self.credit_ms)
+        if not self.config.retain_idle_credit:
+            self.credit_ms = min(0.0, self.credit_ms)
         if self.config.policy == "targeted" and self.config.harm_alpha is not None:
             self.harm_credit_ms = {phase: min(0.0, balance) for phase, balance in self.harm_credit_ms.items()}
 

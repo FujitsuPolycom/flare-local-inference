@@ -741,3 +741,50 @@ def test_accepted_winner_uses_geomean_then_worst_decode_tail_then_probe_expense(
                                          ["higher-tail", "lower-tail", "lower-cost", "throughput"])
     assert [row["config_id"] for row in ranked] == ["throughput", "lower-cost", "lower-tail", "higher-tail"]
     assert rank_accepted_configurations(rows, gates, []) == []
+
+
+def test_retain_idle_credit_cli_option_is_boolean_and_excluded_from_validation_overrides(
+    tmp_path,
+):
+    from scripts.scheduling_sim.learning import build_configurations, main, parser
+    from scripts.scheduling_sim.learning_policy import PolicyConfig
+
+    defaults = build_configurations(
+        parser().parse_args(["--policies", "retained-refresh"]), PolicyConfig
+    )
+    assert defaults[-1].config.retain_idle_credit is False
+    enabled = build_configurations(
+        parser().parse_args(
+            [
+                "--policies",
+                "retained-refresh",
+                "--alpha",
+                "0.002",
+                "--retain-idle-credit",
+            ]
+        ),
+        PolicyConfig,
+    )
+    assert enabled[-1].config.retain_idle_credit is True
+    assert enabled[-1].id.endswith(":retain_idle_credit=True")
+    with pytest.raises(ValueError, match="sweeps are numeric"):
+        build_configurations(
+            parser().parse_args(
+                ["--policies", "retained-refresh", "--sweep", "retain_idle_credit=0,1"]
+            ),
+            PolicyConfig,
+        )
+    for value in (None, 0, 1, "true"):
+        with pytest.raises(ValueError, match="boolean"):
+            PolicyConfig(retain_idle_credit=value)
+    with pytest.raises(SystemExit) as error:
+        main(
+            [
+                "--preset",
+                "validate",
+                "--configs",
+                str(tmp_path / "unused.json"),
+                "--retain-idle-credit",
+            ]
+        )
+    assert error.value.code == 2

@@ -71,28 +71,30 @@ impl RefreshState {
     pub fn complete(&mut self, origin: PlanOrigin, timing: ExecutionTiming) {
         match origin {
             PlanOrigin::Ordinary => {
-                if let Some(duration) = cost::observed_duration_ns(timing) {
+                if let Some(duration) = cost::observed_compute_duration_ns(timing) {
                     self.credit_ns = CREDIT_CAP_NS.min(self.credit_ns + INCOME_RATE * duration as f64);
+                }
+                if let Some(duration) = cost::observed_duration_ns(timing) {
                     self.acceptance_credit_ns = CREDIT_CAP_NS.min(self.acceptance_credit_ns + ACCEPTANCE_INCOME_RATE * duration as f64);
                 }
             }
             PlanOrigin::Discovery => {}
             _ => {
-                let duration = cost::observed_duration_ns(timing).unwrap_or(timing.wall_ns);
-                if origin.is_acceptance() { self.acceptance_credit_ns -= duration as f64; }
-                else { self.credit_ns -= duration as f64; }
+                if origin.is_acceptance() {
+                    let duration = cost::observed_duration_ns(timing).unwrap_or(timing.wall_ns);
+                    self.acceptance_credit_ns -= duration as f64;
+                } else {
+                    let duration = cost::timing_refresh_duration_ns(timing);
+                    self.credit_ns -= duration as f64;
+                }
                 self.active = false;
             }
         }
     }
 
-    pub fn idle(&mut self) {
-        self.credit_ns = self.credit_ns.min(0.0);
-        self.acceptance_credit_ns = self.acceptance_credit_ns.min(0.0);
-    }
-
     pub fn abort(&mut self) {
         self.active = false;
-        self.idle();
+        self.credit_ns = self.credit_ns.min(0.0);
+        self.acceptance_credit_ns = self.acceptance_credit_ns.min(0.0);
     }
 }

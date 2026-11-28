@@ -1155,11 +1155,15 @@ impl RequestScheduler {
         self.refresh.credit_ns
     }
 
+    /// Validates that no execution is in flight across an idle gap.
+    ///
+    /// Timing-refresh and acceptance-learning ledgers retain bounded earned credit
+    /// (`<= CREDIT_CAP_NS`) and negative debt across idle intervals because idle adds
+    /// neither credit nor ordinary duration.
     pub fn idle(&mut self) -> Result<()> {
         if !self.submissions.is_empty() {
             return Err("idle requires no submitted execution".into());
         }
-        self.refresh.idle();
         Ok(())
     }
 

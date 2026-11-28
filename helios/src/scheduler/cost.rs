@@ -28,6 +28,34 @@ pub(crate) fn observed_duration_ns(timing: ExecutionTiming) -> Option<u64> {
         .map(|ns| if timing.queued { ns } else { ns.max(timing.wall_ns) })
 }
 
+/// Returns compute duration excluding measured embedding-delivery readiness wait.
+///
+/// Mirrors `ActionCosts::observe`: when `gpu_ns <= wait_ns` the cost sample is
+/// discarded as zero and this returns `None`, so ordinary executions earn no
+/// timing-refresh credit and refresh episodes fall back to charging unexcluded
+/// physical duration rather than `0`.
+pub(crate) fn observed_compute_duration_ns(timing: ExecutionTiming) -> Option<u64> {
+    let wait_ns = timing.readiness.map_or(0, |intervals| intervals.wait_ns());
+    let gpu_ns = timing.gpu_ns.into_iter().flatten().max().filter(|&ns| ns > 0)?;
+    if gpu_ns <= wait_ns {
+        return None;
+    }
+    let observed = if timing.queued { gpu_ns } else { gpu_ns.max(timing.wall_ns) };
+    Some(observed - wait_ns)
+}
+
+/// Duration charged to the timing-refresh ledger for a completed refresh probe.
+///
+/// Uses compute duration excluding measured readiness wait when the GPU sample
+/// is valid and exceeds `wait_ns`; otherwise charges unexcluded physical time
+/// (or isolated wall time when GPU timing is absent), ensuring every validated
+/// refresh completion incurs a strictly positive charge.
+pub(crate) fn timing_refresh_duration_ns(timing: ExecutionTiming) -> u64 {
+    observed_compute_duration_ns(timing)
+        .or_else(|| observed_duration_ns(timing))
+        .unwrap_or(timing.wall_ns)
+}
+
 /// Prefers the shortest positive measured duration, yielding `0` only when every
 /// aggregated shape is unmeasured.
 pub(super) fn min_measured_duration(current: Option<u64>, nanos: u64) -> Option<u64> {
@@ -410,5 +438,66 @@ mod tests {
         reversed.set_measured(&step_for(5, 6, 39), 18_000_000);
         assert_eq!(reversed.packed_round_duration(16, 4), Some(18_000_000));
         assert_eq!(reversed.packed_round_duration(16, 6), Some(18_000_000));
+    }
+
+    #[test]
+    fn compute_refresh_duration_excludes_readiness_wait_and_charges_positive_on_zero_compute() {
+        use crate::execution::{ExecutionTiming, ReadinessIntervals};
+        let timestamps = [1_000u64, 256_000, 256_100]
+            .into_iter()
+            .flat_map(u64::to_ne_bytes)
+            .collect::<Vec<_>>();
+        let readiness = ReadinessIntervals::decode(&timestamps).unwrap();
+        assert_eq!(readiness.wait_ns(), 255_000);
+
+        let mut gpu_ns = [None; 16];
+        gpu_ns[0] = Some(400_000);
+        let isolated = ExecutionTiming { gpu_ns, readiness: Some(readiness), wall_ns: 410_000, queued: false };
+        assert_eq!(super::observed_compute_duration_ns(isolated), Some(155_000));
+        assert_eq!(super::timing_refresh_duration_ns(isolated), 155_000);
+
+        let queued = ExecutionTiming { queued: true, ..isolated };
+        assert_eq!(super::observed_compute_duration_ns(queued), Some(145_000));
+        assert_eq!(super::timing_refresh_duration_ns(queued), 145_000);
+
+        // Missing GPU timing falls back to isolated wall time.
+        let invalid = ExecutionTiming { readiness: Some(readiness), wall_ns: 100_000, ..Default::default() };
+        assert_eq!(super::observed_compute_duration_ns(invalid), None);
+        assert_eq!(super::timing_refresh_duration_ns(invalid), 100_000);
+
+        // When wait_ns >= gpu_ns, ActionCosts::observe discards the 0-ns sample; compute duration
+        // must return None while refresh charging falls back to unexcluded physical duration (> 0)
+        // whether wall_ns is populated or zero.
+        let mut dominated_gpu = [None; 16];
+        dominated_gpu[0] = Some(200_000);
+        let dominated_with_wall = ExecutionTiming {
+            gpu_ns: dominated_gpu,
+            readiness: Some(readiness),
+            wall_ns: 260_000,
+            queued: false,
+        };
+        assert_eq!(super::observed_compute_duration_ns(dominated_with_wall), None);
+        assert_eq!(super::timing_refresh_duration_ns(dominated_with_wall), 260_000);
+
+        let dominated_no_wall = ExecutionTiming {
+            gpu_ns: dominated_gpu,
+            readiness: Some(readiness),
+            wall_ns: 0,
+            queued: false,
+        };
+        assert_eq!(super::observed_compute_duration_ns(dominated_no_wall), None);
+        assert_eq!(super::timing_refresh_duration_ns(dominated_no_wall), 200_000);
+
+        // Exact boundary wait_ns == gpu_ns also yields 0 compute and charges physical time.
+        let mut equal_gpu = [None; 16];
+        equal_gpu[0] = Some(255_000);
+        let equal_timing = ExecutionTiming {
+            gpu_ns: equal_gpu,
+            readiness: Some(readiness),
+            wall_ns: 0,
+            queued: false,
+        };
+        assert_eq!(super::observed_compute_duration_ns(equal_timing), None);
+        assert_eq!(super::timing_refresh_duration_ns(equal_timing), 255_000);
     }
 }

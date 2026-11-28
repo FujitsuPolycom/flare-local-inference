@@ -2468,12 +2468,13 @@ fn invalid_refresh_timing_pays_isolated_wall_time_once_without_refreshing_cost()
 }
 
 #[test]
-fn ordinary_income_excludes_queued_wall_wait_and_idle_discards_only_positive_credit() {
+fn ordinary_income_excludes_queued_wall_wait_and_idle_retains_credit_while_abort_discards_positive() {
     let mut s = engine(2, false);
     let a = add(&mut s, 1, 64, 4096);
     let b = add(&mut s, 2, 64, 4096);
     ready(&mut s, &[a, b]);
     s.refresh.credit_ns = 0.0;
+    s.refresh.acceptance_credit_ns = 0.0;
     let first = s.phase_plan(GraphKind::Decode, Some(a));
     let second = s.phase_plan(GraphKind::Decode, Some(b));
     let fence = Fence(s.submitted.0 + 1);
@@ -2489,9 +2490,21 @@ fn ordinary_income_excludes_queued_wall_wait_and_idle_discards_only_positive_cre
     timing.wall_ns = 200 * MS;
     timing.queued = true;
     complete_timed(&mut s, &second, Fence(fence.0 + 1), 0, false, timing);
-    assert!((s.refresh_credit_ns() - 70_000_000.0 * 0.002 / 0.998).abs() < 1e-8);
+    let earned = 70_000_000.0 * 0.002 / 0.998;
+    let acceptance_earned = 70_000_000.0 * 0.01 / 0.99;
+    assert!((s.refresh_credit_ns() - earned).abs() < 1e-8);
+    assert!((s.acceptance_credit_ns() - acceptance_earned).abs() < 1e-8);
     s.idle().unwrap();
+    assert!((s.refresh_credit_ns() - earned).abs() < 1e-8);
+    assert!((s.acceptance_credit_ns() - acceptance_earned).abs() < 1e-8);
+    s.refresh.abort();
     assert_eq!(s.refresh_credit_ns(), 0.0);
+    assert_eq!(s.acceptance_credit_ns(), 0.0);
+    s.refresh.credit_ns = -5_000_000.0;
+    s.refresh.acceptance_credit_ns = -4_000_000.0;
+    s.refresh.abort();
+    assert_eq!(s.refresh_credit_ns(), -5_000_000.0);
+    assert_eq!(s.acceptance_credit_ns(), -4_000_000.0);
 }
 
 #[test]
@@ -2535,6 +2548,7 @@ fn refresh_funding_requires_earned_credit_and_accounts_for_repeated_attempts_and
     ready(&mut s, &[h]);
     set_cost(&mut s, GraphKind::Decode, 1, 1, 10 * MS);
     set_cost(&mut s, GraphKind::Decode, 2, 1, 100 * MS);
+    s.refresh.credit_ns = 0.0;
     s.idle().unwrap();
     s.advance_to(s.now_ns + s.policy.estimate_ttl_ns).unwrap();
     let ordinary = |s: &mut RequestScheduler, duration| {
@@ -2543,12 +2557,13 @@ fn refresh_funding_requires_earned_credit_and_accounts_for_repeated_attempts_and
         assert_eq!((plan.kind, plan.batch_capacity), (GraphKind::Decode, 1));
     };
     ordinary(&mut s, 10 * MS);
-    assert!(s.refresh_credit_ns() > 0.0);
+    let retained = s.refresh_credit_ns();
+    assert!(retained > 0.0);
     s.idle().unwrap();
-    assert_eq!(s.refresh_credit_ns(), 0.0);
+    assert_eq!(s.refresh_credit_ns(), retained);
 
     let mut ordinary_ns = 10 * MS;
-    for _ in 0..249 {
+    for _ in 0..248 {
         ordinary(&mut s, 10 * MS);
         ordinary_ns += 10 * MS;
     }
@@ -2595,7 +2610,7 @@ fn refresh_funding_requires_earned_credit_and_accounts_for_repeated_attempts_and
     assert!(!s.refresh.active());
     assert!(refresh_ns as f64 <= ordinary_ns as f64 * 0.002 / 0.998 + (20 * MS) as f64);
     assert!((s.refresh_credit_ns()
-        - ((ordinary_ns - 10 * MS) as f64 * 0.002 / 0.998 - refresh_ns as f64)).abs() < 1e-6);
+        - (ordinary_ns as f64 * 0.002 / 0.998 - refresh_ns as f64)).abs() < 1e-6);
     s.idle().unwrap();
     assert_eq!(s.refresh_credit_ns(), -15_000_000.0);
 }
@@ -3530,7 +3545,7 @@ fn acceptance_probe_charges_one_round_preserves_timing_credit_and_carries_debt()
     assert_eq!(state.acceptance_credit_ns, -5.0 * MS as f64);
     assert_eq!(state.credit_ns, timing_credit);
     assert!(!state.active());
-    state.idle();
+    state.abort();
     assert_eq!(state.acceptance_credit_ns, -5.0 * MS as f64);
     assert_eq!(state.credit_ns, 0.0);
 }
@@ -5792,4 +5807,376 @@ fn cold_scored_prefill_checkpoint_cuts_and_atomic_spans_use_natural_fit_discover
         (10_240, 10_000, PlanOrigin::Ordinary)
     );
     assert_eq!(span_sched.request(h).unwrap().consumed_tokens, 20_000);
+}
+
+fn large_prefill_engine(prefill_capacities: &[usize], terminal_capacities: &[usize]) -> RequestScheduler {
+    let mut s = RequestScheduler::new(
+        [9; 32],
+        SchedulerLimits {
+            max_active: 1,
+            request_slots: 1,
+            max_sequence_tokens: 131_072,
+            prefill_chunk_size: 8192,
+            pages: 4096,
+            snapshots: 64,
+        },
+        SchedulerCapabilities {
+            completion_token_capacity: 16,
+            vocabulary: 1024,
+            page_tokens: 64,
+            vision: crate::model::VisionCapabilities::disabled(),
+            draft_pages_per_request: 0,
+            completion_inputs: vec![],
+            speculative_allocations: vec![],
+            state_rows_per_request: None,
+        },
+    )
+    .unwrap();
+    s.prefill_graphs(prefill_capacities).unwrap();
+    s.terminal_prefill_graphs(terminal_capacities).unwrap();
+    let mut graphs = super::tests::duration_graphs(1);
+    graphs.retain(|g| g.kind != GraphKind::Prefill && g.kind != GraphKind::TerminalPrefill);
+    for g in &mut graphs {
+        g.estimated_duration_ns = MS;
+    }
+    for &capacity in prefill_capacities {
+        graphs.push(crate::execution::GraphDescriptor {
+            tuned_bindings: vec![],
+            confidence_width: 0,
+            name: format!("prefill-{capacity}"),
+            kind: GraphKind::Prefill,
+            sampling_mode: SamplingMode::General,
+            draft_tokens: 0,
+            handle: 100 + capacity,
+            batch_capacity: 1,
+            token_capacity: capacity,
+            packed_token_capacity: 0,
+            prefill_capacity: 0,
+            estimated_duration_ns: 10 * MS,
+            input_bindings: vec![],
+        });
+    }
+    for &capacity in terminal_capacities {
+        graphs.push(crate::execution::GraphDescriptor {
+            tuned_bindings: vec![],
+            confidence_width: 0,
+            name: format!("terminal-prefill-{capacity}"),
+            kind: GraphKind::TerminalPrefill,
+            sampling_mode: SamplingMode::General,
+            draft_tokens: 0,
+            handle: 1000 + capacity,
+            batch_capacity: 1,
+            token_capacity: capacity,
+            packed_token_capacity: 0,
+            prefill_capacity: 0,
+            estimated_duration_ns: 12 * MS,
+            input_bindings: vec![],
+        });
+    }
+    s.measured_graph_durations(&graphs).unwrap();
+    s
+}
+
+#[test]
+fn idle_separated_short_requests_accumulate_refresh_credit_and_recover_stale_shape() {
+    let prefill_caps = [4096, 6144, 8192];
+    let terminal_caps = [128, 4096, 6144, 8192];
+    let mut s = large_prefill_engine(&prefill_caps, &terminal_caps);
+    let key = |kind, cap| cost::Key { drafts: 0, kind, batch: 1, tokens: cap, prefill: 0, packed: 0 };
+    let fast_prefill_ns = |cap: usize| match cap {
+        4096 => 88 * MS,
+        6144 => 119 * MS,
+        8192 => 145 * MS,
+        _ => unreachable!(),
+    };
+    let fast_terminal_ns = |cap: usize| match cap {
+        128 => 14 * MS,
+        _ => fast_prefill_ns(cap) + 27 * MS,
+    };
+
+    // Prefill(8192) is the oldest stale shape with a poisoned 250 ms estimate; Prefill(4096),
+    // Prefill(6144), and TerminalPrefill shapes are fresh with Prefill(6144) winning Ordinary.
+    let ttl = s.policy.estimate_ttl_ns;
+    s.advance_to(1_000 * MS).unwrap();
+    set_cost(&mut s, GraphKind::Prefill, 1, 8192, 250 * MS);
+    s.advance_to(1_000 * MS + ttl + 1_000 * MS).unwrap();
+    set_cost(&mut s, GraphKind::Prefill, 1, 4096, fast_prefill_ns(4096));
+    set_cost(&mut s, GraphKind::Prefill, 1, 6144, fast_prefill_ns(6144));
+    for &cap in &terminal_caps {
+        set_cost(&mut s, GraphKind::TerminalPrefill, 1, cap, fast_terminal_ns(cap));
+    }
+    s.refresh.credit_ns = 0.0;
+    s.idle().unwrap();
+
+    // Serve sequential 64,000-token prompts (< 2,495 ms each) separated by idle gaps.
+    // Credit earned across idle gaps funds the refresh of stale Prefill(8192), which then wins.
+    let mut ordinary_ns = 0u64;
+    let mut refresh_ns = 0u64;
+    let mut last_refresh_ns = 0u64;
+    let mut first_refresh: Option<cost::Key> = None;
+    let mut ordinary_8192_after_recovery = 0usize;
+
+    for req_id in 1u32..=5 {
+        let handle = add(&mut s, req_id, 64_000, 1);
+        while s.request(handle).is_ok() {
+            let plan = s.plan().unwrap();
+            let duration = match plan.kind {
+                GraphKind::Prefill => fast_prefill_ns(plan.token_capacity),
+                GraphKind::TerminalPrefill => fast_terminal_ns(plan.token_capacity),
+                _ => MS,
+            };
+            match plan.origin {
+                PlanOrigin::Ordinary => {
+                    ordinary_ns += duration;
+                    if first_refresh.is_some()
+                        && plan.kind == GraphKind::Prefill
+                        && plan.token_capacity == 8192
+                    {
+                        ordinary_8192_after_recovery += 1;
+                    }
+                }
+                PlanOrigin::RefreshStart(target) => {
+                    if first_refresh.is_none() {
+                        first_refresh = Some(target);
+                    }
+                    refresh_ns += duration;
+                    last_refresh_ns = duration;
+                }
+                _ => {}
+            }
+            let fence = Fence(s.submitted.0 + 1);
+            s.commit(&plan, fence).unwrap();
+            s.advance_to(s.now_ns + duration).unwrap();
+            complete_timed(&mut s, &plan, fence, 0, true, gpu_time(duration));
+        }
+        s.idle().unwrap();
+        if req_id == 1 {
+            assert!(s.refresh_credit_ns() > 0.0 && s.refresh_credit_ns() < refresh::CREDIT_CAP_NS);
+            assert!(first_refresh.is_none());
+        }
+    }
+
+    assert_eq!(first_refresh, Some(key(GraphKind::Prefill, 8192)));
+    assert!(ordinary_8192_after_recovery >= 12);
+    assert!(refresh_ns as f64 <= ordinary_ns as f64 * 0.002 / 0.998 + last_refresh_ns as f64);
+}
+
+#[test]
+fn expensive_stale_shape_does_not_starve_smaller_stale_shapes_under_credit_refill() {
+    // Reproduces the D > ttl_ns / 499 starvation hazard: Prefill(8192) costs 145 ms (> 60.12 ms),
+    // so repaying its -140 ms refresh debt requires ~72.3 s (> 30 s TTL) of ordinary compute.
+    // By the time credit refills to 5 ms, Prefill(8192) has expired again. Oldest-last-touch
+    // ordering (observed_at_ns.max(last_attempt_ns)) must still advance to stale Prefill(2048),
+    // allowing Prefill(2048) (now genuinely fastest at 30 ms -> 68.3 tok/ms) to recover.
+    let prefill_caps = [2048, 6144, 8192];
+    let terminal_caps = [128, 2048, 6144, 8192];
+    let mut s = large_prefill_engine(&prefill_caps, &terminal_caps);
+    let key = |cap| cost::Key { drafts: 0, kind: GraphKind::Prefill, batch: 1, tokens: cap, prefill: 0, packed: 0 };
+    let actual_prefill_ns = |cap: usize| match cap {
+        2048 => 30 * MS,  // 68.27 tok/ms (true fastest after recovery)
+        6144 => 100 * MS, // 61.44 tok/ms (fresh incumbent; faster than 8192 even after 8192 refreshes)
+        8192 => 145 * MS, // 56.50 tok/ms (stays slower than 6144, so it re-expires during debt refill)
+        _ => unreachable!(),
+    };
+    let actual_terminal_ns = |cap: usize| match cap {
+        128 => 14 * MS,
+        _ => actual_prefill_ns(cap) + 20 * MS,
+    };
+
+    let ttl = s.policy.estimate_ttl_ns;
+    // Prefill(8192) observed at t=1s (stale 300ms); Prefill(2048) at t=2s (stale 200ms > 100ms
+    // so it cannot win a 2048-token checkpoint cut as Ordinary before being refreshed).
+    s.advance_to(1_000 * MS).unwrap();
+    set_cost(&mut s, GraphKind::Prefill, 1, 8192, 300 * MS);
+    s.advance_to(2_000 * MS).unwrap();
+    set_cost(&mut s, GraphKind::Prefill, 1, 2048, 200 * MS);
+    // Advance past TTL so both 8192 and 2048 are stale; keep 6144 and TerminalPrefill fresh.
+    s.advance_to(2_000 * MS + ttl + 1_000 * MS).unwrap();
+    set_cost(&mut s, GraphKind::Prefill, 1, 6144, actual_prefill_ns(6144));
+    for &cap in &terminal_caps {
+        set_cost(&mut s, GraphKind::TerminalPrefill, 1, cap, actual_terminal_ns(cap));
+    }
+    s.refresh.credit_ns = 0.0;
+
+    let mut probed_targets = Vec::new();
+    let mut saw_8192_stale_again_before_2048_probe = false;
+    let mut ordinary_ns = 0u64;
+    let mut refresh_ns = 0u64;
+    let mut last_refresh_ns = 0u64;
+    let mut saw_ordinary_2048 = false;
+
+    for req_id in 1u32..=120 {
+        let handle = add(&mut s, req_id, 65_536, 1);
+        while s.request(handle).is_ok() {
+            let plan = s.plan().unwrap();
+            let duration = match plan.kind {
+                GraphKind::Prefill => actual_prefill_ns(plan.token_capacity),
+                GraphKind::TerminalPrefill => actual_terminal_ns(plan.token_capacity),
+                _ => MS,
+            };
+            match plan.origin {
+                PlanOrigin::Ordinary => {
+                    ordinary_ns += duration;
+                    if plan.kind == GraphKind::Prefill && plan.token_capacity == 2048 {
+                        saw_ordinary_2048 = true;
+                    }
+                }
+                PlanOrigin::RefreshStart(target) => {
+                    if target == key(2048) && !s.costs.is_fresh(key(8192)) {
+                        saw_8192_stale_again_before_2048_probe = true;
+                    }
+                    if target.kind == GraphKind::Prefill {
+                        probed_targets.push(target);
+                    }
+                    refresh_ns += duration;
+                    last_refresh_ns = duration;
+                }
+                _ => {}
+            }
+            let fence = Fence(s.submitted.0 + 1);
+            s.commit(&plan, fence).unwrap();
+            s.advance_to(s.now_ns + duration).unwrap();
+            complete_timed(&mut s, &plan, fence, 0, true, gpu_time(duration));
+        }
+        s.idle().unwrap();
+        if saw_ordinary_2048 {
+            break;
+        }
+    }
+
+    assert!(
+        probed_targets.len() >= 2 && probed_targets[0] == key(8192) && probed_targets[1] == key(2048),
+        "expected first probe on oldest stale 8192, then second probe on 2048 without starvation; got {probed_targets:?}"
+    );
+    assert!(
+        saw_8192_stale_again_before_2048_probe,
+        "Prefill(8192) must have re-expired during credit refill before Prefill(2048) was probed"
+    );
+    assert!(saw_ordinary_2048, "smaller stale shape 2048 must recover and become Ordinary winner");
+    assert!(refresh_ns as f64 <= ordinary_ns as f64 * 0.002 / 0.998 + last_refresh_ns as f64);
+}
+
+#[test]
+fn timing_refresh_excludes_readiness_wait_from_episode_debt() {
+    use crate::execution::ReadinessIntervals;
+    let timestamps = [1_000u64, 1_000 + 255 * MS, 1_000 + 255 * MS + 100]
+        .into_iter()
+        .flat_map(u64::to_ne_bytes)
+        .collect::<Vec<_>>();
+    let readiness = ReadinessIntervals::decode(&timestamps).unwrap();
+    assert_eq!(readiness.wait_ns(), 255 * MS);
+    let mut timing = gpu_time(400 * MS);
+    timing.wall_ns = 400 * MS;
+    timing.readiness = Some(readiness);
+
+    // Ordinary income uses compute duration (145 ms) for timing credit and physical (400 ms) for acceptance.
+    let mut state = refresh::RefreshState::default();
+    state.complete(PlanOrigin::Ordinary, timing);
+    assert!((state.credit_ns - (145 * MS) as f64 * 0.002 / 0.998).abs() < 1e-6);
+    assert!((state.acceptance_credit_ns - (400 * MS) as f64 * 0.01 / 0.99).abs() < 1e-6);
+
+    // Ordinary completion with wait_ns >= gpu_ns earns 0 timing credit (sample discarded by ActionCosts)
+    // while acceptance credit still earns from physical duration.
+    let mut dominated_state = refresh::RefreshState::default();
+    let mut dominated_timing = gpu_time(200 * MS);
+    dominated_timing.wall_ns = 260 * MS;
+    dominated_timing.readiness = Some(readiness);
+    dominated_state.complete(PlanOrigin::Ordinary, dominated_timing);
+    assert_eq!(dominated_state.credit_ns, 0.0);
+    assert!((dominated_state.acceptance_credit_ns - (260 * MS) as f64 * 0.01 / 0.99).abs() < 1e-6);
+
+    // Ordinary completion with absent GPU timing earns 0 on both ledgers.
+    let absent_timing = ExecutionTiming { readiness: Some(readiness), wall_ns: 100 * MS, ..Default::default() };
+    let mut absent_state = refresh::RefreshState::default();
+    absent_state.complete(PlanOrigin::Ordinary, absent_timing);
+    assert_eq!(absent_state.credit_ns, 0.0);
+    assert_eq!(absent_state.acceptance_credit_ns, 0.0);
+
+    // AcceptanceStart charges raw physical time (400 ms), including readiness wait, and wall_ns when GPU timing is absent.
+    let mut acc_state = refresh::RefreshState::default();
+    acc_state.acceptance_credit_ns = refresh::CREDIT_CAP_NS;
+    let dummy_step = ScheduledStep {
+        draft_tokens: 7,
+        kind: GraphKind::Speculative,
+        batch_capacity: 1,
+        token_capacity: 8,
+        packed_token_capacity: 8,
+        mixed: None,
+        requires_feedback: true,
+        lanes: vec![ScheduledLane {
+            request: RequestHandle { slot: 0, generation: 1 },
+            start_position: 65,
+            tokens: 8,
+        }],
+    };
+    acc_state.commit(PlanOrigin::AcceptanceStart, Fence(1), &dummy_step);
+    acc_state.complete(PlanOrigin::AcceptanceStart, timing);
+    assert_eq!(acc_state.acceptance_credit_ns, -395.0 * MS as f64);
+
+    let mut acc_absent_state = refresh::RefreshState::default();
+    acc_absent_state.acceptance_credit_ns = refresh::CREDIT_CAP_NS;
+    acc_absent_state.commit(PlanOrigin::AcceptanceStart, Fence(2), &dummy_step);
+    acc_absent_state.complete(PlanOrigin::AcceptanceStart, absent_timing);
+    assert_eq!(acc_absent_state.acceptance_credit_ns, -95.0 * MS as f64);
+
+    // RefreshStart excludes measured readiness wait: ActionCosts records 145 ms and debt is -140 ms.
+    let mut s = engine(1, false);
+    let h = add(&mut s, 1, 512, 4);
+    ready(&mut s, &[h]);
+    s.advance_to(s.now_ns + s.policy.estimate_ttl_ns).unwrap();
+    let mut plan = s.phase_plan(GraphKind::Decode, Some(h));
+    let key = cost::Key::from_step(&plan);
+    plan.origin = PlanOrigin::RefreshStart(key);
+    s.refresh.credit_ns = refresh::CREDIT_CAP_NS;
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&plan, fence).unwrap();
+    s.advance_to(s.now_ns + timing.wall_ns).unwrap();
+    complete_timed(&mut s, &plan, fence, 0, false, timing);
+    assert_eq!(s.costs.duration_key(key), Some(145 * MS));
+    assert_eq!(s.refresh_credit_ns(), -140.0 * MS as f64);
+}
+
+#[test]
+fn readiness_wait_exceeding_gpu_duration_does_not_cause_zero_charge_refresh_loop() {
+    use crate::execution::ReadinessIntervals;
+    let timestamps = [1_000u64, 1_000 + 120 * MS, 1_000 + 120 * MS + 100]
+        .into_iter()
+        .flat_map(u64::to_ne_bytes)
+        .collect::<Vec<_>>();
+    let readiness = ReadinessIntervals::decode(&timestamps).unwrap();
+    assert_eq!(readiness.wait_ns(), 120 * MS);
+
+    for wall_ns in [0u64, 130 * MS] {
+        let mut s = engine(2, false);
+        let h = add(&mut s, 1, 64, 4096);
+        ready(&mut s, &[h]);
+        set_cost(&mut s, GraphKind::Decode, 1, 1, 10 * MS);
+        set_cost(&mut s, GraphKind::Decode, 2, 1, 100 * MS);
+        s.advance_to(s.now_ns + s.policy.estimate_ttl_ns).unwrap();
+        set_cost(&mut s, GraphKind::Decode, 1, 1, 10 * MS);
+        s.refresh.credit_ns = refresh::CREDIT_CAP_NS;
+
+        let probe = s.plan().unwrap();
+        let target = cost::Key::from_step(&probe);
+        assert_eq!(probe.origin, PlanOrigin::RefreshStart(target));
+        assert_eq!(probe.batch_capacity, 2);
+        let before = s.costs.observation(target);
+
+        let fence = Fence(s.submitted.0 + 1);
+        s.commit(&probe, fence).unwrap();
+        // gpu_ns (100 ms) <= readiness.wait_ns (120 ms): ActionCosts::observe discards the 0-ns
+        // sample so the entry stays stale, while RefreshState must charge unexcluded physical time
+        // so credit drops below CREDIT_CAP_NS and the next plan returns Ordinary (no free loop).
+        let mut timing = gpu_time(100 * MS);
+        timing.wall_ns = wall_ns;
+        timing.readiness = Some(readiness);
+        s.advance_to(s.now_ns + (100 * MS).max(wall_ns)).unwrap();
+        complete_timed(&mut s, &probe, fence, 0, false, timing);
+
+        assert_eq!(s.costs.observation(target), before, "0-ns compute sample must leave entry stale");
+        let expected_charge = (100 * MS).max(wall_ns) as f64;
+        assert_eq!(s.refresh_credit_ns(), refresh::CREDIT_CAP_NS - expected_charge);
+        assert!(s.refresh_credit_ns() < 0.0);
+        assert_eq!(s.plan().unwrap().origin, PlanOrigin::Ordinary);
+    }
 }

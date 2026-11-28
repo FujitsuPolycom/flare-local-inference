@@ -106,7 +106,7 @@ def build_configurations(args, policy_type):
         "epsilon", "temperature", "quantile", "alpha", "credit_cap_ms", "refresh_every",
         "block_size", "estimator", "anneal", "probe_loss_ms", "probe_extra_ms",
         "refresh_busy_ms", "audit_every", "probe_harm_ms", "harm_alpha", "initial_discovery",
-        "mean_estimator", "partial_blocks") if getattr(args, name) is not None}
+        "mean_estimator", "partial_blocks", "retain_idle_credit") if getattr(args, name) is not None}
     if args.screen_grid:
         if args.sweep or parameters or args.policies != "all" or args.funding != "funded":
             raise ValueError("--screen-grid defines its policy-specific parameters and both funding variants")
@@ -129,13 +129,13 @@ def build_configurations(args, policy_type):
     variants = []
     for expression in args.sweep:
         name, separator, values = expression.partition("=")
+        if separator and name in ("estimator", "anneal", "initial_discovery", "mean_estimator", "partial_blocks", "retain_idle_credit"):
+            raise ValueError("categorical and boolean parameters use explicit flags; sweeps are numeric")
         if not separator or name not in parameters.keys() | {
                 "epsilon", "temperature", "quantile", "alpha", "credit_cap_ms", "refresh_every", "block_size",
                 "probe_loss_ms", "probe_extra_ms", "refresh_busy_ms", "audit_every", "probe_harm_ms",
                 "harm_alpha"}:
             raise ValueError("sweep uses a policy parameter followed by =VALUE,VALUE")
-        if name in ("estimator", "anneal", "initial_discovery", "mean_estimator", "partial_blocks"):
-            raise ValueError("categorical and boolean parameters use explicit flags; sweeps are numeric")
         converter = int if name in ("refresh_every", "block_size", "audit_every") else float
         for value in values.split(","):
             variants.append({name: converter(value)})
@@ -436,6 +436,8 @@ def parser():
     result.add_argument("--mean-estimator", choices=("arithmetic", "ema"))
     result.add_argument("--partial-blocks", action="store_true", default=None,
                         help="condition timing uncertainty on fractional unfinished blocks")
+    result.add_argument("--retain-idle-credit", action="store_true", default=None,
+                        help="retain bounded earned exploration credit across idle gaps")
     result.add_argument("--estimator", choices=("cumulative", "regime", "log-regime"))
     result.add_argument("--anneal", action="store_true", default=None)
     result.add_argument("--sweep", action="append", default=[], help="one-factor parameter=VALUE,VALUE; repeat for independent sweeps")
@@ -477,7 +479,8 @@ def main(argv=None):
                         "epsilon", "temperature", "quantile", "alpha", "credit_cap_ms",
                         "refresh_every", "block_size", "estimator", "anneal", "probe_loss_ms",
                         "probe_extra_ms", "refresh_busy_ms", "audit_every", "probe_harm_ms",
-                        "harm_alpha", "initial_discovery", "mean_estimator", "partial_blocks"))):
+                        "harm_alpha", "initial_discovery", "mean_estimator", "partial_blocks",
+                        "retain_idle_credit"))):
                 raise ValueError("validation policy parameters come exclusively from --configs")
         if args.bootstrap_replicates < 100 or args.max_steps < 1:
             raise ValueError("bootstrap needs at least 100 replicates and max-steps must be positive")
