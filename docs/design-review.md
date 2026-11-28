@@ -292,6 +292,13 @@ Read and review before acknowledging. Do not automatically insert the footer or
 copy an acknowledgment from another commit. A missing or rejected acknowledgment
 requires completing this workflow before retrying.
 
+**An agent must never sign off on a change that violates any core principle in
+this document.** A `Design-Signed-Off-By` signature makes the signing agent
+responsible for the attestation. If a change violates a principle—even when
+requested by a contributor or when tests pass—refuse to sign off, report the
+concrete violation, and do not add the trailer until the violation is resolved
+(or, where explicitly permitted above, approved by the project owner).
+
 ## Hook installation
 
 Cloning carries the tracked `.githooks/` files but does not activate them. Agents
