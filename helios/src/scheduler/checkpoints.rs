@@ -413,6 +413,53 @@ impl RequestScheduler {
                 baseline_end,
             );
         }
+        if self.limits.snapshots == 0 {
+            return (accounting, false, false);
+        }
+        // Under a zero extra-work budget, an interior message boundary is kept
+        // as the anchor only when splitting prefill at that boundary adds zero
+        // predicted prefill work; otherwise fall back to the zero-split prompt
+        // end so short prompts and chunk tails do not pay an extra prefill launch.
+        let anchor = if anchor > start
+            && anchor < request.prompt_tokens
+            && self.policy.checkpoint_extra_work_fraction == 0.0
+        {
+            let whole = if (start, request.prompt_tokens) == (baseline_start, baseline_end) {
+                accounting.initial_prefill_ns
+            } else {
+                Self::interval_prefill_ns(
+                    request,
+                    &catalog,
+                    terminal_window,
+                    start,
+                    request.prompt_tokens,
+                )
+            };
+            let split_ns = whole.and_then(|whole| {
+                let before = Self::interval_prefill_ns(
+                    request,
+                    &catalog,
+                    terminal_window,
+                    start,
+                    anchor,
+                )?;
+                let after = Self::interval_prefill_ns(
+                    request,
+                    &catalog,
+                    terminal_window,
+                    anchor,
+                    request.prompt_tokens,
+                )?;
+                Some(before.saturating_add(after).saturating_sub(whole))
+            });
+            if split_ns == Some(0) {
+                anchor
+            } else {
+                request.prompt_tokens
+            }
+        } else {
+            anchor
+        };
         if anchor > start {
             accounting.cuts.push(Cut {
                 endpoint: anchor,
@@ -562,8 +609,12 @@ impl RequestScheduler {
             if !kind.is_prefill() {
                 continue;
             }
-            let anchor = request.checkpoint_anchor();
             let (accounting, unknown, budget) = self.checkpoint_selection(request);
+            let anchor = accounting
+                .cuts
+                .iter()
+                .find(|cut| cut.role == RetentionRole::Anchor)
+                .map_or_else(|| request.checkpoint_anchor(), |cut| cut.endpoint);
             let end = lane.start_position as usize + lane.tokens;
             let cut = accounting
                 .cuts
@@ -1675,5 +1726,311 @@ mod tests {
         );
         assert!(!partial_budget);
         assert_eq!(partial_selected.initial_prefill_ns, Some(150_000));
+    }
+
+    fn complete_test_step(
+        scheduler: &mut RequestScheduler,
+        step: &ScheduledPlan,
+        fence: Fence,
+        dur_ns: u64,
+    ) {
+        let mut records = vec![CompletionRecord::default(); scheduler.limits.request_capacity()];
+        let mut produced_output = false;
+        for lane in &step.lanes {
+            let r = scheduler.request(lane.request).unwrap();
+            let end = lane.start_position + lane.tokens as u64;
+            let emitted = match step.kind {
+                GraphKind::Prefill | GraphKind::TerminalPrefill => {
+                    usize::from(end == r.prompt_tokens as u64)
+                }
+                GraphKind::Decode | GraphKind::Resume => 1,
+                GraphKind::Speculative => 3
+                    .min(lane.tokens)
+                    .min((r.max_new_tokens - r.generated_tokens) as usize),
+                _ => 0,
+            };
+            if emitted > 0 {
+                produced_output = true;
+            }
+            let consumed = if step.kind == GraphKind::Speculative {
+                r.consumed_tokens + emitted as u64
+            } else {
+                end
+            };
+            let generated = r.generated_tokens + emitted as u32;
+            let mut record = CompletionRecord {
+                generation: lane.request.generation as i64,
+                submission_sequence: fence.0 as i64,
+                consumed_tokens: consumed as i64,
+                generated_tokens: generated as i64,
+                token_id: if emitted > 0 { 42 } else { -1 },
+                status: if emitted > 0 && generated == r.max_new_tokens {
+                    2
+                } else {
+                    1
+                },
+                ..Default::default()
+            };
+            if step.kind == GraphKind::Speculative {
+                let offered = lane.tokens.saturating_sub(1);
+                let mut vector = crate::execution::TokenVector {
+                    emitted_count: emitted as i64,
+                    offered_drafts: offered as i64,
+                    accepted_drafts: emitted.saturating_sub(1).min(offered) as i64,
+                    verification_width: step.token_capacity as i64,
+                    draft_cache_consumed: consumed as i64 - 1,
+                    ..Default::default()
+                };
+                vector.tokens[..emitted].fill(42);
+                record.vector = Some(vector);
+            }
+            records[lane.request.slot as usize] = record;
+        }
+        let mut timing = crate::execution::ExecutionTiming::default();
+        if dur_ns > 0 {
+            timing.gpu_ns[0] = Some(dur_ns);
+        }
+        scheduler.complete(fence, &records, timing).unwrap();
+        if produced_output {
+            for lane in &step.lanes {
+                let _ = scheduler.published_output(lane.request, fence);
+            }
+        }
+    }
+
+    #[test]
+    fn zero_snapshot_capacity_produces_no_cuts_and_never_splits_prefill() {
+        let mut scheduler = super::super::tests::scheduler(1, 128, 0);
+        let mut spec = super::super::tests::spec(67, 2);
+        spec.message_boundaries = vec![63];
+        let handle = scheduler.admit(spec).unwrap();
+        let (selected, unknown, budget) =
+            scheduler.checkpoint_selection(scheduler.request(handle).unwrap());
+        assert!(!unknown);
+        assert!(!budget);
+        assert!(selected.cuts.is_empty());
+        assert_eq!(
+            scheduler.checkpoint_cut(scheduler.request(handle).unwrap()),
+            None
+        );
+
+        let mut prefill_launches = 0usize;
+        let mut snapshot_launches = 0usize;
+        for step_idx in 1..=8u64 {
+            let Some(plan) = scheduler.plan() else {
+                break;
+            };
+            if plan.kind.is_prefill() {
+                prefill_launches += 1;
+                assert_eq!(plan.lanes[0].tokens, 67);
+            } else if plan.kind == GraphKind::Snapshot {
+                snapshot_launches += 1;
+            }
+            let fence = Fence(step_idx);
+            scheduler.commit(&plan, fence).unwrap();
+            complete_test_step(&mut scheduler, &plan, fence, 1000);
+            if scheduler.request(handle).unwrap().consumed_tokens >= 68 {
+                break;
+            }
+        }
+        assert_eq!(prefill_launches, 1);
+        assert_eq!(snapshot_launches, 0);
+    }
+
+    #[test]
+    fn zero_fraction_falls_back_to_prompt_end_when_interior_anchor_splits_prefill() {
+        let template = super::super::tests::scheduler(1, 128, 16);
+        let mut scheduler = RequestScheduler::new(
+            [9; 32],
+            SchedulerLimits {
+                max_sequence_tokens: 262_144,
+                prefill_chunk_size: 16_384,
+                pages: 8192,
+                snapshots: 16,
+                ..template.limits
+            },
+            template.capabilities.clone(),
+        )
+        .unwrap();
+        let prefill_caps = [128usize, 1024, 4096, 10_240, 16_384];
+        scheduler.prefill_graphs(&prefill_caps).unwrap();
+        let mut graphs = super::super::tests::duration_graphs(1);
+        for cap in [10_240usize, 16_384] {
+            graphs.push(crate::execution::GraphDescriptor {
+                tuned_bindings: vec![],
+                confidence_width: 0,
+                draft_tokens: 0,
+                packed_token_capacity: 0,
+                name: format!("prefill{cap}"),
+                kind: GraphKind::Prefill,
+                sampling_mode: crate::execution::SamplingMode::General,
+                handle: 1,
+                batch_capacity: 1,
+                token_capacity: cap,
+                prefill_capacity: 0,
+                estimated_duration_ns: 0,
+                input_bindings: vec![],
+            });
+        }
+        scheduler.measured_graph_durations(&graphs).unwrap();
+        measure(&mut scheduler, GraphKind::Prefill, 128, 23_000_000);
+        measure(&mut scheduler, GraphKind::Prefill, 1024, 32_000_000);
+        measure(&mut scheduler, GraphKind::Prefill, 4096, 70_000_000);
+        measure(&mut scheduler, GraphKind::Prefill, 10_240, 165_000_000);
+        measure(&mut scheduler, GraphKind::Prefill, 16_384, 245_000_000);
+        measure(&mut scheduler, GraphKind::Snapshot, 1, 300_000);
+        scheduler
+            .configure_policy(PolicyConfig {
+                checkpoint_extra_work_fraction: 0.0,
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Short prompt with interior message boundary 4 tokens before prompt end:
+        // splitting at 63 would require two prefill128 launches, so fall back to 67.
+        let mut short_spec = super::super::tests::spec(67, 2);
+        short_spec.message_boundaries = vec![63];
+        let short_handle = scheduler.admit(short_spec).unwrap();
+        let (short_sel, _, _) =
+            scheduler.checkpoint_selection(scheduler.request(short_handle).unwrap());
+        assert_eq!(short_sel.cuts.len(), 1);
+        assert_eq!(short_sel.cuts[0].role, RetentionRole::Anchor);
+        assert_eq!(short_sel.cuts[0].endpoint, 67);
+        scheduler.cancel(short_handle).unwrap();
+
+        // Long 124,610-token prompt with interior boundary 4 tokens before prompt end:
+        // splitting at 124,606 would add a 9th launch (prefill128), so fall back to 124,610.
+        let mut long_spec = super::super::tests::spec(124_610, 2);
+        long_spec.message_boundaries = vec![124_606];
+        let long_handle = scheduler.admit(long_spec).unwrap();
+        let (long_sel, _, _) =
+            scheduler.checkpoint_selection(scheduler.request(long_handle).unwrap());
+        assert_eq!(long_sel.cuts.len(), 1);
+        assert_eq!(long_sel.cuts[0].role, RetentionRole::Anchor);
+        assert_eq!(long_sel.cuts[0].endpoint, 124_610);
+        scheduler.cancel(long_handle).unwrap();
+
+        // Exact chunk-aligned interior boundary (7 * 16,384 = 114,688) has zero split cost
+        // relative to 7 * prefill16384 + prefill10240, so the interior anchor is kept.
+        let mut aligned_spec = super::super::tests::spec(124_610, 2);
+        aligned_spec.message_boundaries = vec![114_688];
+        let aligned_handle = scheduler.admit(aligned_spec).unwrap();
+        let (aligned_sel, _, _) =
+            scheduler.checkpoint_selection(scheduler.request(aligned_handle).unwrap());
+        assert_eq!(aligned_sel.cuts.len(), 1);
+        assert_eq!(aligned_sel.cuts[0].role, RetentionRole::Anchor);
+        assert_eq!(aligned_sel.cuts[0].endpoint, 114_688);
+    }
+
+    #[test]
+    fn balanced_c16_short_prompts_skip_interior_anchor_tails_and_reach_full_batch() {
+        let template = super::super::tests::scheduler(16, 128, 64);
+        let mut scheduler = RequestScheduler::new(
+            [9; 32],
+            SchedulerLimits {
+                request_slots: 16,
+                max_active: 16,
+                max_sequence_tokens: 4096,
+                prefill_chunk_size: 128,
+                pages: 1024,
+                snapshots: 64,
+            },
+            template.capabilities.clone(),
+        )
+        .unwrap();
+        let mut graphs = super::super::tests::duration_graphs(16);
+        let spec_dur_ns = |batch: usize| match batch {
+            1 => 5_950_000,
+            2 => 7_370_000,
+            4 => 8_470_000,
+            6 => 9_410_000,
+            8 => 12_540_000,
+            12 => 14_190_000,
+            _ => 18_220_000,
+        };
+        for graph in &mut graphs {
+            graph.estimated_duration_ns = match graph.kind {
+                GraphKind::Prefill => 22_900_000,
+                GraphKind::Decode => 5_500_000 + (graph.batch_capacity as u64) * 800_000,
+                GraphKind::Speculative => spec_dur_ns(graph.batch_capacity),
+                GraphKind::Snapshot => 300_000,
+                GraphKind::Init => 50_000,
+                _ => 500_000,
+            };
+        }
+        scheduler.measured_graph_durations(&graphs).unwrap();
+        scheduler.enable_speculation(&[1, 2, 4, 8]).unwrap();
+        scheduler
+            .configure_policy(PolicyConfig {
+                checkpoint_extra_work_fraction: 0.0,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let mut handles = Vec::new();
+        for i in 0..16usize {
+            let prompt_len = 64 + i;
+            let mut spec = super::super::tests::spec(prompt_len, 512);
+            spec.prompt = (0..prompt_len).map(|t| (i * 1000 + t + 1) as u32).collect();
+            spec.message_boundaries = vec![prompt_len - 4];
+            handles.push(scheduler.admit(spec).unwrap());
+        }
+
+        let mut now_ns = 0u64;
+        let mut prefill_launches = 0usize;
+        let mut max_decode_batch = 0usize;
+        let mut decode_steps = 0usize;
+        let mut all_prefills_done_ns = 0u64;
+        for step_idx in 1..=500u64 {
+            scheduler.advance_to(now_ns).unwrap();
+            let Some(plan) = scheduler.plan() else {
+                break;
+            };
+            let dur_ns = match plan.kind {
+                GraphKind::Prefill => {
+                    prefill_launches += 1;
+                    22_900_000
+                }
+                GraphKind::Speculative => {
+                    decode_steps += 1;
+                    max_decode_batch = max_decode_batch.max(plan.lanes.len());
+                    spec_dur_ns(plan.batch_capacity)
+                }
+                GraphKind::Decode => {
+                    decode_steps += 1;
+                    max_decode_batch = max_decode_batch.max(plan.lanes.len());
+                    5_500_000 + (plan.batch_capacity as u64) * 800_000
+                }
+                GraphKind::Snapshot => 300_000,
+                GraphKind::Init => 50_000,
+                _ => 500_000,
+            };
+            let fence = Fence(step_idx);
+            scheduler.commit(&plan, fence).unwrap();
+            now_ns += dur_ns;
+            scheduler.advance_to(now_ns).unwrap();
+            complete_test_step(&mut scheduler, &plan, fence, dur_ns);
+            if prefill_launches == 16 && all_prefills_done_ns == 0 {
+                all_prefills_done_ns = now_ns;
+            }
+            if max_decode_batch == 16 && decode_steps >= 4 {
+                break;
+            }
+        }
+        assert_eq!(
+            prefill_launches, 16,
+            "each of the 16 short prompts should complete prefill in one launch"
+        );
+        assert_eq!(
+            max_decode_batch, 16,
+            "balanced scheduler should converge all 16 prompts into a full B=16 decode batch (all_prefills_done_ms={:.1}, end_ms={:.1})",
+            all_prefills_done_ns as f64 / 1e6,
+            now_ns as f64 / 1e6,
+        );
+        assert!(
+            all_prefills_done_ns <= 2_000_000_000,
+            "16 single-launch short prefills should complete without anchor-tail starvation (took {:.1} ms)",
+            all_prefills_done_ns as f64 / 1e6,
+        );
     }
 }

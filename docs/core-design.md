@@ -1435,10 +1435,14 @@ to earlier tokens cannot reuse a checkpoint for different tokens.
 
 The scheduler chooses the last eligible complete-message boundary as the request's
 conversation anchor. If no message boundary is eligible, the prompt end is the
-anchor. Anchor retention is best effort and independent of duration estimates.
-Earlier complete-message boundaries compete in reverse message order; a distinct
-prompt end follows them. There is no capture-count limit or allocation of a fixed
-snapshot share to each request.
+anchor. When snapshot storage has zero capacity, the scheduler emits no checkpoint
+cuts. Under a nonzero extra-work fraction, anchor retention is best effort and
+independent of duration estimates; when `scheduler_checkpoint_extra_work_fraction`
+is zero, an interior message boundary is retained as the anchor only if splitting
+prefill there adds zero predicted prefill work, otherwise the prompt end serves as
+the anchor. Earlier complete-message boundaries compete in reverse message order;
+a distinct prompt end follows them. There is no capture-count limit or allocation
+of a fixed snapshot share to each request.
 
 Extra captures use a request-local work allowance. Its prefill component is
 `scheduler_checkpoint_extra_work_fraction` times the estimated uncached prefill

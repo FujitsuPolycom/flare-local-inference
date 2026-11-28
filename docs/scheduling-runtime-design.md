@@ -551,8 +551,11 @@ program. A finishing prefill exposes its decoder and checkpoint operation only
 after completion.
 
 Checkpoint retention uses the exact token endpoints supplied by the native
-frontend. The last eligible completed message is a best-effort conversation
-anchor; the prompt end substitutes when there is no eligible message. Earlier
+frontend. Zero snapshot capacity disables all checkpoint cuts. Otherwise, the last
+eligible completed message is a best-effort conversation anchor, falling back to
+the prompt end when no message is eligible or when
+`scheduler_checkpoint_extra_work_fraction` is zero and splitting prefill at an
+interior message boundary would add predicted prefill work. Earlier
 messages are considered in reverse order, followed by a distinct prompt end.
 Additional prefill splits and snapshot copies must fit a request-local allowance
 of `scheduler_checkpoint_extra_work_fraction` times estimated uncached prefill
