@@ -129,7 +129,7 @@ def common_preparation_kwargs(plan, *, compile_forwards: bool | None = None, ker
     return {
         "parameters": parameters,
         "tuning_replica": plan.tuning_replica,
-        "context": plan.recipe.context,
+        "context": plan.declared_context,
         "snapshot_budget_bytes": plan.snapshots * plan.costs.state_row_bytes,
         "headroom_bytes": plan.headroom_bytes + plan.reserve_bytes,
         "retain_graphs": retain_graphs,

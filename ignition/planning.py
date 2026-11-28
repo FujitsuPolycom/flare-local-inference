@@ -189,10 +189,12 @@ class Plan:
     def __post_init__(self):
         if not isinstance(self.parameters, RecipeParameters):
             raise TypeError("Plan.parameters must be a RecipeParameters instance")
+        _validate_checkpoint_context(self.recipe, self.checkpoint)
         if self.parameters.tensor_parallel != self.world_size:
             object.__setattr__(self, "parameters", replace(self.parameters, tensor_parallel=self.world_size))
         context = self.parameter_context
         self.parameters.validate(context)
+        _validate_declared_context(self.recipe, self.checkpoint, self.declared_context)
         if self.benchmark_selection is not None:
             selection = self.benchmark_selection
             if not isinstance(selection, BenchmarkSelection):
@@ -323,7 +325,7 @@ class Plan:
 
     @property
     def demand_pages(self) -> int:
-        return self.concurrency * (self.recipe.context // self.page_tokens)
+        return self.concurrency * (self.declared_context // self.page_tokens)
 
     @property
     def page_tokens(self) -> int:
@@ -355,14 +357,19 @@ class Plan:
         return self.pages * self.page_tokens
 
     @property
+    def declared_context(self) -> int:
+        """The longest sequence the checkpoint and resolved parameters serve, before page limits."""
+        return self.parameters.adjust_context(self.recipe.base_context(self.checkpoint), self.parameter_context)
+
+    @property
     def context(self) -> int:
         """The longest sequence one request may reach."""
-        return min(self.recipe.context, self.tokens)
+        return min(self.declared_context, self.tokens)
 
     @property
     def guaranteed_tokens(self) -> int:
         """Tokens every request can hold while all admitted requests are active."""
-        return min(self.recipe.context, self.pages // self.concurrency * self.page_tokens)
+        return min(self.declared_context, self.pages // self.concurrency * self.page_tokens)
 
     @property
     def snapshots(self) -> int:
@@ -390,7 +397,7 @@ class Plan:
             "tuning_gpus": [gpu.index for gpu in self.tuning_gpus],
             "benchmark_selection": None if self.benchmark_selection is None else self.benchmark_selection.to_dict(),
             "context": self.context,
-            "checkpoint_context": self.recipe.context,
+            "checkpoint_context": self.declared_context,
             "weights_bytes": self.weights_bytes,
             "mapped_host_bytes": self.checkpoint.mapped_host_bytes,
             "graph_bytes": self.graph_bytes,
@@ -411,6 +418,23 @@ class Plan:
             "reserve_bytes": self.reserve_bytes,
             "supply_bytes": self.supply_bytes,
         }
+
+
+def _validate_declared_context(recipe: Recipe, checkpoint: Checkpoint, declared: int) -> None:
+    if type(declared) is not int or not 64 <= declared < 2**31 or declared % 64:
+        raise UsageError(
+            f"{checkpoint.alias} declared context ({declared!r}) must be a 64-aligned positive int32"
+        )
+    if declared % recipe.page_tokens:
+        raise UsageError(
+            f"{checkpoint.alias} context ({declared:,}) must be a multiple of"
+            f" the recipe page size ({recipe.page_tokens})"
+        )
+
+
+def _validate_checkpoint_context(recipe: Recipe, checkpoint: Checkpoint) -> None:
+    if checkpoint.context is not None:
+        _validate_declared_context(recipe, checkpoint, checkpoint.context)
 
 
 def _normalize_parameters(recipe: Recipe, parameters: RecipeParameters | None,
@@ -440,6 +464,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *,
     the recipe's estimate, adjusted through `parameters` hooks.
     """
     params = _normalize_parameters(recipe, parameters, reserve_bytes)
+    _validate_checkpoint_context(recipe, checkpoint)
     params = replace(params, tensor_parallel=len(gpus))
     context = ParameterContext(
         recipe=recipe,
@@ -527,6 +552,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *,
     for which enough GPUs fit, taking the first such GPUs in index order.
     """
     params = _normalize_parameters(recipe, parameters, reserve_bytes)
+    _validate_checkpoint_context(recipe, checkpoint)
     pre_context = ParameterContext(
         recipe=recipe,
         checkpoint=checkpoint,

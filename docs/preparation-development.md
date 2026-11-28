@@ -31,9 +31,9 @@ Each recipe declares its preparation contract by binding a frozen
   universal core flags and the declared recipe table.
 - `planning.Plan` carries the resolved `parameters` instance directly and
   invokes its `validate`, `filter_world_sizes`, `adjust_weights_bytes`,
-  `adjust_rank_costs`, `adjust_page_tokens`, `shortfall_options`,
-  `status_parts`, `to_dict`, `manifest_parameters`, and `reproduction_args`
-  hooks.
+  `adjust_rank_costs`, `adjust_page_tokens`, `adjust_context`,
+  `capacity_relief_options`, `status_parts`, `to_dict`, `manifest_parameters`,
+  and `reproduction_args` hooks.
 - `ignition.preparation.rebuild_manifest.from_plan` constructs
   `PreparationManifest` (`parameters` and `reproduction_args`) exclusively by
   serializing `plan.parameters` alongside checkpoint provenance, emitting only

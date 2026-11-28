@@ -43,7 +43,7 @@ def model_epilog(recipe, checkpoint, *, prog="ignition") -> str:
         f"Model recipe: {checkpoint.alias}",
         f"  Checkpoint: {checkpoint.repository}",
         f"  --gpus: select {gpus} GPUs",
-        f"  Context: {recipe.context:,} tokens (page size: {recipe.page_tokens})",
+        f"  Context: {recipe.declared_context(checkpoint):,} tokens (page size: {recipe.page_tokens})",
     ]
     spec = recipe.speculation
     if spec is not None:

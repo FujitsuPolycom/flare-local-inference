@@ -581,6 +581,12 @@ class ParameterGroup:
             page_tokens = subgroup.adjust_page_tokens(page_tokens, context)
         return page_tokens
 
+    def adjust_context(self, context_tokens: int, context: ParameterContext) -> int:
+        """Adjust the declared serving context ceiling in tokens before page limits."""
+        for _, subgroup in self._subgroups():
+            context_tokens = subgroup.adjust_context(context_tokens, context)
+        return context_tokens
+
     def adjust_headroom_bytes(self, headroom_bytes: int, context: ParameterContext) -> int:
         """Adjust transient warm-up/capture headroom bytes."""
         for _, subgroup in self._subgroups():
@@ -1290,8 +1296,12 @@ class MixedPrefillParameters(ParameterGroup):
 # ---------------------------------------------------------------------------
 
 
-def _recipe_context_limit(_group: RecipeParameters, context: ParameterContext) -> int | None:
-    return None if context.recipe is None else context.recipe.context
+def _declared_context_limit(group: RecipeParameters, context: ParameterContext) -> int | None:
+    if context.recipe is None:
+        return None
+    root = context.root if context.root is not None else group
+    ctx = replace(context, root=root)
+    return root.adjust_context(context.recipe.base_context(context.checkpoint), ctx)
 
 
 @dataclass(frozen=True)
@@ -1323,7 +1333,7 @@ class RecipeParameters(ParameterGroup):
         metavar="N",
         value_type=int,
         min_value=64,
-        max_fn=_recipe_context_limit,
+        max_fn=_declared_context_limit,
         multiple_of=64,
         manifest_key="prefill_chunk",
         scope=ParameterScope.DEPLOYMENT,
@@ -1466,13 +1476,26 @@ class RecipeParameters(ParameterGroup):
             raise UsageError(
                 f"--max-concurrency for {ctx.alias} must be 1 through {concurrency_limit}"
             )
+        # Validate composed subgroups before calling `adjust_context`, which may depend on them.
+        for _, subgroup in self._subgroups():
+            subgroup.validate(ctx)
         if ctx.recipe is not None:
-            if self.prefill_chunk % 64 or not 64 <= self.prefill_chunk <= ctx.recipe.context:
+            limit = _declared_context_limit(self, ctx)
+            if type(limit) is not int or not 64 <= limit < 2**31 or limit % 64:
+                raise UsageError(
+                    f"{ctx.alias} declared context ({limit!r}) must be a 64-aligned positive int32"
+                )
+            if limit % ctx.recipe.page_tokens:
+                raise UsageError(
+                    f"{ctx.alias} context ({limit:,}) must be a multiple of"
+                    f" the recipe page size ({ctx.recipe.page_tokens})"
+                )
+            if self.prefill_chunk % 64 or not 64 <= self.prefill_chunk <= limit:
                 raise UsageError(
                     f"--prefill-chunk-size for {ctx.alias} must be a multiple of 64"
-                    f" from 64 through {ctx.recipe.context:,}"
+                    f" from 64 through {limit:,}"
                 )
-        super().validate(ctx)
+        self.validate_fields(ctx)
 
     def manifest_parameters(self, context: ParameterContext) -> list[tuple[str, ParameterScope, Any]]:
         ctx = replace(context, root=self)

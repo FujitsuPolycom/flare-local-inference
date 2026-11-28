@@ -74,6 +74,19 @@ class SamplingDefaults:
         return result
 
 
+def _plain_mappings(value: object) -> object:
+    """Replace read-only mapping proxies with plain dicts so checkpoints pickle cleanly."""
+    if isinstance(value, Mapping):
+        return {key: _plain_mappings(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_plain_mappings(item) for item in value)
+    return value
+
+
+def _restore_checkpoint(cls, values: dict[str, object]) -> "Checkpoint":
+    return cls(**values)
+
+
 @dataclass(frozen=True)
 class Checkpoint:
     """One qualified checkpoint revision and where its stored tensors reside."""
@@ -103,6 +116,22 @@ class Checkpoint:
     plain_ranks: Mapping[int, "RankCosts"] | None = None
     # API model name advertised for this checkpoint; empty uses the recipe's `served_model_name`.
     served_model_name: str = ""
+    # Longest sequence this checkpoint's configuration serves when it differs from the recipe's
+    # `context`; None uses the recipe's `context`. Recipes may declare it statically or derive
+    # it from checkpoint metadata in `Recipe.inspect_replacement`.
+    context: int | None = None
+
+    def __post_init__(self):
+        if self.context is not None and (
+            type(self.context) is not int or not 64 <= self.context < 2**31 or self.context % 64
+        ):
+            raise ValueError("checkpoint context must be a 64-aligned positive int32")
+
+    def __reduce__(self):
+        return (
+            _restore_checkpoint,
+            (type(self), {item.name: _plain_mappings(getattr(self, item.name)) for item in fields(self)}),
+        )
 
 
 @dataclass(frozen=True)
@@ -242,6 +271,8 @@ class Recipe:
             if (checkpoint.ranks is None) != (checkpoint.plain_ranks is None) or (
                     checkpoint.ranks is not None and set(checkpoint.ranks) != set(checkpoint.plain_ranks)):
                 raise ValueError(f"{checkpoint.alias} declares costs with and without speculation for different sizes")
+            if checkpoint.context is not None and checkpoint.context % self.page_tokens:
+                raise ValueError(f"{checkpoint.alias} context must be a multiple of the recipe page size ({self.page_tokens})")
 
     @property
     def concurrency(self) -> int:
@@ -276,6 +307,20 @@ class Recipe:
 
     def served_name(self, checkpoint: Checkpoint) -> str:
         return checkpoint.served_model_name or self.served_model_name
+
+    def base_context(self, checkpoint: Checkpoint | None = None) -> int:
+        """Serving context ceiling declared by `checkpoint`, else the recipe's native context."""
+        return self.context if checkpoint is None or checkpoint.context is None else checkpoint.context
+
+    def declared_context(self, checkpoint: Checkpoint | None = None,
+                         parameters: RecipeParameters | None = None) -> int:
+        """Serving context ceiling for `checkpoint` after applying parameter-specific adjustments."""
+        params = self.parameters if parameters is None else parameters
+        base = self.base_context(checkpoint)
+        context = ParameterContext(
+            recipe=self, checkpoint=checkpoint, root=params, defaults=self.parameters,
+        )
+        return params.adjust_context(base, context)
 
     def costs(self, world_size: int, speculation: SpeculationParameters | None,
               checkpoint: Checkpoint | None = None) -> RankCosts:

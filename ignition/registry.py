@@ -206,6 +206,11 @@ def _resolve_replacement(recipe: Recipe, qualified: Checkpoint, metadata: Path, 
         return replacement
     if not isinstance(inspected, Checkpoint):
         raise UsageError(f"{source}: recipe replacement inspection returned {type(inspected).__name__}")
+    if inspected.context is not None and inspected.context % recipe.page_tokens:
+        raise UsageError(
+            f"{source}: checkpoint context ({inspected.context:,}) must be a multiple of"
+            f" the recipe page size ({recipe.page_tokens})"
+        )
     return inspected
 
 

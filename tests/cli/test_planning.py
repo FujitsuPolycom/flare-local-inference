@@ -5,6 +5,7 @@
 
 from dataclasses import dataclass, replace
 import json
+import pickle
 from types import MappingProxyType, SimpleNamespace
 
 import pytest
@@ -356,3 +357,207 @@ def test_weight_adjustment_hook_sizes_gpus_and_records_manifest(monkeypatch):
     by_key = {p.key: p for p in encoded.parameters}
     assert by_key["sharded_attention"].scope == proto.PREPARATION_PARAMETER_SCOPE_DEPLOYMENT
     assert by_key["sharded_attention"].value.bool_value is True
+
+
+@dataclass(frozen=True)
+class ToyScalingCheckpoint(Checkpoint):
+    """Recipe-local Checkpoint subclass carrying mechanism-specific metadata outside core Ignition."""
+
+    rope_parameters: MappingProxyType | dict | None = None
+
+
+@dataclass(frozen=True)
+class ToyContextScaleGroup(ParameterGroup):
+    """Recipe-defined ParameterGroup extending the declared serving context ceiling."""
+
+    context_scale: int = param(
+        1,
+        flag="--toy-context-scale",
+        metavar="N",
+        value_type=int,
+        min_value=1,
+        max_value=8,
+        scope=ParameterScope.DEPLOYMENT,
+        help="toy serving context scale factor",
+    )
+
+    def adjust_context(self, context_tokens: int, context: ParameterContext) -> int:
+        return context_tokens * self.context_scale
+
+
+@dataclass(frozen=True)
+class ToyContextParameters(RecipeParameters):
+    scaling: ToyContextScaleGroup = ToyContextScaleGroup()
+
+    def to_dict(self, context: ParameterContext | None = None) -> dict:
+        result = super().to_dict(context)
+        checkpoint = None if context is None else context.checkpoint
+        if isinstance(checkpoint, ToyScalingCheckpoint) and checkpoint.rope_parameters is not None:
+            result["rope_parameters"] = dict(checkpoint.rope_parameters)
+        return result
+
+
+def test_checkpoint_context_replaces_the_recipe_ceiling(capsys):
+    from ignition.cli import parse_args
+    from ignition.cli.config import Configuration
+    from ignition.cli.help import model_epilog
+    from ignition.cli.serve import _BODY_BYTES_PER_TOKEN, _MAX_BODY_BYTES, _server_options
+    from ignition.preparation.bootstrap import common_preparation_kwargs
+
+    recipe = _recipe(device_gib=20, parameters=ToyContextParameters(max_concurrency=4, prefill_chunk=4096, speculation=DRAFTING))
+    native = recipe.checkpoints[0]
+    rope = {
+        "rope_type": "yarn",
+        "factor": 4.0,
+        "original_max_position_embeddings": 262144,
+        "mrope_section": [11, 11, 10],
+    }
+    scaled = ToyScalingCheckpoint(
+        alias=native.alias,
+        repository=native.repository,
+        revision=native.revision,
+        architecture=native.architecture,
+        stored_bytes=native.stored_bytes,
+        device_bytes=native.device_bytes,
+        draft_bytes=native.draft_bytes,
+        scale_compressed_device_bytes=MappingProxyType({"csf": 10 * GIB}),
+        ranks=MappingProxyType(dict(recipe.ranks)),
+        plain_ranks=MappingProxyType(dict(recipe.plain_ranks)),
+        context=1048576,
+        rope_parameters=MappingProxyType(rope),
+    )
+    gpus = (_gpu(0),)
+    parameters = replace(recipe.parameters, max_concurrency=1)
+
+    native_plan = planning.plan(recipe, native, gpus, selected=(0,), parameters=parameters)
+    scaled_plan = planning.plan(recipe, scaled, gpus, selected=(0,), parameters=parameters)
+
+    assert native_plan.declared_context == native_plan.context == 262144
+    assert native_plan.to_dict()["checkpoint_context"] == 262144
+    assert "rope_parameters" not in native_plan.to_dict()
+    assert scaled_plan.declared_context == scaled_plan.context == 1048576
+    assert scaled_plan.guaranteed_tokens == 1048576
+    assert scaled_plan.demand_pages == 1048576 // 64
+    scaled_report = scaled_plan.to_dict()
+    assert scaled_report["checkpoint_context"] == 1048576
+    assert scaled_report["rope_parameters"] == rope
+    assert json.loads(json.dumps(scaled_report, allow_nan=False))["rope_parameters"] == rope
+
+    # Parameter validation, dynamic --help, preparation kwargs, and HTTP body limits follow the ceiling.
+    context = replace(scaled_plan.parameter_context, checkpoint=scaled)
+    assert replace(parameters, prefill_chunk=524288).validate(context) is None
+    with pytest.raises(UsageError):
+        replace(parameters, prefill_chunk=524288).validate(replace(context, checkpoint=native))
+    assert "Context: 1,048,576 tokens" in model_epilog(recipe, scaled)
+    assert "Context: 262,144 tokens" in model_epilog(recipe, native)
+    scaled_recipe = replace(recipe, checkpoints=(scaled,))
+    with pytest.raises(SystemExit) as exc:
+        parse_args(["export", scaled.alias, "--help"], recipes=(scaled_recipe,))
+    assert exc.value.code == 0
+    help_out = capsys.readouterr().out
+    assert "64..1,048,576" in help_out
+    assert "Context: 1,048,576 tokens" in help_out
+    assert common_preparation_kwargs(scaled_plan, kernel_cache=None, retain_graphs=False)["context"] == 1048576
+
+    configuration = Configuration.load(None)
+    model = SimpleNamespace(model_id=scaled.repository)
+    assert _server_options(configuration, model, scaled_plan)["max_body_bytes"] == 1048576 * _BODY_BYTES_PER_TOKEN
+    huge_recipe = replace(_recipe(device_gib=20), max_images=4, image_bytes=32 << 20)
+    huge_scaled = replace(huge_recipe.checkpoints[0], context=16 * 1048576)
+    huge_plan = planning.plan(huge_recipe, huge_scaled, gpus, selected=(0,),
+                              parameters=replace(huge_recipe.parameters, max_concurrency=1))
+    assert _server_options(configuration, model, huge_plan)["max_body_bytes"] == _MAX_BODY_BYTES
+
+    # Checkpoints and recipe subclasses carrying MappingProxyType fields round-trip through pickle.
+    restored = pickle.loads(pickle.dumps(scaled))
+    assert restored == scaled
+    assert type(restored) is ToyScalingCheckpoint
+
+
+def test_parameter_group_adjust_context_scales_plan_bounds_and_manifest(monkeypatch):
+    from ignition.cli.config import Configuration
+    from ignition.cli.serve import _BODY_BYTES_PER_TOKEN, _server_options
+    from ignition.preparation.bootstrap import common_preparation_kwargs
+
+    monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
+    recipe = _recipe(device_gib=20, parameters=ToyContextParameters(max_concurrency=4, prefill_chunk=4096))
+    checkpoint = recipe.checkpoints[0]
+    gpus = (_gpu(0),)
+
+    scaled_params = replace(
+        recipe.parameters,
+        max_concurrency=1,
+        prefill_chunk=32768,
+        scaling=ToyContextScaleGroup(context_scale=4),
+    )
+    scaled_plan = planning.plan(recipe, checkpoint, gpus, selected=(0,), parameters=scaled_params)
+    assert scaled_plan.declared_context == scaled_plan.context == 1048576
+    assert scaled_plan.guaranteed_tokens == 1048576
+    assert scaled_plan.demand_pages == 1048576 // 64
+    assert scaled_plan.to_dict()["checkpoint_context"] == 1048576
+    assert common_preparation_kwargs(scaled_plan, kernel_cache=None, retain_graphs=False)["context"] == 1048576
+    assert _server_options(Configuration.load(None), SimpleNamespace(model_id=checkpoint.repository),
+                           scaled_plan)["max_body_bytes"] == 1048576 * _BODY_BYTES_PER_TOKEN
+    # Parameter validation admits chunks up to the adjusted ceiling and rejects chunks above it.
+    assert replace(scaled_params, prefill_chunk=524288).validate(scaled_plan.parameter_context) is None
+    with pytest.raises(UsageError, match="--prefill-chunk-size"):
+        replace(scaled_params, prefill_chunk=1048576 + 64).validate(scaled_plan.parameter_context)
+
+    manifest = rebuild_manifest.from_plan(SimpleNamespace(directory=None), scaled_plan)
+    assert "--toy-context-scale" in manifest["reproduction_args"]
+    by_key = {entry["key"]: entry for entry in manifest["parameters"]}
+    assert by_key["context_scale"]["value"] == {"uint_value": 4}
+
+    # Subgroup parameter constraints reject invalid values before adjust_context runs.
+    with pytest.raises(UsageError, match="--toy-context-scale"):
+        planning.plan(
+            recipe, checkpoint, gpus, selected=(0,),
+            parameters=replace(scaled_params, scaling=ToyContextScaleGroup(context_scale=0)),
+        )
+
+
+def test_checkpoint_context_validation():
+    recipe = _recipe(device_gib=20)
+    native = recipe.checkpoints[0]
+
+    for bad_context in (0, -64, 32, 100, True, 2**31, "1048576"):
+        with pytest.raises(ValueError, match="checkpoint context"):
+            replace(native, context=bad_context)
+
+    # Checkpoint context must also align with the recipe's page size in static declarations, resolution, and plans.
+    page128 = replace(recipe, page_tokens=128)
+    for bad_aligned in (192, 4160):
+        misaligned = replace(native, context=bad_aligned)
+        with pytest.raises(ValueError, match="page size"):
+            replace(page128, checkpoints=(misaligned,))
+        with pytest.raises(UsageError, match="page size"):
+            planning.plan(page128, misaligned, (_gpu(0),), selected=(0,),
+                          parameters=replace(page128.parameters, max_concurrency=1))
+        with pytest.raises(UsageError, match="page size"):
+            planning.fit(page128, misaligned, (_gpu(0),),
+                         parameters=replace(page128.parameters, max_concurrency=1))
+    from ignition.registry import _resolve_replacement
+    hooked = replace(page128, inspect_replacement=lambda _meta, replacement: replace(replacement, context=192))
+    with pytest.raises(UsageError, match="page size"):
+        _resolve_replacement(hooked, native, None, "example/alt", "deadbeef", native.stored_bytes, "example/alt")
+
+    # An adjust_context hook returning a non-aligned or out-of-range ceiling is rejected explicitly.
+    @dataclass(frozen=True)
+    class BadContextGroup(ParameterGroup):
+        target: int = 192
+
+        def adjust_context(self, context_tokens: int, context: ParameterContext) -> int:
+            return self.target
+
+    @dataclass(frozen=True)
+    class BadContextParams(RecipeParameters):
+        bad: BadContextGroup = BadContextGroup()
+
+    bad_recipe = replace(page128, parameters=BadContextParams(max_concurrency=1, prefill_chunk=64))
+    with pytest.raises(UsageError, match="page size"):
+        planning.plan(bad_recipe, native, (_gpu(0),), selected=(0,))
+    with pytest.raises(UsageError, match="64-aligned positive int32"):
+        planning.plan(
+            bad_recipe, native, (_gpu(0),), selected=(0,),
+            parameters=replace(bad_recipe.parameters, bad=BadContextGroup(target=100)),
+        )

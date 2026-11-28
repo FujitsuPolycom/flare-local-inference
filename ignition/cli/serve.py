@@ -22,6 +22,8 @@ from .preparation import Host, derive, fetch, resolve_model, resolve_parameters,
 # Request bytes allowed per context token: JSON-escaped text (a \uXXXX escape takes six bytes per
 # UTF-16 unit) and message structure stay well within this for prompts that fill the context.
 _BODY_BYTES_PER_TOKEN = 32
+# Matches Helios's HTTP admission cap (`helios/src/server.rs`, `Server::start`).
+_MAX_BODY_BYTES = 256 << 20
 
 
 def _checkpoint_fabric(args):
@@ -64,7 +66,10 @@ def _server_options(configuration, model, plan) -> dict:
         "reserve_bytes": plan.reserve_bytes,
         "api_key": configuration.get("server.api_key").value,
         "queue_capacity": 4 * plan.concurrency, "frontend_workers": plan.concurrency,
-        "max_body_bytes": plan.max_images * recipe.image_bytes + recipe.context * _BODY_BYTES_PER_TOKEN,
+        "max_body_bytes": min(
+            _MAX_BODY_BYTES,
+            plan.max_images * recipe.image_bytes + plan.declared_context * _BODY_BYTES_PER_TOKEN,
+        ),
         "context_hint": "context is limited by the checkpoint and available cache capacity",
         "capacity_hint": "--max-concurrency sets the request limit; a lower [memory] reserve leaves more KV pages",
         **({"decode_weight_bytes": checkpoint.decode_weight_bytes} if checkpoint.decode_weight_bytes > 0 else {}),
